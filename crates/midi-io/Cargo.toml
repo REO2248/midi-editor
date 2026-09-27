@@ -1,0 +1,10 @@
+[package]
+name = "midi-io"
+edition.workspace = true
+license.workspace = true
+description = "MIDI I/O: port enumeration, output, playback engine"
+
+[dependencies]
+midir.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

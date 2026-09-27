@@ -1,0 +1,456 @@
+//! SMF read/write layer.
+//!
+//! Read: midly (zero-copy, `SmfBytemap` gives each event's raw byte span).
+//! Write: custom serializer that re-emits untouched events byte-verbatim and
+//! only encodes new/edited events. Note: midly's bytemap span is the event
+//! body *excluding* the leading delta VLQ (the status byte IS included for
+//! channel events; a body starting <0x80 is a running-status event).
+
+use bytes::Bytes;
+use midly::{MetaMessage, MidiMessage, SmfBytemap, TrackEventKind};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("SMF parse failed: {0}")]
+    Parse(String),
+    #[error("parser panicked on malformed input")]
+    Panic,
+}
+
+#[derive(Debug, Clone)]
+pub enum EventKind {
+    /// channel voice/mode event; status byte includes channel nibble
+    Channel { status: u8, data: [u8; 2], len: u8 },
+    /// meta event: type byte + raw payload (encoding-agnostic, Shift-JIS safe)
+    Meta { meta_type: u8, data: Bytes },
+    /// F0 sysex payload, without the leading F0
+    SysEx(Bytes),
+    /// F7 escape sequence payload, without the leading F7
+    Escape(Bytes),
+}
+
+#[derive(Debug, Clone)]
+pub struct Event {
+    /// absolute tick within the track
+    pub tick: u64,
+    /// ordering inside the same tick (file order)
+    pub seq: u32,
+    /// raw event bytes minus the leading delta VLQ. `None` = synthesized/edited.
+    /// May start with a data byte (<0x80) when the source used running status.
+    pub raw_body: Option<Bytes>,
+    pub kind: EventKind,
+}
+
+#[derive(Debug)]
+pub struct Track {
+    pub events: Vec<Event>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Division {
+    Metrical(u16),
+    /// semantic fps (24/25/29/30) + ticks per frame
+    Smpte { fps: u8, ticks_per_frame: u8 },
+}
+
+impl Default for Division {
+    /// 480 PPQ — the de facto modern SMF resolution.
+    fn default() -> Self {
+        Self::Metrical(480)
+    }
+}
+
+#[derive(Debug)]
+pub struct File {
+    pub format: u16,
+    pub division: Division,
+    pub tracks: Vec<Track>,
+    /// non-fatal problems seen during load (non-MTrk chunks midly drops, etc.)
+    pub warnings: Vec<String>,
+}
+
+pub fn parse(raw: &[u8]) -> Result<File, Error> {
+    let map = catch_unwind(AssertUnwindSafe(|| SmfBytemap::parse(raw)))
+        .map_err(|_| Error::Panic)?
+        .map_err(|e| Error::Parse(format!("{e}")))?;
+
+    let mut warnings = Vec::new();
+    detect_extra_chunks(raw, &mut warnings);
+
+    let format = match map.header.format {
+        midly::Format::SingleTrack => 0,
+        midly::Format::Parallel => 1,
+        midly::Format::Sequential => 2,
+    };
+    let division = match map.header.timing {
+        midly::Timing::Metrical(t) => Division::Metrical(t.as_int()),
+        midly::Timing::Timecode(fps, tpf) => Division::Smpte {
+            fps: fps.as_int(),
+            ticks_per_frame: tpf,
+        },
+    };
+
+    let tracks = map
+        .tracks
+        .iter()
+        .map(|t| {
+            let mut tick: u64 = 0;
+            let events = t
+                .iter()
+                .enumerate()
+                .map(|(seq, (span, ev))| {
+                    tick += ev.delta.as_int() as u64;
+                    Event {
+                        tick,
+                        seq: seq as u32,
+                        raw_body: Some(Bytes::copy_from_slice(span)),
+                        kind: convert_kind(&ev.kind),
+                    }
+                })
+                .collect();
+            Track { events }
+        })
+        .collect();
+
+    Ok(File {
+        format,
+        division,
+        tracks,
+        warnings,
+    })
+}
+
+fn detect_extra_chunks(raw: &[u8], warnings: &mut Vec<String>) {
+    if raw.len() < 14 || raw[0..4] != *b"MThd" {
+        return;
+    }
+    let hlen = u32::from_be_bytes(raw[4..8].try_into().unwrap()) as usize;
+    let mut pos = 8 + hlen;
+    while pos + 8 <= raw.len() {
+        let id = &raw[pos..pos + 4];
+        let len = u32::from_be_bytes(raw[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        if id != b"MTrk" {
+            warnings.push(format!(
+                "non-MTrk chunk {:?} ({} bytes) at offset {} is not preserved by the parser",
+                String::from_utf8_lossy(id),
+                len,
+                pos
+            ));
+        }
+        pos += 8 + len;
+    }
+    if pos < raw.len() {
+        warnings.push(format!("{} trailing bytes after last chunk", raw.len() - pos));
+    }
+}
+
+fn convert_kind(kind: &TrackEventKind<'_>) -> EventKind {
+    match kind {
+        TrackEventKind::Midi { channel, message } => {
+            let status = midi_status(message) | channel.as_int();
+            let (d0, d1, len) = midi_data(message);
+            EventKind::Channel {
+                status,
+                data: [d0, d1],
+                len,
+            }
+        }
+        TrackEventKind::SysEx(data) => EventKind::SysEx(Bytes::copy_from_slice(data)),
+        TrackEventKind::Escape(data) => EventKind::Escape(Bytes::copy_from_slice(data)),
+        TrackEventKind::Meta(m) => meta_to_kind(m),
+    }
+}
+
+fn midi_status(m: &MidiMessage) -> u8 {
+    match m {
+        MidiMessage::NoteOff { .. } => 0x80,
+        MidiMessage::NoteOn { .. } => 0x90,
+        MidiMessage::Aftertouch { .. } => 0xA0,
+        MidiMessage::Controller { .. } => 0xB0,
+        MidiMessage::ProgramChange { .. } => 0xC0,
+        MidiMessage::ChannelAftertouch { .. } => 0xD0,
+        MidiMessage::PitchBend { .. } => 0xE0,
+    }
+}
+
+fn midi_data(m: &MidiMessage) -> (u8, u8, u8) {
+    match m {
+        MidiMessage::NoteOff { key, vel } | MidiMessage::NoteOn { key, vel } => {
+            (key.as_int(), vel.as_int(), 2)
+        }
+        MidiMessage::Aftertouch { key, vel } => (key.as_int(), vel.as_int(), 2),
+        MidiMessage::Controller { controller, value } => {
+            (controller.as_int(), value.as_int(), 2)
+        }
+        MidiMessage::ProgramChange { program } => (program.as_int(), 0, 1),
+        MidiMessage::ChannelAftertouch { vel } => (vel.as_int(), 0, 1),
+        MidiMessage::PitchBend { bend } => {
+            let v = bend.as_int();
+            ((v & 0x7F) as u8, (v >> 7) as u8, 2)
+        }
+    }
+}
+
+fn meta(meta_type: u8, data: &[u8]) -> EventKind {
+    EventKind::Meta {
+        meta_type,
+        data: Bytes::copy_from_slice(data),
+    }
+}
+
+fn meta_to_kind(m: &MetaMessage<'_>) -> EventKind {
+    match m {
+        MetaMessage::TrackNumber(n) => match n {
+            Some(v) => meta(0x00, &v.to_be_bytes()),
+            None => meta(0x00, &[]),
+        },
+        MetaMessage::Text(d) => meta(0x01, d),
+        MetaMessage::Copyright(d) => meta(0x02, d),
+        MetaMessage::TrackName(d) => meta(0x03, d),
+        MetaMessage::InstrumentName(d) => meta(0x04, d),
+        MetaMessage::Lyric(d) => meta(0x05, d),
+        MetaMessage::Marker(d) => meta(0x06, d),
+        MetaMessage::CuePoint(d) => meta(0x07, d),
+        MetaMessage::ProgramName(d) => meta(0x08, d),
+        MetaMessage::DeviceName(d) => meta(0x09, d),
+        MetaMessage::MidiChannel(ch) => meta(0x20, &[ch.as_int()]),
+        MetaMessage::MidiPort(p) => meta(0x21, &[p.as_int()]),
+        MetaMessage::EndOfTrack => meta(0x2F, &[]),
+        MetaMessage::Tempo(t) => meta(0x51, &t.as_int().to_be_bytes()[1..]),
+        MetaMessage::SmpteOffset(o) => {
+            let rr: u8 = match o.fps() {
+                midly::Fps::Fps24 => 0,
+                midly::Fps::Fps25 => 1,
+                midly::Fps::Fps29 => 2,
+                midly::Fps::Fps30 => 3,
+            };
+            meta(
+                0x54,
+                &[
+                    (rr << 5) | (o.hour() & 0x1F),
+                    o.minute(),
+                    o.second(),
+                    o.frame(),
+                    o.subframe(),
+                ],
+            )
+        }
+        MetaMessage::TimeSignature(n, d, c, t) => meta(0x58, &[*n, *d, *c, *t]),
+        MetaMessage::KeySignature(sf, minor) => meta(0x59, &[*sf as u8, *minor as u8]),
+        MetaMessage::SequencerSpecific(d) => meta(0x7F, d),
+        MetaMessage::Unknown(ty, d) => meta(*ty, d),
+    }
+}
+
+// ---- writer ----
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WriteOptions {
+    /// collapse consecutive same-status channel events to running status
+    pub running_status: bool,
+}
+
+pub fn write_vlq(mut v: u64, out: &mut Vec<u8>) {
+    let mut buf = [0u8; 10];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = (v & 0x7F) as u8;
+        v >>= 7;
+        if v == 0 {
+            break;
+        }
+    }
+    for b in &buf[i..buf.len() - 1] {
+        out.push(b | 0x80);
+    }
+    out.push(buf[buf.len() - 1]);
+}
+
+fn encode_body(kind: &EventKind, out: &mut Vec<u8>) {
+    match kind {
+        EventKind::Channel { status, data, len } => {
+            out.push(*status);
+            out.push(data[0]);
+            if *len == 2 {
+                out.push(data[1]);
+            }
+        }
+        EventKind::Meta { meta_type, data } => {
+            out.push(0xFF);
+            out.push(*meta_type);
+            write_vlq(data.len() as u64, out);
+            out.extend_from_slice(data);
+        }
+        EventKind::SysEx(data) => {
+            out.push(0xF0);
+            write_vlq(data.len() as u64, out);
+            out.extend_from_slice(data);
+        }
+        EventKind::Escape(data) => {
+            out.push(0xF7);
+            write_vlq(data.len() as u64, out);
+            out.extend_from_slice(data);
+        }
+    }
+}
+
+/// status byte to emit before a raw body that begins with a data byte
+/// (the source relied on running status). Only channel events qualify.
+fn implied_status(kind: &EventKind) -> Option<u8> {
+    match kind {
+        EventKind::Channel { status, .. } => Some(*status),
+        _ => None,
+    }
+}
+
+/// Serialize tracks to SMF bytes. Events keep their stored `raw_body` when
+/// present; ordering is by (tick, seq). Byte-verbatim when nothing was edited.
+pub fn write(format_req: u16, division: Division, tracks: &[Track], opts: WriteOptions) -> Vec<u8> {
+    let division_raw = match division {
+        Division::Metrical(t) => t,
+        Division::Smpte {
+            fps,
+            ticks_per_frame,
+        } => (((-(fps as i8)) as u8 as u16) << 8) | ticks_per_frame as u16,
+    };
+    let ntrks = tracks.len() as u16;
+    let format = if ntrks == 1 { 0 } else { format_req.max(1) };
+
+    let mut out = Vec::new();
+    out.extend_from_slice(b"MThd");
+    out.extend_from_slice(&6u32.to_be_bytes());
+    out.extend_from_slice(&format.to_be_bytes());
+    out.extend_from_slice(&ntrks.to_be_bytes());
+    out.extend_from_slice(&division_raw.to_be_bytes());
+
+    for track in tracks {
+        let mut body = Vec::with_capacity(4096);
+        let mut prev_tick = 0u64;
+        let mut prev_status: Option<u8> = None;
+        let mut sorted: Vec<&Event> = track.events.iter().collect();
+        sorted.sort_by_key(|e| (e.tick, e.seq));
+
+        for ev in sorted {
+            let delta = ev.tick - prev_tick;
+            prev_tick = ev.tick;
+            write_vlq(delta, &mut body);
+
+            let body_bytes = match &ev.raw_body {
+                Some(raw) if !raw.is_empty() => raw.clone(),
+                _ => {
+                    let mut b = Vec::new();
+                    encode_body(&ev.kind, &mut b);
+                    Bytes::from(b)
+                }
+            };
+
+            let first = body_bytes[0];
+            if first < 0x80 {
+                // body relies on running status from the source stream
+                if let Some(st) = implied_status(&ev.kind) {
+                    if prev_status != Some(st) {
+                        body.push(st);
+                    }
+                    prev_status = Some(st);
+                }
+                body.extend_from_slice(&body_bytes);
+            } else {
+                let is_channel = (0x80..0xF0).contains(&first);
+                if opts.running_status && is_channel && prev_status == Some(first) {
+                    body.extend_from_slice(&body_bytes[1..]);
+                } else {
+                    body.extend_from_slice(&body_bytes);
+                }
+                prev_status = if is_channel { Some(first) } else { None };
+            }
+        }
+        // ensure EOT
+        let has_eot = sorted_last_is_eot(track);
+        if !has_eot {
+            write_vlq(0, &mut body);
+            body.extend_from_slice(&[0xFF, 0x2F, 0x00]);
+        }
+
+        out.extend_from_slice(b"MTrk");
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        out.extend_from_slice(&body);
+    }
+    out
+}
+
+fn sorted_last_is_eot(track: &Track) -> bool {
+    track
+        .events
+        .iter()
+        .max_by_key(|e| (e.tick, e.seq))
+        .map(|e| matches!(e.kind, EventKind::Meta { meta_type: 0x2F, .. }))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// fixture: format-1, SJIS track name, running status, SysEx
+    fn fixture() -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(b"MThd\x00\x00\x00\x06\x00\x01\x00\x02\x01\xE0");
+        // track 0: conductor
+        let t0: &[u8] = &[
+            0x00, 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20, // tempo 500000
+            0x00, 0xFF, 0x58, 0x04, 0x04, 0x02, 0x18, 0x08, // 4/4
+            0x00, 0xFF, 0x2F, 0x00, // EOT
+        ];
+        // track 1: SJIS name "テスト", notes w/ running status, sysex
+        let mut t1 = Vec::new();
+        t1.extend_from_slice(&[0x00, 0xFF, 0x03, 0x06]);
+        t1.extend_from_slice(&[0x83, 0x60, 0x83, 0x60, 0x83, 0x60]); // "テスト" Shift-JIS
+        t1.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]);
+        t1.extend_from_slice(&[0x60, 0x3C, 0x00]); // running status: NoteOn vel0
+        t1.extend_from_slice(&[0x00, 0xF0, 0x04, 0x7E, 0x7F, 0x09, 0x01]); // GM on
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        f.extend_from_slice(b"MTrk");
+        f.extend_from_slice(&(t0.len() as u32).to_be_bytes());
+        f.extend_from_slice(t0);
+        f.extend_from_slice(b"MTrk");
+        f.extend_from_slice(&(t1.len() as u32).to_be_bytes());
+        f.extend_from_slice(&t1);
+        f
+    }
+
+    #[test]
+    fn roundtrip_byte_identical() {
+        let src = fixture();
+        let f = parse(&src).unwrap();
+        let out = write(f.format, f.division, &f.tracks, WriteOptions::default());
+        assert_eq!(src, out, "round-trip must be byte identical");
+    }
+
+    #[test]
+    fn sjis_preserved() {
+        let f = parse(&fixture()).unwrap();
+        match &f.tracks[1].events[0].kind {
+            EventKind::Meta {
+                meta_type: 0x03,
+                data,
+            } => {
+                assert_eq!(
+                    &data[..],
+                    &[0x83, 0x60, 0x83, 0x60, 0x83, 0x60],
+                    "track name raw bytes"
+                );
+            }
+            other => panic!("expected track name meta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_does_not_panic() {
+        let mut bad = fixture();
+        bad.truncate(bad.len() - 3);
+        let _ = parse(&bad); // must not panic
+    }
+}

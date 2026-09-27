@@ -1,0 +1,12 @@
+[package]
+name = "output"
+edition.workspace = true
+license.workspace = true
+description = "Track output destinations: MIDI ports or hosted plugins"
+
+[dependencies]
+midi-io.workspace = true
+vst3-host.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true

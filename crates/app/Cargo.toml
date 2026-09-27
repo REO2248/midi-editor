@@ -1,0 +1,21 @@
+[package]
+name = "midi-editor"
+edition.workspace = true
+license.workspace = true
+description = "Pure-SMF MIDI editor — gpui app"
+
+[dependencies]
+gpui-kit.workspace = true
+document.workspace = true
+smf-core.workspace = true
+commands.workspace = true
+midi-io.workspace = true
+output.workspace = true
+mcp-server.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[[bin]]
+name = "midi-editor"
+path = "src/main.rs"

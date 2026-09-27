@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# local crates
+smf-core = { path = "crates/smf-core" }
+document = { path = "crates/document" }
+commands = { path = "crates/commands" }
+midi-io = { path = "crates/midi-io" }
+output = { path = "crates/output" }
+mcp-server = { path = "crates/mcp-server" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# MIDI / SMF
+midly = "0.5"
+midir = "0.10"
+
+# Plugin hosting. default-features=false drops its cpal backend for now:
+# midir(alsa 0.9) and cpal(alsa 0.11) both link `alsa-sys` and cargo cannot
+# resolve the conflict; audio output is wired up later once the dep story is
+# settled (newer midir, or our own audio path).
+vst3-host = { version = "0.9", default-features = false }
+
+# GUI (gpui via gpui-kit facade; gpui is gpui-pre 0.3.6 underneath)
+gpui-kit = "0.6"
+
+# MCP server
+rmcp = { version = "3.4", features = ["server", "transport-io", "macros", "schemars"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+
+[profile.dev]
+# faster link times during spike work
+incremental = true

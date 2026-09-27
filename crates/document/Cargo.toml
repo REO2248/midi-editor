@@ -1,0 +1,11 @@
+[package]
+name = "document"
+edition.workspace = true
+license.workspace = true
+description = "Canonical MIDI document model: raw event layer + derived views"
+
+[dependencies]
+smf-core.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+serde.workspace = true

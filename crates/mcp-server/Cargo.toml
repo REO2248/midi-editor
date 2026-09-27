@@ -1,0 +1,15 @@
+[package]
+name = "mcp-server"
+edition.workspace = true
+license.workspace = true
+description = "Embedded MCP server over the shared document transaction path"
+
+[dependencies]
+rmcp = { workspace = true, features = ["server", "transport-io", "macros", "schemars"] }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+document.workspace = true
+smf-core.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
