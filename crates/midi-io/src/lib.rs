@@ -83,3 +83,90 @@ impl Output {
         }
     }
 }
+
+/// Scheduled playback on a dedicated thread.
+///
+/// The caller snapshots the timeline as `(absolute µs, channel event bytes)`
+/// pairs; the thread sleeps until each deadline and sends verbatim. Meta and
+/// SysEx events never reach the port — filtering is the caller's job.
+/// `position_us` is updated as the schedule advances so the UI can draw a
+/// playhead.
+pub struct Playback {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    position_us: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Playback {
+    /// `events` must be sorted by absolute µs. `start_us` seeks: events before
+    /// it are skipped and the clock starts at `start_us`.
+    pub fn start(
+        mut out: Output,
+        events: Vec<(u64, Vec<u8>)>,
+        start_us: u64,
+    ) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let position_us = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (stop2, pos2) = (stop.clone(), position_us.clone());
+        let thread = std::thread::spawn(move || {
+            use std::sync::atomic::Ordering::Relaxed;
+            let t0 = std::time::Instant::now();
+            pos2.store(start_us, Relaxed);
+            for (us, bytes) in events {
+                if stop2.load(Relaxed) {
+                    break;
+                }
+                if us < start_us {
+                    continue;
+                }
+                let target = t0 + std::time::Duration::from_micros(us - start_us);
+                loop {
+                    let now = std::time::Instant::now();
+                    if now >= target {
+                        break;
+                    }
+                    if stop2.load(Relaxed) {
+                        break;
+                    }
+                    std::thread::sleep((target - now).min(std::time::Duration::from_millis(2)));
+                }
+                if stop2.load(Relaxed) {
+                    break;
+                }
+                pos2.store(us, Relaxed);
+                let _ = out.send(&bytes);
+            }
+            out.panic();
+        });
+        Self {
+            stop,
+            position_us,
+            thread: Some(thread),
+        }
+    }
+
+    pub fn position_us(&self) -> u64 {
+        self.position_us.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// True while the playback thread is alive (also true at end-of-timeline
+    /// until the final panic has been sent).
+    pub fn is_running(&self) -> bool {
+        self.thread
+            .as_ref()
+            .is_some_and(|t| !t.is_finished())
+    }
+
+    pub fn stop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+impl Drop for Playback {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}

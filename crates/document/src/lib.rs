@@ -244,6 +244,29 @@ impl Document {
         self.tempo_map = TempoMap::build(&self.tracks, self.division);
     }
 
+    /// Playback timeline: all channel events across tracks as
+    /// `(absolute µs, wire bytes)` — status byte included, sorted by time.
+    /// Meta/SysEx events are excluded (they never go down the wire).
+    /// Channel -> port routing belongs to the caller.
+    pub fn timeline(&self) -> Vec<(u64, Vec<u8>)> {
+        let mut out = Vec::new();
+        for t in &self.tracks {
+            for e in &t.events {
+                if let EventKind::Channel { status, data, len } = &e.kind {
+                    let mut b = Vec::with_capacity(3);
+                    b.push(*status);
+                    b.push(data[0]);
+                    if *len == 2 {
+                        b.push(data[1]);
+                    }
+                    out.push((self.tempo_map.tick_to_us(e.tick), b));
+                }
+            }
+        }
+        out.sort_by_key(|(us, _)| *us);
+        out
+    }
+
     pub fn serialize(&self, opts: smf_core::WriteOptions) -> Vec<u8> {
         let tracks: Vec<smf_core::Track> = self
             .tracks
@@ -269,6 +292,84 @@ fn op_removed(op: &Op) -> Vec<(usize, Event)> {
     match op {
         Op::RemoveEvents { removed, .. } => removed.clone(),
         _ => vec![],
+    }
+}
+
+/// A note rectangle derived by pairing NoteOn with its matching NoteOff
+/// (or NoteOn-vel0). Dangling NoteOns stay visible (`end_tick: None`).
+#[derive(Debug, Clone)]
+pub struct Note {
+    pub track: usize,
+    pub channel: u8,
+    pub key: u8,
+    pub vel: u8,
+    pub start_tick: u64,
+    /// `None` = dangling NoteOn (import diagnostic surfaces these)
+    pub end_tick: Option<u64>,
+    pub on_id: EventId,
+    pub off_id: Option<EventId>,
+}
+
+impl Document {
+    /// Derived view over the raw event truth — O(events). Call after edits.
+    pub fn notes(&self) -> Vec<Note> {
+        let mut out = Vec::new();
+        for (ti, t) in self.tracks.iter().enumerate() {
+            // (channel, key) -> pending NoteOn stack
+            let mut pending: [[Vec<usize>; 128]; 16] =
+                std::array::from_fn(|_| std::array::from_fn(|_| Vec::new()));
+            let mut on_events: Vec<(u64, u8, EventId)> = Vec::new(); // tick, vel, id per noteOn
+            for e in &t.events {
+                let EventKind::Channel { status, data, .. } = &e.kind else {
+                    continue;
+                };
+                let ch = (status & 0x0F) as usize;
+                let msg = status & 0xF0;
+                let key = data[0] as usize;
+                match (msg, data[1]) {
+                    (0x90, v) if v > 0 => {
+                        pending[ch][key].push(on_events.len());
+                        on_events.push((e.tick, v, e.id));
+                    }
+                    (0x80, _) | (0x90, _) => {
+                        if let Some(idx) = pending[ch][key].pop() {
+                            let (start, vel, on_id) = on_events[idx];
+                            out.push(Note {
+                                track: ti,
+                                channel: ch as u8,
+                                key: key as u8,
+                                vel,
+                                start_tick: start,
+                                end_tick: Some(e.tick),
+                                on_id,
+                                off_id: Some(e.id),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // dangling noteOns — kept visible for the import diagnostics report
+            for (ch, keys) in pending.iter().enumerate() {
+                for (key, stack) in keys.iter().enumerate() {
+                    for &idx in stack {
+                        let (start, vel, on_id) = on_events[idx];
+                        out.push(Note {
+                            track: ti,
+                            channel: ch as u8,
+                            key: key as u8,
+                            vel,
+                            start_tick: start,
+                            end_tick: None,
+                            on_id,
+                            off_id: None,
+                        });
+                    }
+                }
+            }
+        }
+        out.sort_by_key(|n| (n.start_tick, n.key));
+        out
     }
 }
 
@@ -327,6 +428,22 @@ impl TempoMap {
         };
         cum + (tick - t0) * mpq as u64 / ppq
     }
+
+    /// Inverse of `tick_to_us` — for playhead positioning.
+    pub fn us_to_tick(&self, us: u64) -> u64 {
+        let ppq = match self.division {
+            Division::Metrical(p) => p.max(1) as u64,
+            Division::Smpte { .. } => return us,
+        };
+        // last breakpoint whose cumulative time is <= us
+        let i = match self.points.binary_search_by(|p| p.2.cmp(&us)) {
+            Ok(i) => i,
+            Err(0) => return us * ppq / 500_000,
+            Err(i) => i - 1,
+        };
+        let (t0, mpq, cum) = self.points[i];
+        t0 + (us - cum) * ppq / mpq.max(1) as u64
+    }
 }
 
 #[cfg(test)]
@@ -365,6 +482,40 @@ mod tests {
             d.apply(bad),
             Err(ApplyError::StaleRevision { .. })
         ));
+    }
+
+    #[test]
+    fn notes_pairing_and_dangling() {
+        // one paired note (on 480/off 960) + one dangling NoteOn at 1440
+        let mk = |tick, status, d0, d1| smf_core::Event {
+            tick,
+            seq: 0,
+            raw_body: None,
+            kind: EventKind::Channel {
+                status,
+                data: [d0, d1],
+                len: 2,
+            },
+        };
+        let f = smf_core::File {
+            format: 1,
+            division: Division::Metrical(480),
+            tracks: vec![smf_core::Track {
+                events: vec![
+                    mk(480, 0x90, 60, 100),
+                    mk(960, 0x80, 60, 0),
+                    mk(1440, 0x91, 64, 90),
+                ],
+            }],
+            warnings: vec![],
+        };
+        let d = Document::from_file(f);
+        let notes = d.notes();
+        assert_eq!(notes.len(), 2);
+        let paired = notes.iter().find(|n| n.key == 60).unwrap();
+        assert_eq!((paired.start_tick, paired.end_tick), (480, Some(960)));
+        let dangling = notes.iter().find(|n| n.key == 64).unwrap();
+        assert_eq!((dangling.channel, dangling.end_tick), (1, None));
     }
 
     #[test]
