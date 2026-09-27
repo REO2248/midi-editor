@@ -9,7 +9,9 @@ A modern, pure-SMF MIDI file editor with an embedded MCP server — a "VSCode fo
 
 Design docs live in `docs/research/` — start with `00-synthesis.md`.
 
-Status: Phase 0 spike (toolchain + architecture verification).
+Status: Phase 1 — file open/save, piano roll + event list, note editing
+(pencil/drag/delete), undo/redo, playback to a MIDI output port, and a live
+MCP tool surface all work against a real .mid document.
 
 ## Build (Windows)
 
@@ -25,3 +27,41 @@ From Git Bash / PowerShell use the helper: `cmd /c C:\Users\Administrator\vcargo
 Spike binaries: `cargo run --bin midi_ports` (midir port enumeration),
 `cargo run --bin vst3_scan` (VST3 discovery + load attempt),
 `cargo run --bin mcp_bridge` (MCP stdio server).
+
+## Running
+
+```
+cargo run --bin midi-editor [file.mid]
+```
+
+Controls: left-click empty space draws a note (16th-note snap), drag a note to
+move it, click selects, Delete removes, Ctrl+Z / Ctrl+Y (or Ctrl+Shift+Z)
+undo/redo, Ctrl+S saves, Ctrl+O opens, Space or the Play button toggles playback
+to the selected output port (click the port name to cycle ports — GM synth,
+loopMIDI, physical interfaces). Mouse wheel scrolls, Ctrl+wheel zooms.
+
+## MCP server
+
+The app embeds a Streamable-HTTP MCP server at `http://127.0.0.1:7878/mcp`
+while it is running. Set `MIDI_MCP_TOKEN` to require `Authorization: Bearer`.
+
+For stdio-only clients (Claude Desktop etc.) use the bridge:
+
+```
+# proxy to the running app (default URL above; --url/--token to override)
+mcp-bridge
+
+# or standalone: edit a file headlessly over stdio
+mcp-bridge --file song.mid
+```
+
+Tools: `document_summary`, `list_notes`, `query_events`, `apply_patch`
+(insert_note / insert_events / remove_events / move_note / set_tempo; atomic,
+one undo step, optional `base_revision` optimistic check), `undo`, `redo`,
+`save`. MCP edits repaint the GUI live.
+
+## i18n
+
+UI strings live in `crates/app/src/i18n.rs` (English default, Japanese bundled).
+`MIDI_EDITOR_LANG=ja` or a `ja*` `LANG` selects Japanese; adding a locale means
+adding a table there — no string literals in UI code.

@@ -7,7 +7,9 @@ mod i18n;
 use i18n::t;
 
 use commands::UndoStack;
-use document::{Document, Event as DocEvent, EventId, Note, Op, Transaction};
+use document::{Document, Event as DocEvent, EventId, Note, Op};
+use mcp_server::{Shared, SharedDoc};
+use std::sync::Mutex;
 use smf_core::EventKind;
 use gpui_kit::*;
 use gpui_kit::component::input::{Input, InputState};
@@ -39,10 +41,7 @@ struct Drag {
 }
 
 struct EditorView {
-    doc: Document,
-    undo: UndoStack,
-    path: Option<PathBuf>,
-    clean_rev: u64,
+    shared: SharedDoc,
     notes_rev: u64,
     notes: Arc<Vec<Note>>,
     ev_rev: u64,
@@ -75,19 +74,26 @@ fn empty_doc() -> Document {
 }
 
 impl EditorView {
-    fn new(path: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let (doc, status, open_path) = match &path {
+    fn new(path: Option<PathBuf>, input: Entity<InputState>, cx: &mut Context<Self>) -> Self {
+        let mut sh = Shared::new(match &path {
             Some(p) => match load_document(p) {
-                Ok(d) => (d, "loaded".into(), Some(p.clone())),
-                Err(e) => (empty_doc(), format!("load failed: {e}").into(), Some(p.clone())),
+                Ok(d) => d,
+                Err(_) => empty_doc(),
             },
-            None => (empty_doc(), "new document".into(), None),
+            None => empty_doc(),
+        });
+        let status: SharedString = match &path {
+            Some(p) => match load_document(p) {
+                Ok(_) => "loaded".into(),
+                Err(e) => format!("load failed: {e}").into(),
+            },
+            None => "new document".into(),
         };
+        sh.path = path.clone();
+        sh.saved_revision = sh.doc.revision();
+        let shared = Arc::new(Mutex::new(sh));
         let mut v = Self {
-            doc,
-            undo: UndoStack::new(512),
-            path: open_path,
-            clean_rev: 0,
+            shared,
             notes_rev: u64::MAX,
             notes: Arc::new(vec![]),
             ev_rev: u64::MAX,
@@ -104,7 +110,7 @@ impl EditorView {
             playback: None,
             play_us: 0,
             focus: cx.focus_handle(),
-            input: cx.new(|cx| InputState::new(window, cx).placeholder(t("field.track_name"))),
+            input,
             status,
         };
         v.sel_track = v.pick_default_track();
@@ -112,8 +118,13 @@ impl EditorView {
         v
     }
 
+    fn doc<R>(&self, f: impl FnOnce(&Document) -> R) -> R {
+        let sh = self.shared.lock().unwrap();
+        f(&sh.doc)
+    }
+
     fn pick_default_track(&self) -> usize {
-        self.doc
+        self.doc(|d| d
             .tracks
             .iter()
             .position(|t| {
@@ -121,32 +132,41 @@ impl EditorView {
                     .iter()
                     .any(|e| matches!(e.kind, EventKind::Channel { .. }))
             })
-            .unwrap_or(0)
+            .unwrap_or(0))
     }
 
     fn refresh_derived(&mut self) {
-        let rev = self.doc.revision();
+        let arc = self.shared.clone();
+        let mut sh = arc.lock().unwrap();
+        self.refresh_derived_sh(&mut sh);
+    }
+
+    fn refresh_derived_sh(&mut self, sh: &mut Shared) {
+        let rev = sh.doc.revision();
         if self.notes_rev != rev {
-            self.notes = Arc::new(self.doc.notes());
+            self.notes = Arc::new(sh.doc.notes());
             self.notes_rev = rev;
         }
         if self.ev_rev != rev {
-            self.events = Arc::new(self.build_event_rows());
+            self.events = Arc::new(self.build_event_rows(&sh.doc));
             self.ev_rev = rev;
         }
     }
 
     fn ppq(&self) -> u64 {
-        match self.doc.division {
+        match self.doc(|d| d.division) {
             Division::Metrical(p) => (p as u64).max(1),
             Division::Smpte { .. } => 480,
         }
     }
 
-    fn build_event_rows(&self) -> Vec<SharedString> {
-        let ppq = self.ppq();
+    fn build_event_rows(&self, doc: &Document) -> Vec<SharedString> {
+        let ppq = match doc.division {
+            Division::Metrical(p) => (p as u64).max(1),
+            Division::Smpte { .. } => 480,
+        };
         let mut rows = Vec::new();
-        for (ti, tr) in self.doc.tracks.iter().enumerate() {
+        for (ti, tr) in doc.tracks.iter().enumerate() {
             for e in &tr.events {
                 let bar = e.tick / (ppq * 4) + 1;
                 let beat = (e.tick % (ppq * 4)) / ppq + 1;
@@ -189,27 +209,23 @@ impl EditorView {
     }
 
     fn apply_tx(&mut self, label: &str, ops: Vec<Op>) {
-        let tx = Transaction {
-            label: label.into(),
-            base: self.doc.revision(),
-            ops,
-        };
-        match self.doc.apply(tx.clone()) {
-            Ok(_) => {
-                self.undo.push(tx);
-                self.refresh_derived();
-            }
+        let arc = self.shared.clone();
+        let mut sh = arc.lock().unwrap();
+        match sh.apply(label, ops) {
+            Ok(_) => self.refresh_derived_sh(&mut sh),
             Err(e) => self.status = format!("apply: {e}").into(),
         }
     }
 
     fn insert_note(&mut self, tick: u64, key: u8, cx: &mut Context<Self>) {
         let ppq = self.ppq();
-        let track = self.sel_track.min(self.doc.tracks.len().saturating_sub(1));
+        let (on_id, off_id, track) = {
+            let mut sh = self.shared.lock().unwrap();
+            let track = self.sel_track.min(sh.doc.tracks.len().saturating_sub(1));
+            (sh.doc.alloc_event_id(), sh.doc.alloc_event_id(), track)
+        };
         let snap = ppq / 4;
         let tick = (tick / snap) * snap;
-        let on_id = self.doc.alloc_event_id();
-        let off_id = self.doc.alloc_event_id();
         let on = DocEvent {
             id: on_id,
             tick,
@@ -245,9 +261,10 @@ impl EditorView {
 
     fn delete_selected(&mut self, cx: &mut Context<Self>) {
         let Some(on_id) = self.selected else { return };
+        let sh = self.shared.lock().unwrap();
         let mut removed: Vec<(usize, document::Event)> = Vec::new();
         let mut track = 0usize;
-        'outer: for (ti, t) in self.doc.tracks.iter().enumerate() {
+        'outer: for (ti, t) in sh.doc.tracks.iter().enumerate() {
             for (ei, e) in t.events.iter().enumerate() {
                 if e.id == on_id {
                     track = ti;
@@ -262,15 +279,16 @@ impl EditorView {
         // also remove its paired noteOff if any
         if let Some(note) = self.notes.iter().find(|n| n.on_id == on_id) {
             if let Some(off_id) = note.off_id {
-                if let Some(pos) = self.doc.tracks[track]
+                if let Some(pos) = sh.doc.tracks[track]
                     .events
                     .iter()
                     .position(|e| e.id == off_id)
                 {
-                    removed.push((pos, self.doc.tracks[track].events[pos].clone()));
+                    removed.push((pos, sh.doc.tracks[track].events[pos].clone()));
                 }
             }
         }
+        drop(sh);
         self.apply_tx("delete note", vec![Op::RemoveEvents { track, removed }]);
         self.selected = None;
         cx.notify();
@@ -281,8 +299,9 @@ impl EditorView {
         if d.dtick == 0 && d.dkey == 0 {
             return;
         }
+        let sh = self.shared.lock().unwrap();
         let mut ops = Vec::new();
-        for (ti, t) in self.doc.tracks.iter().enumerate() {
+        for (ti, t) in sh.doc.tracks.iter().enumerate() {
             if ti != d.track {
                 continue;
             }
@@ -307,6 +326,7 @@ impl EditorView {
                 });
             }
         }
+        drop(sh);
         if !ops.is_empty() {
             self.apply_tx("move note", ops);
         }
@@ -314,32 +334,43 @@ impl EditorView {
     }
 
     fn undo(&mut self, cx: &mut Context<Self>) {
-        if let Some(l) = self.undo.undo(&mut self.doc) {
+        let arc = self.shared.clone();
+        let mut sh = arc.lock().unwrap();
+        if let Some(l) = { let Shared { doc, undo, .. } = &mut *sh; undo.undo(doc) } {
             self.status = format!("undo {l}").into();
             self.selected = None;
-            self.refresh_derived();
+            self.refresh_derived_sh(&mut sh);
+            drop(sh);
             cx.notify();
         }
     }
 
     fn redo(&mut self, cx: &mut Context<Self>) {
-        if let Some(l) = self.undo.redo(&mut self.doc) {
+        let arc = self.shared.clone();
+        let mut sh = arc.lock().unwrap();
+        if let Some(l) = { let Shared { doc, undo, .. } = &mut *sh; undo.redo(doc) } {
             self.status = format!("redo {l}").into();
             self.selected = None;
-            self.refresh_derived();
+            self.refresh_derived_sh(&mut sh);
+            drop(sh);
             cx.notify();
         }
     }
 
     fn save(&mut self, cx: &mut Context<Self>) {
-        match &self.path {
+        let path = {
+            let sh = self.shared.lock().unwrap();
+            sh.path.clone()
+        };
+        match path {
             Some(p) => {
-                let bytes = self.doc.serialize(smf_core::WriteOptions {
+                let mut sh = self.shared.lock().unwrap();
+                let bytes = sh.doc.serialize(smf_core::WriteOptions {
                     running_status: false,
                 });
-                match std::fs::write(p, bytes) {
+                match std::fs::write(&p, bytes) {
                     Ok(_) => {
-                        self.clean_rev = self.doc.revision();
+                        sh.saved_revision = sh.doc.revision();
                         self.status = t("status.saved").into();
                     }
                     Err(e) => self.status = format!("{e}").into(),
@@ -359,7 +390,7 @@ impl EditorView {
             if let Ok(Ok(Some(path))) = rx.await {
                 if let Some(this) = this.upgrade() {
                     this.update(cx, |v, cx| {
-                        v.path = Some(path);
+                        v.shared.lock().unwrap().path = Some(path);
                         v.save(cx);
                     });
                 }
@@ -391,10 +422,14 @@ impl EditorView {
         match load_document(&path) {
             Ok(d) => {
                 self.stop_playback();
-                self.doc = d;
-                self.undo = UndoStack::new(512);
-                self.path = Some(path);
-                self.clean_rev = self.doc.revision();
+                // swap the document in place — the MCP server holds this same Arc
+                {
+                    let mut sh = self.shared.lock().unwrap();
+                    sh.doc = d;
+                    sh.undo = UndoStack::new(512);
+                    sh.path = Some(path);
+                    sh.saved_revision = sh.doc.revision();
+                }
                 self.sel_track = self.pick_default_track();
                 self.selected = None;
                 self.refresh_derived();
@@ -421,7 +456,7 @@ impl EditorView {
         };
         match midi_io::Output::open(port.index) {
             Ok(out) => {
-                let events = self.doc.timeline();
+                let events = self.doc(|d| d.timeline());
                 self.playback = Some(Playback::start(out, events, self.play_us));
             }
             Err(e) => self.status = format!("{e}").into(),
@@ -490,14 +525,17 @@ impl Render for EditorView {
                 self.play_us = 0;
             }
         }
-        let playhead_tick = self.doc.tempo_map.us_to_tick(self.play_us);
-
-        let title = self
-            .path
-            .as_ref()
-            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-            .unwrap_or_else(|| t("status.no_file").to_string());
-        let dirty = self.doc.revision() != self.clean_rev;
+        let (playhead_tick, title, dirty) = {
+            let sh = self.shared.lock().unwrap();
+            (
+                sh.doc.tempo_map.us_to_tick(self.play_us),
+                sh.path
+                    .as_ref()
+                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .unwrap_or_else(|| t("status.no_file").to_string()),
+                sh.doc.revision() != sh.saved_revision,
+            )
+        };
         let ppq = self.ppq();
         let pos = {
             let bar = playhead_tick / (ppq * 4) + 1;
@@ -793,14 +831,20 @@ impl Render for EditorView {
 }
 
 fn main() {
+    std::panic::set_hook(Box::new(|i| eprintln!("panic: {i}")));
     let path = std::env::args().nth(1).map(PathBuf::from);
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
         let path = path.clone();
         cx.spawn(async move |cx| {
             cx.open_window(WindowOptions::default(), move |window, cx| {
+                let input = cx.new(|cx| {
+                    InputState::new(window, cx).placeholder(t("field.track_name"))
+                });
                 let view = cx.new(|cx| {
-                    let v = EditorView::new(path.clone(), window, cx);
+                    let v = EditorView::new(path.clone(), input, cx);
+                    spawn_mcp(v.shared.clone());
+                    spawn_doc_watch(cx, v.shared.clone());
                     window.focus(&v.focus.clone(), cx);
                     v
                 });
@@ -810,4 +854,62 @@ fn main() {
         })
         .detach();
     });
+}
+
+/// In-app MCP server: Streamable-HTTP on 127.0.0.1:7878/mcp on its own
+/// tokio runtime thread. Bearer token = MIDI_MCP_TOKEN env (unset = open on
+/// loopback only). `mcp-bridge` is the stdio frontend for stdio-only clients.
+fn spawn_mcp(shared: SharedDoc) {
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("mcp http: failed to build tokio runtime: {e}");
+                return;
+            }
+        };
+        rt.block_on(async move {
+            let token = std::env::var("MIDI_MCP_TOKEN").ok();
+            if let Err(e) = mcp_server::serve_http(shared, "127.0.0.1:7878", token).await {
+                eprintln!("mcp http: {e}");
+            }
+        });
+    });
+}
+
+/// Poll the shared doc's notify counter so MCP-driven edits repaint the UI
+/// even while the user is idle.
+fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
+    cx.spawn(async move |this, cx| {
+        let mut last = 0u64;
+        loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(150))
+                .await;
+            let cur = shared.lock().unwrap().gui_notify.load(std::sync::atomic::Ordering::Relaxed);
+            let dirty = cur != last;
+            if dirty {
+                last = cur;
+            }
+            if let Some(this) = this.upgrade() {
+                this.update(cx, |v, cx| {
+                    if dirty {
+                        v.refresh_derived();
+                    }
+                    // repaint while playing so the playhead/counter advance
+                    if dirty || v.playback.is_some() {
+                        cx.notify();
+                    }
+                    // auto-stop repaint: catch the moment playback ends
+                    if v.playback.is_none() && v.play_us != 0 {
+                        v.play_us = 0;
+                        cx.notify();
+                    }
+                });
+            } else {
+                break;
+            }
+        }
+    })
+    .detach();
 }

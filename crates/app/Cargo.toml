@@ -15,6 +15,7 @@ mcp-server.workspace = true
 bytes.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+tokio.workspace = true
 tracing-subscriber.workspace = true
 
 [[bin]]

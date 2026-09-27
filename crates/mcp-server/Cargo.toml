@@ -5,11 +5,16 @@ license.workspace = true
 description = "Embedded MCP server over the shared document transaction path"
 
 [dependencies]
-rmcp = { workspace = true, features = ["server", "transport-io", "macros", "schemars"] }
+rmcp = { workspace = true, features = ["client", "server", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "macros", "schemars"] }
 tokio.workspace = true
+axum.workspace = true
+http.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 document.workspace = true
+bytes.workspace = true
+commands.workspace = true
 smf-core.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
