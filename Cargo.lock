@@ -5227,6 +5227,7 @@ dependencies = [
 name = "output"
 version = "0.0.0"
 dependencies = [
+ "cpal",
  "midi-io",
  "serde",
  "thiserror 2.0.21",
