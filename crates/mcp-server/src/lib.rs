@@ -440,6 +440,14 @@ fn tool_defs() -> Vec<(&'static str, Tool)> {
             ),
         ),
         (
+            "diagnostics",
+            tool(
+                "diagnostics",
+                "Import-quality findings over the raw event layer: dangling noteOn, zero-length notes, missing End-of-Track, tempo events outside the conductor track. Each has code/track/tick/event_id + detail.",
+                object_schema(serde_json::json!({})),
+            ),
+        ),
+        (
             "apply_patch",
             tool(
                 "apply_patch",
@@ -482,6 +490,19 @@ fn dispatch(
     let mut sh = shared.lock().unwrap();
     match name {
         "document_summary" => ok_json(summary_json(&sh.doc, &sh.path, sh.saved_revision)),
+        "diagnostics" => {
+            let diags = sh.doc.diagnose();
+            ok_json(serde_json::json!({
+                "count": diags.len(),
+                "diagnostics": diags.iter().map(|d| serde_json::json!({
+                    "code": d.code,
+                    "track": d.track,
+                    "tick": d.tick,
+                    "event_id": d.event,
+                    "detail": d.detail,
+                })).collect::<Vec<_>>(),
+            }))
+        }
         "list_notes" => {
             let track = args["track"].as_u64().map(|v| v as usize);
             let from = args["from_tick"].as_u64().unwrap_or(0);

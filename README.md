@@ -9,9 +9,11 @@ A modern, pure-SMF MIDI file editor with an embedded MCP server — a "VSCode fo
 
 Design docs live in `docs/research/` — start with `00-synthesis.md`.
 
-Status: Phase 1 — file open/save, piano roll + event list, note editing
-(pencil/drag/delete), undo/redo, playback to a MIDI output port, and a live
-MCP tool surface all work against a real .mid document.
+Status: Phase 1 + early Phase 2 — file open/save, piano roll + event list,
+note editing (draw/drag/edge-resize/marquee multi-select/velocity lane),
+undo/redo, multi-destination playback (MIDI port or hosted VST3 instrument via
+vst3-host + cpal, per-track routing), import diagnostics, and a live MCP tool
+surface all work against a real .mid document.
 
 ## Build (Windows)
 
@@ -34,11 +36,16 @@ Spike binaries: `cargo run --bin midi_ports` (midir port enumeration),
 cargo run --bin midi-editor [file.mid]
 ```
 
-Controls: left-click empty space draws a note (16th-note snap), drag a note to
-move it, click selects, Delete removes, Ctrl+Z / Ctrl+Y (or Ctrl+Shift+Z)
-undo/redo, Ctrl+S saves, Ctrl+O opens, Space or the Play button toggles playback
-to the selected output port (click the port name to cycle ports — GM synth,
-loopMIDI, physical interfaces). Mouse wheel scrolls, Ctrl+wheel zooms.
+Controls: left-click empty space draws a note (16th-note snap), empty-drag is
+a marquee multi-select, drag a note to move it (all selected notes move
+together), drag a note's right edge to resize, click selects (shift toggles),
+Delete removes the selection, the bottom strip edits note velocity for the
+current track, Ctrl+Z / Ctrl+Y (or Ctrl+Shift+Z) undo/redo, Ctrl+S saves,
+Ctrl+O opens, Space or the Play button toggles playback. The destination
+button (`T<n> ▸ name`) cycles the *selected track's* output: MIDI ports (GM
+synth, loopMIDI, physical interfaces) and discovered VST3 plugins; `*`
+means the track inherits the default destination. Mouse wheel scrolls,
+Ctrl+wheel zooms.
 
 ## MCP server
 
@@ -55,10 +62,16 @@ mcp-bridge
 mcp-bridge --file song.mid
 ```
 
-Tools: `document_summary`, `list_notes`, `query_events`, `apply_patch`
+Tools: `document_summary`, `list_notes`, `query_events`, `diagnostics`
+(import-quality findings: dangling noteOn, zero-length notes, missing EOT,
+tempo outside the conductor track), `apply_patch`
 (insert_note / insert_events / remove_events / move_note / set_tempo; atomic,
 one undo step, optional `base_revision` optimistic check), `undo`, `redo`,
 `save`. MCP edits repaint the GUI live.
+
+Text metas decode by heuristic: UTF-8 → Shift-JIS → Latin-1, with the XF
+`FF 09` "JP" charset marker acting as a file-wide hint. Raw bytes are never
+rewritten — round-trip stays byte-exact.
 
 ## i18n
 

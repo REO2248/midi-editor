@@ -14,7 +14,8 @@ use smf_core::EventKind;
 use gpui_kit::*;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::Root;
-use midi_io::{Playback, PortInfo};
+use midi_io::{EventSink, Playback, PortSink};
+use std::collections::{BTreeSet, HashMap};
 use smf_core::Division;
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -28,16 +29,50 @@ const TRACK_COLORS: [u32; 8] = [
 const SEL_COLOR: u32 = 0xffffff;
 const DANGLING_COLOR: u32 = 0xff4f4f;
 
+/// One selectable output destination: a hardware/software MIDI port or a
+/// hosted VST3 instrument.
+enum DestKind {
+    /// index into midir's port list
+    Midi(usize),
+    /// path to the .vst3 bundle
+    Plugin(PathBuf),
+}
+
+struct DestSpec {
+    label: String,
+    kind: DestKind,
+}
+
+/// What a left-drag on the piano roll is doing.
+#[derive(Clone, Copy, PartialEq)]
+enum DragMode {
+    /// move note(s) in pitch+time
+    Move,
+    /// stretch the note's right edge (duration)
+    Resize,
+    /// rubber-band select on empty canvas
+    Marquee,
+    /// vertical drag in the velocity lane; `dkey` carries the new velocity
+    Velocity,
+}
+
 struct Drag {
+    mode: DragMode,
     on_id: EventId,
     off_id: Option<EventId>,
     track: usize,
     orig_start: u64,
     orig_end: Option<u64>,
     orig_key: u8,
-    /// current preview delta (ticks, semitones)
+    /// Move: delta applied to start+key (and to every selected note).
+    /// Resize: delta applied to the end tick.
     dtick: i64,
     dkey: i32,
+    /// Marquee corners in (tick, key) space
+    a_tick: i64,
+    a_key: i32,
+    b_tick: i64,
+    b_key: i32,
 }
 
 struct EditorView {
@@ -47,15 +82,26 @@ struct EditorView {
     ev_rev: u64,
     events: Arc<Vec<SharedString>>,
     sel_track: usize,
-    selected: Option<EventId>,
+    /// selected note `on_id`s (marquee multi-select)
+    selection: BTreeSet<EventId>,
     drag: Option<Drag>,
     /// canvas bounds as painted last frame — for hit-testing
     roll_bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// velocity lane bounds — same trick for the lane's hit-testing
+    lane_bounds: Rc<Cell<Bounds<Pixels>>>,
     scroll_x: f32,
     scroll_y: f32,
     zoom: f32,
-    ports: Vec<PortInfo>,
-    port_idx: usize,
+    /// All playback destinations: MIDI ports (GS Wavetable, loopMIDI,
+    /// physical IFs) followed by discovered VST3 plugins.
+    dests: Vec<DestSpec>,
+    /// Dest used by tracks with no explicit assignment.
+    default_dest: usize,
+    /// track index -> index into `dests`
+    track_dest: HashMap<usize, usize>,
+    /// Plugin instances opened for the current playback; dropping them
+    /// stops their audio streams.
+    active_plugins: Vec<output::PluginOutput>,
     playback: Option<Playback>,
     play_us: u64,
     focus: FocusHandle,
@@ -99,14 +145,33 @@ impl EditorView {
             ev_rev: u64::MAX,
             events: Arc::new(vec![]),
             sel_track: 0,
-            selected: None,
+            selection: BTreeSet::new(),
             drag: None,
             roll_bounds: Rc::new(Cell::new(Bounds::new(point(px(0.0), px(0.0)), size(px(0.0), px(0.0))))),
+            lane_bounds: Rc::new(Cell::new(Bounds::new(point(px(0.0), px(0.0)), size(px(0.0), px(0.0))))),
             scroll_x: 0.0,
             scroll_y: (127.0 - 84.0) * NOTE_H, // show ~C3..C7
             zoom: 0.08,
-            ports: midi_io::list_outputs().unwrap_or_default(),
-            port_idx: 0,
+            dests: {
+                let mut d: Vec<DestSpec> = midi_io::list_outputs()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|p| DestSpec {
+                        label: p.name,
+                        kind: DestKind::Midi(p.index),
+                    })
+                    .collect();
+                for p in output::discover_plugins() {
+                    d.push(DestSpec {
+                        label: format!("{} [VST3]", p.name),
+                        kind: DestKind::Plugin(p.path),
+                    });
+                }
+                d
+            },
+            default_dest: 0,
+            track_dest: HashMap::new(),
+            active_plugins: Vec::new(),
             playback: None,
             play_us: 0,
             focus: cx.focus_handle(),
@@ -165,7 +230,11 @@ impl EditorView {
             Division::Metrical(p) => (p as u64).max(1),
             Division::Smpte { .. } => 480,
         };
+        let hint = doc.text_encoding_hint();
         let mut rows = Vec::new();
+        for d in doc.diagnose() {
+            rows.push(format!("[{}] tk{} @{}", d.code, d.track + 1, d.tick).into());
+        }
         for (ti, tr) in doc.tracks.iter().enumerate() {
             for e in &tr.events {
                 let bar = e.tick / (ppq * 4) + 1;
@@ -187,7 +256,7 @@ impl EditorView {
                         format!("{name} ch{ch:<2} {:>3} {:>3}", data[0], data[1])
                     }
                     EventKind::Meta { meta_type, data } => match *meta_type {
-                        0x03 => format!("TrkName {}", lossy(data)),
+                        0x03 => format!("TrkName {}", smf_core::decode_text(data, hint)),
                         0x51 if data.len() == 3 => {
                             let mpq = u32::from_be_bytes([0, data[0], data[1], data[2]]);
                             format!("Tempo   {:.2} bpm", 60_000_000.0 / mpq as f64)
@@ -195,6 +264,9 @@ impl EditorView {
                         0x2F => "EndOfTrack".to_string(),
                         0x58 => format!("TimeSig {}/{}", data.get(0).copied().unwrap_or(4), data.get(1).copied().unwrap_or(4)),
                         0x59 => "KeySig".to_string(),
+                        other @ 0x01..=0x09 => {
+                            format!("Meta 0x{other:02X} {}", smf_core::decode_text(data, hint))
+                        }
                         other => format!("Meta 0x{other:02X} {}B", data.len()),
                     },
                     EventKind::SysEx(d) => format!("SysEx   {}B", d.len()),
@@ -255,15 +327,14 @@ impl EditorView {
                 events: vec![on, off],
             }],
         );
-        self.selected = Some(on_id);
+        self.selection = BTreeSet::from([on_id]);
         cx.notify();
     }
 
-    fn delete_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(on_id) = self.selected else { return };
-        let sh = self.shared.lock().unwrap();
-        let mut removed: Vec<(usize, document::Event)> = Vec::new();
+    /// Remove a note's on+off events; returns the op (or None if id unknown).
+    fn remove_note_op(sh: &Shared, on_id: EventId, off_id: Option<EventId>) -> Option<Op> {
         let mut track = 0usize;
+        let mut removed: Vec<(usize, document::Event)> = Vec::new();
         'outer: for (ti, t) in sh.doc.tracks.iter().enumerate() {
             for (ei, e) in t.events.iter().enumerate() {
                 if e.id == on_id {
@@ -274,49 +345,151 @@ impl EditorView {
             }
         }
         if removed.is_empty() {
+            return None;
+        }
+        if let Some(off_id) = off_id {
+            if let Some(pos) = sh.doc.tracks[track]
+                .events
+                .iter()
+                .position(|e| e.id == off_id)
+            {
+                removed.push((pos, sh.doc.tracks[track].events[pos].clone()));
+            }
+        }
+        Some(Op::RemoveEvents { track, removed })
+    }
+
+    fn delete_selected(&mut self, cx: &mut Context<Self>) {
+        if self.selection.is_empty() {
             return;
         }
-        // also remove its paired noteOff if any
-        if let Some(note) = self.notes.iter().find(|n| n.on_id == on_id) {
-            if let Some(off_id) = note.off_id {
-                if let Some(pos) = sh.doc.tracks[track]
-                    .events
-                    .iter()
-                    .position(|e| e.id == off_id)
-                {
-                    removed.push((pos, sh.doc.tracks[track].events[pos].clone()));
-                }
+        let sh = self.shared.lock().unwrap();
+        let mut ops = Vec::new();
+        for &on_id in &self.selection {
+            let off_id = self
+                .notes
+                .iter()
+                .find(|n| n.on_id == on_id)
+                .and_then(|n| n.off_id);
+            if let Some(op) = Self::remove_note_op(&sh, on_id, off_id) {
+                ops.push(op);
             }
         }
         drop(sh);
-        self.apply_tx("delete note", vec![Op::RemoveEvents { track, removed }]);
-        self.selected = None;
+        if !ops.is_empty() {
+            self.apply_tx("delete notes", ops);
+        }
+        self.selection.clear();
         cx.notify();
     }
 
     fn commit_drag(&mut self, cx: &mut Context<Self>) {
         let Some(d) = self.drag.take() else { return };
+        match d.mode {
+            DragMode::Marquee => {
+                // rect select: notes intersecting the rubber-band box
+                let (t0, t1) = (d.a_tick.min(d.b_tick), d.a_tick.max(d.b_tick));
+                let (k0, k1) = (d.a_key.min(d.b_key), d.a_key.max(d.b_key));
+                self.selection = self
+                    .notes
+                    .iter()
+                    .filter(|n| {
+                        let st = n.start_tick as i64;
+                        let en = n.end_tick.unwrap_or(n.start_tick) as i64;
+                        let key = n.key as i32;
+                        st <= t1 && en >= t0 && key >= k0 && key <= k1
+                    })
+                    .map(|n| n.on_id)
+                    .collect();
+                cx.notify();
+                return;
+            }
+            DragMode::Resize => {
+                if d.dtick == 0 {
+                    return;
+                }
+                let Some(orig_end) = d.orig_end else { return };
+                let new_end = ((orig_end as i64 + d.dtick).max(d.orig_start as i64 + 1)) as u64;
+                let sh = self.shared.lock().unwrap();
+                let mut ops = Vec::new();
+                if let Some(off_id) = d.off_id {
+                    for e in &sh.doc.tracks[d.track].events {
+                        if e.id == off_id {
+                            let mut after = e.clone();
+                            after.tick = new_end;
+                            after.raw_body = None;
+                            ops.push(Op::UpdateEvent {
+                                track: d.track,
+                                before: e.clone(),
+                                after,
+                            });
+                        }
+                    }
+                }
+                drop(sh);
+                if !ops.is_empty() {
+                    self.apply_tx("resize note", ops);
+                }
+                cx.notify();
+                return;
+            }
+            DragMode::Velocity => {
+                let vel = d.dkey.clamp(1, 127) as u8;
+                let sh = self.shared.lock().unwrap();
+                let mut ops = Vec::new();
+                for e in &sh.doc.tracks[d.track].events {
+                    if e.id == d.on_id {
+                        let mut after = e.clone();
+                        if let EventKind::Channel { data, .. } = &mut after.kind {
+                            data[1] = vel;
+                        }
+                        after.raw_body = None;
+                        ops.push(Op::UpdateEvent {
+                            track: d.track,
+                            before: e.clone(),
+                            after,
+                        });
+                    }
+                }
+                drop(sh);
+                if !ops.is_empty() {
+                    self.apply_tx("set velocity", ops);
+                }
+                cx.notify();
+                return;
+            }
+            DragMode::Move => {}
+        }
         if d.dtick == 0 && d.dkey == 0 {
             return;
         }
+        // move every selected note by the same delta; fall back to the
+        // dragged note if the selection never took (e.g. programmatic)
+        let ids: BTreeSet<EventId> = if self.selection.contains(&d.on_id) {
+            self.selection.clone()
+        } else {
+            BTreeSet::from([d.on_id])
+        };
+        let notes = self.notes.clone();
         let sh = self.shared.lock().unwrap();
         let mut ops = Vec::new();
         for (ti, t) in sh.doc.tracks.iter().enumerate() {
-            if ti != d.track {
-                continue;
-            }
             for e in &t.events {
-                let is_on = e.id == d.on_id;
-                let is_off = d.off_id == Some(e.id);
-                if !is_on && !is_off {
+                let Some(n) = notes.iter().find(|n| {
+                    ids.contains(&n.on_id) && (e.id == n.on_id || n.off_id == Some(e.id))
+                }) else {
                     continue;
-                }
+                };
+                let is_on = e.id == n.on_id;
+                let orig = if is_on {
+                    n.start_tick
+                } else {
+                    n.end_tick.unwrap_or(n.start_tick)
+                };
                 let mut after = e.clone();
-                after.tick = ((if is_on { d.orig_start } else { d.orig_end.unwrap_or(d.orig_start) }) as i64
-                    + d.dtick)
-                    .max(0) as u64;
+                after.tick = ((orig as i64 + d.dtick).max(0)) as u64;
                 if let EventKind::Channel { data, .. } = &mut after.kind {
-                    data[0] = (d.orig_key as i32 + d.dkey).clamp(0, 127) as u8;
+                    data[0] = (n.key as i32 + d.dkey).clamp(0, 127) as u8;
                 }
                 after.raw_body = None; // re-encode from kind
                 ops.push(Op::UpdateEvent {
@@ -328,7 +501,7 @@ impl EditorView {
         }
         drop(sh);
         if !ops.is_empty() {
-            self.apply_tx("move note", ops);
+            self.apply_tx("move notes", ops);
         }
         cx.notify();
     }
@@ -338,7 +511,7 @@ impl EditorView {
         let mut sh = arc.lock().unwrap();
         if let Some(l) = { let Shared { doc, undo, .. } = &mut *sh; undo.undo(doc) } {
             self.status = format!("undo {l}").into();
-            self.selected = None;
+            self.selection.clear();
             self.refresh_derived_sh(&mut sh);
             drop(sh);
             cx.notify();
@@ -350,7 +523,7 @@ impl EditorView {
         let mut sh = arc.lock().unwrap();
         if let Some(l) = { let Shared { doc, undo, .. } = &mut *sh; undo.redo(doc) } {
             self.status = format!("redo {l}").into();
-            self.selected = None;
+            self.selection.clear();
             self.refresh_derived_sh(&mut sh);
             drop(sh);
             cx.notify();
@@ -431,7 +604,7 @@ impl EditorView {
                     sh.saved_revision = sh.doc.revision();
                 }
                 self.sel_track = self.pick_default_track();
-                self.selected = None;
+                self.selection.clear();
                 self.refresh_derived();
                 self.status = "loaded".into();
             }
@@ -449,18 +622,61 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Effective destination index for a track: its explicit assignment or
+    /// the global default.
+    fn dest_of(&self, track: usize) -> usize {
+        self.track_dest
+            .get(&track)
+            .copied()
+            .unwrap_or(self.default_dest)
+            .min(self.dests.len().saturating_sub(1))
+    }
+
     fn start_playback(&mut self) {
-        let Some(port) = self.ports.get(self.port_idx) else {
+        if self.dests.is_empty() {
             self.status = t("status.no_port").into();
             return;
-        };
-        match midi_io::Output::open(port.index) {
-            Ok(out) => {
-                let events = self.doc(|d| d.timeline());
-                self.playback = Some(Playback::start(out, events, self.play_us));
-            }
-            Err(e) => self.status = format!("{e}").into(),
         }
+        let tagged = self.doc(|d| d.timeline_tagged());
+        // open each destination that at least one event needs
+        let needed: BTreeSet<usize> =
+            tagged.iter().map(|(_, tr, _)| self.dest_of(*tr)).collect();
+        let mut sinks: Vec<Box<dyn EventSink>> = Vec::new();
+        let mut sink_of: HashMap<usize, usize> = HashMap::new();
+        self.active_plugins.clear();
+        for d in needed {
+            let Some(spec) = self.dests.get(d) else { continue };
+            match &spec.kind {
+                DestKind::Midi(idx) => match midi_io::Output::open(*idx) {
+                    Ok(out) => {
+                        sink_of.insert(d, sinks.len());
+                        sinks.push(Box::new(PortSink::new(out)));
+                    }
+                    Err(e) => self.status = format!("{e}").into(),
+                },
+                DestKind::Plugin(path) => {
+                    match output::PluginOutput::open(path) {
+                        Ok(plugin) => {
+                            sink_of.insert(d, sinks.len());
+                            sinks.push(Box::new(plugin.event_sink()));
+                            self.active_plugins.push(plugin);
+                        }
+                        Err(e) => self.status = format!("{e}").into(),
+                    }
+                }
+            }
+        }
+        if sinks.is_empty() {
+            self.status = t("status.no_port").into();
+            return;
+        }
+        let events: Vec<(u64, usize, Vec<u8>)> = tagged
+            .into_iter()
+            .filter_map(|(us, tr, b)| {
+                sink_of.get(&self.dest_of(tr)).map(|&s| (us, s, b))
+            })
+            .collect();
+        self.playback = Some(Playback::start(sinks, events, self.play_us));
     }
 
     fn stop_playback(&mut self) {
@@ -468,6 +684,7 @@ impl EditorView {
             self.play_us = p.position_us();
             p.stop();
         }
+        self.active_plugins.clear();
     }
 
     /// tick,key under a window-space mouse position
@@ -489,6 +706,22 @@ impl EditorView {
         }).cloned()
     }
 
+    /// Note whose right edge is within ~6px of `pos` — a resize target.
+    fn edge_at(&self, pos: Point<Pixels>) -> Option<Note> {
+        let (tick, key) = self.hit(pos);
+        self.notes
+            .iter()
+            .rev()
+            .find(|n| {
+                n.key as i32 == key
+                    && n.end_tick.is_some()
+                    && tick >= n.start_tick as i64
+                    && ((n.end_tick.unwrap() as i64) - tick) as f32 * self.zoom <= 6.0
+                    && ((n.end_tick.unwrap() as i64) - tick) as f32 * self.zoom >= -2.0
+            })
+            .cloned()
+    }
+
     fn button(label: &'static str, cx: &Context<Self>, on: impl Fn(&mut Self, &mut Context<Self>) + 'static) -> Stateful<Div> {
         div()
             .id(label)
@@ -503,9 +736,7 @@ impl EditorView {
     }
 }
 
-fn lossy(b: &bytes::Bytes) -> String {
-    String::from_utf8_lossy(b).into_owned()
-}
+
 
 fn load_document(path: &PathBuf) -> Result<Document, String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
@@ -542,17 +773,32 @@ impl Render for EditorView {
             let beat = (playhead_tick % (ppq * 4)) / ppq + 1;
             format!("{bar}.{beat}.{:>3}", playhead_tick % ppq)
         };
-        let port_label = self
-            .ports
-            .get(self.port_idx)
-            .map(|p| p.name.clone())
-            .unwrap_or_else(|| t("status.no_port").to_string());
+        let port_label = {
+            let eff = self.dest_of(self.sel_track);
+            let name = self
+                .dests
+                .get(eff)
+                .map(|d| d.label.clone())
+                .unwrap_or_else(|| t("status.no_port").to_string());
+            let mark = if self.track_dest.contains_key(&self.sel_track) {
+                ""
+            } else {
+                "*"
+            };
+            format!("T{}{} ▸ {}", self.sel_track + 1, mark, name)
+        };
 
         // --- piano roll canvas -------------------------------------------------
         let notes = self.notes.clone();
         let (scroll_x, scroll_y, zoom) = (self.scroll_x, self.scroll_y, self.zoom);
-        let selected = self.selected;
-        let drag = self.drag.as_ref().map(|d| (d.on_id, d.dtick, d.dkey));
+        let selection = self.selection.clone();
+        let drag = self
+            .drag
+            .as_ref()
+            .map(|d| (d.mode, d.on_id, d.dtick, d.dkey));
+        let marquee = self.drag.as_ref().and_then(|d| {
+            (d.mode == DragMode::Marquee).then_some((d.a_tick, d.a_key, d.b_tick, d.b_key))
+        });
         let bounds_cell = self.roll_bounds.clone();
         let playing = self.playback.is_some();
         let play_x_tick = playhead_tick;
@@ -602,11 +848,19 @@ impl Render for EditorView {
                     let mut st = n.start_tick as i64;
                     let mut en = n.end_tick.unwrap_or(n.start_tick + ppq / 4) as i64;
                     let mut key = n.key as i32;
-                    if let Some((d_on, dtick, dkey)) = drag {
-                        if d_on == n.on_id {
-                            st += dtick;
-                            en += dtick;
-                            key += dkey;
+                    if let Some((mode, d_on, dtick, dkey)) = drag {
+                        match mode {
+                            DragMode::Move
+                                if d_on == n.on_id || selection.contains(&n.on_id) =>
+                            {
+                                st += dtick;
+                                en += dtick;
+                                key += dkey;
+                            }
+                            DragMode::Resize if d_on == n.on_id => {
+                                en = (en + dtick).max(st + 1);
+                            }
+                            _ => {}
                         }
                     }
                     let x = bounds.origin.x + px(st as f32 * zoom - scroll_x);
@@ -621,7 +875,7 @@ impl Render for EditorView {
                     if y < bounds.origin.y - px(NOTE_H) || y > bounds.origin.y + h {
                         continue;
                     }
-                    let c = if Some(n.on_id) == selected {
+                    let c = if selection.contains(&n.on_id) {
                         SEL_COLOR
                     } else if n.end_tick.is_none() {
                         DANGLING_COLOR
@@ -639,6 +893,19 @@ impl Render for EditorView {
                     window.paint_quad(fill(
                         Bounds::new(point(px_x, bounds.origin.y), size(px(1.5), h)),
                         rgb(0x50ff9f),
+                    ));
+                }
+                // marquee rubber band
+                if let Some((a_t, a_k, b_t, b_k)) = marquee {
+                    let (t0, t1) = (a_t.min(b_t), a_t.max(b_t));
+                    let (k0, k1) = (a_k.min(b_k), a_k.max(b_k));
+                    let x0 = bounds.origin.x + px(t0 as f32 * zoom - scroll_x);
+                    let x1 = bounds.origin.x + px(t1 as f32 * zoom - scroll_x);
+                    let y0 = bounds.origin.y + px((127.0 - k1 as f32) * NOTE_H - scroll_y);
+                    let y1 = bounds.origin.y + px((127.0 - k0 as f32) * NOTE_H - scroll_y);
+                    window.paint_quad(fill(
+                        Bounds::new(point(x0, y0), size(x1 - x0, y1 - y0)),
+                        rgba(0x4f8cff33),
                     ));
                 }
             },
@@ -692,8 +959,21 @@ impl Render for EditorView {
                     .text_color(rgb(0x9fd0ff))
                     .child(port_label)
                     .on_click(cx.listener(|v, _e, _w, cx| {
-                        if !v.ports.is_empty() {
-                            v.port_idx = (v.port_idx + 1) % v.ports.len();
+                        if !v.dests.is_empty() {
+                            // cycles the SELECTED track's assignment through
+                            // [inherit default] -> dest 0..n -> inherit
+                            let n = v.dests.len();
+                            let tr = v.sel_track;
+                            match v.track_dest.get(&tr).copied() {
+                                None => v.track_dest.insert(tr, 0),
+                                Some(d) if d + 1 < n => {
+                                    v.track_dest.insert(tr, d + 1)
+                                }
+                                Some(_) => v.track_dest.remove(&tr),
+                            };
+                            if let Some(&d) = v.track_dest.get(&tr) {
+                                v.default_dest = d;
+                            }
                         }
                         cx.notify();
                     })),
@@ -743,13 +1023,59 @@ impl Render for EditorView {
                 }),
         );
 
+        // velocity lane (DAW-style bottom strip, selected track only)
+        let lane_sel_track = self.sel_track;
+        let lane_bounds_cell = self.lane_bounds.clone();
+        let lane = canvas(
+            move |bounds, _window, _cx| {
+                lane_bounds_cell.set(bounds);
+            },
+            {
+                let lane_notes = self.notes.clone();
+                let lane_selection = self.selection.clone();
+                let drag_v = drag;
+                move |bounds, _state, _window, _cx| {
+                    let h: f32 = bounds.size.height.into();
+                    for n in lane_notes.iter().filter(|n| n.track == lane_sel_track) {
+                        let x = bounds.origin.x + px(n.start_tick as f32 * zoom - scroll_x);
+                        if x < bounds.origin.x || x > bounds.origin.x + bounds.size.width {
+                            continue;
+                        }
+                        let mut vel = n.vel as f32 / 127.0;
+                        if let Some((DragMode::Velocity, d_on, _, dkey)) = drag_v {
+                            if d_on == n.on_id {
+                                vel = (dkey as f32 / 127.0).clamp(0.0, 1.0);
+                            }
+                        }
+                        let bh = px((h - 6.0) * vel);
+                        let y = bounds.origin.y + px(h) - bh - px(3.0);
+                        let c = if lane_selection.contains(&n.on_id) {
+                            SEL_COLOR
+                        } else {
+                            TRACK_COLORS[n.track % TRACK_COLORS.len()]
+                        };
+                        _window.paint_quad(fill(
+                            Bounds::new(point(x, y), size(px(2.0), bh)),
+                            rgb(c),
+                        ));
+                    }
+                }
+            },
+        );
+
         let body = body.child(
             div()
                 .flex_1()
                 .h_full()
-                .relative()
-                .overflow_hidden()
-                .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _w, cx| {
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex_1()
+                        .relative()
+                        .overflow_hidden()
+                        .child(roll.size_full())
+                        .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _w, cx| {
                     let d = ev.delta.pixel_delta(px(20.0));
                     if ev.modifiers.control {
                         this.zoom = (this.zoom * (1.0 - d.y.to_f64() as f32 * 0.002)).clamp(0.005, 0.8);
@@ -762,9 +1088,11 @@ impl Render for EditorView {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
-                        if let Some(n) = this.note_at(ev.position) {
-                            this.selected = Some(n.on_id);
+                        let shift = ev.modifiers.shift;
+                        if let Some(n) = this.edge_at(ev.position) {
+                            this.sel_track = n.track;
                             this.drag = Some(Drag {
+                                mode: DragMode::Resize,
                                 on_id: n.on_id,
                                 off_id: n.off_id,
                                 track: n.track,
@@ -773,32 +1101,173 @@ impl Render for EditorView {
                                 orig_key: n.key,
                                 dtick: 0,
                                 dkey: 0,
+                                a_tick: 0,
+                                a_key: 0,
+                                b_tick: 0,
+                                b_key: 0,
+                            });
+                        } else if let Some(n) = this.note_at(ev.position) {
+                            if shift {
+                                if !this.selection.remove(&n.on_id) {
+                                    this.selection.insert(n.on_id);
+                                }
+                            } else if !this.selection.contains(&n.on_id) {
+                                this.selection = BTreeSet::from([n.on_id]);
+                            }
+                            this.sel_track = n.track;
+                            this.drag = Some(Drag {
+                                mode: DragMode::Move,
+                                on_id: n.on_id,
+                                off_id: n.off_id,
+                                track: n.track,
+                                orig_start: n.start_tick,
+                                orig_end: n.end_tick,
+                                orig_key: n.key,
+                                dtick: 0,
+                                dkey: 0,
+                                a_tick: 0,
+                                a_key: 0,
+                                b_tick: 0,
+                                b_key: 0,
                             });
                         } else {
                             let (tick, key) = this.hit(ev.position);
                             if (0..=127).contains(&key) {
-                                this.selected = None;
-                                this.insert_note(tick as u64, key as u8, cx);
+                                if !shift {
+                                    this.selection.clear();
+                                }
+                                // becomes a marquee on drag; a click without
+                                // drag inserts a note at the anchor
+                                this.drag = Some(Drag {
+                                    mode: DragMode::Marquee,
+                                    on_id: 0,
+                                    off_id: None,
+                                    track: 0,
+                                    orig_start: 0,
+                                    orig_end: None,
+                                    orig_key: 0,
+                                    dtick: 0,
+                                    dkey: 0,
+                                    a_tick: tick,
+                                    a_key: key,
+                                    b_tick: tick,
+                                    b_key: key,
+                                });
                             }
                         }
                         cx.notify();
                     }),
                 )
                 .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
-                    if this.drag.is_some() && ev.pressed_button == Some(MouseButton::Left) {
-                        let (tick, key) = this.hit(ev.position);
-                        if let Some(d) = &mut this.drag {
+                    if ev.pressed_button != Some(MouseButton::Left) {
+                        return;
+                    }
+                    let (tick, key) = this.hit(ev.position);
+                    let Some(d) = &mut this.drag else { return };
+                    match d.mode {
+                        DragMode::Move => {
                             d.dtick = tick - d.orig_start as i64;
                             d.dkey = key - d.orig_key as i32;
                         }
-                        cx.notify();
+                        DragMode::Resize => {
+                            d.dtick = tick - d.orig_end.unwrap_or(d.orig_start) as i64;
+                        }
+                        DragMode::Marquee => {
+                            d.b_tick = tick;
+                            d.b_key = key;
+                        }
+                        DragMode::Velocity => {}
                     }
+                    cx.notify();
                 }))
                 .on_mouse_up(
                     MouseButton::Left,
-                    cx.listener(|this, _ev: &MouseUpEvent, _w, cx| this.commit_drag(cx)),
+                    cx.listener(|this, ev: &MouseUpEvent, _w, cx| {
+                        // a marquee that never left its anchor = click → insert
+                        let click_insert = this.drag.as_ref().is_some_and(|d| {
+                            d.mode == DragMode::Marquee
+                                && (d.b_tick - d.a_tick).abs() < 2
+                                && (d.b_key - d.a_key).abs() == 0
+                        });
+                        if click_insert {
+                            let d = this.drag.take().unwrap();
+                            if (0..=127).contains(&d.a_key) {
+                                this.insert_note(d.a_tick.max(0) as u64, d.a_key as u8, cx);
+                            }
+                        } else {
+                            this.commit_drag(cx);
+                        }
+                        let _ = ev;
+                    }),
                 )
-                .child(roll.size_full()),
+                )
+                .child(
+                    div()
+                        .h(px(56.0))
+                        .w_full()
+                        .bg(rgb(0x14141a))
+                        .border_t_1()
+                        .border_color(rgb(0x2a2a35))
+                        .child(lane.size_full())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
+                                let b = this.lane_bounds.get();
+                                let x = f32::from(ev.position.x) - f32::from(b.origin.x);
+                                let y = f32::from(ev.position.y) - f32::from(b.origin.y);
+                                let tick = ((x + this.scroll_x) / this.zoom).max(0.0) as u64;
+                                let vel =
+                                    ((1.0 - y / f32::from(b.size.height)) * 127.0) as i32;
+                                // nearest note in the selected track
+                                if let Some(n) = this
+                                    .notes
+                                    .iter()
+                                    .filter(|n| n.track == this.sel_track)
+                                    .min_by_key(|n| {
+                                        let st = n.start_tick as i64;
+                                        (tick as i64 - st).abs()
+                                    })
+                                {
+                                    this.selection = BTreeSet::from([n.on_id]);
+                                    this.drag = Some(Drag {
+                                        mode: DragMode::Velocity,
+                                        on_id: n.on_id,
+                                        off_id: n.off_id,
+                                        track: n.track,
+                                        orig_start: n.start_tick,
+                                        orig_end: n.end_tick,
+                                        orig_key: n.key,
+                                        dtick: 0,
+                                        dkey: vel.clamp(1, 127),
+                                        a_tick: 0,
+                                        a_key: 0,
+                                        b_tick: 0,
+                                        b_key: 0,
+                                    });
+                                }
+                                cx.notify();
+                            }),
+                        )
+                        .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
+                            let Some(d) = &mut this.drag else { return };
+                            if d.mode != DragMode::Velocity
+                                || ev.pressed_button != Some(MouseButton::Left)
+                            {
+                                return;
+                            }
+                            let b = this.lane_bounds.get();
+                            let y = f32::from(ev.position.y) - f32::from(b.origin.y);
+                            d.dkey = ((1.0 - y / f32::from(b.size.height)) * 127.0) as i32;
+                            d.dkey = d.dkey.clamp(1, 127);
+                            cx.notify();
+                        }))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _ev: &MouseUpEvent, _w, cx| {
+                                this.commit_drag(cx)
+                            }),
+                        ),
+                ),
         );
 
         div()

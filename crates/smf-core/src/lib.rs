@@ -390,6 +390,57 @@ fn sorted_last_is_eot(track: &Track) -> bool {
         .unwrap_or(false)
 }
 
+/// Guessed encoding of a meta text payload. SMF never specifies an encoding;
+/// Shift-JIS is the de-facto standard for Japanese-authored files, Latin-1
+/// for Western ones, and some modern tools write UTF-8.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextEncoding {
+    Utf8,
+    ShiftJis,
+    /// anything that decodes as neither UTF-8 nor SJIS: raw-ish fallback
+    Latin1,
+}
+
+impl TextEncoding {
+    pub fn label(self) -> &'static str {
+        match self {
+            TextEncoding::Utf8 => "UTF-8",
+            TextEncoding::ShiftJis => "Shift-JIS",
+            TextEncoding::Latin1 => "Latin-1",
+        }
+    }
+}
+
+/// Decode a meta text payload for display. `hint` wins over detection
+/// (e.g. a file-wide XF "JP" marker or a user override).
+pub fn decode_text(data: &[u8], hint: Option<TextEncoding>) -> String {
+    let enc = hint.unwrap_or_else(|| guess_encoding(data));
+    match enc {
+        TextEncoding::Utf8 => String::from_utf8_lossy(data).into_owned(),
+        TextEncoding::ShiftJis => {
+            encoding_rs::SHIFT_JIS.decode(data).0.into_owned()
+        }
+        TextEncoding::Latin1 => encoding_rs::WINDOWS_1252
+            .decode(data)
+            .0
+            .into_owned(),
+    }
+}
+
+/// Heuristic: valid UTF-8 wins (pure ASCII included); else SJIS if the byte
+/// pattern parses cleanly as SJIS (no replacement chars produced); else
+/// Latin-1.
+pub fn guess_encoding(data: &[u8]) -> TextEncoding {
+    if std::str::from_utf8(data).is_ok() {
+        return TextEncoding::Utf8;
+    }
+    let (_, _, had_errors) = encoding_rs::SHIFT_JIS.decode(data);
+    if !had_errors {
+        return TextEncoding::ShiftJis;
+    }
+    TextEncoding::Latin1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,6 +496,20 @@ mod tests {
             }
             other => panic!("expected track name meta, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sjis_decodes() {
+        let (sjis, _, _) = encoding_rs::SHIFT_JIS.encode("テスト");
+        let sjis = sjis.as_ref();
+        assert_eq!(guess_encoding(sjis), TextEncoding::ShiftJis);
+        assert_eq!(decode_text(sjis, None), "テスト");
+        let ascii = b"Lead";
+        assert_eq!(guess_encoding(ascii), TextEncoding::Utf8);
+        assert_eq!(decode_text(ascii, None), "Lead");
+        // Latin-1 high bytes that are neither UTF-8 nor SJIS
+        let latin = [0xE9u8, 0x20]; // e-acute + space
+        assert_eq!(guess_encoding(&latin), TextEncoding::Latin1);
     }
 
     #[test]

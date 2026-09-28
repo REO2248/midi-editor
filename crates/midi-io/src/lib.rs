@@ -84,13 +84,48 @@ impl Output {
     }
 }
 
+/// A destination a playback thread can deliver raw channel-message bytes to.
+/// Implementors: `PortSink` (WinMM port) and the output crate's plugin sink.
+pub trait EventSink: Send {
+    /// How long before the scheduled deadline the thread should wake the sink:
+    /// audio-clock destinations queue the event with a sample offset instead of
+    /// firing on the wall clock. Ports use the default (send at the deadline).
+    fn lead_us(&self) -> u64 {
+        0
+    }
+    /// Deliver one event `rem_us` µs before its scheduled time.
+    fn send_at(&mut self, bytes: &[u8], rem_us: u64);
+    /// All-notes-off / reset — called on stop and at end of timeline.
+    fn panic(&mut self);
+}
+
+/// `EventSink` over a `MidiOutputConnection`.
+pub struct PortSink {
+    out: Output,
+}
+
+impl PortSink {
+    pub fn new(out: Output) -> Self {
+        Self { out }
+    }
+}
+
+impl EventSink for PortSink {
+    fn send_at(&mut self, bytes: &[u8], _rem_us: u64) {
+        let _ = self.out.send(bytes);
+    }
+    fn panic(&mut self) {
+        self.out.panic();
+    }
+}
+
 /// Scheduled playback on a dedicated thread.
 ///
-/// The caller snapshots the timeline as `(absolute µs, channel event bytes)`
-/// pairs; the thread sleeps until each deadline and sends verbatim. Meta and
-/// SysEx events never reach the port — filtering is the caller's job.
-/// `position_us` is updated as the schedule advances so the UI can draw a
-/// playhead.
+/// The caller snapshots the timeline as `(absolute µs, sink index, channel
+/// event bytes)` triples; the thread sleeps until each deadline and sends
+/// verbatim. Meta and SysEx events never reach a sink — filtering is the
+/// caller's job. `position_us` is updated as the schedule advances so the UI
+/// can draw a playhead.
 pub struct Playback {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     position_us: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -99,10 +134,11 @@ pub struct Playback {
 
 impl Playback {
     /// `events` must be sorted by absolute µs. `start_us` seeks: events before
-    /// it are skipped and the clock starts at `start_us`.
+    /// it are skipped and the clock starts at `start_us`. Each event carries
+    /// the index of the sink to deliver it to.
     pub fn start(
-        mut out: Output,
-        events: Vec<(u64, Vec<u8>)>,
+        mut sinks: Vec<Box<dyn EventSink>>,
+        events: Vec<(u64, usize, Vec<u8>)>,
         start_us: u64,
     ) -> Self {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -112,14 +148,16 @@ impl Playback {
             use std::sync::atomic::Ordering::Relaxed;
             let t0 = std::time::Instant::now();
             pos2.store(start_us, Relaxed);
-            for (us, bytes) in events {
+            for (us, sink_idx, bytes) in events {
                 if stop2.load(Relaxed) {
                     break;
                 }
                 if us < start_us {
                     continue;
                 }
-                let target = t0 + std::time::Duration::from_micros(us - start_us);
+                let Some(sink) = sinks.get_mut(sink_idx) else { continue };
+                let target = t0 + std::time::Duration::from_micros(us - start_us)
+                    - std::time::Duration::from_micros(sink.lead_us());
                 loop {
                     let now = std::time::Instant::now();
                     if now >= target {
@@ -134,9 +172,13 @@ impl Playback {
                     break;
                 }
                 pos2.store(us, Relaxed);
-                let _ = out.send(&bytes);
+                let deadline = t0 + std::time::Duration::from_micros(us - start_us);
+                let rem = deadline.saturating_duration_since(std::time::Instant::now()).as_micros() as u64;
+                sink.send_at(&bytes, rem);
             }
-            out.panic();
+            for s in &mut sinks {
+                s.panic();
+            }
         });
         Self {
             stop,

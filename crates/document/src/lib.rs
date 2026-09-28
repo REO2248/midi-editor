@@ -35,6 +35,17 @@ pub struct Track {
     pub events: Vec<Event>,
 }
 
+/// One import diagnostic finding.
+#[derive(Debug, Clone)]
+pub struct Diagnostic {
+    /// stable machine-readable id ("dangling-noteon", ...)
+    pub code: &'static str,
+    pub track: usize,
+    pub tick: u64,
+    pub event: Option<EventId>,
+    pub detail: String,
+}
+
 #[derive(Debug)]
 pub struct Document {
     pub format: u16,
@@ -244,13 +255,92 @@ impl Document {
         self.tempo_map = TempoMap::build(&self.tracks, self.division);
     }
 
-    /// Playback timeline: all channel events across tracks as
-    /// `(absolute µs, wire bytes)` — status byte included, sorted by time.
-    /// Meta/SysEx events are excluded (they never go down the wire).
-    /// Channel -> port routing belongs to the caller.
-    pub fn timeline(&self) -> Vec<(u64, Vec<u8>)> {
-        let mut out = Vec::new();
+    /// File-wide text-encoding hint from an XF `FF 09` charset marker
+    /// ("JP" => Shift-JIS). Returns None when the file carries no marker.
+    pub fn text_encoding_hint(&self) -> Option<smf_core::TextEncoding> {
         for t in &self.tracks {
+            for e in &t.events {
+                if let EventKind::Meta {
+                    meta_type: 0x09,
+                    data,
+                } = &e.kind
+                {
+                    if String::from_utf8_lossy(data)
+                        .to_ascii_uppercase()
+                        .contains("JP")
+                    {
+                        return Some(smf_core::TextEncoding::ShiftJis);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Import-quality diagnostics over the raw event layer. Each finding is
+    /// stable-identified (code + event id) so UI and MCP can both surface it.
+    /// Nothing here mutates — normalization stays an explicit undoable edit.
+    pub fn diagnose(&self) -> Vec<Diagnostic> {
+        let mut out = Vec::new();
+        for (ti, t) in self.tracks.iter().enumerate() {
+            let mut eot = false;
+            for e in &t.events {
+                if matches!(e.kind, EventKind::Meta { meta_type: 0x2F, .. }) {
+                    eot = true;
+                }
+                // tempo maps outside track 0 (format-1 files): legal but
+                // most players ignore them — worth flagging
+                if self.format == 1
+                    && ti != 0
+                    && matches!(e.kind, EventKind::Meta { meta_type: 0x51, .. })
+                {
+                    out.push(Diagnostic {
+                        code: "tempo-outside-conductor",
+                        track: ti,
+                        tick: e.tick,
+                        event: Some(e.id),
+                        detail: "tempo change outside track 0 is ignored by many players".into(),
+                    });
+                }
+            }
+            if !eot && !t.events.is_empty() {
+                out.push(Diagnostic {
+                    code: "missing-eot",
+                    track: ti,
+                    tick: t.events.last().map(|e| e.tick).unwrap_or(0),
+                    event: None,
+                    detail: "track has no End-of-Track meta event".into(),
+                });
+            }
+        }
+        for n in self.notes() {
+            if n.end_tick.is_none() {
+                out.push(Diagnostic {
+                    code: "dangling-noteon",
+                    track: n.track,
+                    tick: n.start_tick,
+                    event: Some(n.on_id),
+                    detail: format!("noteOn ch{} key{} never released", n.channel + 1, n.key),
+                });
+            } else if n.end_tick == Some(n.start_tick) {
+                out.push(Diagnostic {
+                    code: "zero-length-note",
+                    track: n.track,
+                    tick: n.start_tick,
+                    event: Some(n.on_id),
+                    detail: format!("zero-length note ch{} key{}", n.channel + 1, n.key),
+                });
+            }
+        }
+        out.sort_by_key(|d| (d.track, d.tick));
+        out
+    }
+
+    /// `(absolute µs, source track index, raw channel message)` sorted by time.
+    /// The track tag lets playback fan events out to per-track destinations.
+    pub fn timeline_tagged(&self) -> Vec<(u64, usize, Vec<u8>)> {
+        let mut out = Vec::new();
+        for (ti, t) in self.tracks.iter().enumerate() {
             for e in &t.events {
                 if let EventKind::Channel { status, data, len } = &e.kind {
                     let mut b = Vec::with_capacity(3);
@@ -259,12 +349,19 @@ impl Document {
                     if *len == 2 {
                         b.push(data[1]);
                     }
-                    out.push((self.tempo_map.tick_to_us(e.tick), b));
+                    out.push((self.tempo_map.tick_to_us(e.tick), ti, b));
                 }
             }
         }
-        out.sort_by_key(|(us, _)| *us);
+        out.sort_by_key(|(us, _, _)| *us);
         out
+    }
+
+    pub fn timeline(&self) -> Vec<(u64, Vec<u8>)> {
+        self.timeline_tagged()
+            .into_iter()
+            .map(|(us, _, b)| (us, b))
+            .collect()
     }
 
     pub fn serialize(&self, opts: smf_core::WriteOptions) -> Vec<u8> {

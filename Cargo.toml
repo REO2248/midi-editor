@@ -21,18 +21,17 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bytes = "1"
+encoding_rs = "0.8"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 
 # MIDI / SMF
 midly = "0.5"
-midir = "0.10"
+midir = "0.11"
 
-# Plugin hosting. default-features=false drops its cpal backend for now:
-# midir(alsa 0.9) and cpal(alsa 0.11) both link `alsa-sys` and cargo cannot
-# resolve the conflict; audio output is wired up later once the dep story is
-# settled (newer midir, or our own audio path).
-vst3-host = { version = "0.9", default-features = false }
+# Plugin hosting incl. its cpal audio backend; midir 0.11 allows alsa
+# >=0.9,<0.12 so both resolve alsa 0.11 / alsa-sys 0.4 — no links conflict.
+vst3-host = { version = "0.9" }
 
 # GUI (gpui via gpui-kit facade; gpui is gpui-pre 0.3.6 underneath)
 gpui-kit = "0.6"
