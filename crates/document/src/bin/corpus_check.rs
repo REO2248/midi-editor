@@ -2,14 +2,19 @@
 // parse -> write must reproduce bytes, and on non-clean input the pipeline
 // must reach a fixpoint (write(parse(write(parse(b)))) == write(parse(b))).
 // Document must round-trip and diagnose() must not panic on any input.
-// Usage: corpus_check <dir>
+// Usage: corpus_check <dir> [dir...]
 fn main() {
-    let dir = std::env::args().nth(1).expect("usage: corpus_check <dir>");
     let (mut exact, mut normalized, mut failed) = (0, 0, 0);
-    let mut entries: Vec<_> = std::fs::read_dir(&dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
+    let mut entries: Vec<_> = std::env::args()
+        .skip(1)
+        .flat_map(|dir| {
+            std::fs::read_dir(&dir)
+                .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect::<Vec<_>>())
+                .unwrap_or_else(|e| {
+                    eprintln!("{dir}: read_dir failed: {e}");
+                    Vec::new()
+                })
+        })
         .filter(|p| {
             p.extension()
                 .map(|e| e == "mid" || e == "smf")
@@ -31,6 +36,18 @@ fn main() {
             Ok(file) => {
                 let opts = smf_core::WriteOptions::default();
                 let out = smf_core::write(file.format, file.division, &file.tracks, opts);
+                let warnings = file.warnings.clone();
+                // document-level path must also survive
+                let doc = document::Document::from_file(file);
+                let diags = doc.diagnose();
+                let _ = doc.serialize(smf_core::WriteOptions::default());
+                if !diags.is_empty() {
+                    let mut counts = std::collections::BTreeMap::new();
+                    for d in &diags {
+                        *counts.entry(d.code).or_insert(0u32) += 1;
+                    }
+                    println!("{name}: diagnostics {counts:?}");
+                }
                 if out == bytes {
                     exact += 1;
                 } else {
@@ -50,7 +67,7 @@ fn main() {
                             "{name}: normalized {} -> {} bytes, warnings: {:?}",
                             bytes.len(),
                             out.len(),
-                            file.warnings
+                            warnings
                         );
                         continue;
                     }
@@ -62,17 +79,6 @@ fn main() {
                         out2.len()
                     );
                     continue;
-                }
-                // document-level path must also survive
-                let doc = document::Document::from_file(file);
-                let diags = doc.diagnose();
-                let _ = doc.serialize(smf_core::WriteOptions::default());
-                if !diags.is_empty() {
-                    let mut counts = std::collections::BTreeMap::new();
-                    for d in &diags {
-                        *counts.entry(d.code).or_insert(0u32) += 1;
-                    }
-                    println!("{name}: ok, diagnostics {counts:?}");
                 }
             }
             Err(e) => {

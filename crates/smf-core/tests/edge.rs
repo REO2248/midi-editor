@@ -178,6 +178,48 @@ fn big_vlq_delta_roundtrips() {
 }
 
 #[test]
+fn running_status_across_meta_recovers_leniently() {
+    // illegal per spec (meta should clear running status) but common in old
+    // sequencer files: strict parse fails, lenient fallback must recover the
+    // events and converge to clean output
+    let t = [
+        0x00, 0x90, 0x3C, 0x64, // NoteOn 60
+        0x00, 0xFF, 0x01, 0x03, b'h', b'e', b'y', // text meta mid-status
+        0x10, 0x40, 0x60, // +16 NoteOn 64 — running status ACROSS the meta
+        0x00, 0xFF, 0x2F, 0x00,
+    ];
+    let mut f = header(0, 480, 1);
+    f.extend(mtrk(&t));
+    let parsed = parse(&f).unwrap();
+    assert!(
+        parsed.warnings.iter().any(|w| w.contains("lenient")),
+        "expected lenient warning, got {:?}",
+        parsed.warnings
+    );
+    let ons: Vec<_> = parsed.tracks[0]
+        .events
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::Channel { status, .. } if status & 0xF0 == 0x90))
+        .collect();
+    assert_eq!(ons.len(), 2, "both noteOns must be recovered");
+    converges(&f);
+}
+
+#[test]
+fn truncated_track_tail_keeps_good_events() {
+    // meta payload length overruns the chunk — recover events up to it
+    let t = [
+        0x00, 0x90, 0x3C, 0x64, // good noteOn
+        0x00, 0xFF, 0x05, 0x7F, b'o', b'k', // lyric claims 127 bytes, only 2 present
+    ];
+    let mut f = header(0, 480, 1);
+    f.extend(mtrk(&t));
+    let parsed = parse(&f).unwrap();
+    assert!(!parsed.tracks[0].events.is_empty());
+    converges(&f);
+}
+
+#[test]
 fn text_encodings_survive_through_fixpoint() {
     // SJIS track name + UTF-8 lyric + Latin-1 marker in one track
     let mut t = Vec::new();

@@ -72,9 +72,25 @@ pub struct File {
 }
 
 pub fn parse(raw: &[u8]) -> Result<File, Error> {
-    let map = catch_unwind(AssertUnwindSafe(|| SmfBytemap::parse(raw)))
-        .map_err(|_| Error::Panic)?
-        .map_err(|e| Error::Parse(format!("{e}")))?;
+    let map = match catch_unwind(AssertUnwindSafe(|| SmfBytemap::parse(raw))) {
+        Ok(Ok(m)) => m,
+        Ok(Err(e)) => {
+            return parse_lenient(raw).map(|mut f| {
+                f.warnings.insert(
+                    0,
+                    format!("strict parse failed ({e}); lenient recovery used"),
+                );
+                f
+            });
+        }
+        Err(_) => {
+            return parse_lenient(raw).map(|mut f| {
+                f.warnings
+                    .insert(0, "strict parser panicked; lenient recovery used".into());
+                f
+            });
+        }
+    };
 
     let mut warnings = Vec::new();
     detect_extra_chunks(raw, &mut warnings);
@@ -144,6 +160,174 @@ fn detect_extra_chunks(raw: &[u8], warnings: &mut Vec<String>) {
     if pos < raw.len() {
         warnings.push(format!("{} trailing bytes after last chunk", raw.len() - pos));
     }
+}
+
+/// Tolerant event walker used when the strict parser rejects a file. Accepts
+/// the common real-world violations: running status surviving meta/sysex
+/// events, payload lengths over-running the chunk, and truncated tails.
+/// Output is normalized on write (full status bytes), so the pipeline stays a
+/// fixpoint even though byte-exactness is lost.
+fn parse_lenient(raw: &[u8]) -> Result<File, Error> {
+    if raw.len() < 14 || &raw[0..4] != b"MThd" {
+        return Err(Error::Parse("missing MThd header".into()));
+    }
+    let hlen = u32::from_be_bytes(raw[4..8].try_into().unwrap()) as usize;
+    if hlen < 6 || 8 + hlen > raw.len() {
+        return Err(Error::Parse("bad MThd length".into()));
+    }
+    let format = u16::from_be_bytes(raw[8..10].try_into().unwrap());
+    let division = if raw[12] & 0x80 != 0 {
+        Division::Smpte {
+            fps: (-(raw[12] as i8)) as u8,
+            ticks_per_frame: raw[13],
+        }
+    } else {
+        Division::Metrical(u16::from_be_bytes(raw[12..14].try_into().unwrap()))
+    };
+
+    let mut warnings = Vec::new();
+    detect_extra_chunks(raw, &mut warnings);
+
+    let mut tracks = Vec::new();
+    let mut pos = 8 + hlen;
+    while pos + 8 <= raw.len() {
+        let id = &raw[pos..pos + 4];
+        let len = u32::from_be_bytes(raw[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        let body_end = pos.saturating_add(8).saturating_add(len).min(raw.len());
+        if id == b"MTrk" {
+            tracks.push(track_lenient(&raw[pos + 8..body_end], tracks.len(), &mut warnings));
+        }
+        let next = pos.saturating_add(8).saturating_add(len);
+        if next <= pos {
+            break; // corrupt length — stop scanning chunks
+        }
+        pos = next;
+    }
+    if tracks.is_empty() {
+        return Err(Error::Parse("no MTrk chunks".into()));
+    }
+    Ok(File {
+        format,
+        division,
+        tracks,
+        warnings,
+    })
+}
+
+fn read_vlq_lenient(data: &[u8], mut p: usize) -> (u64, usize) {
+    let mut v: u64 = 0;
+    for _ in 0..10 {
+        match data.get(p) {
+            Some(&b) => {
+                p += 1;
+                v = (v << 7) | (b & 0x7f) as u64;
+                if b & 0x80 == 0 {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    (v, p)
+}
+
+fn track_lenient(data: &[u8], tno: usize, warnings: &mut Vec<String>) -> Track {
+    let mut events = Vec::new();
+    let mut tick = 0u64;
+    let mut running: Option<u8> = None;
+    let mut p = 0usize;
+    while p < data.len() {
+        let (delta, np) = read_vlq_lenient(data, p);
+        p = np;
+        if p >= data.len() {
+            break;
+        }
+        tick = tick.saturating_add(delta);
+        let ev_start = p;
+        let st = data[p];
+        let kind;
+        let mut clean = true; // false when the raw span must not be re-emitted
+        if st == 0xFF {
+            p += 1;
+            let Some(&mt) = data.get(p) else { break };
+            p += 1;
+            let (l, np) = read_vlq_lenient(data, p);
+            p = np;
+            let end = p.saturating_add(l as usize).min(data.len());
+            if end < p + l as usize {
+                warnings.push(format!(
+                    "track {tno}: meta 0x{mt:02x} payload overruns chunk (clamped)"
+                ));
+                clean = false; // raw_body holds the bogus declared length
+            }
+            kind = EventKind::Meta {
+                meta_type: mt,
+                data: Bytes::copy_from_slice(&data[p..end]),
+            };
+            p = end;
+            // note: running status intentionally NOT cleared — old sequencers
+            // emit running-status data bytes right after meta events
+        } else if st == 0xF0 || st == 0xF7 {
+            let is_sysex = st == 0xF0;
+            p += 1;
+            let (l, np) = read_vlq_lenient(data, p);
+            p = np;
+            let end = p.saturating_add(l as usize).min(data.len());
+            if end < p + l as usize {
+                warnings.push(format!(
+                    "track {tno}: sysex/escape payload overruns chunk (clamped)"
+                ));
+                clean = false;
+            }
+            let payload = Bytes::copy_from_slice(&data[p..end]);
+            kind = if is_sysex {
+                EventKind::SysEx(payload)
+            } else {
+                EventKind::Escape(payload)
+            };
+            p = end;
+        } else if st >= 0x80 {
+            running = Some(st);
+            p += 1;
+            let want = if matches!(st >> 4, 0xC | 0xD) { 1 } else { 2 };
+            if p + want > data.len() {
+                warnings.push(format!("track {tno}: truncated channel event at end"));
+                break;
+            }
+            kind = EventKind::Channel {
+                status: st,
+                data: [data[p], data.get(p + 1).copied().unwrap_or(0)],
+                len: want as u8,
+            };
+            p += want;
+        } else {
+            let Some(st) = running else {
+                warnings.push(format!(
+                    "track {tno}: data byte 0x{st:02x} with no running status — event dropped"
+                ));
+                p += 1;
+                continue;
+            };
+            let want = if matches!(st >> 4, 0xC | 0xD) { 1 } else { 2 };
+            if p + want > data.len() {
+                warnings.push(format!("track {tno}: truncated channel event at end"));
+                break;
+            }
+            kind = EventKind::Channel {
+                status: st,
+                data: [data[p], data.get(p + 1).copied().unwrap_or(0)],
+                len: want as u8,
+            };
+            p += want;
+        }
+        events.push(Event {
+            tick,
+            seq: events.len() as u32,
+            raw_body: clean.then(|| Bytes::copy_from_slice(&data[ev_start..p])),
+            kind,
+        });
+    }
+    Track { events }
 }
 
 fn convert_kind(kind: &TrackEventKind<'_>) -> EventKind {
