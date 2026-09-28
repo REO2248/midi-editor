@@ -159,20 +159,18 @@ fn empty_doc() -> Document {
 
 impl EditorView {
     fn new(path: Option<PathBuf>, input: Entity<InputState>, cx: &mut Context<Self>) -> Self {
-        let mut sh = Shared::new(match &path {
-            Some(p) => match load_document(p) {
-                Ok(d) => d,
-                Err(_) => empty_doc(),
-            },
-            None => empty_doc(),
-        });
-        let status: SharedString = match &path {
-            Some(p) => match load_document(p) {
-                Ok(_) => "loaded".into(),
-                Err(e) => format!("load failed: {e}").into(),
-            },
-            None => "new document".into(),
+        let loaded = path.as_ref().map(load_document);
+        // the warning(s) belong in the status line, not swallowed
+        let (doc, status): (Document, SharedString) = match loaded {
+            Some(Ok((d, w))) if !w.is_empty() => (
+                d,
+                format!("loaded — {} warning(s): {}", w.len(), w.join("; ")).into(),
+            ),
+            Some(Ok((d, _))) => (d, "loaded".into()),
+            Some(Err(e)) => (empty_doc(), format!("load failed: {e}").into()),
+            None => (empty_doc(), "new document".into()),
         };
+        let mut sh = Shared::new(doc);
         sh.path = path.clone();
         sh.saved_revision = sh.doc.revision();
         // destination catalog: real MIDI ports by name, then discovered VST3s
@@ -805,7 +803,7 @@ impl EditorView {
 
     fn open(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         match load_document(&path) {
-            Ok(d) => {
+            Ok((d, load_warnings)) => {
                 self.stop_playback();
                 // swap the document in place â€” the MCP server holds this same Arc
                 {
@@ -825,7 +823,13 @@ impl EditorView {
                 }
                 self.apply_prefs(&path);
                 self.refresh_derived();
-                self.status = "loaded".into();
+                self.status = if load_warnings.is_empty() {
+                    "loaded".into()
+                } else {
+                    format!("loaded — {} warning(s): {}",
+                        load_warnings.len(),
+                        load_warnings.join("; ")).into()
+                };
             }
             Err(e) => self.status = e.to_string().into(),
         }
@@ -1104,10 +1108,11 @@ impl EditorView {
 
 
 
-fn load_document(path: &PathBuf) -> Result<Document, String> {
+fn load_document(path: &PathBuf) -> Result<(Document, Vec<String>), String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     let file = smf_core::parse(&bytes).map_err(|e| e.to_string())?;
-    Ok(Document::from_file(file))
+    let warnings = file.warnings.clone();
+    Ok((Document::from_file(file), warnings))
 }
 
 /// Session state that cannot live inside the SMF: per-track output

@@ -572,14 +572,7 @@ impl Render for EditorView {
                 };
                 v.apply_tx("set track name", ops);
                 cx.notify();
-            }))
-            .child(
-                div()
-                    .text_color(rgb(0x77778a))
-                    .text_size(px(11.0))
-                    .child(format!("{}", self.status)),
-            );
-
+            }));
         // --- body: event list + roll -------------------------------------------
         let body = div().flex().flex_1().min_h(px(0.0)).child(
             div()
@@ -595,6 +588,13 @@ impl Render for EditorView {
                         .text_size(px(11.0))
                         .text_color(rgb(0x77778a))
                         .child(format!("{} ({})", t("events.header"), self.events.len()))
+                        .child(
+                            div()
+                                .mt_1()
+                                .text_size(px(10.0))
+                                .text_color(rgb(0x77778a))
+                                .child(format!("{}", self.status)),
+                        )
                         .children((n_diags > 0).then(|| {
                             div()
                                 .id("fix-diags")
