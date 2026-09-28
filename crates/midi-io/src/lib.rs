@@ -3,7 +3,18 @@
 //! as ordinary output ports — no special-casing.
 
 use midir::{Ignore, MidiInput, MidiOutput, MidiOutputConnection};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+/// A stable output-destination identity — what the UI persists and MCP tools
+/// name. Ports are addressed by NAME (indexes shift as devices come and go).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Destination {
+    /// midir output port, resolved by name at open time
+    MidiPort { port_name: String },
+    /// hosted VST3 plugin instance, by bundle path
+    Plugin { plugin_path: String },
+}
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -68,6 +79,24 @@ impl Output {
         Ok(Self { conn, name })
     }
 
+    /// Open the first output port whose name equals `name` — the stable way
+    /// to address ports across sessions.
+    pub fn open_named(name: &str) -> Result<Self, Error> {
+        let out = MidiOutput::new("midi-editor").map_err(|e| Error::Init(e.to_string()))?;
+        let port = out
+            .ports()
+            .into_iter()
+            .find(|p| out.port_name(p).map(|n| n == name).unwrap_or(false))
+            .ok_or_else(|| Error::Connect(format!("port '{name}' not found")))?;
+        let conn = out
+            .connect(&port, "midi-editor-out")
+            .map_err(|e| Error::Connect(e.to_string()))?;
+        Ok(Self {
+            conn,
+            name: name.to_string(),
+        })
+    }
+
     pub fn send(&mut self, bytes: &[u8]) -> Result<(), Error> {
         self.conn
             .send(bytes)
@@ -81,6 +110,69 @@ impl Output {
             let _ = self.send(&[0xB0 | ch, 121, 0]); // Reset All Controllers
             let _ = self.send(&[0xB0 | ch, 120, 0]); // All Sound Off
         }
+    }
+}
+
+/// One open input connection. Timestamps each incoming message in µs relative
+/// to the moment `open` returned (not midir's platform epoch) so callers can
+/// place recorded events on the playback timeline directly.
+pub struct Input {
+    // connection must stay alive to keep receiving
+    _conn: midir::MidiInputConnection<()>,
+    pub name: String,
+}
+
+impl Input {
+    /// `cb(us_since_open, bytes)` is called on midir's callback thread.
+    pub fn open<F>(index: usize, mut cb: F) -> Result<Self, Error>
+    where
+        F: FnMut(u64, &[u8]) + Send + 'static,
+    {
+        let mut inp = MidiInput::new("midi-editor-in").map_err(|e| Error::Init(e.to_string()))?;
+        inp.ignore(Ignore::None);
+        let port = inp
+            .ports()
+            .into_iter()
+            .nth(index)
+            .ok_or_else(|| Error::Connect(format!("input {index} not found")))?;
+        let name = inp.port_name(&port).unwrap_or_else(|_| "<unknown>".into());
+        let t0 = std::time::Instant::now();
+        let conn = inp
+            .connect(
+                &port,
+                "midi-editor-in",
+                move |_ts, bytes, _| cb(t0.elapsed().as_micros() as u64, bytes),
+                (),
+            )
+            .map_err(|e| Error::Connect(e.to_string()))?;
+        Ok(Self { _conn: conn, name })
+    }
+
+    pub fn open_named<F>(name: &str, mut cb: F) -> Result<Self, Error>
+    where
+        F: FnMut(u64, &[u8]) + Send + 'static,
+    {
+        let mut inp = MidiInput::new("midi-editor-in").map_err(|e| Error::Init(e.to_string()))?;
+        inp.ignore(Ignore::None);
+        let port = inp
+            .ports()
+            .into_iter()
+            .find(|p| inp.port_name(p).map(|n| n == name).unwrap_or(false))
+            .ok_or_else(|| Error::Connect(format!("input '{name}' not found")))?;
+        let pname = inp.port_name(&port).unwrap_or_else(|_| name.to_string());
+        let t0 = std::time::Instant::now();
+        let conn = inp
+            .connect(
+                &port,
+                "midi-editor-in",
+                move |_ts, bytes, _| cb(t0.elapsed().as_micros() as u64, bytes),
+                (),
+            )
+            .map_err(|e| Error::Connect(e.to_string()))?;
+        Ok(Self {
+            _conn: conn,
+            name: pname,
+        })
     }
 }
 
@@ -119,6 +211,26 @@ impl EventSink for PortSink {
     }
 }
 
+/// Raise the OS scheduler/timer resolution for the duration of playback so
+/// the 2 ms sleep granularity actually lands near 1 ms (Windows defaults to
+/// ~15.6 ms). Per-process scope on Win10 2004+; released on thread end.
+#[cfg(windows)]
+fn set_timer_resolution(ms: u32) {
+    extern "system" {
+        fn timeBeginPeriod(u: u32) -> u32;
+        fn timeEndPeriod(u: u32) -> u32;
+    }
+    unsafe {
+        if ms == 0 {
+            timeEndPeriod(1);
+        } else {
+            timeBeginPeriod(ms);
+        }
+    }
+}
+#[cfg(not(windows))]
+fn set_timer_resolution(_ms: u32) {}
+
 /// Scheduled playback on a dedicated thread.
 ///
 /// The caller snapshots the timeline as `(absolute µs, sink index, channel
@@ -135,50 +247,79 @@ pub struct Playback {
 impl Playback {
     /// `events` must be sorted by absolute µs. `start_us` seeks: events before
     /// it are skipped and the clock starts at `start_us`. Each event carries
-    /// the index of the sink to deliver it to.
+    /// the index of the sink to deliver it to. With `loop_from_us`, reaching
+    /// the end all-notes-offs every sink and restarts the schedule at that
+    /// point — sinks (and VST3 audio streams) stay alive across the boundary.
     pub fn start(
         mut sinks: Vec<Box<dyn EventSink>>,
         events: Vec<(u64, usize, Vec<u8>)>,
         start_us: u64,
+        loop_from_us: Option<u64>,
     ) -> Self {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let position_us = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (stop2, pos2) = (stop.clone(), position_us.clone());
         let thread = std::thread::spawn(move || {
             use std::sync::atomic::Ordering::Relaxed;
-            let t0 = std::time::Instant::now();
-            pos2.store(start_us, Relaxed);
-            for (us, sink_idx, bytes) in events {
-                if stop2.load(Relaxed) {
-                    break;
-                }
-                if us < start_us {
-                    continue;
-                }
-                let Some(sink) = sinks.get_mut(sink_idx) else { continue };
-                let target = t0 + std::time::Duration::from_micros(us - start_us)
-                    - std::time::Duration::from_micros(sink.lead_us());
-                loop {
-                    let now = std::time::Instant::now();
-                    if now >= target {
-                        break;
-                    }
+            set_timer_resolution(1);
+            let mut base_us = start_us;
+            let mut t0 = std::time::Instant::now();
+            let mut i = events.partition_point(|(us, _, _)| *us < base_us);
+            'outer: loop {
+                while i < events.len() {
                     if stop2.load(Relaxed) {
-                        break;
+                        break 'outer;
                     }
-                    std::thread::sleep((target - now).min(std::time::Duration::from_millis(2)));
+                    let (us, sink_idx, bytes) = &events[i];
+                    i += 1;
+                    let us = *us;
+                    let Some(sink) = sinks.get_mut(*sink_idx) else { continue };
+                    let target = t0 + std::time::Duration::from_micros(us - base_us)
+                        - std::time::Duration::from_micros(sink.lead_us());
+                    loop {
+                        let now = std::time::Instant::now();
+                        if now >= target {
+                            break;
+                        }
+                        if stop2.load(Relaxed) {
+                            break 'outer;
+                        }
+                        let rem = target - now;
+                        if rem > std::time::Duration::from_millis(2) {
+                            std::thread::sleep(rem.min(std::time::Duration::from_millis(2)));
+                        } else {
+                            std::hint::spin_loop();
+                        }
+                    }
+                    pos2.store(us, Relaxed);
+                    let deadline = t0 + std::time::Duration::from_micros(us - base_us);
+                    let rem = deadline
+                        .saturating_duration_since(std::time::Instant::now())
+                        .as_micros() as u64;
+                    sink.send_at(bytes, rem);
                 }
-                if stop2.load(Relaxed) {
-                    break;
+                for s in &mut sinks {
+                    s.panic();
                 }
-                pos2.store(us, Relaxed);
-                let deadline = t0 + std::time::Duration::from_micros(us - start_us);
-                let rem = deadline.saturating_duration_since(std::time::Instant::now()).as_micros() as u64;
-                sink.send_at(&bytes, rem);
+                match loop_from_us {
+                    Some(ls) => {
+                        let ni = events.partition_point(|(us, _, _)| *us < ls);
+                        // nothing to replay → don't spin on panic forever
+                        if ni >= events.len() {
+                            break;
+                        }
+                        base_us = ls;
+                        t0 = std::time::Instant::now();
+                        i = ni;
+                        pos2.store(ls, Relaxed);
+                    }
+                    None => break,
+                }
             }
             for s in &mut sinks {
                 s.panic();
             }
+            set_timer_resolution(0);
         });
         Self {
             stop,

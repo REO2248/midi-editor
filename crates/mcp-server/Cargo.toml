@@ -12,6 +12,7 @@ http.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 document.workspace = true
+midi-io.workspace = true
 bytes.workspace = true
 commands.workspace = true
 smf-core.workspace = true

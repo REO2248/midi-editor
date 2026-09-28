@@ -3,15 +3,9 @@
 //! physical interface — all the same WinMM path) or a hosted VST3 plugin
 //! instance driven by vst3-host + cpal.
 
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Destination {
-    /// midir output port, index resolved at open time by name+instance
-    MidiPort { port_name: String },
-    /// hosted plugin instance
-    Plugin { plugin_path: String },
-}
+/// Destination identity lives in midi-io (name-addressed ports); re-exported
+/// here so `output::Destination` keeps working.
+pub use midi_io::Destination;
 
 /// A discovered VST3 bundle.
 #[derive(Debug, Clone)]

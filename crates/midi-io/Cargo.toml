@@ -6,5 +6,6 @@ description = "MIDI I/O: port enumeration, output, playback engine"
 
 [dependencies]
 midir.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

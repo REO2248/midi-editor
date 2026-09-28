@@ -92,6 +92,13 @@ pub enum Op {
         before: Event,
         after: Event,
     },
+    /// Append a track at `index` (usually == tracks.len()); `track` is the
+    /// inserted track's before-image so undo can remove it by position.
+    InsertTrack { index: usize, track: Track },
+    /// Remove the whole track; `track` is its before-image.
+    RemoveTrack { index: usize, track: Track },
+    /// Replace the track's display name meta (0x03) before-image kept.
+    UpdateTrack { index: usize, before: Track, after: Track },
 }
 
 impl Document {
@@ -208,6 +215,32 @@ impl Document {
                         t.events.sort_by_key(|e| (e.tick, e.seq));
                     }
                 }
+                Op::InsertTrack { index, track } => {
+                    self.tracks
+                        .insert((*index).min(self.tracks.len()), track.clone());
+                }
+                Op::RemoveTrack { index, .. } => {
+                    if *index < self.tracks.len() {
+                        self.tracks.remove(*index);
+                    }
+                }
+                Op::UpdateTrack { index, after, .. } => {
+                    if let Some(t) = self.tracks.get_mut(*index) {
+                        *t = after.clone();
+                    }
+                }
+            }
+            // keep the track's cached conventional metas honest
+            let ti = match op {
+                Op::InsertEvents { track, .. }
+                | Op::RemoveEvents { track, .. }
+                | Op::UpdateEvent { track, .. } => Some(*track),
+                Op::InsertTrack { index, .. }
+                | Op::RemoveTrack { index, .. }
+                | Op::UpdateTrack { index, .. } => Some(*index),
+            };
+            if let Some(ti) = ti {
+                self.refresh_track_meta(ti);
             }
         }
         self.revision += 1;
@@ -248,11 +281,56 @@ impl Document {
                         }
                     }
                 }
+                Op::InsertTrack { index, .. } => {
+                    if *index < self.tracks.len() {
+                        self.tracks.remove(*index);
+                    }
+                }
+                Op::RemoveTrack { index, track } => {
+                    self.tracks
+                        .insert((*index).min(self.tracks.len()), track.clone());
+                }
+                Op::UpdateTrack { index, before, .. } => {
+                    if let Some(t) = self.tracks.get_mut(*index) {
+                        *t = before.clone();
+                    }
+                }
+            }
+            let ti = match op {
+                Op::InsertEvents { track, .. }
+                | Op::RemoveEvents { track, .. }
+                | Op::UpdateEvent { track, .. } => Some(*track),
+                Op::InsertTrack { index, .. }
+                | Op::RemoveTrack { index, .. }
+                | Op::UpdateTrack { index, .. } => Some(*index),
+            };
+            if let Some(ti) = ti {
+                self.refresh_track_meta(ti);
             }
         }
         self.revision += 1;
         self.rebuild_index();
         self.tempo_map = TempoMap::build(&self.tracks, self.division);
+    }
+
+    /// Rescan the first name/out-port/out-channel metas after an edit so the
+    /// `Track` cache fields stay correct without callers doing it.
+    fn refresh_track_meta(&mut self, ti: usize) {
+        if let Some(t) = self.tracks.get_mut(ti) {
+            t.name = None;
+            t.out_port = 0;
+            t.out_channel = 0;
+            for e in &t.events {
+                if let EventKind::Meta { meta_type, data } = &e.kind {
+                    match *meta_type {
+                        0x03 if t.name.is_none() => t.name = Some(data.clone()),
+                        0x21 if !data.is_empty() => t.out_port = data[0],
+                        0x20 if !data.is_empty() => t.out_channel = data[0],
+                        _ => {}
+                    }
+                }
+            }
+        }
     }
 
     /// File-wide text-encoding hint from an XF `FF 09` charset marker
@@ -537,7 +615,529 @@ impl Document {
     }
 }
 
-/// SetTempo breakpoints + cumulative microseconds, binary-searched.
+/// Semantic region transforms. Each method builds the low-level `Op`s for
+/// one undoable Transaction — shared by the GUI and the MCP tool surface so
+/// both see identical semantics. All take `&mut self` only to mint event ids.
+impl Document {
+    fn chan_event(status_nibble: u8, channel: u8, d0: u8, d1: u8) -> EventKind {
+        EventKind::Channel {
+            status: (status_nibble & 0xF0) | (channel & 0x0F),
+            data: [d0, d1],
+            len: 2,
+        }
+    }
+
+    /// seq after every existing event at `tick` in `track`
+    fn next_seq(&self, track: usize, tick: u64) -> u32 {
+        self.tracks
+            .get(track)
+            .map(|t| {
+                t.events
+                    .iter()
+                    .filter(|e| e.tick == tick)
+                    .map(|e| e.seq)
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
+            .saturating_add(1)
+    }
+
+    /// Quantize note starts inside [from,to) to `grid` ticks.
+    /// `strength` 0..=100 interpolates between the original and the grid point;
+    /// the note's duration is preserved (on+off shift together).
+    pub fn quantize_ops(
+        &mut self,
+        track: usize,
+        from: u64,
+        to: u64,
+        grid: u64,
+        strength: u32,
+    ) -> Vec<Op> {
+        let grid = grid.max(1) as i64;
+        let str_f = strength.min(100) as f64 / 100.0;
+        let mut ops = Vec::new();
+        for n in self
+            .notes()
+            .into_iter()
+            .filter(|n| n.track == track && n.start_tick >= from && n.start_tick < to)
+        {
+            let start = n.start_tick as i64;
+            let snapped = ((start + grid / 2) / grid) * grid;
+            let new_start = (start as f64 + (snapped - start) as f64 * str_f).round() as i64;
+            let delta = new_start - start;
+            if delta == 0 {
+                continue;
+            }
+            let ids: Vec<EventId> = [Some(n.on_id), n.off_id].into_iter().flatten().collect();
+            for id in ids {
+                if let Some((ti, ei)) = self.by_id.get(&id).copied() {
+                    let mut after = self.tracks[ti].events[ei].clone();
+                    after.tick = after.tick.saturating_add_signed(delta);
+                    ops.push(Op::UpdateEvent {
+                        track: ti,
+                        before: self.tracks[ti].events[ei].clone(),
+                        after,
+                    });
+                }
+            }
+        }
+        ops
+    }
+
+    /// Transpose all notes starting inside [from,to) by `semitones`
+    /// (clamped to 0..=127; notes that would leave the range are skipped).
+    pub fn transpose_ops(
+        &mut self,
+        track: usize,
+        from: u64,
+        to: u64,
+        semitones: i32,
+    ) -> Vec<Op> {
+        let mut ops = Vec::new();
+        for n in self
+            .notes()
+            .into_iter()
+            .filter(|n| n.track == track && n.start_tick >= from && n.start_tick < to)
+        {
+            let Some(new_key) = (n.key as i32 + semitones)
+                .try_into()
+                .ok()
+                .filter(|k: &u8| *k <= 127)
+            else {
+                continue;
+            };
+            for id in [Some(n.on_id), n.off_id].into_iter().flatten() {
+                if let Some((ti, ei)) = self.by_id.get(&id).copied() {
+                    let before = self.tracks[ti].events[ei].clone();
+                    let mut after = before.clone();
+                    if let EventKind::Channel { data, .. } = &mut after.kind {
+                        data[0] = new_key;
+                    }
+                    ops.push(Op::UpdateEvent { track: ti, before, after });
+                }
+            }
+        }
+        ops
+    }
+
+    /// Multiply noteOn velocities inside [from,to) by `factor` (clamped 1..127).
+    pub fn scale_velocity_ops(
+        &mut self,
+        track: usize,
+        from: u64,
+        to: u64,
+        factor: f64,
+    ) -> Vec<Op> {
+        let mut ops = Vec::new();
+        for n in self
+            .notes()
+            .into_iter()
+            .filter(|n| n.track == track && n.start_tick >= from && n.start_tick < to)
+        {
+            let nv = ((n.vel as f64 * factor).round() as i64).clamp(1, 127) as u8;
+            if nv == n.vel {
+                continue;
+            }
+            if let Some((ti, ei)) = self.by_id.get(&n.on_id).copied() {
+                let before = self.tracks[ti].events[ei].clone();
+                let mut after = before.clone();
+                if let EventKind::Channel { data, .. } = &mut after.kind {
+                    data[1] = nv;
+                }
+                ops.push(Op::UpdateEvent { track: ti, before, after });
+            }
+        }
+        ops
+    }
+
+    /// Retarget every channel event in [from,to) to `channel` (0-indexed).
+    pub fn set_channel_ops(
+        &mut self,
+        track: usize,
+        from: u64,
+        to: u64,
+        channel: u8,
+    ) -> Vec<Op> {
+        let mut ops = Vec::new();
+        let t = match self.tracks.get(track) {
+            Some(t) => t,
+            None => return ops,
+        };
+        for e in &t.events {
+            if e.tick < from || e.tick >= to {
+                continue;
+            }
+            if let EventKind::Channel { status, .. } = &e.kind {
+                if status & 0x0F == channel & 0x0F {
+                    continue;
+                }
+                let mut after = e.clone();
+                if let EventKind::Channel { status, .. } = &mut after.kind {
+                    *status = (*status & 0xF0) | (channel & 0x0F);
+                }
+                ops.push(Op::UpdateEvent {
+                    track,
+                    before: e.clone(),
+                    after,
+                });
+            }
+        }
+        ops
+    }
+
+    /// Insert a program change (with optional bank select CC0/CC32 first) —
+    /// classic "pick a patch" as raw events.
+    pub fn set_program_ops(
+        &mut self,
+        track: usize,
+        tick: u64,
+        channel: u8,
+        program: u8,
+        bank_msb: Option<u8>,
+        bank_lsb: Option<u8>,
+    ) -> Vec<Op> {
+        let mut seq = self.next_seq(track, tick);
+        let mut mk = |kind: EventKind| Event {
+            id: self.alloc_event_id(),
+            tick,
+            seq: { let s = seq; seq += 1; s },
+            raw_body: None,
+            kind,
+        };
+        let mut events = Vec::new();
+        if let Some(m) = bank_msb {
+            events.push(mk(Self::chan_event(0xB0, channel, 0, m)));
+        }
+        if let Some(l) = bank_lsb {
+            events.push(mk(Self::chan_event(0xB0, channel, 32, l)));
+        }
+        events.push(mk(EventKind::Channel {
+            status: 0xC0 | (channel & 0x0F),
+            data: [program & 0x7F, 0],
+            len: 1,
+        }));
+        vec![Op::InsertEvents { track, events }]
+    }
+
+    /// Insert (or replace at same tick) one CC point.
+    pub fn set_cc_ops(
+        &mut self,
+        track: usize,
+        tick: u64,
+        channel: u8,
+        cc: u8,
+        value: u8,
+    ) -> Vec<Op> {
+        let seq = self.next_seq(track, tick);
+        vec![Op::InsertEvents {
+            track,
+            events: vec![Event {
+                id: self.alloc_event_id(),
+                tick,
+                seq,
+                raw_body: None,
+                kind: Self::chan_event(0xB0, channel, cc & 0x7F, value & 0x7F),
+            }],
+        }]
+    }
+
+    /// Pitch bend point (0..16383, center 8192).
+    pub fn set_pitch_bend_ops(
+        &mut self,
+        track: usize,
+        tick: u64,
+        channel: u8,
+        value: u16,
+    ) -> Vec<Op> {
+        let v = value.min(16383);
+        let seq = self.next_seq(track, tick);
+        vec![Op::InsertEvents {
+            track,
+            events: vec![Event {
+                id: self.alloc_event_id(),
+                tick,
+                seq,
+                raw_body: None,
+                kind: Self::chan_event(0xE0, channel, (v & 0x7F) as u8, (v >> 7) as u8),
+            }],
+        }]
+    }
+
+    /// Set/replace the tempo at `tick` on the conductor track (track 0).
+    pub fn set_tempo_ops(&mut self, tick: u64, bpm: f64) -> Vec<Op> {
+        let mpq = (60_000_000.0 / bpm.max(1.0)).round().clamp(1.0, 0xFF_FFFF as f64) as u32;
+        let data = Bytes::copy_from_slice(&mpq.to_be_bytes()[1..]);
+        // replace an existing tempo event at the same tick
+        if let Some(e) = self
+            .tracks
+            .first()
+            .and_then(|t| {
+                t.events.iter().find(|e| {
+                    e.tick == tick && matches!(e.kind, EventKind::Meta { meta_type: 0x51, .. })
+                })
+            })
+            .cloned()
+        {
+            let mut after = e.clone();
+            after.kind = EventKind::Meta {
+                meta_type: 0x51,
+                data,
+            };
+            return vec![Op::UpdateEvent {
+                track: 0,
+                before: e,
+                after,
+            }];
+        }
+        vec![Op::InsertEvents {
+            track: 0,
+            events: vec![Event {
+                id: self.alloc_event_id(),
+                tick,
+                seq: self.next_seq(0, tick),
+                raw_body: None,
+                kind: EventKind::Meta {
+                    meta_type: 0x51,
+                    data,
+                },
+            }],
+        }]
+    }
+
+    /// Set/replace the time signature at `tick` on track 0 (denominator given
+    /// as the actual value — 4, 8, … — encoded to the SMF power-of-two form).
+    pub fn set_time_sig_ops(&mut self, tick: u64, num: u8, den: u8) -> Vec<Op> {
+        let dd = (den.max(1) as f64).log2().round() as u8;
+        let data = Bytes::copy_from_slice(&[num, dd, 24, 8]);
+        if let Some(e) = self
+            .tracks
+            .first()
+            .and_then(|t| {
+                t.events.iter().find(|e| {
+                    e.tick == tick && matches!(e.kind, EventKind::Meta { meta_type: 0x58, .. })
+                })
+            })
+            .cloned()
+        {
+            let mut after = e.clone();
+            after.kind = EventKind::Meta {
+                meta_type: 0x58,
+                data,
+            };
+            return vec![Op::UpdateEvent {
+                track: 0,
+                before: e,
+                after,
+            }];
+        }
+        vec![Op::InsertEvents {
+            track: 0,
+            events: vec![Event {
+                id: self.alloc_event_id(),
+                tick,
+                seq: self.next_seq(0, tick),
+                raw_body: None,
+                kind: EventKind::Meta {
+                    meta_type: 0x58,
+                    data,
+                },
+            }],
+        }]
+    }
+
+    /// Set the track's output channel meta (`FF 20`): update the existing
+    /// marker or insert one at tick 0.
+    pub fn set_track_channel_ops(&mut self, track: usize, channel: u8) -> Vec<Op> {
+        if let Some(e) = self
+            .tracks
+            .get(track)
+            .and_then(|t| {
+                t.events.iter().find(|e| {
+                    matches!(e.kind, EventKind::Meta { meta_type: 0x20, .. })
+                })
+            })
+            .cloned()
+        {
+            let mut after = e.clone();
+            after.kind = EventKind::Meta {
+                meta_type: 0x20,
+                data: Bytes::copy_from_slice(&[channel & 0x0F]),
+            };
+            return vec![Op::UpdateEvent {
+                track,
+                before: e,
+                after,
+            }];
+        }
+        vec![Op::InsertEvents {
+            track,
+            events: vec![Event {
+                id: self.alloc_event_id(),
+                tick: 0,
+                seq: 0,
+                raw_body: None,
+                kind: EventKind::Meta {
+                    meta_type: 0x20,
+                    data: Bytes::copy_from_slice(&[channel & 0x0F]),
+                },
+            }],
+        }]
+    }
+
+    /// Clone every channel event in [from,to) shifted to start at `to`.
+    /// (Meta events stay behind — duplicating tempo/EOT would corrupt the
+    /// structure; EOT never duplicates.)
+    pub fn duplicate_range_ops(&mut self, track: usize, from: u64, to: u64) -> Vec<Op> {
+        let span = to.saturating_sub(from);
+        if span == 0 {
+            return vec![];
+        }
+        let t = match self.tracks.get(track) {
+            Some(t) => t,
+            None => return vec![],
+        };
+        let mut events: Vec<Event> = t
+            .events
+            .iter()
+            .filter(|e| e.tick >= from && e.tick < to)
+            .filter(|e| matches!(e.kind, EventKind::Channel { .. }))
+            .cloned()
+            .collect();
+        for e in &mut events {
+            e.tick += span;
+            e.id = self.alloc_event_id();
+        }
+        if events.is_empty() {
+            return vec![];
+        }
+        vec![Op::InsertEvents { track, events }]
+    }
+
+    /// Delete every channel event in [from,to) plus the matching NoteOff of
+    /// any note that starts inside the range (notes delete whole).
+    pub fn delete_range_ops(&mut self, track: usize, from: u64, to: u64) -> Vec<Op> {
+        let t = match self.tracks.get(track) {
+            Some(t) => t,
+            None => return vec![],
+        };
+        let mut ids: std::collections::BTreeSet<EventId> = t
+            .events
+            .iter()
+            .filter(|e| e.tick >= from && e.tick < to)
+            .filter(|e| matches!(e.kind, EventKind::Channel { .. }))
+            .map(|e| e.id)
+            .collect();
+        for n in self
+            .notes()
+            .into_iter()
+            .filter(|n| n.track == track && n.start_tick >= from && n.start_tick < to)
+        {
+            ids.insert(n.on_id);
+            if let Some(o) = n.off_id {
+                ids.insert(o);
+            }
+        }
+        ids.into_iter()
+            .filter_map(|id| {
+                self.by_id
+                    .get(&id)
+                    .copied()
+                    .map(|(ti, ei)| Op::RemoveEvents {
+                        track: ti,
+                        removed: vec![(ei, self.tracks[ti].events[ei].clone())],
+                    })
+            })
+            .collect()
+    }
+
+    /// Append a fresh track (EOT at tick 0) and optionally a name meta.
+    pub fn add_track_ops(&mut self, name: Option<&str>) -> Vec<Op> {
+        let mut events = vec![Event {
+            id: self.alloc_event_id(),
+            tick: 0,
+            seq: 0,
+            raw_body: None,
+            kind: EventKind::Meta {
+                meta_type: 0x2F,
+                data: Bytes::new(),
+            },
+        }];
+        if let Some(n) = name {
+            events.insert(
+                0,
+                Event {
+                    id: self.alloc_event_id(),
+                    tick: 0,
+                    seq: 0,
+                    raw_body: None,
+                    kind: EventKind::Meta {
+                        meta_type: 0x03,
+                        data: Bytes::copy_from_slice(n.as_bytes()),
+                    },
+                },
+            );
+        }
+        vec![Op::InsertTrack {
+            index: self.tracks.len(),
+            track: Track {
+                name: name.map(|n| Bytes::copy_from_slice(n.as_bytes())),
+                out_port: 0,
+                out_channel: 0,
+                events,
+            },
+        }]
+    }
+
+    /// Remove track `index` entirely (undo restores it wholesale).
+    pub fn remove_track_ops(&mut self, index: usize) -> Vec<Op> {
+        match self.tracks.get(index) {
+            Some(t) => vec![Op::RemoveTrack {
+                index,
+                track: t.clone(),
+            }],
+            None => vec![],
+        }
+    }
+
+    /// Set/replace the track name meta (0x03) at tick 0.
+    pub fn set_track_name_ops(&mut self, track: usize, name: &str) -> Vec<Op> {
+        if let Some(e) = self
+            .tracks
+            .get(track)
+            .and_then(|t| {
+                t.events
+                    .iter()
+                    .find(|e| matches!(e.kind, EventKind::Meta { meta_type: 0x03, .. }))
+            })
+            .cloned()
+        {
+            let mut after = e.clone();
+            after.kind = EventKind::Meta {
+                meta_type: 0x03,
+                data: Bytes::copy_from_slice(name.as_bytes()),
+            };
+            return vec![Op::UpdateEvent {
+                track,
+                before: e,
+                after,
+            }];
+        }
+        vec![Op::InsertEvents {
+            track,
+            events: vec![Event {
+                id: self.alloc_event_id(),
+                tick: 0,
+                seq: 0,
+                raw_body: None,
+                kind: EventKind::Meta {
+                    meta_type: 0x03,
+                    data: Bytes::copy_from_slice(name.as_bytes()),
+                },
+            }],
+        }]
+    }
+}
 #[derive(Debug, Default)]
 pub struct TempoMap {
     /// (tick, us_per_quarter, cumulative_us)
@@ -578,6 +1178,18 @@ impl TempoMap {
             prev_mpq = mpq;
         }
         TempoMap { points, division }
+    }
+
+    /// Breakpoints as (tick, µs-per-quarter, cumulative-µs); for MCP reads.
+    pub fn points(&self) -> &[(u64, u32, u64)] {
+        &self.points
+    }
+
+    pub fn ppq(&self) -> u64 {
+        match self.division {
+            Division::Metrical(p) => p.max(1) as u64,
+            Division::Smpte { .. } => 480,
+        }
     }
 
     pub fn tick_to_us(&self, tick: u64) -> u64 {

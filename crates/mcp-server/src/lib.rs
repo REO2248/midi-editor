@@ -13,7 +13,9 @@
 use bytes::Bytes;
 use commands::UndoStack;
 use document::{ApplyError, Document, Event, EventId, Op, Transaction};
+use midi_io::Destination;
 use smf_core::EventKind;
+use std::collections::{HashMap, HashSet};
 use rmcp::model::*;
 use rmcp::service::{RequestContext, ServiceExt};
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
@@ -22,15 +24,41 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// A transport action the MCP side requests and the GUI poller drains —
+/// playback itself lives in the app process (owns sinks/audio), MCP just asks.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TransportReq {
+    Play,
+    Stop,
+    Seek { tick: u64 },
+}
+
 /// Shared editor state. The GUI owns one `Arc`; MCP handlers hold clones and
 /// lock briefly per request. `gui_notify` is bumped on every MCP-side edit so
 /// the UI can poll and repaint (the GUI has no push channel into views).
+///
+/// The destination/track state lives here too (not in the view) so MCP tools
+/// can see and route the same destinations the GUI offers, and so the GUI's
+/// sidecar persist() covers MCP-originated routing changes.
 pub struct Shared {
     pub doc: Document,
     pub undo: UndoStack,
     pub path: Option<PathBuf>,
     pub saved_revision: u64,
     pub gui_notify: Arc<AtomicU64>,
+    /// destination catalog: (display label, stable identity). Index into this
+    /// vec is what `default_dest`/`track_dest` reference — identities, never
+    /// midir indexes.
+    pub dests: Vec<(String, Destination)>,
+    pub default_dest: usize,
+    /// track index -> index into `dests`
+    pub track_dest: HashMap<usize, usize>,
+    pub muted: HashSet<usize>,
+    pub soloed: HashSet<usize>,
+    pub metronome: bool,
+    pub loop_enabled: bool,
+    /// drained by the GUI watcher
+    pub transport_req: Vec<TransportReq>,
 }
 
 pub type SharedDoc = Arc<Mutex<Shared>>;
@@ -43,7 +71,34 @@ impl Shared {
             path: None,
             saved_revision: 0,
             gui_notify: Arc::new(AtomicU64::new(0)),
+            dests: Vec::new(),
+            default_dest: 0,
+            track_dest: HashMap::new(),
+            muted: HashSet::new(),
+            soloed: HashSet::new(),
+            metronome: false,
+            loop_enabled: false,
+            transport_req: Vec::new(),
         }
+    }
+
+    /// Index into `dests` for `dest`, appending a fresh entry when absent.
+    /// Missing MIDI ports keep their identity — `open_named` fails at play
+    /// time, which surfaces a readable error instead of a wrong port.
+    pub fn ensure_dest(&mut self, label: &str, dest: Destination) -> usize {
+        if let Some(i) = self.dests.iter().position(|(_, d)| *d == dest) {
+            return i;
+        }
+        self.dests.push((label.to_string(), dest));
+        self.dests.len() - 1
+    }
+
+    /// The destination index a track resolves to (per-track override else default).
+    pub fn dest_of(&self, track: usize) -> usize {
+        self.track_dest
+            .get(&track)
+            .copied()
+            .unwrap_or(self.default_dest)
     }
 
     /// Apply a transaction and push it onto the shared undo stack.
@@ -487,6 +542,244 @@ fn tool_defs() -> Vec<(&'static str, Tool)> {
                 object_schema(serde_json::json!({"path": {"type": "string"}})),
             ),
         ),
+        (
+            "get_tempo_map",
+            tool(
+                "get_tempo_map",
+                "Tempo breakpoints: [{tick, us_per_quarter, bpm, cumulative_us}] + ppq. Read before editing tempo or converting ticks<->time.",
+                object_schema(serde_json::json!({})),
+            ),
+        ),
+        (
+            "get_meta",
+            tool(
+                "get_meta",
+                "Meta events (names, markers, lyrics, text, tempo, time-sig) with text decoded (UTF-8/SJIS). Args: track?, meta_type? (hex int)",
+                object_schema(serde_json::json!({
+                    "track": {"type": "integer"},
+                    "meta_type": {"type": "integer"},
+                })),
+            ),
+        ),
+        (
+            "get_cc",
+            tool(
+                "get_cc",
+                "Latest controller value per (track, channel, cc) — the current CC state. Args: track?, channel?, cc?",
+                object_schema(serde_json::json!({
+                    "track": {"type": "integer"},
+                    "channel": {"type": "integer"},
+                    "cc": {"type": "integer"},
+                })),
+            ),
+        ),
+        (
+            "list_midi_ports",
+            tool(
+                "list_midi_ports",
+                "Enumerate real MIDI outputs/inputs on this machine (WinMM): [{index, name}]. Use names in set_track_destination.",
+                object_schema(serde_json::json!({})),
+            ),
+        ),
+        (
+            "list_destinations",
+            tool(
+                "list_destinations",
+                "Output routing: catalog [{index, label, kind, port_name|plugin_path}], default_dest, per-track overrides, mute/solo.",
+                object_schema(serde_json::json!({})),
+            ),
+        ),
+        (
+            "set_track_destination",
+            tool(
+                "set_track_destination",
+                "Route a track to an output. Args: track, destination: {\"midi_port\":\"<name>\"} | {\"vst3\":\"<bundle path>\"} | \"default\" (inherit). Unknown destinations are remembered and fail at play time.",
+                object_schema(serde_json::json!({
+                    "track": {"type": "integer"},
+                    "destination": {},
+                })),
+            ),
+        ),
+        (
+            "transport",
+            tool(
+                "transport",
+                "Ask the GUI transport: {action: \"play\"|\"stop\"|\"seek\", tick?}. Only works while the app is running.",
+                object_schema(serde_json::json!({
+                    "action": {"type": "string"},
+                    "tick": {"type": "integer"},
+                })),
+            ),
+        ),
+        (
+            "quantize",
+            tool(
+                "quantize",
+                "Snap note onsets to a grid (duration preserved). Args: track? (all when omitted), from?, to?, grid? (ticks, default ppq/4), strength? (0-100, default 100). Optional base_revision.",
+                object_schema(serde_json::json!({
+                    "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
+                    "grid": {"type": "integer"}, "strength": {"type": "integer"},
+                    "base_revision": {"type": "integer"},
+                })),
+            ),
+        ),
+        (
+            "transpose",
+            tool(
+                "transpose",
+                "Shift note pitch. Args: track?, from?, to?, semitones (+/-). Notes leaving 0..127 are skipped. Optional base_revision.",
+                object_schema(serde_json::json!({
+                    "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
+                    "semitones": {"type": "integer"}, "base_revision": {"type": "integer"},
+                })),
+            ),
+        ),
+        (
+            "scale_velocity",
+            tool(
+                "scale_velocity",
+                "Multiply note velocities. Args: track?, from?, to?, factor (e.g. 1.2 = +20%). Optional base_revision.",
+                object_schema(serde_json::json!({
+                    "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
+                    "factor": {"type": "number"}, "base_revision": {"type": "integer"},
+                })),
+            ),
+        ),
+        (
+            "set_channel",
+            tool(
+                "set_channel",
+                "Retarget all channel events in range to one channel. Args: track, from?, to?, channel (1-16). Optional base_revision.",
+                object_schema(serde_json::json!({
+                    "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
+                    "channel": {"type": "integer"}, "base_revision": {"type": "integer"},
+                })),
+            ),
+        ),
+        (
+            "set_program",
+            tool(
+                "set_program",
+                "Program change (with optional bank CC0/CC32) on a track. Args: track, tick, program (0-127), channel? (default track channel), bank_msb?, bank_lsb?. Optional base_revision.",
+                object_schema(serde_json::json!({
+                    "track": {"type": "integer"}, "tick": {"type": "integer"},
+                    "program": {"type": "integer"}, "channel": {"type": "integer"},
+                    "bank_msb": {"type": "integer"}, "bank_lsb": {"type": "integer"},
+                    "base_revision": {"type": "integer"},
+                })),
+            ),
+        ),
+        (
+            "set_cc",
+            tool(
+                "set_cc",
+                "Insert controller events. Args: track, channel? (default track channel), points: [{tick, cc, value}] — or scalar {tick, cc, value}. Optional base_revision.",
+                object_schema(serde_json::json!({
+                    "track": {"type": "integer"}, "channel": {"type": "integer"},
+                    "tick": {"type": "integer"}, "cc": {"type": "integer"}, "value": {"type": "integer"},
+                    "points": {"type": "array", "items": {"type": "object"}},
+                    "base_revision": {"type": "integer"},
+                })),
+            ),
+        ),
+        (
+            "set_pitch_bend",
+            tool(
+                "set_pitch_bend",
+                "Insert a pitch-bend event. Args: track, tick, value (0..16383, 8192=center), channel?. Optional base_revision.",
+                object_schema(serde_json::json!({
+                    "track": {"type": "integer"}, "tick": {"type": "integer"},
+                    "value": {"type": "integer"}, "channel": {"type": "integer"},
+                    "base_revision": {"type": "integer"},
+                })),
+            ),
+        ),
+        (
+            "set_tempo",
+            tool(
+                "set_tempo",
+                "Set/replace tempo at a tick (conductor track). Args: tick, bpm. Optional base_revision.",
+                object_schema(serde_json::json!({
+                    "tick": {"type": "integer"}, "bpm": {"type": "number"},
+                    "base_revision": {"type": "integer"},
+                })),
+            ),
+        ),
+        (
+            "set_time_signature",
+            tool(
+                "set_time_signature",
+                "Set/replace time signature at a tick. Args: tick, num (beats/bar), den (beat value 4=quarter,8=eighth). Optional base_revision.",
+                object_schema(serde_json::json!({
+                    "tick": {"type": "integer"}, "num": {"type": "integer"}, "den": {"type": "integer"},
+                    "base_revision": {"type": "integer"},
+                })),
+            ),
+        ),
+        (
+            "set_track_channel",
+            tool(
+                "set_track_channel",
+                "Set the track's default channel (FF20 meta). Args: track, channel (1-16). Optional base_revision.",
+                object_schema(serde_json::json!({
+                    "track": {"type": "integer"}, "channel": {"type": "integer"},
+                    "base_revision": {"type": "integer"},
+                })),
+            ),
+        ),
+        (
+            "set_track_name",
+            tool(
+                "set_track_name",
+                "Set track name (UTF-8 meta 0x03). Args: track, name. Optional base_revision.",
+                object_schema(serde_json::json!({
+                    "track": {"type": "integer"}, "name": {"type": "string"},
+                    "base_revision": {"type": "integer"},
+                })),
+            ),
+        ),
+        (
+            "add_track",
+            tool(
+                "add_track",
+                "Append a track (with optional name). Args: name?. Optional base_revision.",
+                object_schema(serde_json::json!({
+                    "name": {"type": "string"}, "base_revision": {"type": "integer"},
+                })),
+            ),
+        ),
+        (
+            "remove_track",
+            tool(
+                "remove_track",
+                "Remove a track entirely. Args: track. Optional base_revision.",
+                object_schema(serde_json::json!({
+                    "track": {"type": "integer"}, "base_revision": {"type": "integer"},
+                })),
+            ),
+        ),
+        (
+            "delete_range",
+            tool(
+                "delete_range",
+                "Delete channel events in [from,to) (notes delete whole). Args: track, from, to. Optional base_revision.",
+                object_schema(serde_json::json!({
+                    "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
+                    "base_revision": {"type": "integer"},
+                })),
+            ),
+        ),
+        (
+            "duplicate_range",
+            tool(
+                "duplicate_range",
+                "Copy channel events in [from,to) to start at `to`. Args: track, from, to. Optional base_revision.",
+                object_schema(serde_json::json!({
+                    "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
+                    "base_revision": {"type": "integer"},
+                })),
+            ),
+        ),
     ]
 }
 
@@ -636,8 +929,403 @@ fn dispatch(
                 None => err_json("no path — pass one or open a file in the editor"),
             }
         }
+        "get_tempo_map" => {
+            let tm = &sh.doc.tempo_map;
+            ok_json(serde_json::json!({
+                "ppq": tm.ppq(),
+                "points": tm.points().iter().map(|(tick, mpq, cum)| serde_json::json!({
+                    "tick": tick, "us_per_quarter": mpq,
+                    "bpm": (60_000_000.0 / *mpq as f64 * 100.0).round() / 100.0,
+                    "cumulative_us": cum,
+                })).collect::<Vec<_>>(),
+            }))
+        }
+        "get_meta" => {
+            let track = args["track"].as_u64().map(|v| v as usize);
+            let mt = args["meta_type"].as_u64().map(|v| v as u8);
+            let hint = sh.doc.text_encoding_hint();
+            let mut out = Vec::new();
+            for (ti, t) in sh.doc.tracks.iter().enumerate() {
+                if track.is_some() && track != Some(ti) {
+                    continue;
+                }
+                for e in &t.events {
+                    if let EventKind::Meta { meta_type, data } = &e.kind {
+                        if mt.is_some() && mt != Some(*meta_type) {
+                            continue;
+                        }
+                        out.push(serde_json::json!({
+                            "track": ti, "id": e.id, "tick": e.tick,
+                            "type": format!("0x{meta_type:02x}"),
+                            "text": smf_core::decode_text(data, hint),
+                            "data_hex": bytes_hex(data),
+                        }));
+                    }
+                }
+            }
+            ok_json(serde_json::json!({"count": out.len(), "meta": out}))
+        }
+        "get_cc" => {
+            let track = args["track"].as_u64().map(|v| v as usize);
+            let chan = args["channel"].as_u64().map(|v| v as u8);
+            let ccn = args["cc"].as_u64().map(|v| v as u8);
+            // latest value wins; events are already tick-sorted
+            let mut latest: HashMap<(usize, u8, u8), (u64, u8)> = HashMap::new();
+            for (ti, t) in sh.doc.tracks.iter().enumerate() {
+                if track.is_some() && track != Some(ti) {
+                    continue;
+                }
+                for e in &t.events {
+                    if let EventKind::Channel { status, data, .. } = &e.kind {
+                        if status & 0xF0 == 0xB0 {
+                            let (ch, cc, val) = (status & 0x0F, data[0], data[1]);
+                            if chan.is_some() && chan != Some(ch) || ccn.is_some() && ccn != Some(cc) {
+                                continue;
+                            }
+                            latest.insert((ti, ch, cc), (e.tick, val));
+                        }
+                    }
+                }
+            }
+            let mut rows: Vec<_> = latest.into_iter().collect();
+            rows.sort_by_key(|(k, _)| *k);
+            ok_json(serde_json::json!({
+                "count": rows.len(),
+                "cc": rows.iter().map(|((t, ch, cc), (tick, v))| serde_json::json!({
+                    "track": t, "channel": ch + 1, "cc": cc, "value": v, "at_tick": tick,
+                })).collect::<Vec<_>>(),
+            }))
+        }
+        "list_midi_ports" => {
+            let outs = midi_io::list_outputs()
+                .unwrap_or_default()
+                .iter()
+                .map(|p| serde_json::json!({"index": p.index, "name": p.name}))
+                .collect::<Vec<_>>();
+            let ins = midi_io::list_inputs()
+                .unwrap_or_default()
+                .iter()
+                .map(|p| serde_json::json!({"index": p.index, "name": p.name}))
+                .collect::<Vec<_>>();
+            ok_json(serde_json::json!({"outputs": outs, "inputs": ins}))
+        }
+        "list_destinations" => ok_json(dests_json(&sh)),
+        "set_track_destination" => {
+            let track = match args["track"].as_u64() {
+                Some(t) => t as usize,
+                None => return err_json("track required"),
+            };
+            if track >= sh.doc.tracks.len() {
+                return err_json(format!("no track {track}"));
+            }
+            let d = &args["destination"];
+            if d.as_str() == Some("default") || d.is_null() {
+                sh.track_dest.remove(&track);
+            } else {
+                let dest = if let Some(p) = d["midi_port"].as_str() {
+                    Destination::MidiPort {
+                        port_name: p.to_string(),
+                    }
+                } else if let Some(p) = d["vst3"].as_str() {
+                    Destination::Plugin {
+                        plugin_path: p.to_string(),
+                    }
+                } else {
+                    return err_json(
+                        "destination must be \"default\", {\"midi_port\": name} or {\"vst3\": path}",
+                    );
+                };
+                let label = dest_label(&dest);
+                let idx = sh.ensure_dest(&label, dest);
+                sh.track_dest.insert(track, idx);
+            }
+            sh.gui_notify.fetch_add(1, Ordering::Relaxed);
+            ok_json(dests_json(&sh))
+        }
+        "transport" => {
+            let req = match args["action"].as_str() {
+                Some("play") => Some(TransportReq::Play),
+                Some("stop") => Some(TransportReq::Stop),
+                Some("seek") => Some(TransportReq::Seek {
+                    tick: args["tick"].as_u64().unwrap_or(0),
+                }),
+                _ => None,
+            };
+            match req {
+                Some(r) => {
+                    sh.transport_req.push(r);
+                    sh.gui_notify.fetch_add(1, Ordering::Relaxed);
+                    ok_json(serde_json::json!({"queued": true}))
+                }
+                None => err_json("action must be play|stop|seek"),
+            }
+        }
+        "quantize" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let (from, to) = region(args);
+            let grid = args["grid"].as_u64().unwrap_or_else(|| sh.doc.tempo_map.ppq() / 4);
+            let strength = args["strength"].as_u64().unwrap_or(100) as u32;
+            let mut ops = Vec::new();
+            for t in sel_tracks(&sh, args) {
+                ops.extend(sh.doc.quantize_ops(t, from, to, grid, strength));
+            }
+            apply_ops(&mut sh, "quantize", ops)
+        }
+        "transpose" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let (from, to) = region(args);
+            let st = args["semitones"].as_i64().unwrap_or(0) as i32;
+            let mut ops = Vec::new();
+            for t in sel_tracks(&sh, args) {
+                ops.extend(sh.doc.transpose_ops(t, from, to, st));
+            }
+            apply_ops(&mut sh, "transpose", ops)
+        }
+        "scale_velocity" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let (from, to) = region(args);
+            let f = args["factor"].as_f64().unwrap_or(1.0);
+            let mut ops = Vec::new();
+            for t in sel_tracks(&sh, args) {
+                ops.extend(sh.doc.scale_velocity_ops(t, from, to, f));
+            }
+            apply_ops(&mut sh, "scale velocity", ops)
+        }
+        "set_channel" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let (from, to) = region(args);
+            let ch = args["channel"].as_u64().unwrap_or(1).max(1).min(16) as u8 - 1;
+            let mut ops = Vec::new();
+            for t in sel_tracks(&sh, args) {
+                ops.extend(sh.doc.set_channel_ops(t, from, to, ch));
+            }
+            apply_ops(&mut sh, "set channel", ops)
+        }
+        "set_program" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let track = args["track"].as_u64().unwrap_or(0) as usize;
+            let tick = args["tick"].as_u64().unwrap_or(0);
+            let ch = args["channel"]
+                .as_u64()
+                .map(|c| (c.max(1).min(16) - 1) as u8)
+                .unwrap_or_else(|| sh.doc.tracks.get(track).map(|t| t.out_channel).unwrap_or(0));
+            let ops = sh.doc.set_program_ops(
+                track,
+                tick,
+                ch,
+                args["program"].as_u64().unwrap_or(0) as u8,
+                args["bank_msb"].as_u64().map(|v| v as u8),
+                args["bank_lsb"].as_u64().map(|v| v as u8),
+            );
+            apply_ops(&mut sh, "set program", ops)
+        }
+        "set_cc" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let track = args["track"].as_u64().unwrap_or(0) as usize;
+            let ch = args["channel"]
+                .as_u64()
+                .map(|c| (c.max(1).min(16) - 1) as u8)
+                .unwrap_or_else(|| sh.doc.tracks.get(track).map(|t| t.out_channel).unwrap_or(0));
+            let mut ops = Vec::new();
+            if let Some(points) = args["points"].as_array() {
+                for p in points {
+                    ops.extend(sh.doc.set_cc_ops(
+                        track,
+                        p["tick"].as_u64().unwrap_or(0),
+                        ch,
+                        p["cc"].as_u64().unwrap_or(7) as u8,
+                        p["value"].as_u64().unwrap_or(0) as u8,
+                    ));
+                }
+            } else {
+                ops.extend(sh.doc.set_cc_ops(
+                    track,
+                    args["tick"].as_u64().unwrap_or(0),
+                    ch,
+                    args["cc"].as_u64().unwrap_or(7) as u8,
+                    args["value"].as_u64().unwrap_or(0) as u8,
+                ));
+            }
+            apply_ops(&mut sh, "set cc", ops)
+        }
+        "set_pitch_bend" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let track = args["track"].as_u64().unwrap_or(0) as usize;
+            let ch = args["channel"]
+                .as_u64()
+                .map(|c| (c.max(1).min(16) - 1) as u8)
+                .unwrap_or_else(|| sh.doc.tracks.get(track).map(|t| t.out_channel).unwrap_or(0));
+            let ops = sh.doc.set_pitch_bend_ops(
+                track,
+                args["tick"].as_u64().unwrap_or(0),
+                ch,
+                args["value"].as_u64().unwrap_or(8192) as u16,
+            );
+            apply_ops(&mut sh, "pitch bend", ops)
+        }
+        "set_tempo" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let ops = sh.doc.set_tempo_ops(
+                args["tick"].as_u64().unwrap_or(0),
+                args["bpm"].as_f64().unwrap_or(120.0),
+            );
+            apply_ops(&mut sh, "set tempo", ops)
+        }
+        "set_time_signature" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let ops = sh.doc.set_time_sig_ops(
+                args["tick"].as_u64().unwrap_or(0),
+                args["num"].as_u64().unwrap_or(4) as u8,
+                args["den"].as_u64().unwrap_or(4) as u8,
+            );
+            apply_ops(&mut sh, "set time signature", ops)
+        }
+        "set_track_channel" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let ops = sh.doc.set_track_channel_ops(
+                args["track"].as_u64().unwrap_or(0) as usize,
+                (args["channel"].as_u64().unwrap_or(1).max(1).min(16) - 1) as u8,
+            );
+            apply_ops(&mut sh, "set track channel", ops)
+        }
+        "set_track_name" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let ops = sh.doc.set_track_name_ops(
+                args["track"].as_u64().unwrap_or(0) as usize,
+                args["name"].as_str().unwrap_or(""),
+            );
+            apply_ops(&mut sh, "set track name", ops)
+        }
+        "add_track" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let ops = sh.doc.add_track_ops(args["name"].as_str());
+            apply_ops(&mut sh, "add track", ops)
+        }
+        "remove_track" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let ops = sh.doc.remove_track_ops(args["track"].as_u64().unwrap_or(0) as usize);
+            apply_ops(&mut sh, "remove track", ops)
+        }
+        "delete_range" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let (from, to) = region(args);
+            let ops = sh
+                .doc
+                .delete_range_ops(args["track"].as_u64().unwrap_or(0) as usize, from, to);
+            apply_ops(&mut sh, "delete range", ops)
+        }
+        "duplicate_range" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let (from, to) = region(args);
+            let ops = sh
+                .doc
+                .duplicate_range_ops(args["track"].as_u64().unwrap_or(0) as usize, from, to);
+            apply_ops(&mut sh, "duplicate range", ops)
+        }
         _ => err_json(format!("unknown tool '{name}'")),
     }
+}
+
+fn check_base(sh: &Shared, args: &serde_json::Value) -> Option<CallToolResponse> {
+    match args["base_revision"].as_u64() {
+        Some(b) if b != sh.doc.revision() => Some(err_json(format!(
+            "stale base_revision: current is {}; call document_summary",
+            sh.doc.revision()
+        ))),
+        _ => None,
+    }
+}
+
+fn region(args: &serde_json::Value) -> (u64, u64) {
+    (
+        args["from"].as_u64().unwrap_or(0),
+        args["to"].as_u64().unwrap_or(u64::MAX),
+    )
+}
+
+/// track arg -> [track]; omitted -> all tracks
+fn sel_tracks(sh: &Shared, args: &serde_json::Value) -> Vec<usize> {
+    match args["track"].as_u64() {
+        Some(t) => vec![t as usize],
+        None => (0..sh.doc.tracks.len()).collect(),
+    }
+}
+
+fn apply_ops(sh: &mut Shared, label: &str, ops: Vec<Op>) -> CallToolResponse {
+    if ops.is_empty() {
+        return ok_json(serde_json::json!({"applied": false, "ops": 0}));
+    }
+    match sh.apply(label, ops) {
+        Ok(rev) => ok_json(serde_json::json!({"applied": true, "revision": rev})),
+        Err(e) => err_json(e.to_string()),
+    }
+}
+
+fn dest_label(d: &Destination) -> String {
+    match d {
+        Destination::MidiPort { port_name } => port_name.clone(),
+        Destination::Plugin { plugin_path } => {
+            format!("{} [VST3]", plugin_path)
+        }
+    }
+}
+
+fn dest_json(d: &Destination) -> serde_json::Value {
+    match d {
+        Destination::MidiPort { port_name } => {
+            serde_json::json!({"kind": "midi_port", "port_name": port_name})
+        }
+        Destination::Plugin { plugin_path } => {
+            serde_json::json!({"kind": "vst3", "plugin_path": plugin_path})
+        }
+    }
+}
+
+fn dests_json(sh: &Shared) -> serde_json::Value {
+    serde_json::json!({
+        "destinations": sh.dests.iter().enumerate().map(|(i, (label, d))| {
+            let mut j = dest_json(d);
+            j["index"] = i.into();
+            j["label"] = label.clone().into();
+            j
+        }).collect::<Vec<_>>(),
+        "default_dest": sh.default_dest,
+        "track_dest": sh.track_dest.iter().map(|(t, d)| (*t, *d)).collect::<HashMap<usize, usize>>(),
+        "muted": sh.muted.iter().copied().collect::<Vec<_>>(),
+        "soloed": sh.soloed.iter().copied().collect::<Vec<_>>(),
+        "metronome": sh.metronome,
+        "loop_enabled": sh.loop_enabled,
+    })
 }
 
 /// Serve over stdio (standalone `--file` mode or tests).

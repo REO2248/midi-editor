@@ -4235,6 +4235,7 @@ dependencies = [
  "commands",
  "document",
  "http",
+ "midi-io",
  "rmcp",
  "serde",
  "serde_json",
@@ -4305,6 +4306,8 @@ dependencies = [
  "mcp-server",
  "midi-io",
  "output",
+ "serde",
+ "serde_json",
  "smf-core",
  "tokio",
  "tracing",
@@ -4317,6 +4320,7 @@ name = "midi-io"
 version = "0.0.0"
 dependencies = [
  "midir",
+ "serde",
  "thiserror 2.0.21",
  "tracing",
 ]

@@ -4,6 +4,7 @@
 //! `Document::apply(Transaction)` so undo is shared with MCP edits.
 
 mod i18n;
+mod render;
 use i18n::t;
 
 use commands::UndoStack;
@@ -12,10 +13,10 @@ use mcp_server::{Shared, SharedDoc};
 use std::sync::Mutex;
 use smf_core::EventKind;
 use gpui_kit::*;
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::InputState;
 use gpui_kit::component::Root;
 use midi_io::{EventSink, Playback, PortSink};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use smf_core::Division;
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -28,20 +29,6 @@ const TRACK_COLORS: [u32; 8] = [
 ];
 const SEL_COLOR: u32 = 0xffffff;
 const DANGLING_COLOR: u32 = 0xff4f4f;
-
-/// One selectable output destination: a hardware/software MIDI port or a
-/// hosted VST3 instrument.
-enum DestKind {
-    /// index into midir's port list
-    Midi(usize),
-    /// path to the .vst3 bundle
-    Plugin(PathBuf),
-}
-
-struct DestSpec {
-    label: String,
-    kind: DestKind,
-}
 
 /// What a left-drag on the piano roll is doing.
 #[derive(Clone, Copy, PartialEq)]
@@ -119,24 +106,15 @@ struct EditorView {
     /// selected note `on_id`s (marquee multi-select)
     selection: BTreeSet<EventId>,
     drag: Option<Drag>,
-    /// canvas bounds as painted last frame — for hit-testing
+    /// canvas bounds as painted last frame â€” for hit-testing
     roll_bounds: Rc<Cell<Bounds<Pixels>>>,
     /// seek-ruler strip bounds
     ruler_bounds: Rc<Cell<Bounds<Pixels>>>,
-    /// velocity lane bounds — same trick for the lane's hit-testing
+    /// velocity lane bounds â€” same trick for the lane's hit-testing
     lane_bounds: Rc<Cell<Bounds<Pixels>>>,
     scroll_x: f32,
     scroll_y: f32,
     zoom: f32,
-    /// All playback destinations: MIDI ports (GS Wavetable, loopMIDI,
-    /// physical IFs) followed by discovered VST3 plugins.
-    dests: Vec<DestSpec>,
-    /// Dest used by tracks with no explicit assignment.
-    default_dest: usize,
-    /// track index -> index into `dests`
-    track_dest: HashMap<usize, usize>,
-    muted: HashSet<usize>,
-    soloed: HashSet<usize>,
     /// Plugin instances opened for the current playback, keyed by dest index;
     /// dropping them stops their audio streams.
     active_plugins: Vec<(usize, output::PluginOutput)>,
@@ -150,15 +128,23 @@ struct EditorView {
     playback: Option<Playback>,
     play_us: u64,
     /// restart at `loop_start_us` when playback reaches the end
-    loop_enabled: bool,
+    /// (`loop_enabled` itself lives in `shared` so MCP can toggle it)
     loop_start_us: u64,
-    /// click on every beat routed to a MIDI destination (GM ch10 woodblock)
-    metronome: bool,
     /// what the bottom lane edits
     lane_mode: LaneMode,
+    /// live MIDI input capture while `rec` is armed
+    rec: Option<Rec>,
     focus: FocusHandle,
     input: Entity<InputState>,
     status: SharedString,
+}
+
+/// Armed recording: timestamps channel messages against the playhead's Âµs base.
+struct Rec {
+    _input: midi_io::Input,
+    buf: std::sync::Arc<Mutex<Vec<(u64, Vec<u8>)>>>,
+    /// document time (Âµs) corresponding to Input's t=0
+    base_us: u64,
 }
 
 fn empty_doc() -> Document {
@@ -189,6 +175,25 @@ impl EditorView {
         };
         sh.path = path.clone();
         sh.saved_revision = sh.doc.revision();
+        // destination catalog: real MIDI ports by name, then discovered VST3s
+        sh.dests = midi_io::list_outputs()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| {
+                (
+                    p.name.clone(),
+                    midi_io::Destination::MidiPort { port_name: p.name },
+                )
+            })
+            .collect();
+        for p in output::discover_plugins() {
+            sh.dests.push((
+                format!("{} [VST3]", p.name),
+                midi_io::Destination::Plugin {
+                    plugin_path: p.path.to_string_lossy().into_owned(),
+                },
+            ));
+        }
         let shared = Arc::new(Mutex::new(sh));
         let mut v = Self {
             shared,
@@ -205,43 +210,24 @@ impl EditorView {
             scroll_x: 0.0,
             scroll_y: (127.0 - 84.0) * NOTE_H, // show ~C3..C7
             zoom: 0.08,
-            dests: {
-                let mut d: Vec<DestSpec> = midi_io::list_outputs()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|p| DestSpec {
-                        label: p.name,
-                        kind: DestKind::Midi(p.index),
-                    })
-                    .collect();
-                for p in output::discover_plugins() {
-                    d.push(DestSpec {
-                        label: format!("{} [VST3]", p.name),
-                        kind: DestKind::Plugin(p.path),
-                    });
-                }
-                d
-            },
-            default_dest: 0,
-            track_dest: HashMap::new(),
-            muted: HashSet::new(),
-            soloed: HashSet::new(),
             active_plugins: Vec::new(),
             plugin_window: None,
             gui_plugin: None,
             enc_override: None,
             playback: None,
             play_us: 0,
-            loop_enabled: false,
-            metronome: false,
             loop_start_us: 0,
             lane_mode: LaneMode::Velocity,
+            rec: None,
             focus: cx.focus_handle(),
             input,
             status,
         };
         v.sel_track = v.pick_default_track();
         v.refresh_derived();
+        if let Some(p) = &path {
+            v.apply_prefs(p);
+        }
         v
     }
 
@@ -349,6 +335,85 @@ impl EditorView {
             Ok(_) => self.refresh_derived_sh(&mut sh),
             Err(e) => self.status = format!("apply: {e}").into(),
         }
+    }
+
+    /// Run a semantic region transform (`Document` *_ops generator) on the
+    /// selection's range â€” or the whole selected track when nothing is
+    /// selected. The same generators power the MCP tools, so GUI and AI edits
+    /// share semantics and undo.
+    fn apply_region_op(
+        &mut self,
+        label: &str,
+        f: impl Fn(&mut Document, usize, u64, u64) -> Vec<Op>,
+    ) {
+        let (tracks, from, to) = if self.selection.is_empty() {
+            (vec![self.sel_track], 0, u64::MAX)
+        } else {
+            let mut tracks = BTreeSet::new();
+            let (mut lo, mut hi) = (u64::MAX, 0u64);
+            for n in self.notes.iter() {
+                if self.selection.contains(&n.on_id) {
+                    tracks.insert(n.track);
+                    lo = lo.min(n.start_tick);
+                    hi = hi.max(n.end_tick.unwrap_or(n.start_tick));
+                }
+            }
+            (tracks.into_iter().collect::<Vec<_>>(), lo, hi + 1)
+        };
+        let ops = {
+            let mut sh = self.shared.lock().unwrap();
+            tracks
+                .into_iter()
+                .flat_map(|t| f(&mut sh.doc, t, from, to))
+                .collect::<Vec<_>>()
+        };
+        if ops.is_empty() {
+            self.status = format!("{label}: nothing to change").into();
+        } else {
+            self.apply_tx(label, ops);
+            self.status = format!("{label}").into();
+        }
+    }
+
+    /// Set the tick-0 tempo to current bpm + delta (via the shared op layer).
+    fn bump_tempo(&mut self, delta: f64) {
+        let cur = self.doc(|d| {
+            d.tempo_map
+                .points()
+                .first()
+                .map(|(_, mpq, _)| 60_000_000.0 / *mpq as f64)
+                .unwrap_or(120.0)
+        });
+        let ops = {
+            let mut sh = self.shared.lock().unwrap();
+            sh.doc.set_tempo_ops(0, (cur + delta).clamp(10.0, 400.0))
+        };
+        self.apply_tx("set tempo", ops);
+    }
+
+    /// Cycle the tick-0 time signature through common meters.
+    fn cycle_time_sig(&mut self) {
+        const SIGS: [(u8, u8); 6] = [(4, 4), (3, 4), (2, 4), (5, 4), (6, 8), (7, 8)];
+        let cur = self.doc(|d| {
+            d.tracks.first().and_then(|t| {
+                t.events.iter().find_map(|e| match &e.kind {
+                    EventKind::Meta {
+                        meta_type: 0x58,
+                        data,
+                    } if data.len() >= 2 => Some((data[0], 1u8 << data[1])),
+                    _ => None,
+                })
+            })
+        });
+        let next = match cur.and_then(|c| SIGS.iter().position(|s| *s == c)) {
+            Some(i) => SIGS[(i + 1) % SIGS.len()],
+            None => SIGS[1],
+        };
+        let ops = {
+            let mut sh = self.shared.lock().unwrap();
+            sh.doc.set_time_sig_ops(0, next.0, next.1)
+        };
+        self.apply_tx("set time signature", ops);
     }
 
     fn insert_note(&mut self, tick: u64, key: u8, cx: &mut Context<Self>) {
@@ -693,6 +758,8 @@ impl EditorView {
                     }
                     Err(e) => self.status = format!("{e}").into(),
                 }
+                drop(sh);
+                self.persist();
             }
             None => self.save_as(cx),
         }
@@ -740,16 +807,23 @@ impl EditorView {
         match load_document(&path) {
             Ok(d) => {
                 self.stop_playback();
-                // swap the document in place — the MCP server holds this same Arc
+                // swap the document in place â€” the MCP server holds this same Arc
                 {
                     let mut sh = self.shared.lock().unwrap();
                     sh.doc = d;
                     sh.undo = UndoStack::new(512);
-                    sh.path = Some(path);
+                    sh.path = Some(path.clone());
                     sh.saved_revision = sh.doc.revision();
                 }
                 self.sel_track = self.pick_default_track();
                 self.selection.clear();
+                {
+                    let mut sh = self.shared.lock().unwrap();
+                    sh.muted.clear();
+                    sh.soloed.clear();
+                    sh.track_dest.clear();
+                }
+                self.apply_prefs(&path);
                 self.refresh_derived();
                 self.status = "loaded".into();
             }
@@ -767,54 +841,58 @@ impl EditorView {
         cx.notify();
     }
 
-    /// Effective destination index for a track: its explicit assignment or
-    /// the global default.
-    fn dest_of(&self, track: usize) -> usize {
-        self.track_dest
-            .get(&track)
-            .copied()
-            .unwrap_or(self.default_dest)
-            .min(self.dests.len().saturating_sub(1))
-    }
-
-    /// Whether a track's events reach an output: muted tracks never play;
-    /// when anything is soloed, only soloed tracks play.
-    fn audible(&self, track: usize) -> bool {
-        if !self.soloed.is_empty() {
-            self.soloed.contains(&track)
-        } else {
-            !self.muted.contains(&track)
-        }
-    }
-
     fn start_playback(&mut self) {
-        if self.dests.is_empty() {
+        // snapshot routing state so no lock is held while opening sinks
+        let (dests, dest_of_track, muted, soloed, metronome, loop_enabled) = {
+            let sh = self.shared.lock().unwrap();
+            let map: HashMap<usize, usize> = (0..sh.doc.tracks.len())
+                .map(|t| (t, sh.dest_of(t)))
+                .collect();
+            (
+                sh.dests.clone(),
+                map,
+                sh.muted.clone(),
+                sh.soloed.clone(),
+                sh.metronome,
+                sh.loop_enabled,
+            )
+        };
+        let dest_of = |t: usize| dest_of_track.get(&t).copied().unwrap_or(0);
+        if dests.is_empty() {
             self.status = t("status.no_port").into();
             return;
         }
+        let audible = |tr: usize| {
+            if !soloed.is_empty() {
+                soloed.contains(&tr)
+            } else {
+                !muted.contains(&tr)
+            }
+        };
         let tagged: Vec<(u64, usize, Vec<u8>)> = self
             .doc(|d| d.timeline_tagged())
             .into_iter()
-            .filter(|(_, tr, _)| self.audible(*tr))
+            .filter(|(_, tr, _)| audible(*tr))
             .collect();
         // open each destination that at least one event needs
-        let needed: BTreeSet<usize> =
-            tagged.iter().map(|(_, tr, _)| self.dest_of(*tr)).collect();
+        let needed: BTreeSet<usize> = tagged.iter().map(|(_, tr, _)| dest_of(*tr)).collect();
         let mut sinks: Vec<Box<dyn EventSink>> = Vec::new();
         let mut sink_of: HashMap<usize, usize> = HashMap::new();
         self.active_plugins.clear();
         for d in needed {
-            let Some(spec) = self.dests.get(d) else { continue };
-            match &spec.kind {
-                DestKind::Midi(idx) => match midi_io::Output::open(*idx) {
-                    Ok(out) => {
-                        sink_of.insert(d, sinks.len());
-                        sinks.push(Box::new(PortSink::new(out)));
+            let Some((_, dest)) = dests.get(d) else { continue };
+            match dest {
+                output::Destination::MidiPort { port_name } => {
+                    match midi_io::Output::open_named(port_name) {
+                        Ok(out) => {
+                            sink_of.insert(d, sinks.len());
+                            sinks.push(Box::new(PortSink::new(out)));
+                        }
+                        Err(e) => self.status = format!("{e}").into(),
                     }
-                    Err(e) => self.status = format!("{e}").into(),
-                },
-                DestKind::Plugin(path) => {
-                    match output::PluginOutput::open(path) {
+                }
+                output::Destination::Plugin { plugin_path } => {
+                    match output::PluginOutput::open(PathBuf::from(plugin_path).as_path()) {
                         Ok(plugin) => {
                             sink_of.insert(d, sinks.len());
                             sinks.push(Box::new(plugin.event_sink()));
@@ -831,17 +909,14 @@ impl EditorView {
         }
         let mut events: Vec<(u64, usize, Vec<u8>)> = tagged
             .into_iter()
-            .filter_map(|(us, tr, b)| {
-                sink_of.get(&self.dest_of(tr)).map(|&s| (us, s, b))
-            })
+            .filter_map(|(us, tr, b)| sink_of.get(&dest_of(tr)).map(|&s| (us, s, b)))
             .collect();
-        if self.metronome {
+        if metronome {
             // prefer a plain MIDI port for clicks; fall back to any sink
-            let click_sink = self
-                .dests
+            let click_sink = dests
                 .iter()
                 .enumerate()
-                .find(|(_, s)| matches!(s.kind, DestKind::Midi(_)))
+                .find(|(_, (_, d))| matches!(d, output::Destination::MidiPort { .. }))
                 .and_then(|(d, _)| sink_of.get(&d).copied())
                 .or_else(|| sink_of.values().next().copied());
             if let Some(s) = click_sink {
@@ -862,7 +937,12 @@ impl EditorView {
             }
         }
         self.loop_start_us = self.play_us;
-        self.playback = Some(Playback::start(sinks, events, self.play_us));
+        self.playback = Some(Playback::start(
+            sinks,
+            events,
+            self.play_us,
+            loop_enabled.then_some(self.loop_start_us),
+        ));
     }
 
     fn stop_playback(&mut self) {
@@ -871,6 +951,84 @@ impl EditorView {
             p.stop();
         }
         self.active_plugins.clear();
+        self.finish_record();
+    }
+
+    /// Arm/disarm live capture from the first MIDI input port onto the
+    /// selected track. Arm also starts playback so timing is audible; a
+    /// second press commits the take as one undoable transaction.
+    fn toggle_record(&mut self) {
+        if self.rec.is_some() {
+            self.finish_record();
+            return;
+        }
+        let buf = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let buf2 = buf.clone();
+        match midi_io::Input::open(0, move |us, b| {
+            buf2.lock().unwrap().push((us, b.to_vec()));
+        }) {
+            Ok(input) => {
+                self.rec = Some(Rec {
+                    _input: input,
+                    buf,
+                    base_us: self.play_us,
+                });
+                if self.playback.is_none() {
+                    self.start_playback();
+                }
+                self.status = format!("rec â†’ T{}", self.sel_track + 1).into();
+            }
+            Err(e) => self.status = format!("rec: {e}").into(),
+        }
+    }
+
+    /// Commit the captured take into the selected track (raw channel events;
+    /// the notes() view pairs on/off for display).
+    fn finish_record(&mut self) {
+        let Some(rec) = self.rec.take() else {
+            return;
+        };
+        let msgs = std::mem::take(&mut *rec.buf.lock().unwrap());
+        let mut sh = self.shared.lock().unwrap();
+        if sh.doc.tracks.is_empty() {
+            let ops = sh.doc.add_track_ops(None);
+            let _ = sh.apply("add track", ops);
+        }
+        let track = self.sel_track.min(sh.doc.tracks.len().saturating_sub(1));
+        let mut events = Vec::new();
+        for (us, b) in msgs {
+            // channel voice messages only; realtime/sysex are not captured
+            if b.is_empty() || b[0] < 0x80 || b[0] >= 0xF0 {
+                continue;
+            }
+            let len = match b[0] & 0xF0 {
+                0xC0 | 0xD0 => 1,
+                _ => 2,
+            };
+            if b.len() < 1 + len as usize {
+                continue;
+            }
+            let tick = sh.doc.tempo_map.us_to_tick(rec.base_us + us);
+            events.push(document::Event {
+                id: sh.doc.alloc_event_id(),
+                tick,
+                seq: u32::MAX / 2,
+                raw_body: None,
+                kind: EventKind::Channel {
+                    status: b[0],
+                    data: [b[1], b.get(2).copied().unwrap_or(0)],
+                    len,
+                },
+            });
+        }
+        let n = events.len();
+        drop(sh);
+        if n == 0 {
+            self.status = "rec: no events".into();
+            return;
+        }
+        self.apply_tx("record", vec![Op::InsertEvents { track, events }]);
+        self.status = format!("rec: {n} events").into();
     }
 
     /// tick,key under a window-space mouse position
@@ -892,7 +1050,7 @@ impl EditorView {
         }).cloned()
     }
 
-    /// Note whose right edge is within ~6px of `pos` — a resize target.
+    /// Note whose right edge is within ~6px of `pos` â€” a resize target.
     fn edge_at(&self, pos: Point<Pixels>) -> Option<Note> {
         let (tick, key) = self.hit(pos);
         self.notes
@@ -920,6 +1078,28 @@ impl EditorView {
             .child(t(label))
             .on_click(cx.listener(move |this, _ev, _w, cx| on(this, cx)))
     }
+
+    /// Small chip with a literal label (symbols/numbers need no i18n key).
+    /// `on` receives the ClickEvent so chips can honour Shift=Ã—10 etc.
+    fn chip(
+        id: &'static str,
+        label: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+        on: impl Fn(&mut Self, &ClickEvent, &mut Context<Self>) + 'static,
+    ) -> Stateful<Div> {
+        div()
+            .id(id)
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .bg(rgb(0x2a2a35))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(0x3a3a48)))
+            .text_color(rgb(0x9fd0ff))
+            .text_size(px(11.0))
+            .child(label.into())
+            .on_click(cx.listener(move |this, ev, _w, cx| on(this, ev, cx)))
+    }
 }
 
 
@@ -930,1098 +1110,157 @@ fn load_document(path: &PathBuf) -> Result<Document, String> {
     Ok(Document::from_file(file))
 }
 
-impl Render for EditorView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // pump the plugin editor window's native event queue while it's open
-        if let Some(w) = &mut self.plugin_window {
-            let _ = w.service_platform_events();
-            if w.closed_by_user() {
-                self.plugin_window = None;
-                self.gui_plugin = None;
-            }
+/// Session state that cannot live inside the SMF: per-track output
+/// assignments (by stable destination identity, not runtime index), mute/solo,
+/// metronome/loop, view transform. Written next to the document as
+/// `song.mid.editor.json`.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct Prefs {
+    default_dest: Option<output::Destination>,
+    track_dest: HashMap<usize, output::Destination>,
+    muted: Vec<usize>,
+    soloed: Vec<usize>,
+    metronome: bool,
+    loop_enabled: bool,
+    zoom: Option<f32>,
+    scroll_x: Option<f32>,
+    scroll_y: Option<f32>,
+    sel_track: Option<usize>,
+    enc: Option<String>,
+    lane: Option<String>,
+}
+
+fn prefs_path(doc_path: &PathBuf) -> PathBuf {
+    PathBuf::from(format!("{}.editor.json", doc_path.display()))
+}
+
+/// Display label for a destination identity (sidecar paths -> stem).
+fn dest_label(d: &output::Destination) -> String {
+    match d {
+        output::Destination::MidiPort { port_name } => port_name.clone(),
+        output::Destination::Plugin { plugin_path } => {
+            let stem = PathBuf::from(plugin_path)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "plugin".into());
+            format!("{stem} [VST3]")
         }
-        self.refresh_derived();
-
-        // advance playhead / auto-stop
-        if let Some(p) = &self.playback {
-            self.play_us = p.position_us();
-            if !p.is_running() {
-                self.playback = None;
-                if self.loop_enabled {
-                    self.play_us = self.loop_start_us;
-                    self.start_playback();
-                } else {
-                    self.play_us = 0;
-                }
-            }
-        }
-        let (playhead_tick, title, dirty, n_diags, track_names) = {
-            let sh = self.shared.lock().unwrap();
-            let hint = self.enc_override.or(sh.doc.text_encoding_hint());
-            (
-                sh.doc.tempo_map.us_to_tick(self.play_us),
-                sh.path
-                    .as_ref()
-                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-                    .unwrap_or_else(|| t("status.no_file").to_string()),
-                sh.doc.revision() != sh.saved_revision,
-                sh.doc.diagnose().len(),
-                sh.doc
-                    .tracks
-                    .iter()
-                    .enumerate()
-                    .map(|(i, tr)| {
-                        tr.name
-                            .as_ref()
-                            .map(|b| smf_core::decode_text(b, hint))
-                            .unwrap_or_else(|| format!("Track {}", i + 1))
-                    })
-                    .collect::<Vec<String>>(),
-            )
-        };
-        let ppq = self.ppq();
-        let pos = {
-            let bar = playhead_tick / (ppq * 4) + 1;
-            let beat = (playhead_tick % (ppq * 4)) / ppq + 1;
-            format!("{bar}.{beat}.{:>3}", playhead_tick % ppq)
-        };
-        let port_label = {
-            let eff = self.dest_of(self.sel_track);
-            let name = self
-                .dests
-                .get(eff)
-                .map(|d| d.label.clone())
-                .unwrap_or_else(|| t("status.no_port").to_string());
-            let mark = if self.track_dest.contains_key(&self.sel_track) {
-                ""
-            } else {
-                "*"
-            };
-            format!("T{}{} ▸ {}", self.sel_track + 1, mark, name)
-        };
-
-        // --- piano roll canvas -------------------------------------------------
-        let notes = self.notes.clone();
-        let (scroll_x, scroll_y, zoom) = (self.scroll_x, self.scroll_y, self.zoom);
-        let selection = self.selection.clone();
-        let drag = self
-            .drag
-            .as_ref()
-            .map(|d| (d.mode, d.on_id, d.dtick, d.dkey));
-        let marquee = self.drag.as_ref().and_then(|d| {
-            (d.mode == DragMode::Marquee).then_some((d.a_tick, d.a_key, d.b_tick, d.b_key))
-        });
-        let bounds_cell = self.roll_bounds.clone();
-        let playing = self.playback.is_some();
-        let play_x_tick = playhead_tick;
-
-        let roll = canvas(
-            move |bounds, _window, _cx| {
-                bounds_cell.set(bounds);
-            },
-            move |bounds, _state, window, _cx| {
-                if playing {
-                    window.request_animation_frame();
-                }
-                let w = bounds.size.width;
-                let h = bounds.size.height;
-                // key rows
-                let k0 = (scroll_y / NOTE_H).max(0.0) as i32;
-                let k1 = ((scroll_y + f32::from(h)) / NOTE_H + 1.0).min(128.0) as i32;
-                for k in k0..k1 {
-                    let black = matches!(k % 12, 1 | 3 | 6 | 8 | 10);
-                    let y = bounds.origin.y + px(k as f32 * NOTE_H - scroll_y);
-                    if black {
-                        window.paint_quad(fill(
-                            Bounds::new(point(bounds.origin.x, y), size(w, px(NOTE_H))),
-                            rgb(0x1a1a21),
-                        ));
-                    }
-                    window.paint_quad(fill(
-                        Bounds::new(point(bounds.origin.x, y), size(w, px(1.0))),
-                        rgb(if k % 12 == 0 { 0x2e2e3a } else { 0x232329 }),
-                    ));
-                }
-                // beat/bar lines
-                let tick0 = (scroll_x / zoom).max(0.0) as u64;
-                let tick1 = tick0 + (f32::from(w) / zoom) as u64 + ppq;
-                let mut t = tick0 / ppq * ppq;
-                while t <= tick1 {
-                    let x = bounds.origin.x + px(t as f32 * zoom - scroll_x);
-                    let bar = t % (ppq * 4) == 0;
-                    window.paint_quad(fill(
-                        Bounds::new(point(x, bounds.origin.y), size(px(1.0), h)),
-                        rgb(if bar { 0x3d3d52 } else { 0x2a2a35 }),
-                    ));
-                    t += ppq;
-                }
-                // notes
-                for n in notes.iter() {
-                    let mut st = n.start_tick as i64;
-                    let mut en = n.end_tick.unwrap_or(n.start_tick + ppq / 4) as i64;
-                    let mut key = n.key as i32;
-                    let mut ghost_orig = false;
-                    if let Some((mode, d_on, dtick, dkey)) = drag {
-                        match mode {
-                            DragMode::Move | DragMode::Duplicate
-                                if d_on == n.on_id || selection.contains(&n.on_id) =>
-                            {
-                                if mode == DragMode::Duplicate {
-                                    ghost_orig = true;
-                                }
-                                st += dtick;
-                                en += dtick;
-                                key += dkey;
-                            }
-                            DragMode::Resize if d_on == n.on_id => {
-                                en = (en + dtick).max(st + 1);
-                            }
-                            _ => {}
-                        }
-                    }
-                    if ghost_orig {
-                        // alt-drag copy: keep the source visible underneath
-                        let ox = bounds.origin.x + px(n.start_tick as f32 * zoom - scroll_x);
-                        let ow = ((n.end_tick.unwrap_or(n.start_tick) - n.start_tick).max(1) as f32
-                            * zoom)
-                            .max(3.0);
-                        let oy = bounds.origin.y
-                            + px((127.0 - n.key as f32) * NOTE_H - scroll_y);
-                        window.paint_quad(fill(
-                            Bounds::new(point(ox, oy + px(1.0)), size(px(ow), px(NOTE_H - 2.0))),
-                            rgba(0x80808044),
-                        ));
-                    }
-                    let x = bounds.origin.x + px(st as f32 * zoom - scroll_x);
-                    let wpx = ((en - st).max(1) as f32 * zoom).max(3.0);
-                    if x + px(wpx) < bounds.origin.x {
-                        continue;
-                    }
-                    if x > bounds.origin.x + w {
-                        break;
-                    }
-                    let y = bounds.origin.y + px((127.0 - key as f32) * NOTE_H - scroll_y);
-                    if y < bounds.origin.y - px(NOTE_H) || y > bounds.origin.y + h {
-                        continue;
-                    }
-                    let c = if selection.contains(&n.on_id) {
-                        SEL_COLOR
-                    } else if n.end_tick.is_none() {
-                        DANGLING_COLOR
-                    } else {
-                        TRACK_COLORS[n.track % TRACK_COLORS.len()]
-                    };
-                    window.paint_quad(fill(
-                        Bounds::new(point(x, y + px(1.0)), size(px(wpx), px(NOTE_H - 2.0))),
-                        rgb(c),
-                    ));
-                }
-                // playhead
-                let px_x = bounds.origin.x + px(play_x_tick as f32 * zoom - scroll_x);
-                if px_x >= bounds.origin.x && px_x <= bounds.origin.x + w {
-                    window.paint_quad(fill(
-                        Bounds::new(point(px_x, bounds.origin.y), size(px(1.5), h)),
-                        rgb(0x50ff9f),
-                    ));
-                }
-                // marquee rubber band
-                if let Some((a_t, a_k, b_t, b_k)) = marquee {
-                    let (t0, t1) = (a_t.min(b_t), a_t.max(b_t));
-                    let (k0, k1) = (a_k.min(b_k), a_k.max(b_k));
-                    let x0 = bounds.origin.x + px(t0 as f32 * zoom - scroll_x);
-                    let x1 = bounds.origin.x + px(t1 as f32 * zoom - scroll_x);
-                    let y0 = bounds.origin.y + px((127.0 - k1 as f32) * NOTE_H - scroll_y);
-                    let y1 = bounds.origin.y + px((127.0 - k0 as f32) * NOTE_H - scroll_y);
-                    window.paint_quad(fill(
-                        Bounds::new(point(x0, y0), size(x1 - x0, y1 - y0)),
-                        rgba(0x4f8cff33),
-                    ));
-                }
-            },
-        );
-
-        // --- header -------------------------------------------------------------
-        let play_label: &'static str = if self.playback.is_some() {
-            t("menu.stop")
-        } else {
-            t("menu.play")
-        };
-        let sel_is_plugin = matches!(
-            self.dests
-                .get(self.dest_of(self.sel_track))
-                .map(|s| &s.kind),
-            Some(DestKind::Plugin(_))
-        );
-        let header = div()
-            .flex()
-            .items_center()
-            .gap_3()
-            .px_3()
-            .h(px(42.0))
-            .bg(rgb(0x14141a))
-            .child(div().text_color(rgb(0x8f8fb0)).child(t("app.title")))
-            .child(
-                div()
-                    .text_color(if dirty { rgb(0xffd24f) } else { rgb(0xd8d8e0) })
-                    .child(format!("{title}{}", if dirty { " *" } else { "" })),
-            )
-            .child(Self::button("menu.open", cx, |v, cx| v.open_dialog(cx)))
-            .child(Self::button("menu.save", cx, |v, cx| v.save(cx)))
-            .child(div().w(px(8.0)))
-            .child(
-                div()
-                    .id("play")
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .bg(rgb(0x245c3a))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(0x2f7a4d)))
-                    .child(play_label)
-                    .on_click(cx.listener(|v, _e, _w, cx| v.toggle_play(cx))),
-            )
-            .child(
-                div()
-                    .id("loop")
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .bg(if self.loop_enabled {
-                        rgb(0x3a5c2a)
-                    } else {
-                        rgb(0x2a2a35)
-                    })
-                    .hover(|s| s.bg(rgb(0x3a3a48)))
-                    .text_color(rgb(if self.loop_enabled {
-                        0xb4ff8c
-                    } else {
-                        0x8f8fb0
-                    }))
-                    .child("loop")
-                    .on_click(cx.listener(|v, _e, _w, cx| {
-                        v.loop_enabled = !v.loop_enabled;
-                        cx.notify();
-                    })),
-            )
-            .child(
-                div()
-                    .id("met")
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .bg(if self.metronome {
-                        rgb(0x3a5c2a)
-                    } else {
-                        rgb(0x2a2a35)
-                    })
-                    .hover(|s| s.bg(rgb(0x3a3a48)))
-                    .text_color(rgb(if self.metronome {
-                        0xb4ff8c
-                    } else {
-                        0x8f8fb0
-                    }))
-                    .child(t("transport.met"))
-                    .on_click(cx.listener(|v, _e, _w, cx| {
-                        v.metronome = !v.metronome;
-                        cx.notify();
-                    })),
-            )
-            .child(div().text_color(rgb(0x8f8fb0)).font_family("Cascadia Mono").child(pos))
-            .child(div().w(px(8.0)))
-            .child(
-                div()
-                    .id("port")
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .bg(rgb(0x2a2a35))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(0x3a3a48)))
-                    .text_color(rgb(0x9fd0ff))
-                    .child(port_label)
-                    .on_click(cx.listener(|v, _e, _w, cx| {
-                        if !v.dests.is_empty() {
-                            // cycles the SELECTED track's assignment through
-                            // [inherit default] -> dest 0..n -> inherit
-                            let n = v.dests.len();
-                            let tr = v.sel_track;
-                            match v.track_dest.get(&tr).copied() {
-                                None => v.track_dest.insert(tr, 0),
-                                Some(d) if d + 1 < n => {
-                                    v.track_dest.insert(tr, d + 1)
-                                }
-                                Some(_) => v.track_dest.remove(&tr),
-                            };
-                            if let Some(&d) = v.track_dest.get(&tr) {
-                                v.default_dest = d;
-                            }
-                        }
-                        cx.notify();
-                    })),
-            )
-            .child(div().flex_1())
-            .child(
-                div()
-                    .id("enc")
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .bg(rgb(0x2a2a35))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(0x3a3a48)))
-                    .text_color(rgb(0xc8c8a8))
-                    .text_size(px(11.0))
-                    .child(format!(
-                        "ENC {}",
-                        match self.enc_override {
-                            None => "auto",
-                            Some(smf_core::TextEncoding::Utf8) => "UTF-8",
-                            Some(smf_core::TextEncoding::ShiftJis) => "SJIS",
-                            Some(smf_core::TextEncoding::Latin1) => "Latin-1",
-                        }
-                    ))
-                    .on_click(cx.listener(|v, _e, _w, cx| {
-                        v.enc_override = match v.enc_override {
-                            None => Some(smf_core::TextEncoding::Utf8),
-                            Some(smf_core::TextEncoding::Utf8) => {
-                                Some(smf_core::TextEncoding::ShiftJis)
-                            }
-                            Some(smf_core::TextEncoding::ShiftJis) => {
-                                Some(smf_core::TextEncoding::Latin1)
-                            }
-                            Some(smf_core::TextEncoding::Latin1) => None,
-                        };
-                        v.ev_rev = u64::MAX; // force event-row rebuild
-                        v.refresh_derived();
-                        cx.notify();
-                    })),
-            )
-            .children(sel_is_plugin.then(|| {
-                div()
-                    .id("plug-gui")
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .bg(rgb(0x2a2a35))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(0x3a3a48)))
-                    .text_color(rgb(0xd0a8ff))
-                    .text_size(px(11.0))
-                    .child("GUI")
-                    .on_click(cx.listener(|v, _e, _w, cx| {
-                        let d = v.dest_of(v.sel_track);
-                        let path = v.dests.get(d).and_then(|s| match &s.kind {
-                            DestKind::Plugin(p) => Some(p.clone()),
-                            _ => None,
-                        });
-                        if let Some(path) = path {
-                            // prefer the instance already driving playback
-                            let live = v
-                                .active_plugins
-                                .iter()
-                                .find(|(i, _)| *i == d)
-                                .map(|(_, p)| p.plugin_handle());
-                            let (arc, is_live) = match live {
-                                Some(a) => (Some(a), true),
-                                None => (output::load_for_gui(&path).ok(), false),
-                            };
-                            match arc {
-                                Some(a) => {
-                                    let mut w = vst3_host::PluginWindow::new(a.clone());
-                                    match w.open() {
-                                        Ok(()) => {
-                                            if !is_live {
-                                                v.gui_plugin = Some(a);
-                                            }
-                                            v.plugin_window = Some(w);
-                                        }
-                                        Err(e) => {
-                                            v.status = format!("plugin GUI: {e}").into()
-                                        }
-                                    }
-                                }
-                                None => {
-                                    v.status = "plugin load failed".into();
-                                }
-                            }
-                        }
-                        cx.notify();
-                    }))
-            }))
-            .child(div().w(px(8.0)))
-            .child(div().w(px(240.0)).child(Input::new(&self.input)))
-            .child(
-                div()
-                    .text_color(rgb(0x77778a))
-                    .text_size(px(11.0))
-                    .child(format!("{}", self.status)),
-            );
-
-        // --- body: event list + roll -------------------------------------------
-        let body = div().flex().flex_1().min_h(px(0.0)).child(
-            div()
-                .w(px(380.0))
-                .h_full()
-                .flex()
-                .flex_col()
-                .bg(rgb(0x17171d))
-                .child(
-                    div()
-                        .px_2()
-                        .py_1()
-                        .text_size(px(11.0))
-                        .text_color(rgb(0x77778a))
-                        .child(format!("{} ({})", t("events.header"), self.events.len()))
-                        .children((n_diags > 0).then(|| {
-                            div()
-                                .id("fix-diags")
-                                .ml_2()
-                                .px_1()
-                                .text_size(px(10.0))
-                                .text_color(rgb(0xffb454))
-                                .cursor_pointer()
-                                .child(format!("{} {} [fix]", n_diags, t("events.issues")))
-                                .on_click(cx.listener(|v, _e, _w, cx| {
-                                    let ops = {
-                                        let mut sh = v.shared.lock().unwrap();
-                                        sh.doc.fix_ops(&[])
-                                    };
-                                    if !ops.is_empty() {
-                                        v.apply_tx("fix diagnostics", ops);
-                                        v.status = t("status.fixed").into();
-                                    }
-                                    cx.notify();
-                                }))
-                        })),
-                )
-                .child({
-                    let events = self.events.clone();
-                    uniform_list("events", events.len(), move |range, _w, _cx| {
-                        range
-                            .map(|i| {
-                                div()
-                                    .h(px(18.0))
-                                    .px_2()
-                                    .text_size(px(11.0))
-                                    .font_family("Cascadia Mono")
-                                    .text_color(rgb(0xb8b8c8))
-                                    .child(events[i].clone())
-                            })
-                            .collect()
-                    })
-                    .h_full()
-                    .flex_1()
-                }),
-        );
-
-        // --- track column: select / mute / solo -------------------------------
-        let track_col = div()
-            .w(px(140.0))
-            .h_full()
-            .flex()
-            .flex_col()
-            .bg(rgb(0x1b1b24))
-            .child(
-                div()
-                    .px_2()
-                    .py_1()
-                    .text_size(px(11.0))
-                    .text_color(rgb(0x77778a))
-                    .child(t("tracks.header")),
-            )
-            .children(track_names.iter().enumerate().map(|(i, name)| {
-                let sel = self.sel_track == i;
-                let muted = self.muted.contains(&i);
-                let soloed = self.soloed.contains(&i);
-                let color = TRACK_COLORS[i % TRACK_COLORS.len()];
-                div()
-                    .id(("track", i))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .h(px(22.0))
-                    .px_1()
-                    .cursor_pointer()
-                    .bg(if sel { rgb(0x2a2a3a) } else { rgb(0x1b1b24) })
-                    .hover(|s| s.bg(rgb(0x252532)))
-                    .on_click(cx.listener(move |v, _e, _w, cx| {
-                        v.sel_track = i;
-                        cx.notify();
-                    }))
-                    .child(
-                        div()
-                            .w(px(10.0))
-                            .h(px(10.0))
-                            .rounded_sm()
-                            .bg(rgb(if muted { 0x555560 } else { color })),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .px_1()
-                            .text_size(px(11.0))
-                            .text_color(rgb(if muted { 0x707080 } else { 0xd8d8e0 }))
-                            .overflow_hidden()
-                            .child(format!("{name}")),
-                    )
-                    .child(
-                        div()
-                            .id(("mute", i))
-                            .px_1()
-                            .text_size(px(9.0))
-                            .text_color(rgb(if muted { 0xffb454 } else { 0x707080 }))
-                            .on_click(cx.listener(move |v, _e: &ClickEvent, _w, cx| {
-                                cx.stop_propagation();
-                                if !v.muted.remove(&i) {
-                                    v.muted.insert(i);
-                                }
-                                cx.notify();
-                            }))
-                            .child("M"),
-                    )
-                    .child(
-                        div()
-                            .id(("solo", i))
-                            .px_1()
-                            .text_size(px(9.0))
-                            .text_color(rgb(if soloed { 0xffd24f } else { 0x707080 }))
-                            .on_click(cx.listener(move |v, _e: &ClickEvent, _w, cx| {
-                                cx.stop_propagation();
-                                if !v.soloed.remove(&i) {
-                                    v.soloed.insert(i);
-                                }
-                                cx.notify();
-                            }))
-                            .child("S"),
-                    )
-            }));
-
-        // velocity / CC / pitch-bend lane (selected track only)
-        let lane_sel_track = self.sel_track;
-        let lane_mode = self.lane_mode;
-        // control events of the selected track matching the lane mode:
-        // (event id, tick, value 0..127 or 0..16383 for PB)
-        let lane_events: Vec<(EventId, u64, i32)> = {
-            let sh = self.shared.lock().unwrap();
-            let tr = lane_sel_track.min(sh.doc.tracks.len().saturating_sub(1));
-            let mut v = Vec::new();
-            if let Some(t) = sh.doc.tracks.get(tr) {
-                for e in &t.events {
-                    if let EventKind::Channel { status, data, .. } = &e.kind {
-                        match (lane_mode, status & 0xF0) {
-                            (LaneMode::CC(cc), 0xB0) if data[0] == cc => {
-                                v.push((e.id, e.tick, data[1] as i32))
-                            }
-                            (LaneMode::PitchBend, 0xE0) => v.push((
-                                e.id,
-                                e.tick,
-                                ((data[1] as i32) << 7) | data[0] as i32,
-                            )),
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            v.sort_by_key(|e| e.1);
-            v
-        };
-        let lane_bounds_cell = self.lane_bounds.clone();
-        let lane = canvas(
-            move |bounds, _window, _cx| {
-                lane_bounds_cell.set(bounds);
-            },
-            {
-                let lane_notes = self.notes.clone();
-                let lane_selection = self.selection.clone();
-                let lane_events = lane_events.clone();
-                let drag_v = drag;
-                move |bounds, _state, window, _cx| {
-                    let h: f32 = bounds.size.height.into();
-                    let vrange = if lane_mode == LaneMode::PitchBend { 16383.0 } else { 127.0 };
-                    match lane_mode {
-                        LaneMode::Velocity => {
-                            for n in lane_notes.iter().filter(|n| n.track == lane_sel_track) {
-                                let x = bounds.origin.x + px(n.start_tick as f32 * zoom - scroll_x);
-                                if x < bounds.origin.x || x > bounds.origin.x + bounds.size.width {
-                                    continue;
-                                }
-                                let mut vel = n.vel as f32 / 127.0;
-                                if let Some((DragMode::Velocity, d_on, _, dkey)) = drag_v {
-                                    if d_on == n.on_id {
-                                        vel = (dkey as f32 / 127.0).clamp(0.0, 1.0);
-                                    }
-                                }
-                                let bh = px((h - 6.0) * vel);
-                                let y = bounds.origin.y + px(h) - bh - px(3.0);
-                                let c = if lane_selection.contains(&n.on_id) {
-                                    SEL_COLOR
-                                } else {
-                                    TRACK_COLORS[n.track % TRACK_COLORS.len()]
-                                };
-                                window.paint_quad(fill(
-                                    Bounds::new(point(x, y), size(px(2.0), bh)),
-                                    rgb(c),
-                                ));
-                            }
-                        }
-                        _ => {
-                            // stepped automation line: dot + run to next point
-                            let mut prev: Option<(Pixels, Pixels)> = None;
-                            for (id, tick, val) in &lane_events {
-                                let mut v = *val;
-                                if let Some((DragMode::LaneEvent, d_on, _, dkey)) = drag_v {
-                                    if d_on == *id {
-                                        v = dkey.clamp(0, vrange as i32);
-                                    }
-                                }
-                                let x = bounds.origin.x + px(*tick as f32 * zoom - scroll_x);
-                                let y = bounds.origin.y
-                                    + px((h - 4.0) * (1.0 - v as f32 / vrange) + 2.0);
-                                if let Some((px_, py_)) = prev {
-                                    // horizontal run at previous level, then
-                                    // a vertical connector at this event's x
-                                    window.paint_quad(fill(
-                                        Bounds::new(
-                                            point(px_, py_),
-                                            size(x - px_, px(1.0)),
-                                        ),
-                                        rgba(0x4fd0ff88),
-                                    ));
-                                    window.paint_quad(fill(
-                                        Bounds::new(
-                                            point(x, y.min(py_)),
-                                            size(px(1.0), (y - py_).abs().max(px(1.0))),
-                                        ),
-                                        rgba(0x4fd0ff88),
-                                    ));
-                                }
-                                window.paint_quad(fill(
-                                    Bounds::new(point(x - px(2.0), y - px(2.0)), size(px(4.0), px(4.0))),
-                                    rgb(0x4fd0ff),
-                                ));
-                                prev = Some((x, y));
-                            }
-                            // drag insert ghost
-                            if let Some((DragMode::LaneEvent, 0, a_tick, dkey)) = drag_v {
-                                let x = bounds.origin.x + px(a_tick as f32 * zoom - scroll_x);
-                                let y = bounds.origin.y
-                                    + px((h - 4.0) * (1.0 - dkey.clamp(0, vrange as i32) as f32 / vrange) + 2.0);
-                                window.paint_quad(fill(
-                                    Bounds::new(point(x - px(2.0), y - px(2.0)), size(px(4.0), px(4.0))),
-                                    rgb(SEL_COLOR),
-                                ));
-                            }
-                        }
-                    }
-                }
-            },
-        );
-
-        // seek ruler: bar ticks/numbers, click positions the playhead
-        let ruler_bounds_cell = self.ruler_bounds.clone();
-        let ruler_play_tick = playhead_tick;
-        let ruler = canvas(
-            move |bounds, _window, _cx| {
-                ruler_bounds_cell.set(bounds);
-            },
-            move |bounds, _state, window, _cx| {
-                let w = bounds.size.width;
-                let tick0 = (scroll_x / zoom).max(0.0) as u64;
-                let tick1 = tick0 + (f32::from(w) / zoom) as u64 + ppq * 4;
-                let mut t = tick0 / (ppq * 4) * (ppq * 4);
-                while t <= tick1 {
-                    let x = bounds.origin.x + px(t as f32 * zoom - scroll_x);
-                    window.paint_quad(fill(
-                        Bounds::new(point(x, bounds.origin.y + px(12.0)), size(px(1.0), px(8.0))),
-                        rgb(0x55556a),
-                    ));
-                    t += ppq * 4;
-                }
-                // playhead marker
-                let hx = bounds.origin.x + px(ruler_play_tick as f32 * zoom - scroll_x);
-                if hx >= bounds.origin.x && hx <= bounds.origin.x + w {
-                    window.paint_quad(fill(
-                        Bounds::new(point(hx - px(2.0), bounds.origin.y), size(px(4.0), px(12.0))),
-                        rgb(0x50ff9f),
-                    ));
-                }
-            },
-        );
-
-        let body = body.child(track_col).child(
-            div()
-                .flex_1()
-                .h_full()
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .h(px(26.0))
-                        .w_full()
-                        .bg(rgb(0x17171d))
-                        .border_b_1()
-                        .border_color(rgb(0x2a2a35))
-                        .cursor_pointer()
-                        .child(ruler.size_full())
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
-                                let b = this.ruler_bounds.get();
-                                let x = f32::from(ev.position.x) - f32::from(b.origin.x);
-                                let tick = ((x + this.scroll_x) / this.zoom).max(0.0) as u64;
-                                let us = this.doc(|d| d.tempo_map.tick_to_us(tick));
-                                let was_playing = this.playback.is_some();
-                                if was_playing {
-                                    this.stop_playback();
-                                }
-                                this.play_us = us;
-                                if was_playing {
-                                    this.start_playback();
-                                }
-                                cx.notify();
-                            }),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .relative()
-                        .overflow_hidden()
-                        .child(roll.size_full())
-                        .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _w, cx| {
-                    let d = ev.delta.pixel_delta(px(20.0));
-                    if ev.modifiers.control {
-                        this.zoom = (this.zoom * (1.0 - d.y.to_f64() as f32 * 0.002)).clamp(0.005, 0.8);
-                    } else {
-                        this.scroll_x = (this.scroll_x + d.x.to_f64() as f32).max(0.0);
-                        this.scroll_y = (this.scroll_y + d.y.to_f64() as f32).max(0.0);
-                    }
-                    cx.notify();
-                }))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, ev: &MouseDownEvent, w, cx| {
-                        w.focus(&this.focus, cx);
-                        let shift = ev.modifiers.shift;
-                        if let Some(n) = this.edge_at(ev.position) {
-                            this.sel_track = n.track;
-                            this.drag = Some(Drag {
-                                mode: DragMode::Resize,
-                                on_id: n.on_id,
-                                off_id: n.off_id,
-                                track: n.track,
-                                orig_start: n.start_tick,
-                                orig_end: n.end_tick,
-                                orig_key: n.key,
-                                dtick: 0,
-                                dkey: 0,
-                                a_tick: 0,
-                                a_key: 0,
-                                b_tick: 0,
-                                b_key: 0,
-                            });
-                        } else if let Some(n) = this.note_at(ev.position) {
-                            if shift {
-                                if !this.selection.remove(&n.on_id) {
-                                    this.selection.insert(n.on_id);
-                                }
-                            } else if !this.selection.contains(&n.on_id) {
-                                this.selection = BTreeSet::from([n.on_id]);
-                            }
-                            this.sel_track = n.track;
-                            this.drag = Some(Drag {
-                                mode: if ev.modifiers.alt {
-                                    DragMode::Duplicate
-                                } else {
-                                    DragMode::Move
-                                },
-                                on_id: n.on_id,
-                                off_id: n.off_id,
-                                track: n.track,
-                                orig_start: n.start_tick,
-                                orig_end: n.end_tick,
-                                orig_key: n.key,
-                                dtick: 0,
-                                dkey: 0,
-                                a_tick: 0,
-                                a_key: 0,
-                                b_tick: 0,
-                                b_key: 0,
-                            });
-                        } else {
-                            let (tick, key) = this.hit(ev.position);
-                            if (0..=127).contains(&key) {
-                                if !shift {
-                                    this.selection.clear();
-                                }
-                                // becomes a marquee on drag; a click without
-                                // drag inserts a note at the anchor
-                                this.drag = Some(Drag {
-                                    mode: DragMode::Marquee,
-                                    on_id: 0,
-                                    off_id: None,
-                                    track: 0,
-                                    orig_start: 0,
-                                    orig_end: None,
-                                    orig_key: 0,
-                                    dtick: 0,
-                                    dkey: 0,
-                                    a_tick: tick,
-                                    a_key: key,
-                                    b_tick: tick,
-                                    b_key: key,
-                                });
-                            }
-                        }
-                        cx.notify();
-                    }),
-                )
-                .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
-                    if ev.pressed_button != Some(MouseButton::Left) {
-                        return;
-                    }
-                    let (tick, key) = this.hit(ev.position);
-                    let Some(d) = &mut this.drag else { return };
-                    match d.mode {
-                        DragMode::Move => {
-                            d.dtick = tick - d.orig_start as i64;
-                            d.dkey = key - d.orig_key as i32;
-                        }
-                        DragMode::Resize => {
-                            d.dtick = tick - d.orig_end.unwrap_or(d.orig_start) as i64;
-                        }
-                        DragMode::Marquee => {
-                            d.b_tick = tick;
-                            d.b_key = key;
-                        }
-                        DragMode::Velocity | DragMode::LaneEvent => {}
-                        DragMode::Duplicate => {
-                            d.dtick = tick - d.orig_start as i64;
-                            d.dkey = key - d.orig_key as i32;
-                        }
-                    }
-                    cx.notify();
-                }))
-                .on_mouse_up(
-                    MouseButton::Left,
-                    cx.listener(|this, ev: &MouseUpEvent, _w, cx| {
-                        // a marquee that never left its anchor = click → insert
-                        let click_insert = this.drag.as_ref().is_some_and(|d| {
-                            d.mode == DragMode::Marquee
-                                && (d.b_tick - d.a_tick).abs() < 2
-                                && (d.b_key - d.a_key).abs() == 0
-                        });
-                        if click_insert {
-                            let d = this.drag.take().unwrap();
-                            if (0..=127).contains(&d.a_key) {
-                                this.insert_note(d.a_tick.max(0) as u64, d.a_key as u8, cx);
-                            }
-                        } else {
-                            this.commit_drag(cx);
-                        }
-                        let _ = ev;
-                    }),
-                )
-                )
-                .child(
-                    div()
-                        .h(px(56.0))
-                        .w_full()
-                        .bg(rgb(0x14141a))
-                        .border_t_1()
-                        .border_color(rgb(0x2a2a35))
-                        .relative()
-                        .child(lane.size_full())
-                        .child(
-                            // lane-mode chip: Vel -> CC1 -> CC7 -> CC10 ->
-                            // CC11 -> CC64 -> PB -> Vel
-                            div()
-                                .id("lane-mode")
-                                .absolute()
-                                .top(px(2.0))
-                                .right(px(4.0))
-                                .px_1()
-                                .rounded_sm()
-                                .bg(rgb(0x2a2a35))
-                                .cursor_pointer()
-                                .hover(|s| s.bg(rgb(0x3a3a48)))
-                                .text_size(px(9.0))
-                                .text_color(rgb(0x9fd0ff))
-                                .child(lane_mode.label())
-                                .on_click(cx.listener(|v, _e: &ClickEvent, _w, cx| {
-                                    cx.stop_propagation();
-                                    v.lane_mode = v.lane_mode.cycle();
-                                    cx.notify();
-                                })),
-                        )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
-                                let b = this.lane_bounds.get();
-                                let x = f32::from(ev.position.x) - f32::from(b.origin.x);
-                                let y = f32::from(ev.position.y) - f32::from(b.origin.y);
-                                let tick = ((x + this.scroll_x) / this.zoom).max(0.0) as u64;
-                                let h = f32::from(b.size.height);
-                                match this.lane_mode {
-                                    LaneMode::Velocity => {
-                                        let vel =
-                                            ((1.0 - y / h) * 127.0) as i32;
-                                        // nearest note in the selected track
-                                        if let Some(n) = this
-                                            .notes
-                                            .iter()
-                                            .filter(|n| n.track == this.sel_track)
-                                            .min_by_key(|n| {
-                                                let st = n.start_tick as i64;
-                                                (tick as i64 - st).abs()
-                                            })
-                                        {
-                                            this.selection = BTreeSet::from([n.on_id]);
-                                            this.drag = Some(Drag {
-                                                mode: DragMode::Velocity,
-                                                on_id: n.on_id,
-                                                off_id: n.off_id,
-                                                track: n.track,
-                                                orig_start: n.start_tick,
-                                                orig_end: n.end_tick,
-                                                orig_key: n.key,
-                                                dtick: 0,
-                                                dkey: vel.clamp(1, 127),
-                                                a_tick: 0,
-                                                a_key: 0,
-                                                b_tick: 0,
-                                                b_key: 0,
-                                            });
-                                        }
-                                    }
-                                    mode => {
-                                        // CC/PB: grab the nearest lane event
-                                        // within ~10px, else insert a new one
-                                        // at the click and drag it
-                                        let vrange = if mode == LaneMode::PitchBend {
-                                            16383.0
-                                        } else {
-                                            127.0
-                                        };
-                                        let val =
-                                            ((1.0 - y / h) * vrange) as i32;
-                                        let tr = this.sel_track;
-                                        let found = {
-                                            let sh = this.shared.lock().unwrap();
-                                            sh.doc.tracks.get(tr).and_then(|t| {
-                                                t.events
-                                                    .iter()
-                                                    .filter(|e| {
-                                                        matches!(e.kind,
-                                                            EventKind::Channel { status, data, .. }
-                                                            if match mode {
-                                                                LaneMode::CC(cc) => status & 0xF0 == 0xB0 && data[0] == cc,
-                                                                LaneMode::PitchBend => status & 0xF0 == 0xE0,
-                                                                LaneMode::Velocity => false,
-                                                            })
-                                                    })
-                                                    .min_by_key(|e| {
-                                                        (e.tick as i64 - tick as i64).abs()
-                                                    })
-                                                    .filter(|e| {
-                                                        ((e.tick as f32 - tick as f32) * this.zoom)
-                                                            .abs()
-                                                            <= 10.0
-                                                    })
-                                                    .map(|e| e.id)
-                                            })
-                                        };
-                                        this.drag = Some(Drag {
-                                            mode: DragMode::LaneEvent,
-                                            on_id: found.unwrap_or(0),
-                                            off_id: None,
-                                            track: tr,
-                                            orig_start: 0,
-                                            orig_end: None,
-                                            orig_key: 0,
-                                            dtick: 0,
-                                            dkey: val.clamp(0, vrange as i32),
-                                            a_tick: tick as i64,
-                                            a_key: 0,
-                                            b_tick: 0,
-                                            b_key: 0,
-                                        });
-                                    }
-                                }
-                                cx.notify();
-                            }),
-                        )
-                        .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
-                            let Some(d) = &mut this.drag else { return };
-                            if !matches!(d.mode, DragMode::Velocity | DragMode::LaneEvent)
-                                || ev.pressed_button != Some(MouseButton::Left)
-                            {
-                                return;
-                            }
-                            let b = this.lane_bounds.get();
-                            let y = f32::from(ev.position.y) - f32::from(b.origin.y);
-                            let h = f32::from(b.size.height);
-                            d.dkey = if d.mode == DragMode::Velocity {
-                                ((1.0 - y / h) * 127.0) as i32
-                            } else {
-                                let vrange = match this.lane_mode {
-                                    LaneMode::PitchBend => 16383.0,
-                                    _ => 127.0,
-                                };
-                                ((1.0 - y / h) * vrange) as i32
-                            };
-                            cx.notify();
-                        }))
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(|this, _ev: &MouseUpEvent, _w, cx| {
-                                this.commit_drag(cx)
-                            }),
-                        ),
-                ),
-        );
-
-        div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .bg(rgb(0x1b1b22))
-            .text_color(rgb(0xd8d8e0))
-            .key_context("editor")
-            .track_focus(&self.focus)
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
-                // typing in the track-name field must not trigger editor keys
-                if this.input.read(cx).focus_handle(cx).is_focused(w) {
-                    return;
-                }
-                let k = ev.keystroke.key.as_str();
-                let ctrl = ev.keystroke.modifiers.control;
-                let shift = ev.keystroke.modifiers.shift;
-                match (ctrl, shift, k) {
-                    (true, false, "z") => this.undo(cx),
-                    (true, false, "y") | (true, true, "z") => this.redo(cx),
-                    (true, false, "s") => this.save(cx),
-                    (true, false, "o") => this.open_dialog(cx),
-                    (false, false, "delete") | (false, false, "backspace") => {
-                        this.delete_selected(cx)
-                    }
-                    (false, false, " ") => this.toggle_play(cx),
-                    _ => {}
-                }
-            }))
-            .child(header)
-            .child(body)
     }
 }
+
+impl EditorView {
+    /// Find or re-create the dest matching a stored identity; returns its index
+    /// into `shared.dests`. Unavailable ports/plugins keep their identity â€”
+    /// the assignment stays visible and plays again once the device is back.
+    fn resolve_dest(&mut self, d: &output::Destination) -> usize {
+        self.shared
+            .lock()
+            .unwrap()
+            .ensure_dest(&dest_label(d), d.clone())
+    }
+
+    fn apply_prefs(&mut self, doc_path: &PathBuf) {
+        let Ok(text) = std::fs::read_to_string(prefs_path(doc_path)) else {
+            return;
+        };
+        let Ok(p) = serde_json::from_str::<Prefs>(&text) else {
+            return;
+        };
+        if let Some(d) = &p.default_dest {
+            let i = self.resolve_dest(d);
+            self.shared.lock().unwrap().default_dest = i;
+        }
+        let overrides: Vec<(usize, usize)> = p
+            .track_dest
+            .iter()
+            .map(|(t, d)| (*t, self.resolve_dest(d)))
+            .collect();
+        {
+            let mut sh = self.shared.lock().unwrap();
+            for (t, d) in overrides {
+                sh.track_dest.insert(t, d);
+            }
+            sh.muted = p.muted.into_iter().collect();
+            sh.soloed = p.soloed.into_iter().collect();
+            sh.metronome = p.metronome;
+            sh.loop_enabled = p.loop_enabled;
+        }
+        if let Some(z) = p.zoom {
+            self.zoom = z;
+        }
+        if let Some(x) = p.scroll_x {
+            self.scroll_x = x;
+        }
+        if let Some(y) = p.scroll_y {
+            self.scroll_y = y;
+        }
+        if let Some(t) = p.sel_track {
+            self.sel_track = t;
+        }
+        self.enc_override = p.enc.as_deref().map(|e| match e {
+            "utf8" => smf_core::TextEncoding::Utf8,
+            "sjis" => smf_core::TextEncoding::ShiftJis,
+            _ => smf_core::TextEncoding::Latin1,
+        });
+        self.lane_mode = match p.lane.as_deref() {
+            Some("pb") => LaneMode::PitchBend,
+            Some(s) if s.starts_with("cc") => s[2..]
+                .parse()
+                .map(LaneMode::CC)
+                .unwrap_or(LaneMode::Velocity),
+            _ => LaneMode::Velocity,
+        };
+    }
+
+    fn persist(&self) {
+        let sh = self.shared.lock().unwrap();
+        let Some(path) = sh.path.clone() else {
+            return;
+        };
+        let prefs = Prefs {
+            default_dest: sh.dests.get(sh.default_dest).map(|(_, d)| d.clone()),
+            track_dest: sh
+                .track_dest
+                .iter()
+                .filter_map(|(t, d)| sh.dests.get(*d).map(|(_, dest)| (*t, dest.clone())))
+                .collect(),
+            muted: sh.muted.iter().copied().collect(),
+            soloed: sh.soloed.iter().copied().collect(),
+            metronome: sh.metronome,
+            loop_enabled: sh.loop_enabled,
+            zoom: Some(self.zoom),
+            scroll_x: Some(self.scroll_x),
+            scroll_y: Some(self.scroll_y),
+            sel_track: Some(self.sel_track),
+            enc: self.enc_override.map(|e| {
+                match e {
+                    smf_core::TextEncoding::Utf8 => "utf8",
+                    smf_core::TextEncoding::ShiftJis => "sjis",
+                    smf_core::TextEncoding::Latin1 => "latin1",
+                }
+                .to_string()
+            }),
+            lane: Some(match self.lane_mode {
+                LaneMode::Velocity => "vel".into(),
+                LaneMode::CC(c) => format!("cc{c}"),
+                LaneMode::PitchBend => "pb".into(),
+            }),
+        };
+        if let Ok(text) = serde_json::to_string_pretty(&prefs) {
+            let _ = std::fs::write(prefs_path(&path), text);
+        }
+    }
+}
+
+
+
 
 fn main() {
     std::panic::set_hook(Box::new(|i| eprintln!("panic: {i}")));
     let path = std::env::args().nth(1).map(PathBuf::from);
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
-        // dark UI — gpui-component's default theme follows the OS and renders
+        // dark UI â€” gpui-component's default theme follows the OS and renders
         // the text input's selection overlay white; pin dark explicitly
         gpui_kit::component::theme::Theme::change(
             gpui_kit::component::theme::ThemeMode::Dark,
@@ -2079,15 +1318,40 @@ fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(150))
                 .await;
-            let cur = shared.lock().unwrap().gui_notify.load(std::sync::atomic::Ordering::Relaxed);
-            let dirty = cur != last;
-            if dirty {
+            let (cur, reqs) = {
+                let mut sh = shared.lock().unwrap();
+                (
+                    sh.gui_notify.load(std::sync::atomic::Ordering::Relaxed),
+                    std::mem::take(&mut sh.transport_req),
+                )
+            };
+            let dirty = cur != last || !reqs.is_empty();
+            if cur != last {
                 last = cur;
             }
             if let Some(this) = this.upgrade() {
                 this.update(cx, |v, cx| {
+                    // MCP transport requests -> real playback actions
+                    for r in reqs {
+                        match r {
+                            mcp_server::TransportReq::Play if v.playback.is_none() => {
+                                v.start_playback();
+                            }
+                            mcp_server::TransportReq::Stop => v.stop_playback(),
+                            mcp_server::TransportReq::Seek { tick } => {
+                                v.play_us = v.doc(|d| d.tempo_map.tick_to_us(tick));
+                                if v.playback.is_some() {
+                                    v.stop_playback();
+                                    v.start_playback();
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                     if dirty {
                         v.refresh_derived();
+                        // cover routing changes that came from MCP tools
+                        v.persist();
                     }
                     // repaint while playing so the playhead/counter advance;
                     // also while a plugin editor is open so its native event
