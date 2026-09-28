@@ -178,7 +178,7 @@ fn parse_lenient(raw: &[u8]) -> Result<File, Error> {
     let format = u16::from_be_bytes(raw[8..10].try_into().unwrap());
     let division = if raw[12] & 0x80 != 0 {
         Division::Smpte {
-            fps: (-(raw[12] as i8)) as u8,
+            fps: (-(raw[12] as i8 as i16)) as u8,
             ticks_per_frame: raw[13],
         }
     } else {

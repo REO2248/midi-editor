@@ -240,6 +240,40 @@ fn duplicate_range_keeps_noteoff_beyond_range() {
 }
 
 #[test]
+fn set_pitch_bend_encodes_14bit_centered() {
+    let mut d = doc(vec![vec![]]);
+    let __ops = d.set_pitch_bend_ops(0, 480, 3, 0x2000); // center
+    apply(&mut d, __ops);
+    match &d.tracks[0].events[0].kind {
+        EventKind::Channel { status, data, .. } => {
+            assert_eq!(*status, 0xE3);
+            assert_eq!(*data, [0x00, 0x40], "center = lsb 0 msb 64");
+        }
+        other => panic!("{other:?}"),
+    }
+    let __ops = d.set_pitch_bend_ops(0, 480, 3, 0x3FFF); // max
+    apply(&mut d, __ops);
+    match &d.tracks[0].events[1].kind {
+        EventKind::Channel { data, .. } => assert_eq!(*data, [0x7F, 0x7F]),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn set_track_channel_writes_meta_and_field() {
+    let mut d = doc(vec![vec![chan(0, 0x90, 60, 100), chan(480, 0x80, 60, 0)]]);
+    let __ops = d.set_track_channel_ops(0, 9);
+    let tx = apply(&mut d, __ops);
+    assert_eq!(d.tracks[0].out_channel, 9);
+    assert!(d.tracks[0].events.iter().any(|e| matches!(
+        &e.kind,
+        EventKind::Meta { meta_type: 0x20, data } if data[..] == [9]
+    )));
+    d.revert(&tx);
+    assert_eq!(d.tracks[0].out_channel, 0);
+}
+
+#[test]
 fn delete_range_removes_whole_notes() {
     let mut d = doc(vec![vec![
         chan(100, 0x90, 60, 100),

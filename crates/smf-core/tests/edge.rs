@@ -220,6 +220,31 @@ fn truncated_track_tail_keeps_good_events() {
 }
 
 #[test]
+fn fuzz_bytes_never_panic() {
+    // xorshift PRNG, fixed seed: deterministic fuzz over arbitrary garbage
+    let mut s: u64 = 0x9E3779B97F4A7C15;
+    let mut rand = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    for i in 0..2000 {
+        let len = (rand() % 512) as usize;
+        let mut buf = Vec::with_capacity(len);
+        for _ in 0..len {
+            buf.push(rand() as u8);
+        }
+        // half the cases get a real MThd so we reach the track walker
+        if i % 2 == 0 && buf.len() >= 14 {
+            buf[0..4].copy_from_slice(b"MThd");
+            buf[4..8].copy_from_slice(&6u32.to_be_bytes());
+        }
+        let _ = parse(&buf); // may Err, must not panic
+    }
+}
+
+#[test]
 fn text_encodings_survive_through_fixpoint() {
     // SJIS track name + UTF-8 lyric + Latin-1 marker in one track
     let mut t = Vec::new();
