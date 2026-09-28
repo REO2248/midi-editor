@@ -56,8 +56,9 @@ text decoding (auto/UTF-8/SJIS/Latin-1) for track names and meta text —
 `auto` uses UTF-8 → Shift-JIS → Latin-1 with the XF `FF 09` "JP" marker as a
 hint. When the event list header shows `[fix]`, clicking it normalizes
 imported-file issues (dangling note-ons, missing EOT, tempo outside the
-conductor track) as a single undoable transaction. Mouse wheel scrolls,
-Ctrl+wheel zooms.
+conductor track) as a single undoable transaction. `met` adds a GM woodblock
+click on every beat (accented downbeats) routed to a MIDI destination. Mouse
+wheel scrolls, Ctrl+wheel zooms.
 
 ## MCP server
 

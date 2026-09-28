@@ -152,6 +152,8 @@ struct EditorView {
     /// restart at `loop_start_us` when playback reaches the end
     loop_enabled: bool,
     loop_start_us: u64,
+    /// click on every beat routed to a MIDI destination (GM ch10 woodblock)
+    metronome: bool,
     /// what the bottom lane edits
     lane_mode: LaneMode,
     focus: FocusHandle,
@@ -231,6 +233,7 @@ impl EditorView {
             playback: None,
             play_us: 0,
             loop_enabled: false,
+            metronome: false,
             loop_start_us: 0,
             lane_mode: LaneMode::Velocity,
             focus: cx.focus_handle(),
@@ -826,12 +829,38 @@ impl EditorView {
             self.status = t("status.no_port").into();
             return;
         }
-        let events: Vec<(u64, usize, Vec<u8>)> = tagged
+        let mut events: Vec<(u64, usize, Vec<u8>)> = tagged
             .into_iter()
             .filter_map(|(us, tr, b)| {
                 sink_of.get(&self.dest_of(tr)).map(|&s| (us, s, b))
             })
             .collect();
+        if self.metronome {
+            // prefer a plain MIDI port for clicks; fall back to any sink
+            let click_sink = self
+                .dests
+                .iter()
+                .enumerate()
+                .find(|(_, s)| matches!(s.kind, DestKind::Midi(_)))
+                .and_then(|(d, _)| sink_of.get(&d).copied())
+                .or_else(|| sink_of.values().next().copied());
+            if let Some(s) = click_sink {
+                let ppq = self.ppq();
+                let end_us = events.iter().map(|e| e.0).max().unwrap_or(0);
+                let mut beat = 0u64;
+                loop {
+                    let us = self.doc(|d| d.tempo_map.tick_to_us(beat * ppq));
+                    if us > end_us {
+                        break;
+                    }
+                    let note = if beat % 4 == 0 { 76 } else { 77 };
+                    events.push((us, s, vec![0x99, note, 110]));
+                    events.push((us + 20_000, s, vec![0x99, note, 0]));
+                    beat += 1;
+                }
+                events.sort_by_key(|e| e.0);
+            }
+        }
         self.loop_start_us = self.play_us;
         self.playback = Some(Playback::start(sinks, events, self.play_us));
     }
@@ -1172,6 +1201,30 @@ impl Render for EditorView {
                     .child("loop")
                     .on_click(cx.listener(|v, _e, _w, cx| {
                         v.loop_enabled = !v.loop_enabled;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .id("met")
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .bg(if self.metronome {
+                        rgb(0x3a5c2a)
+                    } else {
+                        rgb(0x2a2a35)
+                    })
+                    .hover(|s| s.bg(rgb(0x3a3a48)))
+                    .text_color(rgb(if self.metronome {
+                        0xb4ff8c
+                    } else {
+                        0x8f8fb0
+                    }))
+                    .child(t("transport.met"))
+                    .on_click(cx.listener(|v, _e, _w, cx| {
+                        v.metronome = !v.metronome;
                         cx.notify();
                     })),
             )
@@ -1627,7 +1680,6 @@ impl Render for EditorView {
                                 if was_playing {
                                     this.start_playback();
                                 }
-                                this.status = format!("seek {tick}").into();
                                 cx.notify();
                             }),
                         ),
@@ -1939,7 +1991,11 @@ impl Render for EditorView {
             .text_color(rgb(0xd8d8e0))
             .key_context("editor")
             .track_focus(&self.focus)
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| {
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+                // typing in the track-name field must not trigger editor keys
+                if this.input.read(cx).focus_handle(cx).is_focused(w) {
+                    return;
+                }
                 let k = ev.keystroke.key.as_str();
                 let ctrl = ev.keystroke.modifiers.control;
                 let shift = ev.keystroke.modifiers.shift;

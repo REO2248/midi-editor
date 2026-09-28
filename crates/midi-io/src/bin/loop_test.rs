@@ -1,5 +1,4 @@
 // loopMIDI end-to-end: send via midi_io::Output, receive on midir input
-use midi_io::EventSink;
 use std::sync::mpsc;
 use std::time::Duration;
 
