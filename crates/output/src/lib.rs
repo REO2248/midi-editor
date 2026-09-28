@@ -112,6 +112,39 @@ impl PluginOutput {
     pub fn midi_panic(&self) {
         self._handle.midi_panic();
     }
+
+    /// samples per µs (playback engine translates `rem_us` to sample offsets)
+    pub fn us_to_samples(&self) -> f64 {
+        self.us_to_samples
+    }
+
+    /// Handle to the live plugin instance (e.g. to open its GUI editor).
+    pub fn plugin_handle(&self) -> std::sync::Arc<std::sync::Mutex<vst3_host::Plugin>> {
+        self._handle.plugin()
+    }
+
+    /// Peak output across all channels since the last read (for metering/tests).
+    pub fn level(&self) -> f32 {
+        self._handle
+            .output_levels()
+            .channels
+            .iter()
+            .map(|c| c.peak)
+            .fold(0.0, f32::max)
+    }
+}
+
+/// Load a plugin just for its GUI — no audio stream. The returned instance
+/// is not wired to any output; use it to inspect/edit the editor, or hand it
+/// to `vst3_host::PluginWindow`.
+pub fn load_for_gui(
+    path: &std::path::Path,
+) -> Result<std::sync::Arc<std::sync::Mutex<vst3_host::Plugin>>, PluginError> {
+    let mut host = vst3_host::Vst3Host::new().map_err(|e| PluginError::Host(e.to_string()))?;
+    let plugin = host
+        .load_plugin(path)
+        .map_err(|e| PluginError::Load(e.to_string()))?;
+    Ok(std::sync::Arc::new(std::sync::Mutex::new(plugin)))
 }
 
 pub struct PluginSink {

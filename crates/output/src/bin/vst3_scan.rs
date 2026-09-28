@@ -1,6 +1,8 @@
 //! spike: discover installed VST3 plugins, then load the first one and send it
 //! a MIDI note via vst3-host (audio backend intentionally off for Phase 0).
 
+use midi_io::EventSink;
+
 fn main() {
     let found = output::discover_plugins();
     println!("== discovered VST3 bundles ==");
@@ -44,6 +46,54 @@ fn main() {
                 }
             }
             Err(e) => eprintln!("load failed: {e}"),
+        }
+    }
+
+    // full realtime path needs an audio device (none on a headless VM); do an
+    // offline render instead — exercises load->process->WAV with no hardware
+    if let Some(first) = found.first() {
+        println!("== PluginOutput::open: {} ==", first.path.display());
+        match output::PluginOutput::open(&first.path) {
+            Ok(out) => {
+                println!("open ok; us_per_sample={:?}", out.us_to_samples());
+                let mut sink = out.event_sink();
+                sink.send_at(&[0x90, 60, 110], 0);
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                let lvl = out.level();
+                println!("after note_on: output level {lvl:.4}");
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                sink.panic();
+                println!("panic sent; level now {:.4}", out.level());
+            }
+            Err(e) => eprintln!("PluginOutput::open failed: {e}"),
+        }
+
+        println!("== offline render_to_wav ==");
+        match vst3_host::simple::load_plugin(&first.path) {
+            Ok(mut plugin) => {
+                use vst3_host::midi::{MidiChannel, MidiEvent};
+                let note = MidiEvent::NoteOn {
+                    channel: MidiChannel::Ch1,
+                    note: 60,
+                    velocity: 110,
+                };
+                let wav = std::path::Path::new("render_test.wav");
+                match vst3_host::simple::render_to_wav(&mut plugin, 1.0, &[note], wav) {
+                    Ok(()) => {
+                        // peak-check the rendered file: silence => no audio produced
+                        let bytes = std::fs::read(wav).unwrap_or_default();
+                        let n = bytes.len();
+                        let floats: Vec<f32> = bytes[44..]
+                            .chunks_exact(4)
+                            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                            .collect();
+                        let peak = floats.iter().map(|f| f.abs()).fold(0.0f32, f32::max);
+                        println!("rendered {n}B wav, {peak:.4} peak amplitude");
+                    }
+                    Err(e) => eprintln!("render_to_wav failed: {e}"),
+                }
+            }
+            Err(e) => eprintln!("reload for render failed: {e}"),
         }
     }
 }

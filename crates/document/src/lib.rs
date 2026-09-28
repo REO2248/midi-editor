@@ -336,6 +336,73 @@ impl Document {
         out
     }
 
+    /// Build the ops that resolve each diagnostic — one undo step for the
+    /// whole batch. `codes` filters by diagnostic code; empty = fix all.
+    pub fn fix_ops(&mut self, codes: &[&str]) -> Vec<Op> {
+        let diags = self.diagnose();
+        let notes = self.notes();
+        let mut ops = Vec::new();
+        for d in diags {
+            if !codes.is_empty() && !codes.contains(&d.code) {
+                continue;
+            }
+            match d.code {
+                "missing-eot" => {
+                    let id = self.alloc_event_id();
+                    ops.push(Op::InsertEvents {
+                        track: d.track,
+                        events: vec![Event {
+                            id,
+                            tick: d.tick,
+                            seq: u32::MAX,
+                            raw_body: None,
+                            kind: EventKind::Meta {
+                                meta_type: 0x2F,
+                                data: Bytes::new(),
+                            },
+                        }],
+                    });
+                }
+                "dangling-noteon" | "zero-length-note" => {
+                    // remove the on event plus its paired off (zero-len keeps one)
+                    let off_id = notes
+                        .iter()
+                        .find(|n| Some(n.on_id) == d.event)
+                        .and_then(|n| n.off_id);
+                    for id in [d.event, off_id].into_iter().flatten() {
+                        if let Some((ti, ei)) = self.by_id.get(&id).copied() {
+                            let e = self.tracks[ti].events[ei].clone();
+                            ops.push(Op::RemoveEvents {
+                                track: ti,
+                                removed: vec![(ei, e)],
+                            });
+                        }
+                    }
+                }
+                "tempo-outside-conductor" => {
+                    // move the tempo event into track 0 (same tick)
+                    if let Some(id) = d.event {
+                        if let Some((ti, ei)) = self.by_id.get(&id).copied() {
+                            let e = self.tracks[ti].events[ei].clone();
+                            ops.push(Op::RemoveEvents {
+                                track: ti,
+                                removed: vec![(ei, e.clone())],
+                            });
+                            let mut moved = e;
+                            moved.id = self.alloc_event_id();
+                            ops.push(Op::InsertEvents {
+                                track: 0,
+                                events: vec![moved],
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        ops
+    }
+
     /// `(absolute µs, source track index, raw channel message)` sorted by time.
     /// The track tag lets playback fan events out to per-track destinations.
     pub fn timeline_tagged(&self) -> Vec<(u64, usize, Vec<u8>)> {

@@ -15,7 +15,7 @@ use gpui_kit::*;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::Root;
 use midi_io::{EventSink, Playback, PortSink};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use smf_core::Division;
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -54,6 +54,40 @@ enum DragMode {
     Marquee,
     /// vertical drag in the velocity lane; `dkey` carries the new velocity
     Velocity,
+    /// lane drag editing a CC/PB event (`on_id` = event id; `dkey` = value)
+    LaneEvent,
+    /// alt-drag: copy the selection instead of moving it
+    Duplicate,
+}
+
+/// What the bottom lane edits for the selected track.
+#[derive(Clone, Copy, PartialEq)]
+enum LaneMode {
+    Velocity,
+    /// Control Change lane, controller number in the field
+    CC(u8),
+    PitchBend,
+}
+
+impl LaneMode {
+    fn cycle(self) -> Self {
+        match self {
+            LaneMode::Velocity => LaneMode::CC(1),
+            LaneMode::CC(1) => LaneMode::CC(7),
+            LaneMode::CC(7) => LaneMode::CC(10),
+            LaneMode::CC(10) => LaneMode::CC(11),
+            LaneMode::CC(11) => LaneMode::CC(64),
+            LaneMode::CC(_) => LaneMode::PitchBend,
+            LaneMode::PitchBend => LaneMode::Velocity,
+        }
+    }
+    fn label(self) -> String {
+        match self {
+            LaneMode::Velocity => "Vel".to_string(),
+            LaneMode::CC(n) => format!("CC{n}"),
+            LaneMode::PitchBend => "PB".to_string(),
+        }
+    }
 }
 
 struct Drag {
@@ -87,6 +121,8 @@ struct EditorView {
     drag: Option<Drag>,
     /// canvas bounds as painted last frame — for hit-testing
     roll_bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// seek-ruler strip bounds
+    ruler_bounds: Rc<Cell<Bounds<Pixels>>>,
     /// velocity lane bounds — same trick for the lane's hit-testing
     lane_bounds: Rc<Cell<Bounds<Pixels>>>,
     scroll_x: f32,
@@ -99,11 +135,25 @@ struct EditorView {
     default_dest: usize,
     /// track index -> index into `dests`
     track_dest: HashMap<usize, usize>,
-    /// Plugin instances opened for the current playback; dropping them
-    /// stops their audio streams.
-    active_plugins: Vec<output::PluginOutput>,
+    muted: HashSet<usize>,
+    soloed: HashSet<usize>,
+    /// Plugin instances opened for the current playback, keyed by dest index;
+    /// dropping them stops their audio streams.
+    active_plugins: Vec<(usize, output::PluginOutput)>,
+    /// Standalone native window showing a plugin's GUI editor.
+    plugin_window: Option<vst3_host::PluginWindow>,
+    /// GUI-only plugin instance (loaded without audio when not playing);
+    /// kept alive so the editor window stays valid.
+    gui_plugin: Option<std::sync::Arc<std::sync::Mutex<vst3_host::Plugin>>>,
+    /// Manual text-encoding override for display decoding (None = auto/XF hint)
+    enc_override: Option<smf_core::TextEncoding>,
     playback: Option<Playback>,
     play_us: u64,
+    /// restart at `loop_start_us` when playback reaches the end
+    loop_enabled: bool,
+    loop_start_us: u64,
+    /// what the bottom lane edits
+    lane_mode: LaneMode,
     focus: FocusHandle,
     input: Entity<InputState>,
     status: SharedString,
@@ -148,6 +198,7 @@ impl EditorView {
             selection: BTreeSet::new(),
             drag: None,
             roll_bounds: Rc::new(Cell::new(Bounds::new(point(px(0.0), px(0.0)), size(px(0.0), px(0.0))))),
+            ruler_bounds: Rc::new(Cell::new(Bounds::new(point(px(0.0), px(0.0)), size(px(0.0), px(0.0))))),
             lane_bounds: Rc::new(Cell::new(Bounds::new(point(px(0.0), px(0.0)), size(px(0.0), px(0.0))))),
             scroll_x: 0.0,
             scroll_y: (127.0 - 84.0) * NOTE_H, // show ~C3..C7
@@ -171,9 +222,17 @@ impl EditorView {
             },
             default_dest: 0,
             track_dest: HashMap::new(),
+            muted: HashSet::new(),
+            soloed: HashSet::new(),
             active_plugins: Vec::new(),
+            plugin_window: None,
+            gui_plugin: None,
+            enc_override: None,
             playback: None,
             play_us: 0,
+            loop_enabled: false,
+            loop_start_us: 0,
+            lane_mode: LaneMode::Velocity,
             focus: cx.focus_handle(),
             input,
             status,
@@ -230,7 +289,7 @@ impl EditorView {
             Division::Metrical(p) => (p as u64).max(1),
             Division::Smpte { .. } => 480,
         };
-        let hint = doc.text_encoding_hint();
+        let hint = self.enc_override.or(doc.text_encoding_hint());
         let mut rows = Vec::new();
         for d in doc.diagnose() {
             rows.push(format!("[{}] tk{} @{}", d.code, d.track + 1, d.tick).into());
@@ -458,7 +517,64 @@ impl EditorView {
                 cx.notify();
                 return;
             }
-            DragMode::Move => {}
+            DragMode::Move | DragMode::Duplicate => {}
+            DragMode::LaneEvent => {
+                // CC/PB lane: update an existing event's value, or insert a
+                // new one when the drag started on empty lane space
+                let mut sh = self.shared.lock().unwrap();
+                let mut ops = Vec::new();
+                if d.on_id == 0 {
+                    let ch = sh.doc.tracks[d.track].out_channel & 0x0F;
+                    let (status, data) = match self.lane_mode {
+                        LaneMode::CC(cc) => (0xB0 | ch, [cc, d.dkey.clamp(0, 127) as u8]),
+                        LaneMode::PitchBend => {
+                            let v = d.dkey.clamp(0, 16383) as u16;
+                            (0xE0 | ch, [(v & 0x7F) as u8, (v >> 7) as u8])
+                        }
+                        LaneMode::Velocity => unreachable!(),
+                    };
+                    let id = sh.doc.alloc_event_id();
+                    ops.push(Op::InsertEvents {
+                        track: d.track,
+                        events: vec![DocEvent {
+                            id,
+                            tick: d.a_tick.max(0) as u64,
+                            seq: 0,
+                            raw_body: None,
+                            kind: EventKind::Channel { status, data, len: 2 },
+                        }],
+                    });
+                } else {
+                    for e in &sh.doc.tracks[d.track].events {
+                        if e.id == d.on_id {
+                            let mut after = e.clone();
+                            if let EventKind::Channel { data, .. } = &mut after.kind {
+                                match self.lane_mode {
+                                    LaneMode::CC(_) => data[1] = d.dkey.clamp(0, 127) as u8,
+                                    LaneMode::PitchBend => {
+                                        let v = d.dkey.clamp(0, 16383) as u16;
+                                        data[0] = (v & 0x7F) as u8;
+                                        data[1] = (v >> 7) as u8;
+                                    }
+                                    LaneMode::Velocity => unreachable!(),
+                                }
+                            }
+                            after.raw_body = None;
+                            ops.push(Op::UpdateEvent {
+                                track: d.track,
+                                before: e.clone(),
+                                after,
+                            });
+                        }
+                    }
+                }
+                drop(sh);
+                if !ops.is_empty() {
+                    self.apply_tx("edit lane", ops);
+                }
+                cx.notify();
+                return;
+            }
         }
         if d.dtick == 0 && d.dkey == 0 {
             return;
@@ -471,8 +587,10 @@ impl EditorView {
             BTreeSet::from([d.on_id])
         };
         let notes = self.notes.clone();
-        let sh = self.shared.lock().unwrap();
-        let mut ops = Vec::new();
+        let duplicate = d.mode == DragMode::Duplicate;
+        let mut sh = self.shared.lock().unwrap();
+        // two passes: shift-and-clone while iterating immutably, mint ids after
+        let mut staged: Vec<(usize, document::Event, bool)> = Vec::new();
         for (ti, t) in sh.doc.tracks.iter().enumerate() {
             for e in &t.events {
                 let Some(n) = notes.iter().find(|n| {
@@ -492,16 +610,40 @@ impl EditorView {
                     data[0] = (n.key as i32 + d.dkey).clamp(0, 127) as u8;
                 }
                 after.raw_body = None; // re-encode from kind
-                ops.push(Op::UpdateEvent {
+                staged.push((ti, after, is_on));
+            }
+        }
+        let mut ops = Vec::new();
+        for (ti, mut after, _is_on) in staged {
+            if duplicate {
+                after.id = sh.doc.alloc_event_id();
+                ops.push(Op::InsertEvents {
                     track: ti,
-                    before: e.clone(),
-                    after,
+                    events: vec![after],
                 });
+            } else {
+                let before = sh
+                    .doc
+                    .tracks[ti]
+                    .events
+                    .iter()
+                    .find(|e| e.id == {
+                        // original id is preserved on `after` for Move
+                        after.id
+                    })
+                    .cloned();
+                if let Some(before) = before {
+                    ops.push(Op::UpdateEvent {
+                        track: ti,
+                        before,
+                        after,
+                    });
+                }
             }
         }
         drop(sh);
         if !ops.is_empty() {
-            self.apply_tx("move notes", ops);
+            self.apply_tx(if duplicate { "duplicate notes" } else { "move notes" }, ops);
         }
         cx.notify();
     }
@@ -632,12 +774,26 @@ impl EditorView {
             .min(self.dests.len().saturating_sub(1))
     }
 
+    /// Whether a track's events reach an output: muted tracks never play;
+    /// when anything is soloed, only soloed tracks play.
+    fn audible(&self, track: usize) -> bool {
+        if !self.soloed.is_empty() {
+            self.soloed.contains(&track)
+        } else {
+            !self.muted.contains(&track)
+        }
+    }
+
     fn start_playback(&mut self) {
         if self.dests.is_empty() {
             self.status = t("status.no_port").into();
             return;
         }
-        let tagged = self.doc(|d| d.timeline_tagged());
+        let tagged: Vec<(u64, usize, Vec<u8>)> = self
+            .doc(|d| d.timeline_tagged())
+            .into_iter()
+            .filter(|(_, tr, _)| self.audible(*tr))
+            .collect();
         // open each destination that at least one event needs
         let needed: BTreeSet<usize> =
             tagged.iter().map(|(_, tr, _)| self.dest_of(*tr)).collect();
@@ -659,7 +815,7 @@ impl EditorView {
                         Ok(plugin) => {
                             sink_of.insert(d, sinks.len());
                             sinks.push(Box::new(plugin.event_sink()));
-                            self.active_plugins.push(plugin);
+                            self.active_plugins.push((d, plugin));
                         }
                         Err(e) => self.status = format!("{e}").into(),
                     }
@@ -676,6 +832,7 @@ impl EditorView {
                 sink_of.get(&self.dest_of(tr)).map(|&s| (us, s, b))
             })
             .collect();
+        self.loop_start_us = self.play_us;
         self.playback = Some(Playback::start(sinks, events, self.play_us));
     }
 
@@ -746,6 +903,14 @@ fn load_document(path: &PathBuf) -> Result<Document, String> {
 
 impl Render for EditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // pump the plugin editor window's native event queue while it's open
+        if let Some(w) = &mut self.plugin_window {
+            let _ = w.service_platform_events();
+            if w.closed_by_user() {
+                self.plugin_window = None;
+                self.gui_plugin = None;
+            }
+        }
         self.refresh_derived();
 
         // advance playhead / auto-stop
@@ -753,11 +918,17 @@ impl Render for EditorView {
             self.play_us = p.position_us();
             if !p.is_running() {
                 self.playback = None;
-                self.play_us = 0;
+                if self.loop_enabled {
+                    self.play_us = self.loop_start_us;
+                    self.start_playback();
+                } else {
+                    self.play_us = 0;
+                }
             }
         }
-        let (playhead_tick, title, dirty) = {
+        let (playhead_tick, title, dirty, n_diags, track_names) = {
             let sh = self.shared.lock().unwrap();
+            let hint = self.enc_override.or(sh.doc.text_encoding_hint());
             (
                 sh.doc.tempo_map.us_to_tick(self.play_us),
                 sh.path
@@ -765,6 +936,18 @@ impl Render for EditorView {
                     .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
                     .unwrap_or_else(|| t("status.no_file").to_string()),
                 sh.doc.revision() != sh.saved_revision,
+                sh.doc.diagnose().len(),
+                sh.doc
+                    .tracks
+                    .iter()
+                    .enumerate()
+                    .map(|(i, tr)| {
+                        tr.name
+                            .as_ref()
+                            .map(|b| smf_core::decode_text(b, hint))
+                            .unwrap_or_else(|| format!("Track {}", i + 1))
+                    })
+                    .collect::<Vec<String>>(),
             )
         };
         let ppq = self.ppq();
@@ -848,11 +1031,15 @@ impl Render for EditorView {
                     let mut st = n.start_tick as i64;
                     let mut en = n.end_tick.unwrap_or(n.start_tick + ppq / 4) as i64;
                     let mut key = n.key as i32;
+                    let mut ghost_orig = false;
                     if let Some((mode, d_on, dtick, dkey)) = drag {
                         match mode {
-                            DragMode::Move
+                            DragMode::Move | DragMode::Duplicate
                                 if d_on == n.on_id || selection.contains(&n.on_id) =>
                             {
+                                if mode == DragMode::Duplicate {
+                                    ghost_orig = true;
+                                }
                                 st += dtick;
                                 en += dtick;
                                 key += dkey;
@@ -862,6 +1049,19 @@ impl Render for EditorView {
                             }
                             _ => {}
                         }
+                    }
+                    if ghost_orig {
+                        // alt-drag copy: keep the source visible underneath
+                        let ox = bounds.origin.x + px(n.start_tick as f32 * zoom - scroll_x);
+                        let ow = ((n.end_tick.unwrap_or(n.start_tick) - n.start_tick).max(1) as f32
+                            * zoom)
+                            .max(3.0);
+                        let oy = bounds.origin.y
+                            + px((127.0 - n.key as f32) * NOTE_H - scroll_y);
+                        window.paint_quad(fill(
+                            Bounds::new(point(ox, oy + px(1.0)), size(px(ow), px(NOTE_H - 2.0))),
+                            rgba(0x80808044),
+                        ));
                     }
                     let x = bounds.origin.x + px(st as f32 * zoom - scroll_x);
                     let wpx = ((en - st).max(1) as f32 * zoom).max(3.0);
@@ -917,6 +1117,12 @@ impl Render for EditorView {
         } else {
             t("menu.play")
         };
+        let sel_is_plugin = matches!(
+            self.dests
+                .get(self.dest_of(self.sel_track))
+                .map(|s| &s.kind),
+            Some(DestKind::Plugin(_))
+        );
         let header = div()
             .flex()
             .items_center()
@@ -944,6 +1150,30 @@ impl Render for EditorView {
                     .hover(|s| s.bg(rgb(0x2f7a4d)))
                     .child(play_label)
                     .on_click(cx.listener(|v, _e, _w, cx| v.toggle_play(cx))),
+            )
+            .child(
+                div()
+                    .id("loop")
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .bg(if self.loop_enabled {
+                        rgb(0x3a5c2a)
+                    } else {
+                        rgb(0x2a2a35)
+                    })
+                    .hover(|s| s.bg(rgb(0x3a3a48)))
+                    .text_color(rgb(if self.loop_enabled {
+                        0xb4ff8c
+                    } else {
+                        0x8f8fb0
+                    }))
+                    .child("loop")
+                    .on_click(cx.listener(|v, _e, _w, cx| {
+                        v.loop_enabled = !v.loop_enabled;
+                        cx.notify();
+                    })),
             )
             .child(div().text_color(rgb(0x8f8fb0)).font_family("Cascadia Mono").child(pos))
             .child(div().w(px(8.0)))
@@ -979,6 +1209,95 @@ impl Render for EditorView {
                     })),
             )
             .child(div().flex_1())
+            .child(
+                div()
+                    .id("enc")
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .bg(rgb(0x2a2a35))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(0x3a3a48)))
+                    .text_color(rgb(0xc8c8a8))
+                    .text_size(px(11.0))
+                    .child(format!(
+                        "ENC {}",
+                        match self.enc_override {
+                            None => "auto",
+                            Some(smf_core::TextEncoding::Utf8) => "UTF-8",
+                            Some(smf_core::TextEncoding::ShiftJis) => "SJIS",
+                            Some(smf_core::TextEncoding::Latin1) => "Latin-1",
+                        }
+                    ))
+                    .on_click(cx.listener(|v, _e, _w, cx| {
+                        v.enc_override = match v.enc_override {
+                            None => Some(smf_core::TextEncoding::Utf8),
+                            Some(smf_core::TextEncoding::Utf8) => {
+                                Some(smf_core::TextEncoding::ShiftJis)
+                            }
+                            Some(smf_core::TextEncoding::ShiftJis) => {
+                                Some(smf_core::TextEncoding::Latin1)
+                            }
+                            Some(smf_core::TextEncoding::Latin1) => None,
+                        };
+                        v.ev_rev = u64::MAX; // force event-row rebuild
+                        v.refresh_derived();
+                        cx.notify();
+                    })),
+            )
+            .children(sel_is_plugin.then(|| {
+                div()
+                    .id("plug-gui")
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .bg(rgb(0x2a2a35))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(0x3a3a48)))
+                    .text_color(rgb(0xd0a8ff))
+                    .text_size(px(11.0))
+                    .child("GUI")
+                    .on_click(cx.listener(|v, _e, _w, cx| {
+                        let d = v.dest_of(v.sel_track);
+                        let path = v.dests.get(d).and_then(|s| match &s.kind {
+                            DestKind::Plugin(p) => Some(p.clone()),
+                            _ => None,
+                        });
+                        if let Some(path) = path {
+                            // prefer the instance already driving playback
+                            let live = v
+                                .active_plugins
+                                .iter()
+                                .find(|(i, _)| *i == d)
+                                .map(|(_, p)| p.plugin_handle());
+                            let (arc, is_live) = match live {
+                                Some(a) => (Some(a), true),
+                                None => (output::load_for_gui(&path).ok(), false),
+                            };
+                            match arc {
+                                Some(a) => {
+                                    let mut w = vst3_host::PluginWindow::new(a.clone());
+                                    match w.open() {
+                                        Ok(()) => {
+                                            if !is_live {
+                                                v.gui_plugin = Some(a);
+                                            }
+                                            v.plugin_window = Some(w);
+                                        }
+                                        Err(e) => {
+                                            v.status = format!("plugin GUI: {e}").into()
+                                        }
+                                    }
+                                }
+                                None => {
+                                    v.status = "plugin load failed".into();
+                                }
+                            }
+                        }
+                        cx.notify();
+                    }))
+            }))
+            .child(div().w(px(8.0)))
             .child(div().w(px(240.0)).child(Input::new(&self.input)))
             .child(
                 div()
@@ -1001,7 +1320,28 @@ impl Render for EditorView {
                         .py_1()
                         .text_size(px(11.0))
                         .text_color(rgb(0x77778a))
-                        .child(format!("{} ({})", t("events.header"), self.events.len())),
+                        .child(format!("{} ({})", t("events.header"), self.events.len()))
+                        .children((n_diags > 0).then(|| {
+                            div()
+                                .id("fix-diags")
+                                .ml_2()
+                                .px_1()
+                                .text_size(px(10.0))
+                                .text_color(rgb(0xffb454))
+                                .cursor_pointer()
+                                .child(format!("{} {} [fix]", n_diags, t("events.issues")))
+                                .on_click(cx.listener(|v, _e, _w, cx| {
+                                    let ops = {
+                                        let mut sh = v.shared.lock().unwrap();
+                                        sh.doc.fix_ops(&[])
+                                    };
+                                    if !ops.is_empty() {
+                                        v.apply_tx("fix diagnostics", ops);
+                                        v.status = t("status.fixed").into();
+                                    }
+                                    cx.notify();
+                                }))
+                        })),
                 )
                 .child({
                     let events = self.events.clone();
@@ -1023,8 +1363,117 @@ impl Render for EditorView {
                 }),
         );
 
-        // velocity lane (DAW-style bottom strip, selected track only)
+        // --- track column: select / mute / solo -------------------------------
+        let track_col = div()
+            .w(px(140.0))
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(0x1b1b24))
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_size(px(11.0))
+                    .text_color(rgb(0x77778a))
+                    .child(t("tracks.header")),
+            )
+            .children(track_names.iter().enumerate().map(|(i, name)| {
+                let sel = self.sel_track == i;
+                let muted = self.muted.contains(&i);
+                let soloed = self.soloed.contains(&i);
+                let color = TRACK_COLORS[i % TRACK_COLORS.len()];
+                div()
+                    .id(("track", i))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .h(px(22.0))
+                    .px_1()
+                    .cursor_pointer()
+                    .bg(if sel { rgb(0x2a2a3a) } else { rgb(0x1b1b24) })
+                    .hover(|s| s.bg(rgb(0x252532)))
+                    .on_click(cx.listener(move |v, _e, _w, cx| {
+                        v.sel_track = i;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .w(px(10.0))
+                            .h(px(10.0))
+                            .rounded_sm()
+                            .bg(rgb(if muted { 0x555560 } else { color })),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .px_1()
+                            .text_size(px(11.0))
+                            .text_color(rgb(if muted { 0x707080 } else { 0xd8d8e0 }))
+                            .overflow_hidden()
+                            .child(format!("{name}")),
+                    )
+                    .child(
+                        div()
+                            .id(("mute", i))
+                            .px_1()
+                            .text_size(px(9.0))
+                            .text_color(rgb(if muted { 0xffb454 } else { 0x707080 }))
+                            .on_click(cx.listener(move |v, _e: &ClickEvent, _w, cx| {
+                                cx.stop_propagation();
+                                if !v.muted.remove(&i) {
+                                    v.muted.insert(i);
+                                }
+                                cx.notify();
+                            }))
+                            .child("M"),
+                    )
+                    .child(
+                        div()
+                            .id(("solo", i))
+                            .px_1()
+                            .text_size(px(9.0))
+                            .text_color(rgb(if soloed { 0xffd24f } else { 0x707080 }))
+                            .on_click(cx.listener(move |v, _e: &ClickEvent, _w, cx| {
+                                cx.stop_propagation();
+                                if !v.soloed.remove(&i) {
+                                    v.soloed.insert(i);
+                                }
+                                cx.notify();
+                            }))
+                            .child("S"),
+                    )
+            }));
+
+        // velocity / CC / pitch-bend lane (selected track only)
         let lane_sel_track = self.sel_track;
+        let lane_mode = self.lane_mode;
+        // control events of the selected track matching the lane mode:
+        // (event id, tick, value 0..127 or 0..16383 for PB)
+        let lane_events: Vec<(EventId, u64, i32)> = {
+            let sh = self.shared.lock().unwrap();
+            let tr = lane_sel_track.min(sh.doc.tracks.len().saturating_sub(1));
+            let mut v = Vec::new();
+            if let Some(t) = sh.doc.tracks.get(tr) {
+                for e in &t.events {
+                    if let EventKind::Channel { status, data, .. } = &e.kind {
+                        match (lane_mode, status & 0xF0) {
+                            (LaneMode::CC(cc), 0xB0) if data[0] == cc => {
+                                v.push((e.id, e.tick, data[1] as i32))
+                            }
+                            (LaneMode::PitchBend, 0xE0) => v.push((
+                                e.id,
+                                e.tick,
+                                ((data[1] as i32) << 7) | data[0] as i32,
+                            )),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            v.sort_by_key(|e| e.1);
+            v
+        };
         let lane_bounds_cell = self.lane_bounds.clone();
         let lane = canvas(
             move |bounds, _window, _cx| {
@@ -1033,42 +1482,156 @@ impl Render for EditorView {
             {
                 let lane_notes = self.notes.clone();
                 let lane_selection = self.selection.clone();
+                let lane_events = lane_events.clone();
                 let drag_v = drag;
-                move |bounds, _state, _window, _cx| {
+                move |bounds, _state, window, _cx| {
                     let h: f32 = bounds.size.height.into();
-                    for n in lane_notes.iter().filter(|n| n.track == lane_sel_track) {
-                        let x = bounds.origin.x + px(n.start_tick as f32 * zoom - scroll_x);
-                        if x < bounds.origin.x || x > bounds.origin.x + bounds.size.width {
-                            continue;
-                        }
-                        let mut vel = n.vel as f32 / 127.0;
-                        if let Some((DragMode::Velocity, d_on, _, dkey)) = drag_v {
-                            if d_on == n.on_id {
-                                vel = (dkey as f32 / 127.0).clamp(0.0, 1.0);
+                    let vrange = if lane_mode == LaneMode::PitchBend { 16383.0 } else { 127.0 };
+                    match lane_mode {
+                        LaneMode::Velocity => {
+                            for n in lane_notes.iter().filter(|n| n.track == lane_sel_track) {
+                                let x = bounds.origin.x + px(n.start_tick as f32 * zoom - scroll_x);
+                                if x < bounds.origin.x || x > bounds.origin.x + bounds.size.width {
+                                    continue;
+                                }
+                                let mut vel = n.vel as f32 / 127.0;
+                                if let Some((DragMode::Velocity, d_on, _, dkey)) = drag_v {
+                                    if d_on == n.on_id {
+                                        vel = (dkey as f32 / 127.0).clamp(0.0, 1.0);
+                                    }
+                                }
+                                let bh = px((h - 6.0) * vel);
+                                let y = bounds.origin.y + px(h) - bh - px(3.0);
+                                let c = if lane_selection.contains(&n.on_id) {
+                                    SEL_COLOR
+                                } else {
+                                    TRACK_COLORS[n.track % TRACK_COLORS.len()]
+                                };
+                                window.paint_quad(fill(
+                                    Bounds::new(point(x, y), size(px(2.0), bh)),
+                                    rgb(c),
+                                ));
                             }
                         }
-                        let bh = px((h - 6.0) * vel);
-                        let y = bounds.origin.y + px(h) - bh - px(3.0);
-                        let c = if lane_selection.contains(&n.on_id) {
-                            SEL_COLOR
-                        } else {
-                            TRACK_COLORS[n.track % TRACK_COLORS.len()]
-                        };
-                        _window.paint_quad(fill(
-                            Bounds::new(point(x, y), size(px(2.0), bh)),
-                            rgb(c),
-                        ));
+                        _ => {
+                            // stepped automation line: dot + run to next point
+                            let mut prev: Option<(Pixels, Pixels)> = None;
+                            for (id, tick, val) in &lane_events {
+                                let mut v = *val;
+                                if let Some((DragMode::LaneEvent, d_on, _, dkey)) = drag_v {
+                                    if d_on == *id {
+                                        v = dkey.clamp(0, vrange as i32);
+                                    }
+                                }
+                                let x = bounds.origin.x + px(*tick as f32 * zoom - scroll_x);
+                                let y = bounds.origin.y
+                                    + px((h - 4.0) * (1.0 - v as f32 / vrange) + 2.0);
+                                if let Some((px_, py_)) = prev {
+                                    // horizontal run at previous level, then
+                                    // a vertical connector at this event's x
+                                    window.paint_quad(fill(
+                                        Bounds::new(
+                                            point(px_, py_),
+                                            size(x - px_, px(1.0)),
+                                        ),
+                                        rgba(0x4fd0ff88),
+                                    ));
+                                    window.paint_quad(fill(
+                                        Bounds::new(
+                                            point(x, y.min(py_)),
+                                            size(px(1.0), (y - py_).abs().max(px(1.0))),
+                                        ),
+                                        rgba(0x4fd0ff88),
+                                    ));
+                                }
+                                window.paint_quad(fill(
+                                    Bounds::new(point(x - px(2.0), y - px(2.0)), size(px(4.0), px(4.0))),
+                                    rgb(0x4fd0ff),
+                                ));
+                                prev = Some((x, y));
+                            }
+                            // drag insert ghost
+                            if let Some((DragMode::LaneEvent, 0, a_tick, dkey)) = drag_v {
+                                let x = bounds.origin.x + px(a_tick as f32 * zoom - scroll_x);
+                                let y = bounds.origin.y
+                                    + px((h - 4.0) * (1.0 - dkey.clamp(0, vrange as i32) as f32 / vrange) + 2.0);
+                                window.paint_quad(fill(
+                                    Bounds::new(point(x - px(2.0), y - px(2.0)), size(px(4.0), px(4.0))),
+                                    rgb(SEL_COLOR),
+                                ));
+                            }
+                        }
                     }
                 }
             },
         );
 
-        let body = body.child(
+        // seek ruler: bar ticks/numbers, click positions the playhead
+        let ruler_bounds_cell = self.ruler_bounds.clone();
+        let ruler_play_tick = playhead_tick;
+        let ruler = canvas(
+            move |bounds, _window, _cx| {
+                ruler_bounds_cell.set(bounds);
+            },
+            move |bounds, _state, window, _cx| {
+                let w = bounds.size.width;
+                let tick0 = (scroll_x / zoom).max(0.0) as u64;
+                let tick1 = tick0 + (f32::from(w) / zoom) as u64 + ppq * 4;
+                let mut t = tick0 / (ppq * 4) * (ppq * 4);
+                while t <= tick1 {
+                    let x = bounds.origin.x + px(t as f32 * zoom - scroll_x);
+                    window.paint_quad(fill(
+                        Bounds::new(point(x, bounds.origin.y + px(12.0)), size(px(1.0), px(8.0))),
+                        rgb(0x55556a),
+                    ));
+                    t += ppq * 4;
+                }
+                // playhead marker
+                let hx = bounds.origin.x + px(ruler_play_tick as f32 * zoom - scroll_x);
+                if hx >= bounds.origin.x && hx <= bounds.origin.x + w {
+                    window.paint_quad(fill(
+                        Bounds::new(point(hx - px(2.0), bounds.origin.y), size(px(4.0), px(12.0))),
+                        rgb(0x50ff9f),
+                    ));
+                }
+            },
+        );
+
+        let body = body.child(track_col).child(
             div()
                 .flex_1()
                 .h_full()
                 .flex()
                 .flex_col()
+                .child(
+                    div()
+                        .h(px(26.0))
+                        .w_full()
+                        .bg(rgb(0x17171d))
+                        .border_b_1()
+                        .border_color(rgb(0x2a2a35))
+                        .cursor_pointer()
+                        .child(ruler.size_full())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
+                                let b = this.ruler_bounds.get();
+                                let x = f32::from(ev.position.x) - f32::from(b.origin.x);
+                                let tick = ((x + this.scroll_x) / this.zoom).max(0.0) as u64;
+                                let us = this.doc(|d| d.tempo_map.tick_to_us(tick));
+                                let was_playing = this.playback.is_some();
+                                if was_playing {
+                                    this.stop_playback();
+                                }
+                                this.play_us = us;
+                                if was_playing {
+                                    this.start_playback();
+                                }
+                                this.status = format!("seek {tick}").into();
+                                cx.notify();
+                            }),
+                        ),
+                )
                 .child(
                     div()
                         .flex_1()
@@ -1087,7 +1650,8 @@ impl Render for EditorView {
                 }))
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
+                    cx.listener(|this, ev: &MouseDownEvent, w, cx| {
+                        w.focus(&this.focus, cx);
                         let shift = ev.modifiers.shift;
                         if let Some(n) = this.edge_at(ev.position) {
                             this.sel_track = n.track;
@@ -1116,7 +1680,11 @@ impl Render for EditorView {
                             }
                             this.sel_track = n.track;
                             this.drag = Some(Drag {
-                                mode: DragMode::Move,
+                                mode: if ev.modifiers.alt {
+                                    DragMode::Duplicate
+                                } else {
+                                    DragMode::Move
+                                },
                                 on_id: n.on_id,
                                 off_id: n.off_id,
                                 track: n.track,
@@ -1176,7 +1744,11 @@ impl Render for EditorView {
                             d.b_tick = tick;
                             d.b_key = key;
                         }
-                        DragMode::Velocity => {}
+                        DragMode::Velocity | DragMode::LaneEvent => {}
+                        DragMode::Duplicate => {
+                            d.dtick = tick - d.orig_start as i64;
+                            d.dkey = key - d.orig_key as i32;
+                        }
                     }
                     cx.notify();
                 }))
@@ -1208,7 +1780,30 @@ impl Render for EditorView {
                         .bg(rgb(0x14141a))
                         .border_t_1()
                         .border_color(rgb(0x2a2a35))
+                        .relative()
                         .child(lane.size_full())
+                        .child(
+                            // lane-mode chip: Vel -> CC1 -> CC7 -> CC10 ->
+                            // CC11 -> CC64 -> PB -> Vel
+                            div()
+                                .id("lane-mode")
+                                .absolute()
+                                .top(px(2.0))
+                                .right(px(4.0))
+                                .px_1()
+                                .rounded_sm()
+                                .bg(rgb(0x2a2a35))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(0x3a3a48)))
+                                .text_size(px(9.0))
+                                .text_color(rgb(0x9fd0ff))
+                                .child(lane_mode.label())
+                                .on_click(cx.listener(|v, _e: &ClickEvent, _w, cx| {
+                                    cx.stop_propagation();
+                                    v.lane_mode = v.lane_mode.cycle();
+                                    cx.notify();
+                                })),
+                        )
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
@@ -1216,49 +1811,115 @@ impl Render for EditorView {
                                 let x = f32::from(ev.position.x) - f32::from(b.origin.x);
                                 let y = f32::from(ev.position.y) - f32::from(b.origin.y);
                                 let tick = ((x + this.scroll_x) / this.zoom).max(0.0) as u64;
-                                let vel =
-                                    ((1.0 - y / f32::from(b.size.height)) * 127.0) as i32;
-                                // nearest note in the selected track
-                                if let Some(n) = this
-                                    .notes
-                                    .iter()
-                                    .filter(|n| n.track == this.sel_track)
-                                    .min_by_key(|n| {
-                                        let st = n.start_tick as i64;
-                                        (tick as i64 - st).abs()
-                                    })
-                                {
-                                    this.selection = BTreeSet::from([n.on_id]);
-                                    this.drag = Some(Drag {
-                                        mode: DragMode::Velocity,
-                                        on_id: n.on_id,
-                                        off_id: n.off_id,
-                                        track: n.track,
-                                        orig_start: n.start_tick,
-                                        orig_end: n.end_tick,
-                                        orig_key: n.key,
-                                        dtick: 0,
-                                        dkey: vel.clamp(1, 127),
-                                        a_tick: 0,
-                                        a_key: 0,
-                                        b_tick: 0,
-                                        b_key: 0,
-                                    });
+                                let h = f32::from(b.size.height);
+                                match this.lane_mode {
+                                    LaneMode::Velocity => {
+                                        let vel =
+                                            ((1.0 - y / h) * 127.0) as i32;
+                                        // nearest note in the selected track
+                                        if let Some(n) = this
+                                            .notes
+                                            .iter()
+                                            .filter(|n| n.track == this.sel_track)
+                                            .min_by_key(|n| {
+                                                let st = n.start_tick as i64;
+                                                (tick as i64 - st).abs()
+                                            })
+                                        {
+                                            this.selection = BTreeSet::from([n.on_id]);
+                                            this.drag = Some(Drag {
+                                                mode: DragMode::Velocity,
+                                                on_id: n.on_id,
+                                                off_id: n.off_id,
+                                                track: n.track,
+                                                orig_start: n.start_tick,
+                                                orig_end: n.end_tick,
+                                                orig_key: n.key,
+                                                dtick: 0,
+                                                dkey: vel.clamp(1, 127),
+                                                a_tick: 0,
+                                                a_key: 0,
+                                                b_tick: 0,
+                                                b_key: 0,
+                                            });
+                                        }
+                                    }
+                                    mode => {
+                                        // CC/PB: grab the nearest lane event
+                                        // within ~10px, else insert a new one
+                                        // at the click and drag it
+                                        let vrange = if mode == LaneMode::PitchBend {
+                                            16383.0
+                                        } else {
+                                            127.0
+                                        };
+                                        let val =
+                                            ((1.0 - y / h) * vrange) as i32;
+                                        let tr = this.sel_track;
+                                        let found = {
+                                            let sh = this.shared.lock().unwrap();
+                                            sh.doc.tracks.get(tr).and_then(|t| {
+                                                t.events
+                                                    .iter()
+                                                    .filter(|e| {
+                                                        matches!(e.kind,
+                                                            EventKind::Channel { status, data, .. }
+                                                            if match mode {
+                                                                LaneMode::CC(cc) => status & 0xF0 == 0xB0 && data[0] == cc,
+                                                                LaneMode::PitchBend => status & 0xF0 == 0xE0,
+                                                                LaneMode::Velocity => false,
+                                                            })
+                                                    })
+                                                    .min_by_key(|e| {
+                                                        (e.tick as i64 - tick as i64).abs()
+                                                    })
+                                                    .filter(|e| {
+                                                        ((e.tick as f32 - tick as f32) * this.zoom)
+                                                            .abs()
+                                                            <= 10.0
+                                                    })
+                                                    .map(|e| e.id)
+                                            })
+                                        };
+                                        this.drag = Some(Drag {
+                                            mode: DragMode::LaneEvent,
+                                            on_id: found.unwrap_or(0),
+                                            off_id: None,
+                                            track: tr,
+                                            orig_start: 0,
+                                            orig_end: None,
+                                            orig_key: 0,
+                                            dtick: 0,
+                                            dkey: val.clamp(0, vrange as i32),
+                                            a_tick: tick as i64,
+                                            a_key: 0,
+                                            b_tick: 0,
+                                            b_key: 0,
+                                        });
+                                    }
                                 }
                                 cx.notify();
                             }),
                         )
                         .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
                             let Some(d) = &mut this.drag else { return };
-                            if d.mode != DragMode::Velocity
+                            if !matches!(d.mode, DragMode::Velocity | DragMode::LaneEvent)
                                 || ev.pressed_button != Some(MouseButton::Left)
                             {
                                 return;
                             }
                             let b = this.lane_bounds.get();
                             let y = f32::from(ev.position.y) - f32::from(b.origin.y);
-                            d.dkey = ((1.0 - y / f32::from(b.size.height)) * 127.0) as i32;
-                            d.dkey = d.dkey.clamp(1, 127);
+                            let h = f32::from(b.size.height);
+                            d.dkey = if d.mode == DragMode::Velocity {
+                                ((1.0 - y / h) * 127.0) as i32
+                            } else {
+                                let vrange = match this.lane_mode {
+                                    LaneMode::PitchBend => 16383.0,
+                                    _ => 127.0,
+                                };
+                                ((1.0 - y / h) * vrange) as i32
+                            };
                             cx.notify();
                         }))
                         .on_mouse_up(
@@ -1304,6 +1965,13 @@ fn main() {
     let path = std::env::args().nth(1).map(PathBuf::from);
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
+        // dark UI — gpui-component's default theme follows the OS and renders
+        // the text input's selection overlay white; pin dark explicitly
+        gpui_kit::component::theme::Theme::change(
+            gpui_kit::component::theme::ThemeMode::Dark,
+            None,
+            cx,
+        );
         let path = path.clone();
         cx.spawn(async move |cx| {
             cx.open_window(WindowOptions::default(), move |window, cx| {
@@ -1365,13 +2033,10 @@ fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
                     if dirty {
                         v.refresh_derived();
                     }
-                    // repaint while playing so the playhead/counter advance
-                    if dirty || v.playback.is_some() {
-                        cx.notify();
-                    }
-                    // auto-stop repaint: catch the moment playback ends
-                    if v.playback.is_none() && v.play_us != 0 {
-                        v.play_us = 0;
+                    // repaint while playing so the playhead/counter advance;
+                    // also while a plugin editor is open so its native event
+                    // queue gets serviced even when the app is idle
+                    if dirty || v.playback.is_some() || v.plugin_window.is_some() {
                         cx.notify();
                     }
                 });

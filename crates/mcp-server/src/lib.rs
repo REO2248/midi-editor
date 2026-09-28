@@ -448,6 +448,14 @@ fn tool_defs() -> Vec<(&'static str, Tool)> {
             ),
         ),
         (
+            "normalize",
+            tool(
+                "normalize",
+                "Resolve import-quality findings as one undo step. Args: codes? (array of diagnostic codes; omitted = fix all). Returns resolved/failed counts.",
+                object_schema(serde_json::json!({"codes": {"type": "array", "items": {"type": "string"}}})),
+            ),
+        ),
+        (
             "apply_patch",
             tool(
                 "apply_patch",
@@ -502,6 +510,25 @@ fn dispatch(
                     "detail": d.detail,
                 })).collect::<Vec<_>>(),
             }))
+        }
+        "normalize" => {
+            let code_strs: Vec<String> = args["codes"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let before = sh.doc.diagnose().len();
+            let codes: Vec<&str> = code_strs.iter().map(String::as_str).collect();
+            let ops = sh.doc.fix_ops(&codes);
+            if ops.is_empty() {
+                return ok_json(serde_json::json!({"fixed": 0, "remaining": before}));
+            }
+            match sh.apply("normalize", ops) {
+                Ok(rev) => {
+                    let remaining = sh.doc.diagnose().len();
+                    ok_json(serde_json::json!({"fixed": before - remaining, "remaining": remaining, "revision": rev}))
+                }
+                Err(e) => err_json(e.to_string()),
+            }
         }
         "list_notes" => {
             let track = args["track"].as_u64().map(|v| v as usize);

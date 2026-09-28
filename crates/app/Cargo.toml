@@ -12,6 +12,7 @@ commands.workspace = true
 midi-io.workspace = true
 output.workspace = true
 mcp-server.workspace = true
+vst3-host.workspace = true
 bytes.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

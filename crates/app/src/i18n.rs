@@ -29,6 +29,9 @@ static EN: &[(&str, &str)] = &[
     ("status.saved", "saved"),
     ("status.failed", "error"),
     ("events.header", "Events"),
+    ("events.issues", "issues"),
+    ("status.fixed", "diagnostics fixed"),
+    ("tracks.header", "Tracks"),
     ("field.track_name", "Track name"),
 ];
 
@@ -46,6 +49,9 @@ static JA: &[(&str, &str)] = &[
     ("status.saved", "保存しました"),
     ("status.failed", "エラー"),
     ("events.header", "イベント"),
+    ("events.issues", "件の問題"),
+    ("status.fixed", "診断を修正しました"),
+    ("tracks.header", "トラック"),
     ("field.track_name", "トラック名"),
 ];
 
