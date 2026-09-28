@@ -191,7 +191,7 @@ fn summary_json(d: &Document, path: &Option<PathBuf>, saved_rev: u64) -> serde_j
         "division": format!("{:?}", d.division),
         "tracks": d.tracks.iter().enumerate().map(|(i, t)| serde_json::json!({
             "index": i,
-            "name": t.name.as_ref().map(|b| String::from_utf8_lossy(b).into_owned()),
+            "name": t.name.as_ref().map(|b| smf_core::decode_text(b, d.text_encoding_hint())),
             "events": t.events.len(),
         })).collect::<Vec<_>>(),
         "events": d.tracks.iter().map(|t| t.events.len()).sum::<usize>(),
@@ -515,13 +515,14 @@ fn tool_defs() -> Vec<(&'static str, Tool)> {
             tool(
                 "apply_patch",
                 "Atomic edit as one undo step. Optional base_revision: when given it must match document_summary.revision (optimistic concurrency) \
-                 (optimistic concurrency). ops: insert_note {track,key,vel,start,dur,channel} | \
+                 (optimistic concurrency). dry_run:true returns the op breakdown without applying. ops: insert_note {track,key,vel,start,dur,channel} | \
                  insert_events {track,events:[{tick,seq,kind:{channel|meta|sysex_hex}}]} | \
                  remove_events {ids} | move_note {on_id,dtick,dkey,dur_dtick} | \
                  set_tempo {tick,bpm}",
                 object_schema(serde_json::json!({
                     "base_revision": {"type": "integer"},
                     "label": {"type": "string"},
+                    "dry_run": {"type": "boolean"},
                     "ops": {"type": "array", "items": {"type": "object"}},
                 })),
             ),
@@ -889,6 +890,30 @@ fn dispatch(
             if ops.is_empty() {
                 return err_json("no ops");
             }
+            if args["dry_run"].as_bool().unwrap_or(false) {
+                // describe what applying would do — nothing is committed
+                let detail = ops
+                    .iter()
+                    .map(|op| match op {
+                        Op::InsertEvents { track, events } => serde_json::json!({
+                            "op": "insert", "track": track, "events": events.len()}),
+                        Op::RemoveEvents { track, removed } => serde_json::json!({
+                            "op": "remove", "track": track, "events": removed.len()}),
+                        Op::UpdateEvent { track, after, .. } => serde_json::json!({
+                            "op": "update", "track": track, "event_id": after.id}),
+                        Op::InsertTrack { index, .. } => serde_json::json!({
+                            "op": "insert_track", "index": index}),
+                        Op::RemoveTrack { index, .. } => serde_json::json!({
+                            "op": "remove_track", "index": index}),
+                        Op::UpdateTrack { index, after, .. } => serde_json::json!({
+                            "op": "update_track", "index": index,
+                            "name": after.name.as_ref().map(|b| String::from_utf8_lossy(b).into_owned())}),
+                    })
+                    .collect::<Vec<_>>();
+                return ok_json(serde_json::json!({
+                    "dry_run": true, "applied": false, "ops": detail,
+                }));
+            }
             match sh.apply(label, ops) {
                 Ok(rev) => ok_json(serde_json::json!({"applied": true, "revision": rev})),
                 Err(e) => err_json(e.to_string()),
@@ -954,10 +979,18 @@ fn dispatch(
                         if mt.is_some() && mt != Some(*meta_type) {
                             continue;
                         }
+                        // only 0x01-0x0F are text-family metas; the rest
+                        // (tempo, time sig, ports, ...) are binary payloads
+                        let text = if (0x01..=0x0f).contains(meta_type) {
+                            serde_json::Value::String(
+                                smf_core::decode_text(data, hint))
+                        } else {
+                            serde_json::Value::Null
+                        };
                         out.push(serde_json::json!({
                             "track": ti, "id": e.id, "tick": e.tick,
                             "type": format!("0x{meta_type:02x}"),
-                            "text": smf_core::decode_text(data, hint),
+                            "text": text,
                             "data_hex": bytes_hex(data),
                         }));
                     }

@@ -310,7 +310,7 @@ impl EditorView {
                             format!("Tempo   {:.2} bpm", 60_000_000.0 / mpq as f64)
                         }
                         0x2F => "EndOfTrack".to_string(),
-                        0x58 => format!("TimeSig {}/{}", data.get(0).copied().unwrap_or(4), data.get(1).copied().unwrap_or(4)),
+                        0x58 => format!("TimeSig {}/{}", data.first().copied().unwrap_or(4), data.get(1).copied().unwrap_or(4)),
                         0x59 => "KeySig".to_string(),
                         other @ 0x01..=0x09 => {
                             format!("Meta 0x{other:02X} {}", smf_core::decode_text(data, hint))
@@ -371,7 +371,7 @@ impl EditorView {
             self.status = format!("{label}: nothing to change").into();
         } else {
             self.apply_tx(label, ops);
-            self.status = format!("{label}").into();
+            self.status = label.to_string().into();
         }
     }
 
@@ -827,7 +827,7 @@ impl EditorView {
                 self.refresh_derived();
                 self.status = "loaded".into();
             }
-            Err(e) => self.status = format!("{e}").into(),
+            Err(e) => self.status = e.to_string().into(),
         }
         cx.notify();
     }
@@ -928,7 +928,7 @@ impl EditorView {
                     if us > end_us {
                         break;
                     }
-                    let note = if beat % 4 == 0 { 76 } else { 77 };
+                    let note = if beat.is_multiple_of(4) { 76 } else { 77 };
                     events.push((us, s, vec![0x99, note, 110]));
                     events.push((us + 20_000, s, vec![0x99, note, 0]));
                     beat += 1;

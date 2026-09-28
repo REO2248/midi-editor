@@ -986,8 +986,9 @@ impl Document {
     }
 
     /// Clone every channel event in [from,to) shifted to start at `to`.
-    /// (Meta events stay behind — duplicating tempo/EOT would corrupt the
-    /// structure; EOT never duplicates.)
+    /// Notes keep their NoteOff even when it sits outside the range — a
+    /// duplicated note must not hang. (Meta events stay behind — duplicating
+    /// tempo/EOT would corrupt the structure.)
     pub fn duplicate_range_ops(&mut self, track: usize, from: u64, to: u64) -> Vec<Op> {
         let span = to.saturating_sub(from);
         if span == 0 {
@@ -1004,6 +1005,23 @@ impl Document {
             .filter(|e| matches!(e.kind, EventKind::Channel { .. }))
             .cloned()
             .collect();
+        // grab the NoteOff of any note whose start is in range — its tick may
+        // lie past `to`, in which case the in-range filter missed it
+        let have: std::collections::BTreeSet<EventId> =
+            events.iter().map(|e| e.id).collect();
+        let extra_offs: Vec<Event> = self
+            .notes()
+            .into_iter()
+            .filter(|n| n.track == track && n.start_tick >= from && n.start_tick < to)
+            .filter_map(|n| n.off_id)
+            .filter(|id| !have.contains(id))
+            .filter_map(|id| {
+                self.by_id
+                    .get(&id)
+                    .map(|&(ti, ei)| self.tracks[ti].events[ei].clone())
+            })
+            .collect();
+        events.extend(extra_offs);
         for e in &mut events {
             e.tick += span;
             e.id = self.alloc_event_id();
@@ -1170,7 +1188,7 @@ impl TempoMap {
         for (tick, mpq) in tempos {
             if let Division::Metrical(ppq) = division {
                 if ppq > 0 {
-                    cum += (tick - prev_tick) as u64 * prev_mpq as u64 / ppq as u64;
+                    cum += (tick - prev_tick) * prev_mpq as u64 / ppq as u64;
                 }
             }
             points.push((tick, mpq, cum));

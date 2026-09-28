@@ -17,11 +17,18 @@ pub struct PluginInfo {
 /// Scan the standard VST3 install locations without loading plugins.
 pub fn discover_plugins() -> Vec<PluginInfo> {
     let mut found = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for dir in vst3_scan_dirs() {
         if let Ok(rd) = std::fs::read_dir(&dir) {
             for ent in rd.flatten() {
                 let p = ent.path();
                 if p.extension().map(|e| e == "vst3").unwrap_or(false) {
+                    // several scan roots can resolve to the same bundle
+                    // (32/64-bit Common Files junctions, copies in both)
+                    let key = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+                    if !seen.insert(key) {
+                        continue;
+                    }
                     found.push(PluginInfo {
                         name: p
                             .file_stem()
@@ -38,11 +45,18 @@ pub fn discover_plugins() -> Vec<PluginInfo> {
 
 fn vst3_scan_dirs() -> Vec<std::path::PathBuf> {
     let mut dirs = Vec::new();
-    for key in ["ProgramFiles", "ProgramFiles(x86)", "CommonProgramFiles"] {
+    for key in ["ProgramFiles", "ProgramFiles(x86)"] {
         if let Ok(v) = std::env::var(key) {
             dirs.push(std::path::PathBuf::from(&v).join("Common Files\\VST3"));
             dirs.push(std::path::PathBuf::from(&v).join("VST3"));
         }
+    }
+    // CommonProgramFiles already ends in "Common Files"
+    if let Ok(v) = std::env::var("CommonProgramFiles") {
+        dirs.push(std::path::PathBuf::from(&v).join("VST3"));
+    }
+    if let Ok(v) = std::env::var("CommonProgramFiles(x86)") {
+        dirs.push(std::path::PathBuf::from(&v).join("VST3"));
     }
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
         dirs.push(std::path::PathBuf::from(local).join("Programs\\Common\\VST3"));
@@ -83,7 +97,7 @@ impl PluginOutput {
         let config = vst3_host::AudioConfig::default();
         let backend = vst3_host::backends::CpalBackend::new()
             .map_err(|e| PluginError::Audio(e.to_string()))?;
-        let handle = vst3_host::play_with_backend(&backend, plugin, config.clone())
+        let handle = vst3_host::play_with_backend(&backend, plugin, config)
             .map_err(|e| PluginError::Audio(e.to_string()))?;
         let sink = handle.midi_sink();
         Ok(Self {

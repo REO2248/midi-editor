@@ -53,4 +53,8 @@ impl UndoStack {
     pub fn len(&self) -> usize {
         self.done.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.done.is_empty()
+    }
 }

@@ -173,7 +173,7 @@ impl Render for EditorView {
                 let mut t = tick0 / ppq * ppq;
                 while t <= tick1 {
                     let x = bounds.origin.x + px(t as f32 * zoom - scroll_x);
-                    let bar = t % (ppq * 4) == 0;
+                    let bar = t.is_multiple_of(ppq * 4);
                     window.paint_quad(fill(
                         Bounds::new(point(x, bounds.origin.y), size(px(1.0), h)),
                         rgb(if bar { 0x3d3d52 } else { 0x2a2a35 }),
@@ -685,7 +685,7 @@ impl Render for EditorView {
                             .text_size(px(11.0))
                             .text_color(rgb(if muted { 0x707080 } else { 0xd8d8e0 }))
                             .overflow_hidden()
-                            .child(format!("{name}")),
+                            .child(name.to_string()),
                     )
                     .child(
                         div()

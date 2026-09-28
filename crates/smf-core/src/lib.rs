@@ -317,7 +317,13 @@ pub fn write(format_req: u16, division: Division, tracks: &[Track], opts: WriteO
         } => (((-(fps as i8)) as u8 as u16) << 8) | ticks_per_frame as u16,
     };
     let ntrks = tracks.len() as u16;
-    let format = if ntrks == 1 { 0 } else { format_req.max(1) };
+    // preserve the source's declared format; only upgrade when the track
+    // count makes it invalid (format 0 forbids >1 track)
+    let format = if format_req == 0 && ntrks > 1 {
+        1
+    } else {
+        format_req
+    };
 
     let mut out = Vec::new();
     out.extend_from_slice(b"MThd");
@@ -458,7 +464,7 @@ mod tests {
         // track 1: SJIS name "テスト", notes w/ running status, sysex
         let mut t1 = Vec::new();
         t1.extend_from_slice(&[0x00, 0xFF, 0x03, 0x06]);
-        t1.extend_from_slice(&[0x83, 0x60, 0x83, 0x60, 0x83, 0x60]); // "テスト" Shift-JIS
+        t1.extend_from_slice(&[0x83, 0x65, 0x83, 0x58, 0x83, 0x67]); // "テスト" Shift-JIS
         t1.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]);
         t1.extend_from_slice(&[0x60, 0x3C, 0x00]); // running status: NoteOn vel0
         t1.extend_from_slice(&[0x00, 0xF0, 0x04, 0x7E, 0x7F, 0x09, 0x01]); // GM on
@@ -490,7 +496,7 @@ mod tests {
             } => {
                 assert_eq!(
                     &data[..],
-                    &[0x83, 0x60, 0x83, 0x60, 0x83, 0x60],
+                    &[0x83, 0x65, 0x83, 0x58, 0x83, 0x67],
                     "track name raw bytes"
                 );
             }
