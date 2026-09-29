@@ -90,8 +90,6 @@ static EN: &[(&str, &str)] = &[
     ("edit.set_length", "Set Length"),
     ("edit.set_velocity", "Set Velocity"),
     ("transport.count_in", "Record Count-In"),
-    ("transport.replay_rec", "Record Replay (GIF)"),
-    ("transport.replay_stop", "Stop & Save Replay"),
     ("help.shortcuts", "Keyboard Shortcuts"),
     ("status.copied", "copied {n} note(s)"),
     ("status.nosel", "no selection"),
@@ -132,8 +130,6 @@ static EN: &[(&str, &str)] = &[
     ("output.first_input", "(first available)"),
     ("output.no_inputs", "(no MIDI inputs)"),
     ("status.rescan", "rescanned: {n} destination(s)"),
-    ("status.replay_rec", "replay: recording…"),
-    ("status.replay_saved", "replay saved → {path}"),
 ];
 
 static JA: &[(&str, &str)] = &[
@@ -207,14 +203,10 @@ static JA: &[(&str, &str)] = &[
     ("output.first_input", "(先頭のポート)"),
     ("output.no_inputs", "(MIDI入力なし)"),
     ("status.rescan", "再スキャン: {n} 件の出力先"),
-    ("status.replay_rec", "リプレイ: 録画中…"),
-    ("status.replay_saved", "リプレイを保存 → {path}"),
     ("edit.legato", "レガート"),
     ("edit.set_length", "長さを統一"),
     ("edit.set_velocity", "ベロシティを統一"),
     ("transport.count_in", "カウントイン録音"),
-    ("transport.replay_rec", "操作リプレイを録画 (GIF)"),
-    ("transport.replay_stop", "録画停止して保存"),
     ("help.shortcuts", "キーボードショートカット"),
     ("status.copied", "{n}個のノートをコピー"),
     ("status.nosel", "選択がありません"),

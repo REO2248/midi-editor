@@ -5,7 +5,6 @@
 
 mod i18n;
 mod icons;
-mod recorder;
 mod render;
 use i18n::{t, tf};
 
@@ -200,8 +199,6 @@ struct EditorView {
     /// Standalone window hosting the open plugin editor (in-process
     /// instance — isolated plugins cannot host a GUI on Windows).
     plugin_window: Option<vst3_host::PluginWindow>,
-    /// screen-capture replay recorder (Transport ▸ Record Replay)
-    recorder: Option<recorder::Recorder>,
     /// Manual text-encoding override for display decoding (None = auto/XF hint)
     enc_override: Option<smf_core::TextEncoding>,
     playback: Option<Playback>,
@@ -317,7 +314,6 @@ impl EditorView {
             zoom: 0.08,
             active_plugins: Vec::new(),
             plugin_window: None,
-            recorder: None,
             enc_override: None,
             playback: None,
             play_us: 0,
@@ -1603,41 +1599,6 @@ impl EditorView {
         }
     }
 
-    /// Toggle replay recording: start captures the window region on a
-    /// worker thread; stop joins it and writes a GIF under the config dir.
-    fn toggle_replay(&mut self, w: &Window) {
-        if self.recorder.is_some() {
-            self.stop_replay();
-            return;
-        }
-        let sf = w.scale_factor() as f64;
-        let b = w.window_bounds().get_bounds();
-        let (x, y) = (
-            f32::from(b.origin.x) as f64 * sf,
-            f32::from(b.origin.y) as f64 * sf,
-        );
-        let (bw, bh) = (
-            f32::from(b.size.width) as f64 * sf,
-            f32::from(b.size.height) as f64 * sf,
-        );
-        self.recorder = Some(recorder::Recorder::start(x, y, bw, bh));
-        self.status = t("status.replay_rec").into();
-    }
-
-    fn stop_replay(&mut self) {
-        let Some(mut r) = self.recorder.take() else {
-            return;
-        };
-        let dir = GlobalPrefs::path().join("replays");
-        self.status = match r.stop(&dir) {
-            Ok(p) => {
-                let ps = p.to_string_lossy().into_owned();
-                tf("status.replay_saved", &[("path", ps.as_str())]).into()
-            }
-            Err(e) => format!("replay: {e}").into(),
-        };
-    }
-
     /// tick,key under a window-space mouse position
     fn hit(&self, pos: Point<Pixels>) -> (i64, i32) {
         let b = self.roll_bounds.get();
@@ -2049,11 +2010,7 @@ fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
                             v.plugin_window = None;
                         }
                     }
-                    if dirty
-                        || v.playback.is_some()
-                        || v.plugin_window.is_some()
-                        || v.recorder.is_some()
-                    {
+                    if dirty || v.playback.is_some() || v.plugin_window.is_some() {
                         cx.notify();
                     }
                 });
