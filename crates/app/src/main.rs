@@ -193,12 +193,22 @@ struct EditorView {
     scroll_x: f32,
     scroll_y: f32,
     zoom: f32,
-    /// Plugin instances opened for the current playback, keyed by dest index;
-    /// dropping them stops their audio streams.
-    active_plugins: Vec<(usize, output::PluginOutput)>,
+    /// Plugin instances kept warm on the host worker thread, keyed by dest
+    /// index. They persist across play/stop/loop so parameter state survives
+    /// and Play doesn't pay a load stall — only an explicit destination
+    /// change, rescan, or app exit unloads them.
+    plugin_slots: HashMap<usize, output::PluginSlot>,
+    /// dest index → bundle path currently being loaded by the host thread
+    plugin_loading: HashMap<usize, PathBuf>,
+    plugin_req: std::sync::mpsc::Sender<output::PluginReq>,
+    plugin_evt: std::sync::mpsc::Receiver<(usize, Result<output::PluginSlot, String>)>,
     /// Standalone window hosting the open plugin editor (in-process
     /// instance — isolated plugins cannot host a GUI on Windows).
     plugin_window: Option<vst3_host::PluginWindow>,
+    /// (dest index, in-process editor instance) for editor↔playback sync:
+    /// param edits drain into the playing slot live, and full state is
+    /// transferred on open/close via save_state/load_state.
+    editor_plugin: Option<(usize, std::sync::Arc<std::sync::Mutex<vst3_host::Plugin>>)>,
     /// Manual text-encoding override for display decoding (None = auto/XF hint)
     enc_override: Option<smf_core::TextEncoding>,
     playback: Option<Playback>,
@@ -292,6 +302,7 @@ impl EditorView {
         sh.dests = build_dest_catalog();
         let g = GlobalPrefs::load();
         let shared = Arc::new(Mutex::new(sh));
+        let (plugin_req, plugin_evt) = output::spawn_plugin_host();
         let mut v = Self {
             shared,
             notes_rev: u64::MAX,
@@ -312,8 +323,12 @@ impl EditorView {
             scroll_x: 0.0,
             scroll_y: (127.0 - 84.0) * NOTE_H, // show ~C3..C7
             zoom: 0.08,
-            active_plugins: Vec::new(),
+            plugin_slots: HashMap::new(),
+            plugin_loading: HashMap::new(),
+            plugin_req,
+            plugin_evt,
             plugin_window: None,
+            editor_plugin: None,
             enc_override: None,
             playback: None,
             play_us: 0,
@@ -1323,6 +1338,90 @@ impl EditorView {
         cx.notify();
     }
 
+    /// If dest `d` is a VST3 bundle not already loaded/loading, ask the host
+    /// thread to warm it. Called when a destination is assigned and from
+    /// `refresh_plugins` — Play then never pays the load stall.
+    fn ensure_plugin(&mut self, d: usize) {
+        let path = {
+            let sh = self.shared.lock().unwrap();
+            match sh.dests.get(d).map(|(_, dest)| dest) {
+                Some(output::Destination::Plugin { plugin_path }) => PathBuf::from(plugin_path),
+                _ => return,
+            }
+        };
+        if self
+            .plugin_slots
+            .get(&d)
+            .map(|s| s.path == path)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        if self.plugin_loading.get(&d) == Some(&path) {
+            return;
+        }
+        // index now points at a different bundle — retire the old instance
+        if self.plugin_slots.remove(&d).is_some() {
+            let _ = self.plugin_req.send(output::PluginReq::Drop(d));
+        }
+        self.plugin_loading.insert(d, path.clone());
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.status = format!("loading {name}…").into();
+        let _ = self.plugin_req.send(output::PluginReq::Open(d, path));
+    }
+
+    /// Warm instances for every VST3 destination a track or the default
+    /// currently resolves to. Cheap to call often — no-ops once satisfied.
+    fn refresh_plugins(&mut self) {
+        let idxs: Vec<usize> = {
+            let sh = self.shared.lock().unwrap();
+            let mut v: Vec<usize> = sh.track_dest.values().copied().collect();
+            v.push(sh.default_dest);
+            v
+        };
+        for d in idxs {
+            self.ensure_plugin(d);
+        }
+    }
+
+    /// Drain host-thread replies into `plugin_slots`/`plugin_loading`.
+    fn poll_plugin_events(&mut self) {
+        while let Ok((d, r)) = self.plugin_evt.try_recv() {
+            self.plugin_loading.remove(&d);
+            match r {
+                Ok(slot) => {
+                    let name = slot
+                        .path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    self.plugin_slots.insert(d, slot);
+                    self.status = format!("{name} ready").into();
+                }
+                Err(e) => self.status = format!("plugin: {e}").into(),
+            }
+        }
+    }
+
+    /// Bounded UI-thread wait for dest `d`'s instance — used at Play press.
+    /// Returns true when a live slot exists.
+    fn wait_plugin(&mut self, d: usize) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            self.poll_plugin_events();
+            if self.plugin_slots.contains_key(&d) {
+                return true;
+            }
+            if !self.plugin_loading.contains_key(&d) || std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+    }
+
     fn start_playback(&mut self) {
         // snapshot routing state so no lock is held while opening sinks
         let (dests, dest_of_track, muted, soloed, metronome, loop_enabled) = {
@@ -1360,7 +1459,10 @@ impl EditorView {
         let needed: BTreeSet<usize> = tagged.iter().map(|(_, tr, _)| dest_of(*tr)).collect();
         let mut sinks: Vec<Box<dyn EventSink>> = Vec::new();
         let mut sink_of: HashMap<usize, usize> = HashMap::new();
-        self.active_plugins.clear();
+        // host transport hints for plugin instances (arps/LFO sync): current
+        // bpm + time signature, then `playing` flipped on per used instance
+        let (bpm, sig_num, sig_den) = self.transport_hints();
+        self.poll_plugin_events();
         for d in needed {
             let Some((_, dest)) = dests.get(d) else { continue };
             match dest {
@@ -1373,14 +1475,19 @@ impl EditorView {
                         Err(e) => self.status = format!("{e}").into(),
                     }
                 }
-                output::Destination::Plugin { plugin_path } => {
-                    match output::PluginOutput::open(PathBuf::from(plugin_path).as_path()) {
-                        Ok(plugin) => {
-                            sink_of.insert(d, sinks.len());
-                            sinks.push(Box::new(plugin.event_sink()));
-                            self.active_plugins.push((d, plugin));
+                output::Destination::Plugin { .. } => {
+                    self.ensure_plugin(d);
+                    if self.wait_plugin(d) {
+                        let slot = self.plugin_slots.get(&d).expect("slot just loaded");
+                        sink_of.insert(d, sinks.len());
+                        sinks.push(Box::new(slot.sink.clone()));
+                        if let Ok(mut p) = slot.plugin.lock() {
+                            let _ = p.set_tempo(bpm);
+                            let _ = p.set_time_signature(sig_num, sig_den);
+                            let _ = p.set_playing(true);
                         }
-                        Err(e) => self.status = format!("{e}").into(),
+                    } else {
+                        self.status = t("status.plugin_fail").into();
                     }
                 }
             }
@@ -1432,8 +1539,41 @@ impl EditorView {
             self.play_us = p.position_us();
             p.stop();
         }
-        self.active_plugins.clear();
+        // silence every warm instance but keep it loaded — the next Play
+        // (and parameter edits made meanwhile) start instantly
+        for slot in self.plugin_slots.values() {
+            let mut s = slot.sink.clone();
+            s.panic();
+            if let Ok(mut pl) = slot.plugin.try_lock() {
+                let _ = pl.set_playing(false);
+            }
+        }
         self.finish_record();
+    }
+
+    /// (bpm, sig_num, sig_den) of the document's head — the transport state
+    /// a hosted plugin should see.
+    fn transport_hints(&self) -> (f64, i32, i32) {
+        self.doc(|d| {
+            let bpm = d
+                .tempo_map
+                .points()
+                .first()
+                .map(|(_, mpq, _)| 60_000_000.0 / (*mpq).max(1) as f64)
+                .unwrap_or(120.0);
+            let mut sig = (4i32, 4i32);
+            'find: for tr in &d.tracks {
+                for e in &tr.events {
+                    if let EventKind::Meta { meta_type: 0x58, data } = &e.kind {
+                        if data.len() >= 2 {
+                            sig = (data[0] as i32, 1i32 << (data[1] & 0x1f));
+                            break 'find;
+                        }
+                    }
+                }
+            }
+            (bpm, sig.0, sig.1)
+        })
     }
 
     /// Arm/disarm live capture from the first MIDI input port onto the
@@ -1562,6 +1702,12 @@ impl EditorView {
         if let Some(mut pw) = self.plugin_window.take() {
             pw.close();
         }
+        self.editor_plugin = None;
+        // dest indices were just remapped — every slot is stale
+        self.plugin_slots.clear();
+        self.plugin_loading.clear();
+        let _ = self.plugin_req.send(output::PluginReq::Clear);
+        self.refresh_plugins();
         let ns = n.to_string();
         self.status = tf("status.rescan", &[("n", ns.as_str())]).into();
     }
@@ -1574,28 +1720,65 @@ impl EditorView {
     fn open_plugin_gui(&mut self) {
         if let Some(mut pw) = self.plugin_window.take() {
             pw.close();
+            self.sync_editor_state_into_slot();
+            self.editor_plugin = None;
             return;
         }
-        let path = {
+        let (d, path) = {
             let sh = self.shared.lock().unwrap();
             let d = sh.dest_of(self.sel_track);
-            sh.dests.get(d).and_then(|(_, dd)| match dd {
+            let p = sh.dests.get(d).and_then(|(_, dd)| match dd {
                 output::Destination::Plugin { plugin_path } => {
                     Some(PathBuf::from(plugin_path))
                 }
                 _ => None,
-            })
+            });
+            (d, p)
         };
         let Some(path) = path else { return };
         match output::load_for_gui(&path) {
             Ok(a) => {
-                let mut pw = vst3_host::PluginWindow::new(a);
+                // adopt the live state of the playing instance so the editor
+                // shows what's actually being heard
+                if let Some(slot) = self
+                    .plugin_slots
+                    .get(&d)
+                    .filter(|s| s.path == path)
+                {
+                    let state = slot.plugin.lock().ok().and_then(|p| p.save_state().ok());
+                    if let Some(data) = state {
+                        if let Ok(mut e) = a.lock() {
+                            let _ = e.load_state(&data);
+                        }
+                    }
+                }
+                let mut pw = vst3_host::PluginWindow::new(a.clone());
                 match pw.open() {
-                    Ok(()) => self.plugin_window = Some(pw),
+                    Ok(()) => {
+                        self.plugin_window = Some(pw);
+                        self.editor_plugin = Some((d, a));
+                    }
                     Err(e) => self.status = format!("plugin GUI: {e}").into(),
                 }
             }
             Err(_) => self.status = "plugin load failed".into(),
+        }
+    }
+
+    /// Push the in-process editor's full state into the playing instance —
+    /// covers program/bank changes parameter-edit draining can't see.
+    fn sync_editor_state_into_slot(&mut self) {
+        let Some((d, editor)) = self.editor_plugin.take() else {
+            return;
+        };
+        let Some(slot) = self.plugin_slots.get(&d) else {
+            return;
+        };
+        let data = editor.lock().ok().and_then(|e| e.save_state().ok());
+        if let Some(data) = data {
+            if let Ok(mut p) = slot.plugin.lock() {
+                let _ = p.load_state(&data);
+            }
         }
     }
 
@@ -1828,6 +2011,8 @@ impl EditorView {
         if let Some(i) = p.snap {
             self.snap_idx = i.min(SNAPS.len() - 1);
         }
+        // start warming any VST3 destinations the prefs just restored
+        self.refresh_plugins();
     }
 
     /// MRU update + persist to the app-wide prefs file.
@@ -1994,10 +2179,13 @@ fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
                             _ => {}
                         }
                     }
+                    v.poll_plugin_events();
                     if dirty {
                         v.refresh_derived();
-                        // cover routing changes that came from MCP tools
+                        // cover routing changes that came from MCP tools —
+                        // also warms any newly-assigned VST3 destination
                         v.persist();
+                        v.refresh_plugins();
                     }
                     // repaint while playing so the playhead/counter advance;
                     // also while a plugin editor is open so its native event
@@ -2006,8 +2194,28 @@ fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
                     // platform events get pumped and user-close is noticed
                     if let Some(pw) = &v.plugin_window {
                         let _ = pw.service_platform_events();
+                        // live param sync: forward the editor's edits into
+                        // the playing instance (best-effort each tick)
+                        if let Some((d, editor)) = &v.editor_plugin {
+                            let edits = editor
+                                .lock()
+                                .map(|mut e| e.take_parameter_edits())
+                                .unwrap_or_default();
+                            if !edits.is_empty() {
+                                if let Some(slot) = v.plugin_slots.get(d) {
+                                    if let Ok(mut p) = slot.plugin.try_lock() {
+                                        for ed in edits {
+                                            if let Some(val) = ed.value {
+                                                let _ = p.set_parameter(ed.id, val);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if pw.closed_by_user() {
                             v.plugin_window = None;
+                            v.sync_editor_state_into_slot();
                         }
                     }
                     if dirty || v.playback.is_some() || v.plugin_window.is_some() {

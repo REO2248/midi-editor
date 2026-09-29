@@ -202,6 +202,75 @@ pub fn load_for_gui(
     Ok(std::sync::Arc::new(std::sync::Mutex::new(plugin)))
 }
 
+/// Send-safe handle to a plugin instance living on the host worker thread.
+/// `PluginOutput` owns the audio stream and is deliberately not `Send`, so it
+/// stays on the worker; the app keeps this handle — the sink (lock-free MIDI
+/// queue), the shared plugin proxy (parameter/state control plane), and the
+/// bundle path — all `Send` — and the plugin keeps running between plays.
+pub struct PluginSlot {
+    /// lock-free event sink; cheap to clone into each playback run
+    pub sink: PluginSink,
+    /// shared plugin instance — `set_parameter`/`save_state`/`load_state`/
+    /// `set_playing`/`set_tempo` all route into the isolated helper
+    pub plugin: std::sync::Arc<std::sync::Mutex<vst3_host::Plugin>>,
+    /// the .vst3 bundle this instance was loaded from (guards against stale
+    /// slots after a destination re-point or rescan)
+    pub path: std::path::PathBuf,
+}
+
+/// Work requests for the plugin host worker thread.
+pub enum PluginReq {
+    /// load+start audio for dest index `usize`; result arrives on the event channel
+    Open(usize, std::path::PathBuf),
+    /// unload the instance for a dest index (dest re-pointed/rescan)
+    Drop(usize),
+    /// drop every instance (rescan rebuilt the catalog)
+    Clear,
+    /// worker exits; instances unload with it
+    Shutdown,
+}
+
+/// Spawn the plugin host thread. It owns every `PluginOutput` (their
+/// `AudioHandle`s are not `Send`); the app talks to it through the request
+/// channel and receives `PluginSlot` handles on the returned receiver.
+/// Requests are processed in order; `Open` replies carry `(dest, result)`.
+pub fn spawn_plugin_host() -> (
+    std::sync::mpsc::Sender<PluginReq>,
+    std::sync::mpsc::Receiver<(usize, Result<PluginSlot, String>)>,
+) {
+    let (req_tx, req_rx) = std::sync::mpsc::channel::<PluginReq>();
+    let (evt_tx, evt_rx) = std::sync::mpsc::channel::<(usize, Result<PluginSlot, String>)>();
+    std::thread::spawn(move || {
+        let mut owned: std::collections::HashMap<usize, PluginOutput> =
+            std::collections::HashMap::new();
+        while let Ok(req) = req_rx.recv() {
+            match req {
+                PluginReq::Open(d, path) => match PluginOutput::open(&path) {
+                    Ok(p) => {
+                        let slot = PluginSlot {
+                            sink: p.event_sink(),
+                            plugin: p.plugin_handle(),
+                            path,
+                        };
+                        owned.insert(d, p);
+                        let _ = evt_tx.send((d, Ok(slot)));
+                    }
+                    Err(e) => {
+                        let _ = evt_tx.send((d, Err(e.to_string())));
+                    }
+                },
+                PluginReq::Drop(d) => {
+                    owned.remove(&d);
+                }
+                PluginReq::Clear => owned.clear(),
+                PluginReq::Shutdown => break,
+            }
+        }
+    });
+    (req_tx, evt_rx)
+}
+
+#[derive(Clone)]
 pub struct PluginSink {
     sink: vst3_host::MidiSink,
     lead_us: u64,

@@ -1776,6 +1776,7 @@ impl Render for EditorView {
                                     sh.default_dest = i;
                                     drop(sh);
                                     v.persist();
+                                    v.ensure_plugin(i);
                                 },
                             )
                             .into_any_element()
@@ -1795,6 +1796,7 @@ impl Render for EditorView {
                                 move |v, _e, _cx| {
                                     v.shared.lock().unwrap().default_dest = i;
                                     v.persist();
+                                    v.ensure_plugin(i);
                                 },
                             )
                             .into_any_element()
