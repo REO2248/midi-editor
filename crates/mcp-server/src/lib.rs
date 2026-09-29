@@ -57,6 +57,9 @@ pub struct Shared {
     pub soloed: HashSet<usize>,
     pub metronome: bool,
     pub loop_enabled: bool,
+    /// opt-in: also chase the last complete SysEx message on play/loop wrap
+    /// (a chased GM/GS/XG reset can wipe the channel-state chase)
+    pub chase_sysex: bool,
     /// drained by the GUI watcher
     pub transport_req: Vec<TransportReq>,
 }
@@ -78,6 +81,7 @@ impl Shared {
             soloed: HashSet::new(),
             metronome: false,
             loop_enabled: false,
+            chase_sysex: false,
             transport_req: Vec::new(),
         }
     }

@@ -442,6 +442,257 @@ impl Document {
             .collect()
     }
 
+    /// Complete SysEx messages in wire form (`F0 … F7`) as
+    /// `(µs, track, bytes)`, timestamped at the FIRST fragment. SMF allows a
+    /// message to be split: an `F0` packet followed by further `F7` escape
+    /// packets, with only the last one ending in `F7`; other events may be
+    /// interleaved between the fragments. A message still open when a new
+    /// `F0` starts (or at end of track) is closed by appending `F7`.
+    /// Standalone `F7` escapes are arbitrary non-MIDI bytes and never start
+    /// or join a message — they are never emitted.
+    pub fn timeline_sysex(&self) -> Vec<(u64, usize, Vec<u8>)> {
+        self.sysex_wire()
+            .into_iter()
+            .map(|(us, ti, b, _)| (us, ti, b))
+            .collect()
+    }
+
+    /// The last SysEx message per track that the file itself terminated
+    /// before `start_us`, retimed to `start_us`. This is the opt-in half of
+    /// the chase: a chased GM/GS/XG reset would wipe the channel state
+    /// `chase_events` just restored, so the caller gates it behind a
+    /// preference (as Logic/Cubase do). Messages we closed by appending `F7`
+    /// (abandoned by a new `F0` or end of track) are skipped — re-sending a
+    /// truncated dump would only confuse the device.
+    pub fn chase_sysex(&self, start_us: u64) -> Vec<(u64, usize, Vec<u8>)> {
+        let mut last: HashMap<usize, Vec<u8>> = HashMap::new();
+        for (us, ti, b, terminated) in self.sysex_wire() {
+            if terminated && us < start_us {
+                last.insert(ti, b);
+            }
+        }
+        let mut tis: Vec<usize> = last.keys().copied().collect();
+        tis.sort_unstable();
+        tis.into_iter()
+            .map(|ti| (start_us, ti, last.remove(&ti).unwrap()))
+            .collect()
+    }
+
+    /// `(µs, track, wire bytes, terminated-in-file)` — the shared joining
+    /// walk behind `timeline_sysex` and `chase_sysex`.
+    fn sysex_wire(&self) -> Vec<(u64, usize, Vec<u8>, bool)> {
+        let mut out = Vec::new();
+        for (ti, t) in self.tracks.iter().enumerate() {
+            let mut open: Option<(u64, Vec<u8>)> = None;
+            for e in &t.events {
+                match &e.kind {
+                    EventKind::SysEx(p) => {
+                        if let Some((us, mut b)) = open.take() {
+                            b.push(0xF7);
+                            out.push((us, ti, b, false));
+                        }
+                        let us = self.tempo_map.tick_to_us(e.tick);
+                        let mut b = Vec::with_capacity(p.len() + 2);
+                        b.push(0xF0);
+                        b.extend_from_slice(p);
+                        if p.last() == Some(&0xF7) {
+                            out.push((us, ti, b, true));
+                        } else {
+                            open = Some((us, b));
+                        }
+                    }
+                    EventKind::Escape(p) => {
+                        if open.is_some() {
+                            let completes = p.last() == Some(&0xF7);
+                            open.as_mut().unwrap().1.extend_from_slice(p);
+                            if completes {
+                                let (us, b) = open.take().unwrap();
+                                out.push((us, ti, b, true));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some((us, mut b)) = open {
+                b.push(0xF7);
+                out.push((us, ti, b, false));
+            }
+        }
+        out.sort_by_key(|(us, _, _, _)| *us);
+        out
+    }
+
+    /// Chase events for starting playback at `start_us`: everything a synth
+    /// needs to be in the state it would have reached by playing the timeline
+    /// from the beginning. All output carries `us = start_us`; the caller
+    /// inserts them at the schedule's seek point so they fire just before the
+    /// first real event at/after the position (loop wraps re-send them the
+    /// same way). Per (track, channel):
+    ///
+    /// - bank MSB/LSB, then program change (bank must precede PC)
+    /// - last value of each CC 0-119 except the channel-mode range; CC64
+    ///   (sustain) lands before the note restrikes below
+    /// - the last RPN/NRPN selector followed by data entry (CC 6/38) — data
+    ///   before the selector would hit the synth's stale cursor
+    /// - pitch bend, channel aftertouch, poly aftertouch
+    /// - note-ons of notes still sounding at `start_us` (their real note-offs
+    ///   are already in the future part of the timeline — never re-sent)
+    /// - notes released earlier but caught by a held pedal: re-struck as
+    ///   note-on + note-off pairs AFTER CC64 so the pedal catches them
+    ///
+    /// Channel-mode messages in the prefix model what the receiver did:
+    /// CC120 drops all sounding notes, CC123/124-127 act as note-offs (a
+    /// held pedal still catches), CC121 clears controller state
+    /// (bank/program survive per RP-015). SysEx is not part of this channel
+    /// chase — see `chase_sysex` for the opt-in message chase.
+    pub fn chase_events(&self, start_us: u64) -> Vec<(u64, usize, Vec<u8>)> {
+        let mut out = Vec::new();
+        for (ti, t) in self.tracks.iter().enumerate() {
+            let mut chans: HashMap<u8, ChaseState> = HashMap::new();
+            for e in &t.events {
+                if self.tempo_map.tick_to_us(e.tick) >= start_us {
+                    break; // events sorted by (tick, seq); tick_to_us is monotonic
+                }
+                let EventKind::Channel { status, data, .. } = &e.kind else {
+                    continue;
+                };
+                let ch = status & 0x0F;
+                let st = chans.entry(ch).or_default();
+                match (status & 0xF0, data[0], data[1]) {
+                    (0x90, key, v) if v > 0 => st.pending[key as usize].push(v),
+                    (0x80, key, _) | (0x90, key, _) => {
+                        // LIFO pairing, same as the notes() view
+                        if let Some(vel) = st.pending[key as usize].pop() {
+                            if st.pedal_down {
+                                st.sustained.push((key, vel));
+                            }
+                        }
+                    }
+                    (0xB0, ctl, v) => match ctl {
+                        0 => st.bank_msb = Some(v),
+                        32 => st.bank_lsb = Some(v),
+                        6 => st.data_msb = Some(v),
+                        38 => st.data_lsb = Some(v),
+                        98 | 99 => {
+                            st.sel_seen = true;
+                            st.sel_nrpn = true;
+                            st.sel_vals[(ctl - 98) as usize] = v;
+                        }
+                        100 | 101 => {
+                            st.sel_seen = true;
+                            st.sel_nrpn = false;
+                            st.sel_vals[(ctl - 98) as usize] = v;
+                        }
+                        64 => {
+                            st.pedal_down = v >= 64;
+                            st.cc[64] = Some(v);
+                            if !st.pedal_down {
+                                st.sustained.clear();
+                            }
+                        }
+                        120 => {
+                            st.pending.iter_mut().for_each(|s| s.clear());
+                            st.sustained.clear();
+                        }
+                        121 => {
+                            // RP-015: controllers to default; bank/program survive
+                            st.cc = std::array::from_fn(|_| None);
+                            st.data_msb = None;
+                            st.data_lsb = None;
+                            st.sel_seen = false;
+                            st.sel_nrpn = false;
+                            st.sel_vals = [0; 4];
+                            st.bend = None;
+                            st.pressure = None;
+                            st.poly = std::array::from_fn(|_| None);
+                            st.pedal_down = false;
+                            st.sustained.clear();
+                        }
+                        123 | 124..=127 => {
+                            // all-notes-off semantics; hold pedal still catches
+                            if st.pedal_down {
+                                for (key, stack) in st.pending.iter_mut().enumerate() {
+                                    for vel in stack.drain(..) {
+                                        st.sustained.push((key as u8, vel));
+                                    }
+                                }
+                            } else {
+                                st.pending.iter_mut().for_each(|s| s.clear());
+                            }
+                        }
+                        _ if ctl < 120 => st.cc[ctl as usize] = Some(v),
+                        _ => {}
+                    },
+                    (0xC0, prog, _) => st.prog = Some(prog),
+                    (0xD0, press, _) => st.pressure = Some(press),
+                    (0xE0, lsb, msb) => st.bend = Some([lsb, msb]),
+                    (0xA0, key, v) => st.poly[key as usize] = Some(v),
+                    _ => {}
+                }
+            }
+            // emit per channel, ascending, in the documented order
+            let mut ch_list: Vec<u8> = chans.keys().copied().collect();
+            ch_list.sort_unstable();
+            macro_rules! push {
+                ($bytes:expr) => {
+                    out.push((start_us, ti, $bytes.to_vec()))
+                };
+            }
+            for ch in ch_list {
+                let st = &chans[&ch];
+                if let Some(v) = st.bank_msb {
+                    push!([0xB0 | ch, 0, v]);
+                }
+                if let Some(v) = st.bank_lsb {
+                    push!([0xB0 | ch, 32, v]);
+                }
+                if let Some(p) = st.prog {
+                    push!([0xC0 | ch, p]);
+                }
+                // bank (0/32) and data entry (6/38) live in dedicated fields,
+                // so this only ever holds plain CC 1-119 (incl. 64 sustain)
+                for (ctl, v) in st.cc.iter().enumerate() {
+                    if let Some(v) = v {
+                        push!([0xB0 | ch, ctl as u8, *v]);
+                    }
+                }
+                if st.sel_seen {
+                    let (msb, lsb) = if st.sel_nrpn { (99u8, 98u8) } else { (101, 100) };
+                    push!([0xB0 | ch, msb, st.sel_vals[(msb - 98) as usize]]);
+                    push!([0xB0 | ch, lsb, st.sel_vals[(lsb - 98) as usize]]);
+                    if let Some(v) = st.data_msb {
+                        push!([0xB0 | ch, 6, v]);
+                    }
+                    if let Some(v) = st.data_lsb {
+                        push!([0xB0 | ch, 38, v]);
+                    }
+                }
+                if let Some([lsb, msb]) = st.bend {
+                    push!([0xE0 | ch, lsb, msb]);
+                }
+                if let Some(v) = st.pressure {
+                    push!([0xD0 | ch, v]);
+                }
+                for (key, v) in st.poly.iter().enumerate() {
+                    if let Some(v) = v {
+                        push!([0xA0 | ch, key as u8, *v]);
+                    }
+                }
+                for (key, stack) in st.pending.iter().enumerate() {
+                    for vel in stack {
+                        push!([0x90 | ch, key as u8, *vel]);
+                    }
+                }
+                for &(key, vel) in &st.sustained {
+                    push!([0x90 | ch, key, vel]);
+                    push!([0x80 | ch, key, 0]);
+                }
+            }
+        }
+        out
+    }
+
     pub fn serialize(&self, opts: smf_core::WriteOptions) -> Vec<u8> {
         let tracks: Vec<smf_core::Track> = self
             .tracks
@@ -561,6 +812,55 @@ pub struct Note {
     pub end_tick: Option<u64>,
     pub on_id: EventId,
     pub off_id: Option<EventId>,
+}
+
+/// Per-(track, channel) state reconstructed by `Document::chase_events` while
+/// scanning the prefix before the play position. `None` = never set (or reset
+/// by CC121) → nothing is emitted for that slot.
+#[derive(Debug)]
+struct ChaseState {
+    /// plain CC 1-119 values (bank 0/32 and data entry 6/38 live separately)
+    cc: [Option<u8>; 128],
+    bank_msb: Option<u8>,
+    bank_lsb: Option<u8>,
+    prog: Option<u8>,
+    data_msb: Option<u8>,
+    data_lsb: Option<u8>,
+    /// any RPN/NRPN selector seen; NRPN vs RPN is whichever group wrote last
+    sel_seen: bool,
+    sel_nrpn: bool,
+    /// CC98, CC99, CC100, CC101 values by `cc - 98`
+    sel_vals: [u8; 4],
+    bend: Option<[u8; 2]>,
+    pressure: Option<u8>,
+    poly: [Option<u8>; 128],
+    pedal_down: bool,
+    /// note-ons still held (key → stack of velocities, LIFO pairing)
+    pending: [Vec<u8>; 128],
+    /// notes already note-off'd but still ringing under the pedal
+    sustained: Vec<(u8, u8)>,
+}
+
+impl Default for ChaseState {
+    fn default() -> Self {
+        Self {
+            cc: std::array::from_fn(|_| None),
+            poly: std::array::from_fn(|_| None),
+            pending: std::array::from_fn(|_| Vec::new()),
+            sel_vals: [0; 4],
+            bank_msb: None,
+            bank_lsb: None,
+            prog: None,
+            data_msb: None,
+            data_lsb: None,
+            sel_seen: false,
+            sel_nrpn: false,
+            bend: None,
+            pressure: None,
+            pedal_down: false,
+            sustained: Vec::new(),
+        }
+    }
 }
 
 impl Document {
@@ -1534,5 +1834,284 @@ mod tests {
         // 120bpm default, 480ppq: tick 480 -> 500000us
         let d = doc_with_note();
         assert_eq!(d.tempo_map.tick_to_us(480), 500_000);
+    }
+
+    // ---- chase_events ----
+
+    fn chase_doc(events: Vec<smf_core::Event>) -> Document {
+        let f = smf_core::File {
+            format: 1,
+            division: Division::Metrical(480),
+            tracks: vec![smf_core::Track { events }],
+            warnings: vec![],
+        };
+        Document::from_file(f)
+    }
+
+    fn ev(tick: u64, status: u8, d0: u8, d1: u8) -> smf_core::Event {
+        smf_core::Event {
+            tick,
+            seq: 0,
+            raw_body: None,
+            kind: EventKind::Channel {
+                status,
+                data: [d0, d1],
+                len: 2,
+            },
+        }
+    }
+
+    fn bytes_of(chase: &[(u64, usize, Vec<u8>)]) -> Vec<Vec<u8>> {
+        chase.iter().map(|(_, _, b)| b.clone()).collect()
+    }
+
+    #[test]
+    fn chase_at_zero_is_empty() {
+        let d = chase_doc(vec![ev(0, 0x90, 60, 100)]);
+        assert!(d.chase_events(0).is_empty());
+    }
+
+    #[test]
+    fn chase_full_state_held_and_sustained_notes() {
+        let d = chase_doc(vec![
+            ev(0, 0xB0, 0, 1),     // bank MSB
+            ev(1, 0xB0, 32, 2),    // bank LSB
+            ev(2, 0xC0, 5, 0),     // program 5
+            ev(10, 0xB0, 7, 100),  // volume
+            ev(20, 0xB0, 7, 90),   // later volume wins
+            ev(30, 0xE0, 3, 64),   // pitch bend
+            ev(15, 0xA0, 60, 40),  // poly AT
+            ev(16, 0xD0, 55, 0),   // channel AT
+            ev(40, 0xB0, 64, 127), // pedal down
+            ev(100, 0x90, 60, 100),
+            ev(200, 0x90, 64, 80),
+            ev(300, 0x80, 60, 0), // 60 released under pedal -> sustained
+            ev(500, 0x90, 72, 70), // still held at the chase point
+        ]);
+        let chase = d.chase_events(d.tempo_map.tick_to_us(720));
+        assert!(chase.iter().all(|&(us, tr, _)| us == d.tempo_map.tick_to_us(720) && tr == 0));
+        assert_eq!(
+            bytes_of(&chase),
+            vec![
+                vec![0xB0, 0, 1],    // bank MSB before PC
+                vec![0xB0, 32, 2],   // bank LSB
+                vec![0xC0, 5],       // program
+                vec![0xB0, 7, 90],   // CC last value
+                vec![0xB0, 64, 127], // pedal down before the pairs below
+                vec![0xE0, 3, 64],   // bend
+                vec![0xD0, 55],      // channel AT
+                vec![0xA0, 60, 40],  // poly AT
+                vec![0x90, 64, 80],  // held notes (ascending key)
+                vec![0x90, 72, 70],
+                vec![0x90, 60, 100], // sustained note re-struck on+off
+                vec![0x80, 60, 0],
+            ]
+        );
+    }
+
+    #[test]
+    fn chase_pedal_up_clears_sustained() {
+        let d = chase_doc(vec![
+            ev(40, 0xB0, 64, 127),
+            ev(100, 0x90, 60, 100),
+            ev(200, 0x80, 60, 0),
+            ev(600, 0xB0, 64, 0),
+        ]);
+        let chase = d.chase_events(d.tempo_map.tick_to_us(720));
+        assert_eq!(bytes_of(&chase), vec![vec![0xB0, 64, 0]]);
+    }
+
+    #[test]
+    fn chase_cc121_clears_controllers_but_not_bank_program() {
+        let d = chase_doc(vec![
+            ev(0, 0xB0, 0, 1),
+            ev(1, 0xB0, 32, 2),
+            ev(2, 0xC0, 5, 0),
+            ev(10, 0xB0, 7, 90),
+            ev(30, 0xE0, 3, 64),
+            ev(600, 0xB0, 121, 0), // reset all controllers
+        ]);
+        let chase = d.chase_events(d.tempo_map.tick_to_us(720));
+        assert_eq!(
+            bytes_of(&chase),
+            vec![vec![0xB0, 0, 1], vec![0xB0, 32, 2], vec![0xC0, 5]]
+        );
+    }
+
+    #[test]
+    fn chase_mode_messages_drop_notes_and_are_not_chased() {
+        // all-notes-off releases held notes (no pedal): nothing to restrike
+        let d = chase_doc(vec![
+            ev(100, 0x90, 60, 100),
+            ev(600, 0xB0, 123, 0),
+        ]);
+        assert!(d.chase_events(d.tempo_map.tick_to_us(720)).is_empty());
+        // all-sound-off kills even pedal-caught notes
+        let d = chase_doc(vec![
+            ev(10, 0xB0, 64, 127),
+            ev(100, 0x90, 60, 100),
+            ev(200, 0x80, 60, 0),
+            ev(600, 0xB0, 120, 0),
+        ]);
+        assert_eq!(
+            bytes_of(&d.chase_events(d.tempo_map.tick_to_us(720))),
+            vec![vec![0xB0, 64, 127]]
+        );
+    }
+
+    #[test]
+    fn chase_rpn_nrpn_selector_then_data() {
+        let d = chase_doc(vec![
+            ev(10, 0xB0, 101, 0), // RPN 0,0 (pitch bend sensitivity)
+            ev(11, 0xB0, 100, 0),
+            ev(12, 0xB0, 6, 2),   // data MSB
+            ev(20, 0xB0, 99, 1),  // switch to NRPN 1,3
+            ev(21, 0xB0, 98, 3),
+            ev(22, 0xB0, 38, 5),  // data LSB
+        ]);
+        assert_eq!(
+            bytes_of(&d.chase_events(d.tempo_map.tick_to_us(720))),
+            vec![
+                vec![0xB0, 99, 1], // NRPN msb first, then lsb...
+                vec![0xB0, 98, 3],
+                vec![0xB0, 6, 2], // ...then data entry
+                vec![0xB0, 38, 5],
+            ]
+        );
+        // all-zero RPN (the common case) must still be chased
+        let d = chase_doc(vec![ev(10, 0xB0, 101, 0), ev(11, 0xB0, 100, 0)]);
+        assert_eq!(
+            bytes_of(&d.chase_events(d.tempo_map.tick_to_us(720))),
+            vec![vec![0xB0, 101, 0], vec![0xB0, 100, 0]]
+        );
+    }
+
+    #[test]
+    fn chase_excludes_events_at_the_play_position() {
+        let d = chase_doc(vec![
+            ev(10, 0xB0, 7, 100),
+            ev(30, 0xE0, 3, 64), // exactly at the start: plays as a real event
+        ]);
+        let start = d.tempo_map.tick_to_us(30);
+        let chase = d.chase_events(start);
+        assert_eq!(bytes_of(&chase), vec![vec![0xB0, 7, 100]]);
+    }
+
+    #[test]
+    fn chase_is_per_track() {
+        let f = smf_core::File {
+            format: 1,
+            division: Division::Metrical(480),
+            tracks: vec![
+                smf_core::Track { events: vec![ev(10, 0xB0, 7, 10)] },
+                smf_core::Track { events: vec![ev(10, 0xB0, 7, 20)] },
+            ],
+            warnings: vec![],
+        };
+        let d = Document::from_file(f);
+        let chase = d.chase_events(d.tempo_map.tick_to_us(720));
+        assert_eq!(
+            chase,
+            vec![
+                (d.tempo_map.tick_to_us(720), 0, vec![0xB0, 7, 10]),
+                (d.tempo_map.tick_to_us(720), 1, vec![0xB0, 7, 20]),
+            ]
+        );
+    }
+
+    #[test]
+    fn chase_dangling_noteon_is_held() {
+        let d = chase_doc(vec![ev(100, 0x91, 64, 90)]);
+        assert_eq!(
+            bytes_of(&d.chase_events(d.tempo_map.tick_to_us(720))),
+            vec![vec![0x91, 64, 90]]
+        );
+    }
+
+    // ---- SysEx timeline / chase ----
+
+    fn sx(tick: u64, payload: &[u8]) -> smf_core::Event {
+        smf_core::Event {
+            tick,
+            seq: 0,
+            raw_body: None,
+            kind: EventKind::SysEx(Bytes::copy_from_slice(payload)),
+        }
+    }
+
+    fn esc(tick: u64, payload: &[u8]) -> smf_core::Event {
+        smf_core::Event {
+            tick,
+            seq: 0,
+            raw_body: None,
+            kind: EventKind::Escape(Bytes::copy_from_slice(payload)),
+        }
+    }
+
+    #[test]
+    fn sysex_complete_and_split_messages_join() {
+        // one complete message + one split across an F0 and two F7 escapes,
+        // with a channel event interleaved between the fragments
+        let d = chase_doc(vec![
+            sx(0, &[0x7E, 0x7F, 0x09, 0x01, 0xF7]), // GM system on
+            sx(100, &[0x41, 0x10, 0x42]),           // split head, no F7
+            ev(110, 0x90, 60, 100),                 // interleaved event
+            esc(120, &[0x12, 0x40]),                // continuation
+            esc(130, &[0x00, 0xF7]),                // final fragment
+        ]);
+        let t0 = d.tempo_map.tick_to_us(0);
+        let t100 = d.tempo_map.tick_to_us(100);
+        assert_eq!(
+            d.timeline_sysex(),
+            vec![
+                (t0, 0, vec![0xF0, 0x7E, 0x7F, 0x09, 0x01, 0xF7]),
+                (
+                    t100,
+                    0,
+                    vec![0xF0, 0x41, 0x10, 0x42, 0x12, 0x40, 0x00, 0xF7]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn sysex_standalone_escapes_and_open_messages() {
+        // standalone escapes carry arbitrary bytes — never sent
+        let d = chase_doc(vec![
+            esc(10, &[0x01, 0x02]),
+            sx(20, &[0x7E, 0x7F]), // never terminated
+            sx(30, &[0x7E, 0x7F, 0x09, 0x01, 0xF7]), // new F0 closes it
+        ]);
+        let t20 = d.tempo_map.tick_to_us(20);
+        let t30 = d.tempo_map.tick_to_us(30);
+        assert_eq!(
+            d.timeline_sysex(),
+            vec![
+                (t20, 0, vec![0xF0, 0x7E, 0x7F, 0xF7]), // closed with F7
+                (t30, 0, vec![0xF0, 0x7E, 0x7F, 0x09, 0x01, 0xF7]),
+            ]
+        );
+        // open at end of track is closed too
+        let d = chase_doc(vec![sx(20, &[0x41, 0x10])]);
+        assert_eq!(
+            d.timeline_sysex(),
+            vec![(d.tempo_map.tick_to_us(20), 0, vec![0xF0, 0x41, 0x10, 0xF7])]
+        );
+    }
+
+    #[test]
+    fn chase_sysex_picks_last_complete_per_track() {
+        let d = chase_doc(vec![
+            sx(0, &[0x7E, 0x7F, 0x09, 0x01, 0xF7]), // GM on
+            sx(100, &[0x41, 0x10, 0x12, 0x00, 0xF7]), // later message wins
+            sx(200, &[0x41, 0x10, 0x40]), // incomplete at the boundary: skipped
+        ]);
+        let start = d.tempo_map.tick_to_us(720);
+        assert_eq!(
+            d.chase_sysex(start),
+            vec![(start, 0, vec![0xF0, 0x41, 0x10, 0x12, 0x00, 0xF7])]
+        );
+        // before any message: nothing
+        assert!(d.chase_sysex(d.tempo_map.tick_to_us(0)).is_empty());
     }
 }

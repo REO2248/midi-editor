@@ -247,6 +247,7 @@ impl PluginOutput {
     pub fn event_sink(&self) -> PluginSink {
         PluginSink {
             sink: self.sink.clone(),
+            plugin: Some(self._handle.plugin()),
             lead_us: (512.0 / self.us_to_samples) as u64,
             us_to_samples: self.us_to_samples,
         }
@@ -376,6 +377,9 @@ pub fn spawn_plugin_host() -> (
 #[derive(Clone)]
 pub struct PluginSink {
     sink: vst3_host::MidiSink,
+    /// control-plane handle for SysEx, which the lock-free `MidiEvent` queue
+    /// cannot carry. `None` = SysEx is dropped (legacy construction).
+    plugin: Option<std::sync::Arc<std::sync::Mutex<vst3_host::Plugin>>>,
     lead_us: u64,
     us_to_samples: f64,
 }
@@ -385,8 +389,22 @@ impl midi_io::EventSink for PluginSink {
         self.lead_us
     }
     fn send_at(&mut self, bytes: &[u8], rem_us: u64) {
+        let offset = (rem_us as f64 * self.us_to_samples) as i32;
+        if bytes.first() == Some(&0xF0) {
+            // SysEx rides the owned-event path; the lock serializes against
+            // audio blocks (bounded by one block) instead of the event ring
+            let Some(plugin) = self.plugin.as_ref() else {
+                return;
+            };
+            let mut p = plugin
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Err(e) = p.send_sysex_at(bytes.to_vec(), offset) {
+                tracing::warn!("plugin sysex rejected: {e}");
+            }
+            return;
+        }
         if let Some(ev) = channel_event(bytes) {
-            let offset = (rem_us as f64 * self.us_to_samples) as i32;
             self.sink.send_midi_at(ev, offset);
         }
     }

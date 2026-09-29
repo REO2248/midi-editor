@@ -191,6 +191,14 @@ pub trait EventSink: Send {
     fn send_at(&mut self, bytes: &[u8], rem_us: u64);
     /// All-notes-off / reset — called on stop and at end of timeline.
     fn panic(&mut self);
+    /// Release sounding notes without the full reset: All Notes Off on every
+    /// channel, leaving controller state and release tails intact. Called at
+    /// loop boundaries, where chased state follows immediately.
+    fn notes_off(&mut self) {
+        for ch in 0u8..16 {
+            self.send_at(&[0xB0 | ch, 123, 0], 0);
+        }
+    }
 }
 
 /// `EventSink` over a `MidiOutputConnection`.
@@ -246,11 +254,14 @@ fn set_timer_resolution(_ms: u32) {}
 
 /// Scheduled playback on a dedicated thread.
 ///
-/// The caller snapshots the timeline as `(absolute µs, sink index, channel
-/// event bytes)` triples; the thread sleeps until each deadline and sends
-/// verbatim. Meta and SysEx events never reach a sink — filtering is the
-/// caller's job. `position_us` is updated as the schedule advances so the UI
-/// can draw a playhead.
+/// The caller snapshots the timeline as `(absolute µs, sink index, message
+/// bytes)` triples; the thread sleeps until each deadline and sends verbatim.
+/// Meta events never reach a sink — filtering is the caller's job. SysEx
+/// reaches sinks as complete `F0 … F7` wire messages; the caller joins SMF
+/// split packets, and a port send blocks until the transmission finishes
+/// (WinMM serializes long messages), which delays later events on that sink.
+/// `position_us` is updated as the schedule advances so the UI can draw a
+/// playhead.
 pub struct Playback {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     position_us: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -311,8 +322,11 @@ impl Playback {
                         .as_micros() as u64;
                     sink.send_at(bytes, rem);
                 }
+                // loop wrap: release notes but keep tails and controller
+                // state — the schedule restarts with chase events at the
+                // loop point, which re-establish whatever should sound
                 for s in &mut sinks {
-                    s.panic();
+                    s.notes_off();
                 }
                 match loop_from_us {
                     Some(ls) => {
@@ -364,5 +378,64 @@ impl Playback {
 impl Drop for Playback {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct RecordingSink(Arc<Mutex<Vec<Vec<u8>>>>);
+
+    impl EventSink for RecordingSink {
+        fn send_at(&mut self, bytes: &[u8], _rem_us: u64) {
+            self.0.lock().unwrap().push(bytes.to_vec());
+        }
+        fn panic(&mut self) {
+            for ch in 0u8..16 {
+                for ctl in [123u8, 121, 120] {
+                    self.0.lock().unwrap().push(vec![0xB0 | ch, ctl, 0]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn loop_wrap_releases_notes_without_full_reset() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let events = vec![
+            (0u64, 0usize, vec![0x90, 60, 100]),
+            (5_000u64, 0usize, vec![0x80, 60, 0]),
+        ];
+        let mut pb = Playback::start(vec![Box::new(RecordingSink(log.clone()))], events, 0, Some(0));
+        // wait for at least two passes: a wrap happened and the schedule
+        // replayed through it
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let strikes = log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|b| b == &&vec![0x90, 60, 100])
+                .count();
+            if strikes >= 2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "schedule did not replay across the loop boundary"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let snapshot = log.lock().unwrap().clone();
+        pb.stop();
+        // the wrap cleanup is notes-off only; 121/120 belong to a full panic
+        assert!(snapshot
+            .iter()
+            .any(|b| b.len() == 3 && b[0] == 0xB0 && b[1] == 123));
+        assert!(snapshot
+            .iter()
+            .all(|b| !(b.len() == 3 && (b[1] == 121 || b[1] == 120))));
     }
 }

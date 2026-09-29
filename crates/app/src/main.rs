@@ -1840,7 +1840,7 @@ impl EditorView {
 
     fn start_playback(&mut self) {
         // snapshot routing state so no lock is held while opening sinks
-        let (dests, dest_of_track, muted, soloed, metronome, loop_enabled) = {
+        let (dests, dest_of_track, muted, soloed, metronome, loop_enabled, chase_sysex) = {
             let sh = lock_shared(&self.shared);
             let map: HashMap<usize, usize> = (0..sh.doc.tracks.len())
                 .map(|t| (t, sh.dest_of(t)))
@@ -1852,6 +1852,7 @@ impl EditorView {
                 sh.soloed.clone(),
                 sh.metronome,
                 sh.loop_enabled,
+                sh.chase_sysex,
             )
         };
         let dest_of = |t: usize| dest_of_track.get(&t).copied().unwrap_or(0);
@@ -1922,10 +1923,18 @@ impl EditorView {
             self.status = t("status.no_port").into();
             return;
         }
-        let mut events: Vec<(u64, usize, Vec<u8>)> = tagged
+        // SysEx first among same-time events: setup traffic (GM/XG resets,
+        // patch dumps) must land before notes struck at the same instant.
+        // The stable sort below keeps sysex < channel < click at equal µs.
+        let mut events: Vec<(u64, usize, Vec<u8>)> = self
+            .doc(|d| d.timeline_sysex())
             .into_iter()
+            .filter(|(_, tr, _)| audible(*tr))
             .filter_map(|(us, tr, b)| sink_of.get(&dest_of(tr)).map(|&s| (us, s, b)))
             .collect();
+        events.extend(tagged.into_iter().filter_map(|(us, tr, b)| {
+            sink_of.get(&dest_of(tr)).map(|&s| (us, s, b))
+        }));
         if metronome {
             // prefer a plain MIDI port for clicks; fall back to any sink
             let click_sink = dests
@@ -1950,6 +1959,32 @@ impl EditorView {
                 }
                 events.sort_by_key(|e| e.0);
             }
+        }
+        // chase: re-establish the state the timeline had built up before the
+        // play position (CC/program/bend/at, plus notes already sounding) so
+        // mid-song starts and loop wraps sound like a continuous pass. Insert
+        // at the same partition the playback thread seeks with: after every
+        // past event, before the first event at/after the position — so real
+        // events at the exact play time land after (and override) the chase.
+        let start_us = self.play_us;
+        let chase: Vec<(u64, usize, Vec<u8>)> = self
+            .doc(|d| d.chase_events(start_us))
+            .into_iter()
+            .filter(|(_, tr, _)| audible(*tr))
+            .filter_map(|(us, tr, b)| sink_of.get(&dest_of(tr)).map(|&s| (us, s, b)))
+            .collect();
+        let at = events.partition_point(|e| e.0 < start_us);
+        events.splice(at..at, chase);
+        // opt-in SysEx chase, spliced BEFORE the channel chase so a chased
+        // reset cannot wipe the program/CC state the channel chase restores
+        if chase_sysex {
+            let sx: Vec<(u64, usize, Vec<u8>)> = self
+                .doc(|d| d.chase_sysex(start_us))
+                .into_iter()
+                .filter(|(_, tr, _)| audible(*tr))
+                .filter_map(|(us, tr, b)| sink_of.get(&dest_of(tr)).map(|&s| (us, s, b)))
+                .collect();
+            events.splice(at..at, sx);
         }
         self.loop_start_us = self.play_us;
         self.playback = Some(Playback::start(
@@ -2508,6 +2543,8 @@ struct Prefs {
     soloed: Vec<usize>,
     metronome: bool,
     loop_enabled: bool,
+    /// None in old sidecars = keep the default (off)
+    chase_sysex: Option<bool>,
     zoom: Option<f32>,
     scroll_x: Option<f32>,
     scroll_y: Option<f32>,
@@ -2570,6 +2607,9 @@ impl EditorView {
             sh.soloed = p.soloed.into_iter().collect();
             sh.metronome = p.metronome;
             sh.loop_enabled = p.loop_enabled;
+            if let Some(c) = p.chase_sysex {
+                sh.chase_sysex = c;
+            }
         }
         // a hand-edited or corrupted sidecar must not blank the roll: a NaN
         // or non-positive zoom makes every coordinate NaN (nothing paints)
@@ -2654,6 +2694,7 @@ impl EditorView {
             soloed: sh.soloed.iter().copied().collect(),
             metronome: sh.metronome,
             loop_enabled: sh.loop_enabled,
+            chase_sysex: Some(sh.chase_sysex),
             zoom: Some(self.zoom),
             scroll_x: Some(self.scroll_x),
             scroll_y: Some(self.scroll_y),

@@ -57,6 +57,7 @@ impl Render for EditorView {
             def_dest,
             loop_en,
             met_en,
+            chsy_en,
             muted_set,
             soloed_set,
             has_track_dest,
@@ -74,6 +75,7 @@ impl Render for EditorView {
                 sh.default_dest,
                 sh.loop_enabled,
                 sh.metronome,
+                sh.chase_sysex,
                 sh.muted.clone(),
                 sh.soloed.clone(),
                 sh.track_dest.contains_key(&self.sel_track),
@@ -1944,6 +1946,21 @@ impl Render for EditorView {
                             {
                                 let mut sh = crate::lock_shared(&v.shared);
                                 sh.metronome = !sh.metronome;
+                            }
+                            v.persist();
+                        },
+                    )
+                    .into_any_element(),
+                    Self::mi(
+                        "tr.chsy",
+                        t("transport.chase_sysex"),
+                        "",
+                        Some(chsy_en),
+                        cx,
+                        |v, _e, _cx| {
+                            {
+                                let mut sh = crate::lock_shared(&v.shared);
+                                sh.chase_sysex = !sh.chase_sysex;
                             }
                             v.persist();
                         },
