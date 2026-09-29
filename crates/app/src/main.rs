@@ -47,6 +47,30 @@ enum DragMode {
     Duplicate,
 }
 
+/// Menubar dropdown that is currently open.
+#[derive(Clone, Copy, PartialEq)]
+enum TopMenu {
+    File,
+    Edit,
+    View,
+    Track,
+    Transport,
+    Help,
+}
+
+/// Second-level (cascading) menu that is open inside a dropdown.
+#[derive(Clone, Copy, PartialEq)]
+enum Sub {
+    /// Track > Output Channel (16 items)
+    Chan,
+    /// Track > Output Destination (ports + plugins)
+    Dest,
+    /// View > Lane
+    Lane,
+    /// View > Text Encoding
+    Enc,
+}
+
 /// What the bottom lane edits for the selected track.
 #[derive(Clone, Copy, PartialEq)]
 enum LaneMode {
@@ -106,11 +130,11 @@ struct EditorView {
     /// selected note `on_id`s (marquee multi-select)
     selection: BTreeSet<EventId>,
     drag: Option<Drag>,
-    /// canvas bounds as painted last frame â€” for hit-testing
+    /// canvas bounds as painted last frame — for hit-testing
     roll_bounds: Rc<Cell<Bounds<Pixels>>>,
     /// seek-ruler strip bounds
     ruler_bounds: Rc<Cell<Bounds<Pixels>>>,
-    /// velocity lane bounds â€” same trick for the lane's hit-testing
+    /// velocity lane bounds — same trick for the lane's hit-testing
     lane_bounds: Rc<Cell<Bounds<Pixels>>>,
     scroll_x: f32,
     scroll_y: f32,
@@ -134,16 +158,22 @@ struct EditorView {
     lane_mode: LaneMode,
     /// live MIDI input capture while `rec` is armed
     rec: Option<Rec>,
+    /// open menubar dropdown + the x-coordinate it was opened at
+    open_menu: Option<(TopMenu, f32)>,
+    /// open cascading submenu + the y of its parent item
+    open_sub: Option<(Sub, f32)>,
+    /// right-docked event list panel visibility
+    show_events: bool,
     focus: FocusHandle,
     input: Entity<InputState>,
     status: SharedString,
 }
 
-/// Armed recording: timestamps channel messages against the playhead's Âµs base.
+/// Armed recording: timestamps channel messages against the playhead's µs base.
 struct Rec {
     _input: midi_io::Input,
     buf: std::sync::Arc<Mutex<Vec<(u64, Vec<u8>)>>>,
-    /// document time (Âµs) corresponding to Input's t=0
+    /// document time (µs) corresponding to Input's t=0
     base_us: u64,
 }
 
@@ -217,6 +247,9 @@ impl EditorView {
             loop_start_us: 0,
             lane_mode: LaneMode::Velocity,
             rec: None,
+            open_menu: None,
+            open_sub: None,
+            show_events: true,
             focus: cx.focus_handle(),
             input,
             status,
@@ -232,6 +265,65 @@ impl EditorView {
     fn doc<R>(&self, f: impl FnOnce(&Document) -> R) -> R {
         let sh = self.shared.lock().unwrap();
         f(&sh.doc)
+    }
+
+    /// New untitled document in place.
+    fn new_file(&mut self, cx: &mut Context<Self>) {
+        self.stop_playback();
+        {
+            let mut sh = self.shared.lock().unwrap();
+            sh.doc = empty_doc();
+            sh.undo = UndoStack::new(512);
+            sh.path = None;
+            sh.saved_revision = sh.doc.revision();
+            sh.muted.clear();
+            sh.soloed.clear();
+            sh.track_dest.clear();
+        }
+        self.selection.clear();
+        self.sel_track = 0;
+        self.enc_override = None;
+        self.refresh_derived();
+        self.status = "new document".into();
+        cx.notify();
+    }
+
+    /// Select every note in the selected track.
+    fn select_all(&mut self, cx: &mut Context<Self>) {
+        self.selection = self
+            .notes
+            .iter()
+            .filter(|n| n.track == self.sel_track)
+            .map(|n| n.on_id)
+            .collect();
+        cx.notify();
+    }
+
+    fn zoom_by(&mut self, f: f32, cx: &mut Context<Self>) {
+        self.zoom = (self.zoom * f).clamp(0.01, 1.0);
+        self.persist();
+        cx.notify();
+    }
+
+    fn set_enc(&mut self, enc: Option<smf_core::TextEncoding>, cx: &mut Context<Self>) {
+        self.enc_override = enc;
+        self.ev_rev = u64::MAX; // force event-row rebuild
+        self.refresh_derived();
+        self.persist();
+        cx.notify();
+    }
+
+    fn set_lane(&mut self, m: LaneMode, cx: &mut Context<Self>) {
+        self.lane_mode = m;
+        self.persist();
+        cx.notify();
+    }
+
+    /// Focus the track-name input (Track > Rename).
+    fn focus_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let fh = self.input.read(cx).focus_handle(cx);
+        window.focus(&fh, cx);
+        cx.notify();
     }
 
     fn pick_default_track(&self) -> usize {
@@ -336,7 +428,7 @@ impl EditorView {
     }
 
     /// Run a semantic region transform (`Document` *_ops generator) on the
-    /// selection's range â€” or the whole selected track when nothing is
+    /// selection's range — or the whole selected track when nothing is
     /// selected. The same generators power the MCP tools, so GUI and AI edits
     /// share semantics and undo.
     fn apply_region_op(
@@ -805,7 +897,7 @@ impl EditorView {
         match load_document(&path) {
             Ok((d, load_warnings)) => {
                 self.stop_playback();
-                // swap the document in place â€” the MCP server holds this same Arc
+                // swap the document in place — the MCP server holds this same Arc
                 {
                     let mut sh = self.shared.lock().unwrap();
                     sh.doc = d;
@@ -980,7 +1072,7 @@ impl EditorView {
                 if self.playback.is_none() {
                     self.start_playback();
                 }
-                self.status = format!("rec â†’ T{}", self.sel_track + 1).into();
+                self.status = format!("rec → T{}", self.sel_track + 1).into();
             }
             Err(e) => self.status = format!("rec: {e}").into(),
         }
@@ -1035,6 +1127,47 @@ impl EditorView {
         self.status = format!("rec: {n} events").into();
     }
 
+    /// Open the selected destination's plugin GUI in its own native window.
+    /// Reuses the live playback instance when one exists.
+    fn open_plugin_gui(&mut self) {
+        let (d, path) = {
+            let sh = self.shared.lock().unwrap();
+            let d = sh.dest_of(self.sel_track);
+            let path = sh.dests.get(d).and_then(|(_, dd)| match dd {
+                output::Destination::Plugin { plugin_path } => {
+                    Some(PathBuf::from(plugin_path))
+                }
+                _ => None,
+            });
+            (d, path)
+        };
+        let Some(path) = path else { return };
+        let live = self
+            .active_plugins
+            .iter()
+            .find(|(i, _)| *i == d)
+            .map(|(_, p)| p.plugin_handle());
+        let (arc, is_live) = match live {
+            Some(a) => (Some(a), true),
+            None => (output::load_for_gui(&path).ok(), false),
+        };
+        match arc {
+            Some(a) => {
+                let mut w = vst3_host::PluginWindow::new(a.clone());
+                match w.open() {
+                    Ok(()) => {
+                        if !is_live {
+                            self.gui_plugin = Some(a);
+                        }
+                        self.plugin_window = Some(w);
+                    }
+                    Err(e) => self.status = format!("plugin GUI: {e}").into(),
+                }
+            }
+            None => self.status = "plugin load failed".into(),
+        }
+    }
+
     /// tick,key under a window-space mouse position
     fn hit(&self, pos: Point<Pixels>) -> (i64, i32) {
         let b = self.roll_bounds.get();
@@ -1054,7 +1187,7 @@ impl EditorView {
         }).cloned()
     }
 
-    /// Note whose right edge is within ~6px of `pos` â€” a resize target.
+    /// Note whose right edge is within ~6px of `pos` — a resize target.
     fn edge_at(&self, pos: Point<Pixels>) -> Option<Note> {
         let (tick, key) = self.hit(pos);
         self.notes
@@ -1084,7 +1217,7 @@ impl EditorView {
     }
 
     /// Small chip with a literal label (symbols/numbers need no i18n key).
-    /// `on` receives the ClickEvent so chips can honour Shift=Ã—10 etc.
+    /// `on` receives the ClickEvent so chips can honour Shift=×10 etc.
     fn chip(
         id: &'static str,
         label: impl Into<SharedString>,
@@ -1133,6 +1266,7 @@ struct Prefs {
     sel_track: Option<usize>,
     enc: Option<String>,
     lane: Option<String>,
+    show_events: Option<bool>,
 }
 
 fn prefs_path(doc_path: &PathBuf) -> PathBuf {
@@ -1155,7 +1289,7 @@ fn dest_label(d: &output::Destination) -> String {
 
 impl EditorView {
     /// Find or re-create the dest matching a stored identity; returns its index
-    /// into `shared.dests`. Unavailable ports/plugins keep their identity â€”
+    /// into `shared.dests`. Unavailable ports/plugins keep their identity —
     /// the assignment stays visible and plays again once the device is back.
     fn resolve_dest(&mut self, d: &output::Destination) -> usize {
         self.shared
@@ -1215,6 +1349,9 @@ impl EditorView {
                 .unwrap_or(LaneMode::Velocity),
             _ => LaneMode::Velocity,
         };
+        if let Some(v) = p.show_events {
+            self.show_events = v;
+        }
     }
 
     fn persist(&self) {
@@ -1250,6 +1387,7 @@ impl EditorView {
                 LaneMode::CC(c) => format!("cc{c}"),
                 LaneMode::PitchBend => "pb".into(),
             }),
+            show_events: Some(self.show_events),
         };
         if let Ok(text) = serde_json::to_string_pretty(&prefs) {
             let _ = std::fs::write(prefs_path(&path), text);
@@ -1265,7 +1403,7 @@ fn main() {
     let path = std::env::args().nth(1).map(PathBuf::from);
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
-        // dark UI â€” gpui-component's default theme follows the OS and renders
+        // dark UI — gpui-component's default theme follows the OS and renders
         // the text input's selection overlay white; pin dark explicitly
         gpui_kit::component::theme::Theme::change(
             gpui_kit::component::theme::ThemeMode::Dark,

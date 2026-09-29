@@ -17,6 +17,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, Weak};
+
+const BG_BAR: u32 = 0x0f0f15;
+const BG_PANEL: u32 = 0x17171d;
+const BG_RAISED: u32 = 0x20202c;
+const BORDER_C: u32 = 0x2a2a35;
+const DIM: u32 = 0x8f8fb0;
+const ACCENT: u32 = 0x9fd0ff;
+
 impl Render for EditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // pump the plugin editor window's native event queue while it's open
@@ -122,7 +130,7 @@ impl Render for EditorView {
                 .map(|(l, _)| l.clone())
                 .unwrap_or_else(|| t("status.no_port").to_string());
             let mark = if has_track_dest { "" } else { "*" };
-            format!("T{}{} â–¸ {}", self.sel_track + 1, mark, name)
+            format!("T{}{} ▸ {}", self.sel_track + 1, mark, name)
         };
 
         // --- piano roll canvas -------------------------------------------------
@@ -265,7 +273,7 @@ impl Render for EditorView {
             },
         );
 
-        // --- header -------------------------------------------------------------
+        // --- palette -------------------------------------------------------------
         let play_label: &'static str = if self.playback.is_some() {
             t("menu.stop")
         } else {
@@ -275,120 +283,141 @@ impl Render for EditorView {
             dests.get(eff_dest).map(|(_, d)| d),
             Some(output::Destination::Plugin { .. })
         );
-        let header = div()
+
+        // --- menu bar -----------------------------------------------------------
+        let open_menu = self.open_menu;
+        let menus: [(TopMenu, &str, f32); 6] = [
+            (TopMenu::File, "menu.file", 46.0),
+            (TopMenu::Edit, "menu.edit", 46.0),
+            (TopMenu::View, "menu.view", 52.0),
+            (TopMenu::Track, "menu.track", 58.0),
+            (TopMenu::Transport, "menu.transport", 90.0),
+            (TopMenu::Help, "menu.help", 50.0),
+        ];
+        let mut menu_bar = div()
             .flex()
             .items_center()
-            .gap_3()
-            .px_3()
-            .h(px(42.0))
-            .bg(rgb(0x14141a))
-            .child(div().text_color(rgb(0x8f8fb0)).child(t("app.title")))
+            .h(px(28.0))
+            .pl_1()
+            .pr_3()
+            .bg(rgb(BG_BAR))
+            .border_b_1()
+            .border_color(rgb(BORDER_C))
+            .text_size(px(12.0))
             .child(
                 div()
-                    .text_color(if dirty { rgb(0xffd24f) } else { rgb(0xd8d8e0) })
-                    .child(format!("{title}{}", if dirty { " *" } else { "" })),
-            )
-            .child(Self::button("menu.open", cx, |v, cx| v.open_dialog(cx)))
-            .child(Self::button("menu.save", cx, |v, cx| v.save(cx)))
-            .child(div().w(px(8.0)))
+                    .w(px(96.0))
+                    .px_2()
+                    .text_color(rgb(0x7a86a8))
+                    .whitespace_nowrap()
+                    .child(t("app.title")),
+            );
+        let mut mx = 96.0f32;
+        for (m, key, w) in menus {
+            let is_open = open_menu.map(|(mm, _)| mm) == Some(m);
+            menu_bar = menu_bar.child(
+                div()
+                    .id(key)
+                    .w(px(w))
+                    .h(px(22.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .rounded_sm()
+                    .bg(if is_open { rgb(BG_RAISED) } else { rgb(BG_BAR) })
+                    .text_color(rgb(if is_open { 0xffffff } else { 0x9a9ab0 }))
+                    .hover(|s| s.bg(rgb(0x1d1d28)))
+                    .child(t(key))
+                    .on_click(cx.listener(move |v, _e, _w, cx| {
+                        v.open_menu = if is_open { None } else { Some((m, mx)) };
+                        v.open_sub = None;
+                        cx.notify();
+                    }))
+                    .on_mouse_move(cx.listener(move |v, _e, _w, cx| {
+                        // while a menu is open, hovering a sibling label switches
+                        if v.open_menu.is_some() && v.open_menu.map(|(mm, _)| mm) != Some(m) {
+                            v.open_menu = Some((m, mx));
+                            v.open_sub = None;
+                            cx.notify();
+                        }
+                    })),
+            );
+            mx += w;
+        }
+        menu_bar = menu_bar
+            .child(div().flex_1())
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgb(if dirty { 0xffd24f } else { 0x9a9ab0 }))
+                    .whitespace_nowrap()
+                    .child(format!("{title}{}", if dirty { " •" } else { "" })),
+            );
+
+        // --- transport bar ------------------------------------------------------
+        let transport_bar = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .h(px(36.0))
+            .bg(rgb(BG_PANEL))
+            .border_b_1()
+            .border_color(rgb(BORDER_C))
+            // play / record / loop / metronome
             .child(
                 div()
                     .id("play")
                     .px_2()
-                    .py_1()
+                    .h(px(22.0))
                     .rounded_sm()
-                    .bg(rgb(0x245c3a))
+                    .flex()
+                    .items_center()
+                    .bg(rgb(if self.playback.is_some() {
+                        0x245c3a
+                    } else {
+                        BG_RAISED
+                    }))
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(0x2f7a4d)))
+                    .text_size(px(11.0))
                     .child(play_label)
                     .on_click(cx.listener(|v, _e, _w, cx| v.toggle_play(cx))),
             )
+            .child(Self::tbtn("rec", "●", self.rec.is_some().then(|| 0x7a2a2a), cx, |v, _cx| {
+                v.toggle_record();
+            }))
+            .child(Self::tbtn("loop", "loop", loop_en.then(|| 0x3a5c2a), cx, |v, _cx| {
+                {
+                    let mut sh = v.shared.lock().unwrap();
+                    sh.loop_enabled = !sh.loop_enabled;
+                }
+                v.persist();
+            }))
+            .child(Self::tbtn("met", "met", met_en.then(|| 0x3a5c2a), cx, |v, _cx| {
+                {
+                    let mut sh = v.shared.lock().unwrap();
+                    sh.metronome = !sh.metronome;
+                }
+                v.persist();
+            }))
+            // position / tempo / meter
             .child(
                 div()
-                    .id("rec")
                     .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .bg(if self.rec.is_some() {
-                        rgb(0x7a2a2a)
-                    } else {
-                        rgb(0x2a2a35)
-                    })
-                    .hover(|s| s.bg(rgb(0x6a3a3a)))
-                    .text_color(rgb(if self.rec.is_some() {
-                        0xff8c8c
-                    } else {
-                        0x8f8fb0
-                    }))
-                    .child("â—")
-                    .on_click(cx.listener(|v, _e, _w, cx| {
-                        v.toggle_record();
-                        cx.notify();
-                    })),
+                    .text_color(rgb(0xd8d8e0))
+                    .text_size(px(12.0))
+                    .font_family("Cascadia Mono")
+                    .child(pos.clone()),
             )
+            .child(div().w(px(6.0)))
             .child(
                 div()
-                    .id("loop")
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .bg(if loop_en {
-                        rgb(0x3a5c2a)
-                    } else {
-                        rgb(0x2a2a35)
-                    })
-                    .hover(|s| s.bg(rgb(0x3a3a48)))
-                    .text_color(rgb(if loop_en {
-                        0xb4ff8c
-                    } else {
-                        0x8f8fb0
-                    }))
-                    .child("loop")
-                    .on_click(cx.listener(|v, _e, _w, cx| {
-                        let mut sh = v.shared.lock().unwrap();
-                        sh.loop_enabled = !sh.loop_enabled;
-                        drop(sh);
-                        v.persist();
-                        cx.notify();
-                    })),
-            )
-            .child(
-                div()
-                    .id("met")
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .bg(if met_en {
-                        rgb(0x3a5c2a)
-                    } else {
-                        rgb(0x2a2a35)
-                    })
-                    .hover(|s| s.bg(rgb(0x3a3a48)))
-                    .text_color(rgb(if met_en {
-                        0xb4ff8c
-                    } else {
-                        0x8f8fb0
-                    }))
-                    .child(t("transport.met"))
-                    .on_click(cx.listener(|v, _e, _w, cx| {
-                        let mut sh = v.shared.lock().unwrap();
-                        sh.metronome = !sh.metronome;
-                        drop(sh);
-                        v.persist();
-                        cx.notify();
-                    })),
-            )
-            .child(div().text_color(rgb(0x8f8fb0)).font_family("Cascadia Mono").child(pos))
-            .child(div().w(px(8.0)))
-            // tempo + meter editing
-            .child(
-                div()
-                    .text_color(rgb(0x8f8fb0))
+                    .text_color(rgb(DIM))
                     .text_size(px(11.0))
-                    .child(format!("{tempo0:.0}â™©")),
+                    .whitespace_nowrap()
+                    .child(format!("{tempo0:.0}♩")),
             )
             .child(Self::chip("bpm-dn", "-", cx, |v, e: &ClickEvent, cx| {
                 v.bump_tempo(if e.modifiers().shift { -10.0 } else { -1.0 });
@@ -402,7 +431,8 @@ impl Render for EditorView {
                 v.cycle_time_sig();
                 cx.notify();
             }))
-            // selection ops (whole selected track when nothing is selected)
+            .child(div().w(px(6.0)))
+            // quick selection ops (selection's range, else whole track)
             .child(Self::chip("quant", "quant", cx, |v, _e, cx| {
                 let g = v.ppq() / 4;
                 v.apply_region_op("quantize", move |d, tr, f, to| {
@@ -410,33 +440,38 @@ impl Render for EditorView {
                 });
                 cx.notify();
             }))
-            .child(Self::chip("tr-up", "tr+", cx, |v, _e, cx| {
-                v.apply_region_op("transpose +1", |d, t, f, to| d.transpose_ops(t, f, to, 1));
-                cx.notify();
-            }))
             .child(Self::chip("tr-dn", "tr-", cx, |v, _e, cx| {
                 v.apply_region_op("transpose -1", |d, t, f, to| d.transpose_ops(t, f, to, -1));
                 cx.notify();
             }))
-            .child(Self::chip("vel-up", "vel+", cx, |v, _e, cx| {
-                v.apply_region_op("vel Ã—1.25", |d, t, f, to| d.scale_velocity_ops(t, f, to, 1.25));
+            .child(Self::chip("tr-up", "tr+", cx, |v, _e, cx| {
+                v.apply_region_op("transpose +1", |d, t, f, to| d.transpose_ops(t, f, to, 1));
                 cx.notify();
             }))
             .child(Self::chip("vel-dn", "vel-", cx, |v, _e, cx| {
-                v.apply_region_op("vel Ã—0.8", |d, t, f, to| d.scale_velocity_ops(t, f, to, 0.8));
+                v.apply_region_op("vel ×0.8", |d, t, f, to| d.scale_velocity_ops(t, f, to, 0.8));
                 cx.notify();
             }))
-            .child(div().w(px(8.0)))
+            .child(Self::chip("vel-up", "vel+", cx, |v, _e, cx| {
+                v.apply_region_op("vel ×1.25", |d, t, f, to| d.scale_velocity_ops(t, f, to, 1.25));
+                cx.notify();
+            }))
+            .child(div().flex_1())
+            // destination of the selected track
             .child(
                 div()
                     .id("port")
                     .px_2()
-                    .py_1()
+                    .h(px(22.0))
+                    .flex()
+                    .items_center()
                     .rounded_sm()
-                    .bg(rgb(0x2a2a35))
+                    .bg(rgb(BG_RAISED))
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(0x3a3a48)))
-                    .text_color(rgb(0x9fd0ff))
+                    .text_color(rgb(ACCENT))
+                    .text_size(px(11.0))
+                    .whitespace_nowrap()
                     .child(port_label)
                     .on_click(cx.listener(|v, _e, _w, cx| {
                         {
@@ -466,136 +501,47 @@ impl Render for EditorView {
                         cx.notify();
                     })),
             )
-            .child(div().flex_1())
-            .child(
-                div()
-                    .id("enc")
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .bg(rgb(0x2a2a35))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(0x3a3a48)))
-                    .text_color(rgb(0xc8c8a8))
-                    .text_size(px(11.0))
-                    .child(format!(
-                        "ENC {}",
-                        match self.enc_override {
-                            None => "auto",
-                            Some(smf_core::TextEncoding::Utf8) => "UTF-8",
-                            Some(smf_core::TextEncoding::ShiftJis) => "SJIS",
-                            Some(smf_core::TextEncoding::Latin1) => "Latin-1",
-                        }
-                    ))
-                    .on_click(cx.listener(|v, _e, _w, cx| {
-                        v.enc_override = match v.enc_override {
-                            None => Some(smf_core::TextEncoding::Utf8),
-                            Some(smf_core::TextEncoding::Utf8) => {
-                                Some(smf_core::TextEncoding::ShiftJis)
-                            }
-                            Some(smf_core::TextEncoding::ShiftJis) => {
-                                Some(smf_core::TextEncoding::Latin1)
-                            }
-                            Some(smf_core::TextEncoding::Latin1) => None,
-                        };
-                        v.ev_rev = u64::MAX; // force event-row rebuild
-                        v.refresh_derived();
-                        v.persist();
-                        cx.notify();
-                    })),
-            )
             .children(sel_is_plugin.then(|| {
                 div()
                     .id("plug-gui")
                     .px_2()
-                    .py_1()
+                    .h(px(22.0))
+                    .flex()
+                    .items_center()
                     .rounded_sm()
-                    .bg(rgb(0x2a2a35))
+                    .bg(rgb(BG_RAISED))
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(0x3a3a48)))
                     .text_color(rgb(0xd0a8ff))
                     .text_size(px(11.0))
                     .child("GUI")
                     .on_click(cx.listener(|v, _e, _w, cx| {
-                        let (d, path) = {
-                            let sh = v.shared.lock().unwrap();
-                            let d = sh.dest_of(v.sel_track);
-                            let path = sh.dests.get(d).and_then(|(_, dd)| match dd {
-                                output::Destination::Plugin { plugin_path } => {
-                                    Some(PathBuf::from(plugin_path))
-                                }
-                                _ => None,
-                            });
-                            (d, path)
-                        };
-                        if let Some(path) = path {
-                            // prefer the instance already driving playback
-                            let live = v
-                                .active_plugins
-                                .iter()
-                                .find(|(i, _)| *i == d)
-                                .map(|(_, p)| p.plugin_handle());
-                            let (arc, is_live) = match live {
-                                Some(a) => (Some(a), true),
-                                None => (output::load_for_gui(&path).ok(), false),
-                            };
-                            match arc {
-                                Some(a) => {
-                                    let mut w = vst3_host::PluginWindow::new(a.clone());
-                                    match w.open() {
-                                        Ok(()) => {
-                                            if !is_live {
-                                                v.gui_plugin = Some(a);
-                                            }
-                                            v.plugin_window = Some(w);
-                                        }
-                                        Err(e) => {
-                                            v.status = format!("plugin GUI: {e}").into()
-                                        }
-                                    }
-                                }
-                                None => {
-                                    v.status = "plugin load failed".into();
-                                }
-                            }
-                        }
+                        v.open_plugin_gui();
                         cx.notify();
                     }))
-            }))
-            .child(div().w(px(8.0)))
-            .child(div().w(px(240.0)).child(Input::new(&self.input)))
-            .child(Self::chip("rename", "rename", cx, |v, _e, cx| {
-                let name = v.input.read(cx).value().to_string();
-                let ops = {
-                    let mut sh = v.shared.lock().unwrap();
-                    sh.doc.set_track_name_ops(v.sel_track, &name)
-                };
-                v.apply_tx("set track name", ops);
-                cx.notify();
             }));
-        // --- body: event list + roll -------------------------------------------
-        let body = div().flex().flex_1().min_h(px(0.0)).child(
-            div()
-                .w(px(380.0))
-                .h_full()
-                .flex()
-                .flex_col()
-                .bg(rgb(0x17171d))
-                .child(
-                    div()
-                        .px_2()
-                        .py_1()
-                        .text_size(px(11.0))
-                        .text_color(rgb(0x77778a))
-                        .child(format!("{} ({})", t("events.header"), self.events.len()))
-                        .child(
-                            div()
-                                .mt_1()
-                                .text_size(px(10.0))
-                                .text_color(rgb(0x77778a))
-                                .child(format!("{}", self.status)),
-                        )
-                        .children((n_diags > 0).then(|| {
+        // --- event list: right-docked panel -------------------------------------
+        let events_panel = div()
+            .w(px(340.0))
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(BG_PANEL))
+            .border_l_1()
+            .border_color(rgb(BORDER_C))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .px_2()
+                    .h(px(26.0))
+                    .border_b_1()
+                    .border_color(rgb(BORDER_C))
+                    .text_size(px(11.0))
+                    .text_color(rgb(0x77778a))
+                    .child(format!("{} ({})", t("events.header"), self.events.len()))
+                    .child(div().flex_1())
+                    .children((n_diags > 0).then(|| {
                             div()
                                 .id("fix-diags")
                                 .ml_2()
@@ -616,38 +562,45 @@ impl Render for EditorView {
                                     cx.notify();
                                 }))
                         })),
-                )
-                .child({
-                    let events = self.events.clone();
-                    uniform_list("events", events.len(), move |range, _w, _cx| {
-                        range
-                            .map(|i| {
-                                div()
-                                    .h(px(18.0))
-                                    .px_2()
-                                    .text_size(px(11.0))
-                                    .font_family("Cascadia Mono")
-                                    .text_color(rgb(0xb8b8c8))
-                                    .child(events[i].clone())
-                            })
-                            .collect()
-                    })
-                    .h_full()
-                    .flex_1()
-                }),
-        );
+            )
+            .child({
+                let events = self.events.clone();
+                uniform_list("events", events.len(), move |range, _w, _cx| {
+                    range
+                        .map(|i| {
+                            div()
+                                .h(px(18.0))
+                                .px_2()
+                                .text_size(px(11.0))
+                                .font_family("Cascadia Mono")
+                                .text_color(rgb(0xb8b8c8))
+                                .child(events[i].clone())
+                        })
+                        .collect()
+                })
+                .h_full()
+                .flex_1()
+            });
+
+        let body = div().flex().flex_1().min_h(px(0.0));
 
         // --- track column: select / mute / solo -------------------------------
         let track_col = div()
-            .w(px(140.0))
+            .w(px(150.0))
             .h_full()
             .flex()
             .flex_col()
             .bg(rgb(0x1b1b24))
+            .border_r_1()
+            .border_color(rgb(BORDER_C))
             .child(
                 div()
                     .px_2()
-                    .py_1()
+                    .h(px(26.0))
+                    .flex()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(rgb(BORDER_C))
                     .text_size(px(11.0))
                     .text_color(rgb(0x77778a))
                     .child(t("tracks.header")),
@@ -748,7 +701,29 @@ impl Render for EditorView {
                             }))
                             .child(format!("c{}", track_chs.get(i).copied().unwrap_or(0) + 1)),
                     )
-            }));
+            }))
+            .child(div().flex_1())
+            // rename field for the selected track, anchored at the panel bottom
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_1()
+                    .h(px(30.0))
+                    .border_t_1()
+                    .border_color(rgb(BORDER_C))
+                    .child(div().flex_1().min_w(px(0.0)).child(Input::new(&self.input)))
+                    .child(Self::chip("rename", "rename", cx, |v, _e, cx| {
+                        let name = v.input.read(cx).value().to_string();
+                        let ops = {
+                            let mut sh = v.shared.lock().unwrap();
+                            sh.doc.set_track_name_ops(v.sel_track, &name)
+                        };
+                        v.apply_tx("set track name", ops);
+                        cx.notify();
+                    })),
+            );
 
         // velocity / CC / pitch-bend lane (selected track only)
         let lane_sel_track = self.sel_track;
@@ -936,7 +911,7 @@ impl Render for EditorView {
                             }),
                         ),
                 )
-                // marker/lyric strip â€” meta 0x06/0x05 shown at their tick
+                // marker/lyric strip — meta 0x06/0x05 shown at their tick
                 .child(
                     div()
                         .h(px(14.0))
@@ -1081,7 +1056,7 @@ impl Render for EditorView {
                 .on_mouse_up(
                     MouseButton::Left,
                     cx.listener(|this, ev: &MouseUpEvent, _w, cx| {
-                        // a marquee that never left its anchor = click â†’ insert
+                        // a marquee that never left its anchor = click → insert
                         let click_insert = this.drag.as_ref().is_some_and(|d| {
                             d.mode == DragMode::Marquee
                                 && (d.b_tick - d.a_tick).abs() < 2
@@ -1257,10 +1232,399 @@ impl Render for EditorView {
                         ),
                 ),
         );
+        let body = body.children(self.show_events.then(|| events_panel));
+
+        // --- status bar ---------------------------------------------------------
+        let enc_label = match self.enc_override {
+            None => "auto".to_string(),
+            Some(e) => e.label().to_string(),
+        };
+        let status_bar = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .h(px(24.0))
+            .bg(rgb(BG_BAR))
+            .border_t_1()
+            .border_color(rgb(BORDER_C))
+            .text_size(px(11.0))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_color(rgb(0x77778a))
+                    .child(format!("{}", self.status)),
+            )
+            .child(Self::chip("st-lane", lane_mode.label(), cx, |v, _e, cx| {
+                v.set_lane(v.lane_mode.cycle(), cx);
+            }))
+            .child(Self::chip("st-enc", format!("enc {enc_label}"), cx, |v, _e, cx| {
+                let next = match v.enc_override {
+                    None => Some(smf_core::TextEncoding::Utf8),
+                    Some(smf_core::TextEncoding::Utf8) => Some(smf_core::TextEncoding::ShiftJis),
+                    Some(smf_core::TextEncoding::ShiftJis) => Some(smf_core::TextEncoding::Latin1),
+                    Some(smf_core::TextEncoding::Latin1) => None,
+                };
+                v.set_enc(next, cx);
+            }))
+            .child(
+                div()
+                    .text_color(rgb(0x77778a))
+                    .font_family("Cascadia Mono")
+                    .whitespace_nowrap()
+                    .child(format!("{pos}  {}", {
+                        let sel = self.selection.len();
+                        if sel > 0 { format!("sel:{sel}") } else { String::new() }
+                    })),
+            );
+
+        // --- open menu dropdown --------------------------------------------------
+        let menu_layer = self.open_menu.map(|(m, mx)| {
+            let items: Vec<AnyElement> = match m {
+                TopMenu::File => vec![
+                    Self::mi("f.new", t("menu.new"), "", None, cx, |v, _w, cx| {
+                        v.new_file(cx);
+                    })
+                    .into_any_element(),
+                    Self::mi("f.open", t("menu.open"), "Ctrl+O", None, cx, |v, _w, cx| {
+                        v.open_dialog(cx);
+                    })
+                    .into_any_element(),
+                    Self::msep().into_any_element(),
+                    Self::mi("f.save", t("menu.save"), "Ctrl+S", None, cx, |v, _w, cx| {
+                        v.save(cx);
+                    })
+                    .into_any_element(),
+                    Self::mi("f.savas", t("menu.save_as"), "", None, cx, |v, _w, cx| {
+                        v.save_as(cx);
+                    })
+                    .into_any_element(),
+                ],
+                TopMenu::Edit => vec![
+                    Self::mi("e.undo", t("menu.undo"), "Ctrl+Z", None, cx, |v, _w, cx| {
+                        v.undo(cx);
+                    })
+                    .into_any_element(),
+                    Self::mi("e.redo", t("menu.redo"), "Ctrl+Y", None, cx, |v, _w, cx| {
+                        v.redo(cx);
+                    })
+                    .into_any_element(),
+                    Self::msep().into_any_element(),
+                    Self::mi("e.selall", t("menu.select_all"), "Ctrl+A", None, cx, |v, _w, cx| {
+                        v.select_all(cx);
+                    })
+                    .into_any_element(),
+                    Self::mi("e.del", t("menu.delete"), "Del", None, cx, |v, _w, cx| {
+                        v.delete_selected(cx);
+                    })
+                    .into_any_element(),
+                    Self::msep().into_any_element(),
+                    Self::mi("e.quant", t("edit.quantize"), "", None, cx, |v, _w, cx| {
+                        let g = v.ppq() / 4;
+                        v.apply_region_op("quantize", move |d, t, f, to| {
+                            d.quantize_ops(t, f, to, g, 100)
+                        });
+                    })
+                    .into_any_element(),
+                    Self::mi("e.trup", t("edit.transpose_up"), "", None, cx, |v, _w, cx| {
+                        v.apply_region_op("transpose +1", |d, t, f, to| d.transpose_ops(t, f, to, 1));
+                    })
+                    .into_any_element(),
+                    Self::mi("e.trdn", t("edit.transpose_dn"), "", None, cx, |v, _w, cx| {
+                        v.apply_region_op("transpose -1", |d, t, f, to| d.transpose_ops(t, f, to, -1));
+                    })
+                    .into_any_element(),
+                    Self::msep().into_any_element(),
+                    Self::mi("e.velup", t("edit.vel_up"), "", None, cx, |v, _w, cx| {
+                        v.apply_region_op("vel ×1.25", |d, t, f, to| d.scale_velocity_ops(t, f, to, 1.25));
+                    })
+                    .into_any_element(),
+                    Self::mi("e.veldn", t("edit.vel_dn"), "", None, cx, |v, _w, cx| {
+                        v.apply_region_op("vel ×0.8", |d, t, f, to| d.scale_velocity_ops(t, f, to, 0.8));
+                    })
+                    .into_any_element(),
+                ],
+                TopMenu::View => vec![
+                    Self::mi("v.events", t("view.events"), "", Some(self.show_events), cx, |v, _w, cx| {
+                        v.show_events = !v.show_events;
+                        v.persist();
+                    })
+                    .into_any_element(),
+                    Self::msep().into_any_element(),
+                    Self::mi("v.zin", t("view.zoom_in"), "Ctrl+=", None, cx, |v, _w, cx| {
+                        v.zoom_by(1.3, cx);
+                    })
+                    .into_any_element(),
+                    Self::mi("v.zout", t("view.zoom_out"), "Ctrl+-", None, cx, |v, _w, cx| {
+                        v.zoom_by(1.0 / 1.3, cx);
+                    })
+                    .into_any_element(),
+                    Self::mi("v.z0", t("view.zoom_reset"), "Ctrl+0", None, cx, |v, _w, cx| {
+                        v.zoom = 0.08;
+                        v.persist();
+                    })
+                    .into_any_element(),
+                    Self::msep().into_any_element(),
+                    Self::mi_sub("v.lane", t("view.lane"), Sub::Lane, cx).into_any_element(),
+                    Self::mi_sub("v.enc", t("view.encoding"), Sub::Enc, cx).into_any_element(),
+                ],
+                TopMenu::Track => {
+                    let mut items = vec![
+                        Self::mi("t.rename", t("track.rename"), "", None, cx, |v, w, cx| {
+                            v.focus_rename(w, cx);
+                        })
+                        .into_any_element(),
+                        Self::msep().into_any_element(),
+                        Self::mi("t.mute", t("track.mute"), "", Some(muted_set.contains(&self.sel_track)), cx, |v, _w, cx| {
+                            let t = v.sel_track;
+                            {
+                                let mut sh = v.shared.lock().unwrap();
+                                if !sh.muted.remove(&t) {
+                                    sh.muted.insert(t);
+                                }
+                            }
+                            v.persist();
+                        })
+                        .into_any_element(),
+                        Self::mi("t.solo", t("track.solo"), "", Some(soloed_set.contains(&self.sel_track)), cx, |v, _w, cx| {
+                            let t = v.sel_track;
+                            {
+                                let mut sh = v.shared.lock().unwrap();
+                                if !sh.soloed.remove(&t) {
+                                    sh.soloed.insert(t);
+                                }
+                            }
+                            v.persist();
+                        })
+                        .into_any_element(),
+                        Self::msep().into_any_element(),
+                        Self::mi_sub("t.chan", t("track.channel"), Sub::Chan, cx).into_any_element(),
+                        Self::mi_sub("t.dest", t("track.dest"), Sub::Dest, cx).into_any_element(),
+                    ];
+                    if sel_is_plugin {
+                        items.push(Self::msep().into_any_element());
+                        items.push(
+                            Self::mi("t.gui", t("track.plugin_gui"), "", None, cx, |v, _w, _cx| {
+                                v.open_plugin_gui();
+                            })
+                            .into_any_element(),
+                        );
+                    }
+                    items
+                }
+                TopMenu::Transport => vec![
+                    Self::mi("tr.play", t("transport.play_stop"), "Space", Some(self.playback.is_some()), cx, |v, _w, cx| {
+                        v.toggle_play(cx);
+                    })
+                    .into_any_element(),
+                    Self::mi("tr.rec", t("transport.record"), "", Some(self.rec.is_some()), cx, |v, _w, _cx| {
+                        v.toggle_record();
+                    })
+                    .into_any_element(),
+                    Self::mi("tr.loop", t("transport.loop"), "", Some(loop_en), cx, |v, _w, _cx| {
+                        {
+                            let mut sh = v.shared.lock().unwrap();
+                            sh.loop_enabled = !sh.loop_enabled;
+                        }
+                        v.persist();
+                    })
+                    .into_any_element(),
+                    Self::mi("tr.met", t("transport.met"), "", Some(met_en), cx, |v, _w, _cx| {
+                        {
+                            let mut sh = v.shared.lock().unwrap();
+                            sh.metronome = !sh.metronome;
+                        }
+                        v.persist();
+                    })
+                    .into_any_element(),
+                ],
+                TopMenu::Help => vec![
+                    Self::mi("h.about", t("help.about"), "", None, cx, |v, _w, _cx| {
+                        v.status = concat!("midi-editor ", env!("CARGO_PKG_VERSION"),
+                            " — pure-SMF editor").into();
+                    })
+                    .into_any_element(),
+                    Self::mi("h.mcp", t("help.mcp"), "", None, cx, |v, _w, _cx| {
+                        v.status = "MCP: http://127.0.0.1:7878/mcp (mcp-bridge for stdio clients)".into();
+                    })
+                    .into_any_element(),
+                ],
+            };
+            // dropdown panel under the clicked label
+            let popup = div()
+                .id("menu-popup")
+                .absolute()
+                .top(px(0.0))
+                .left(px(mx))
+                .w(px(210.0))
+                .flex()
+                .flex_col()
+                .py_1()
+                .bg(rgb(BG_RAISED))
+                .border_1()
+                .border_color(rgb(BORDER_C))
+                .rounded_md()
+                .shadow_lg()
+                .children(items)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_v, _e, _w, cx| cx.stop_propagation()),
+                );
+            // cascading submenu (also inside the overlay so clicks elsewhere close all)
+            let sub_popup = self.open_sub.and_then(|(s, y)| {
+                let x2 = mx + 208.0;
+                let rows: Vec<AnyElement> = match s {
+                    Sub::Chan => (0u8..16)
+                        .map(|ch| {
+                            let cur = track_chs.get(self.sel_track).copied().unwrap_or(0);
+                            Self::mi(
+                                ("chan", ch as usize),
+                                format!("Channel {}", ch + 1),
+                                "",
+                                Some(cur == ch),
+                                cx,
+                                move |v, _w, cx| {
+                                    let tr = v.sel_track;
+                                    let ops = {
+                                        let mut sh = v.shared.lock().unwrap();
+                                        sh.doc.set_track_channel_ops(tr, ch)
+                                    };
+                                    v.apply_tx("set track channel", ops);
+                                },
+                            )
+                            .into_any_element()
+                        })
+                        .collect(),
+                    Sub::Dest => {
+                        let mut rows: Vec<AnyElement> = vec![Self::mi(
+                            "dest.inherit",
+                            t("track.default_dest"),
+                            "",
+                            Some(!has_track_dest),
+                            cx,
+                            |v, _w, _cx| {
+                                v.shared.lock().unwrap().track_dest.remove(&v.sel_track);
+                                v.persist();
+                            },
+                        )
+                        .into_any_element()];
+                        rows.extend(dests.iter().enumerate().map(|(i, (label, _))| {
+                            Self::mi(
+                                ("dest", i),
+                                label.clone(),
+                                "",
+                                Some(has_track_dest && eff_dest == i),
+                                cx,
+                                move |v, _w, _cx| {
+                                    let mut sh = v.shared.lock().unwrap();
+                                    sh.track_dest.insert(v.sel_track, i);
+                                    sh.default_dest = i;
+                                    drop(sh);
+                                    v.persist();
+                                },
+                            )
+                            .into_any_element()
+                        }));
+                        rows
+                    }
+                    Sub::Lane => {
+                        const LANES: [LaneMode; 7] = [
+                            LaneMode::Velocity,
+                            LaneMode::CC(1),
+                            LaneMode::CC(7),
+                            LaneMode::CC(10),
+                            LaneMode::CC(11),
+                            LaneMode::CC(64),
+                            LaneMode::PitchBend,
+                        ];
+                        LANES.iter()
+                            .enumerate()
+                            .map(|(i, lm)| {
+                                Self::mi(
+                                    ("lane", i),
+                                    lm.label(),
+                                    "",
+                                    Some(self.lane_mode == *lm),
+                                    cx,
+                                    move |v, _w, cx| v.set_lane(*lm, cx),
+                                )
+                                .into_any_element()
+                            })
+                            .collect()
+                    }
+                    Sub::Enc => {
+                        let opts: [(Option<smf_core::TextEncoding>, &str); 4] = [
+                            (None, "auto"),
+                            (Some(smf_core::TextEncoding::Utf8), "UTF-8"),
+                            (Some(smf_core::TextEncoding::ShiftJis), "Shift-JIS"),
+                            (Some(smf_core::TextEncoding::Latin1), "Latin-1"),
+                        ];
+                        opts.into_iter()
+                            .enumerate()
+                            .map(|(i, (e, label))| {
+                                Self::mi(
+                                    ("enc", i),
+                                    label,
+                                    "",
+                                    Some(self.enc_override == e),
+                                    cx,
+                                    move |v, _w, cx| v.set_enc(e, cx),
+                                )
+                                .into_any_element()
+                            })
+                            .collect()
+                    }
+                };
+                Some(
+                    div()
+                        .id("sub-popup")
+                        .absolute()
+                        .top(px((y - 30.0).max(0.0)))
+                        .left(px(x2))
+                        .w(px(190.0))
+                        .max_h(px(360.0))
+                        .overflow_hidden()
+                        .flex()
+                        .flex_col()
+                        .py_1()
+                        .bg(rgb(BG_RAISED))
+                        .border_1()
+                        .border_color(rgb(BORDER_C))
+                        .rounded_md()
+                        .shadow_lg()
+                        .children(rows)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_v, _e, _w, cx| cx.stop_propagation()),
+                        ),
+                )
+            });
+            div()
+                .id("menu-overlay")
+                .absolute()
+                .top(px(28.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                .bottom(px(0.0))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|v, _e, _w, cx| {
+                        v.open_menu = None;
+                        v.open_sub = None;
+                        cx.notify();
+                    }),
+                )
+                .child(popup)
+                .children(sub_popup)
+        });
 
         div()
             .flex()
             .flex_col()
+            .relative()
             .size_full()
             .bg(rgb(0x1b1b22))
             .text_color(rgb(0xd8d8e0))
@@ -1279,6 +1643,21 @@ impl Render for EditorView {
                     (true, false, "y") | (true, true, "z") => this.redo(cx),
                     (true, false, "s") => this.save(cx),
                     (true, false, "o") => this.open_dialog(cx),
+                    (true, false, "n") => this.new_file(cx),
+                    (true, false, "a") => this.select_all(cx),
+                    (true, false, "=") | (true, false, "+") => this.zoom_by(1.3, cx),
+                    (true, false, "-") => this.zoom_by(1.0 / 1.3, cx),
+                    (true, false, "0") => {
+                        this.zoom = 0.08;
+                        this.persist();
+                        cx.notify();
+                    }
+                    (false, false, "escape") => {
+                        this.open_menu = None;
+                        this.open_sub = None;
+                        this.selection.clear();
+                        cx.notify();
+                    }
                     (false, false, "delete") | (false, false, "backspace") => {
                         this.delete_selected(cx)
                     }
@@ -1286,7 +1665,146 @@ impl Render for EditorView {
                     _ => {}
                 }
             }))
-            .child(header)
+            .child(menu_bar)
+            .child(transport_bar)
             .child(body)
+            .child(status_bar)
+            .children(menu_layer)
+    }
+}
+
+// --- menubar helpers -----------------------------------------------------------
+
+impl EditorView {
+    /// One dropdown row: optional check glyph, label, right-aligned shortcut.
+    /// Clicking closes the whole menu and runs `f`.
+    fn mi(
+        id: impl Into<ElementId>,
+        label: impl Into<SharedString>,
+        shortcut: &'static str,
+        check: Option<bool>,
+        cx: &mut Context<Self>,
+        f: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> Stateful<Div> {
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .h(px(24.0))
+            .px_2()
+            .mx_1()
+            .rounded_sm()
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(0x2f2f42)))
+            .text_size(px(12.0))
+            .text_color(rgb(0xd8d8e0))
+            .whitespace_nowrap()
+            .child(
+                div()
+                    .w(px(14.0))
+                    .text_size(px(10.0))
+                    .text_color(rgb(0x8fd0a0))
+                    .child(if check == Some(true) { "✓" } else { "" }),
+            )
+            .child(div().flex_1().child(label.into()))
+            .child(
+                div()
+                    .pl_2()
+                    .text_color(rgb(0x666677))
+                    .text_size(px(10.0))
+                    .child(shortcut),
+            )
+            .on_mouse_move(cx.listener(|v, _e: &MouseMoveEvent, _w, cx| {
+                // leaving a submenu parent closes the cascade
+                if v.open_sub.is_some() {
+                    v.open_sub = None;
+                    cx.notify();
+                }
+            }))
+            .on_click(cx.listener(move |v, e, w, cx| {
+                cx.stop_propagation();
+                v.open_menu = None;
+                v.open_sub = None;
+                let _ = e;
+                f(v, w, cx);
+                cx.notify();
+            }))
+    }
+
+    /// Dropdown row that cascades: hovering opens its submenu at the row's y.
+    fn mi_sub(id: &'static str, label: &'static str, sub: Sub, cx: &mut Context<Self>) -> Stateful<Div> {
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .h(px(24.0))
+            .px_2()
+            .mx_1()
+            .rounded_sm()
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(0x2f2f42)))
+            .text_size(px(12.0))
+            .text_color(rgb(0xd8d8e0))
+            .whitespace_nowrap()
+            .child(div().w(px(14.0)))
+            .child(div().flex_1().child(label))
+            .child(
+                div()
+                    .pl_2()
+                    .text_color(rgb(0x666677))
+                    .text_size(px(10.0))
+                    .child("▸"),
+            )
+            .on_mouse_move(cx.listener(move |v, e: &MouseMoveEvent, _w, cx| {
+                let y = f32::from(e.position.y);
+                if v.open_sub.map(|(s, _)| s) != Some(sub) {
+                    v.open_sub = Some((sub, y));
+                    cx.notify();
+                }
+            }))
+            .on_click(cx.listener(move |v, e: &ClickEvent, _w, cx| {
+                cx.stop_propagation();
+                v.open_sub = Some((sub, f32::from(e.position().y)));
+                cx.notify();
+            }))
+    }
+
+    /// Dropdown separator line.
+    fn msep() -> Div {
+        div().h(px(1.0)).mx_2().my_1().bg(rgb(0x2a2a35))
+    }
+}
+
+impl EditorView {
+    /// Transport-bar button: raised chip, greenish when `active`.
+    fn tbtn(
+        id: &'static str,
+        label: impl Into<SharedString>,
+        active: Option<u32>,
+        cx: &mut Context<Self>,
+        on: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+    ) -> Stateful<Div> {
+        div()
+            .id(id)
+            .px_2()
+            .h(px(22.0))
+            .rounded_sm()
+            .flex()
+            .items_center()
+            .bg(rgb(active.unwrap_or(BG_RAISED)))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(0x3a3a48)))
+            .text_color(rgb(if active.is_some() {
+                0xd8ffe0
+            } else {
+                0xc8c8d8
+            }))
+            .text_size(px(11.0))
+            .whitespace_nowrap()
+            .child(label.into())
+            .on_click(cx.listener(move |v, _e, _w, cx| {
+                on(v, cx);
+                cx.notify();
+            }))
     }
 }
