@@ -128,14 +128,6 @@ impl Render for EditorView {
             let beat = (playhead_tick % (ppq * 4)) / ppq + 1;
             format!("{bar}.{beat}.{:>3}", playhead_tick % ppq)
         };
-        let port_label = {
-            let name = dests
-                .get(eff_dest)
-                .map(|(l, _)| l.clone())
-                .unwrap_or_else(|| t("status.no_port").to_string());
-            let mark = if has_track_dest { "" } else { "*" };
-            format!("T{}{} ▸ {}", self.sel_track + 1, mark, name)
-        };
 
         // --- piano roll canvas -------------------------------------------------
         let notes = self.notes.clone();
@@ -575,34 +567,6 @@ impl Render for EditorView {
             .child(Self::ibtn("i.zin", "zoom_in", t("tip.zin"), false, cx, |v, _e, cx| {
                 v.zoom_by(1.3, cx);
             }))
-            .child(Self::vsep())
-            // destination of the selected track
-            .child(
-                div()
-                    .id("port")
-                    .px_2()
-                    .h(px(26.0))
-                    .flex()
-                    .items_center()
-                    .rounded_sm()
-                    .bg(rgb(BG_RAISED))
-                    .border_1()
-                    .border_color(rgb(BORDER_C))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(0x3a3a48)))
-                    .tooltip(move |_w, cx| cx.new(|_| Tip(t("tip.dest").into())).into())
-                    .text_color(rgb(ACCENT))
-                    .text_size(px(11.0))
-                    .whitespace_nowrap()
-                    .child(port_label)
-                    .child(div().pl_1().child(icon("keyboard_arrow_down", 14.0, 0x77778a)))
-                    .on_click(cx.listener(|v, e: &ClickEvent, _w, cx| {
-                        // shows the current destination; the picker itself
-                        // lives in the Output menubar dropdown
-                        v.open_menu = Some((TopMenu::Output, e.position().x.into()));
-                        cx.notify();
-                    })),
-            )
             .children(sel_is_plugin.then(|| {
                 Self::ibtn("i.gui", "piano", t("tip.gui"), false, cx, |v, _e, cx| {
                     v.open_plugin_gui();
