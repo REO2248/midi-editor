@@ -3,14 +3,14 @@
 //! Private items are visible here because this is a child module of the
 //! crate root where EditorView is defined.
 
-use crate::*;
+use crate::geometry::{drag_window, tick_window, ZOOM_MAX, ZOOM_MIN};
 use crate::i18n::t;
 use crate::icons::icon;
-use std::any::Any;
-use document::EventId;
+use crate::*;
 use gpui_kit::component::input::Input;
 use gpui_kit::*;
 use smf_core::EventKind;
+use std::any::Any;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
@@ -33,6 +33,11 @@ impl Render for EditorView {
         // the plugin editor lives in the helper subprocess's own window —
         // no native event queue to pump here
         self.refresh_derived();
+        // keep both scroll axes inside the content (resizes, zooms, edits all
+        // self-heal here) and edge-scroll while a drag is parked at a border;
+        // `panning` keeps animation frames flowing only while it actually moves
+        self.clamp_scroll();
+        let panning = self.drag_auto_pan();
 
         // advance playhead / auto-stop (looping happens inside the
         // playback thread; reaching this branch means playback ended)
@@ -43,46 +48,20 @@ impl Render for EditorView {
                 self.play_us = 0;
             }
         }
-        let (playhead_tick, title, dirty, n_diags, track_names, dests, eff_dest, def_dest, loop_en, met_en, muted_set, soloed_set, has_track_dest, markers, tempo0, sig, track_chs) = {
+        let (
+            playhead_tick,
+            title,
+            dirty,
+            dests,
+            eff_dest,
+            def_dest,
+            loop_en,
+            met_en,
+            muted_set,
+            soloed_set,
+            has_track_dest,
+        ) = {
             let sh = crate::lock_shared(&self.shared);
-            let hint = self.enc_override.or(sh.doc.text_encoding_hint());
-            let markers: Vec<(u64, String)> = sh
-                .doc
-                .tracks
-                .iter()
-                .flat_map(|t| &t.events)
-                .filter_map(|e| match &e.kind {
-                    EventKind::Meta { meta_type, data }
-                        if matches!(*meta_type, 0x05 | 0x06) =>
-                    {
-                        Some((e.tick, smf_core::decode_text(data, hint)))
-                    }
-                    _ => None,
-                })
-                .collect();
-            let tempo0 = sh
-                .doc
-                .tempo_map
-                .points()
-                .first()
-                .map(|(_, mpq, _)| 60_000_000.0 / *mpq as f64)
-                .unwrap_or(120.0);
-            let sig = sh
-                .doc
-                .tracks
-                .first()
-                .and_then(|t| {
-                    t.events.iter().find_map(|e| match &e.kind {
-                        EventKind::Meta {
-                            meta_type: 0x58,
-                            data,
-                        } if data.len() >= 2 => {
-                            Some(format!("{}/{}", data[0], 1u8 << data[1]))
-                        }
-                        _ => None,
-                    })
-                })
-                .unwrap_or_else(|| "4/4".into());
             (
                 sh.doc.tempo_map.us_to_tick(self.play_us),
                 sh.path
@@ -90,18 +69,6 @@ impl Render for EditorView {
                     .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
                     .unwrap_or_else(|| t("status.no_file").to_string()),
                 sh.doc.revision() != sh.saved_revision,
-                sh.doc.diagnose().len(),
-                sh.doc
-                    .tracks
-                    .iter()
-                    .enumerate()
-                    .map(|(i, tr)| {
-                        tr.name
-                            .as_ref()
-                            .map(|b| smf_core::decode_text(b, hint))
-                            .unwrap_or_else(|| format!("Track {}", i + 1))
-                    })
-                    .collect::<Vec<String>>(),
                 sh.dests.clone(),
                 sh.dest_of(self.sel_track),
                 sh.default_dest,
@@ -110,12 +77,17 @@ impl Render for EditorView {
                 sh.muted.clone(),
                 sh.soloed.clone(),
                 sh.track_dest.contains_key(&self.sel_track),
-                markers,
-                tempo0,
-                sig,
-                sh.doc.tracks.iter().map(|t| t.out_channel).collect::<Vec<u8>>(),
             )
         };
+        // revision-cached document chrome (markers, names, diagnostics, …) —
+        // rebuilt on edits only, never per animation frame
+        let doc_ui = self.doc_ui.clone();
+        let n_diags = doc_ui.n_diags;
+        let tempo0 = doc_ui.tempo0;
+        let sig = doc_ui.sig.clone();
+        let track_names = doc_ui.track_names.clone();
+        let track_chs = doc_ui.track_chs.clone();
+        let markers = &doc_ui.markers;
         let ppq = self.ppq();
         let pos = {
             let bar = playhead_tick / (ppq * 4) + 1;
@@ -144,7 +116,8 @@ impl Render for EditorView {
                 bounds_cell.set(bounds);
             },
             move |bounds, _state, window, _cx| {
-                if playing {
+                if playing || panning {
+                    // panning: edge auto-pan frames; playing: playhead
                     window.request_animation_frame();
                 }
                 let w = bounds.size.width;
@@ -179,8 +152,21 @@ impl Render for EditorView {
                     ));
                     t += ppq;
                 }
-                // notes
-                for n in notes.iter() {
+                // notes — enter the sorted list by binary search. While a
+                // Move/Duplicate drag shifts notes, widen the window toward
+                // the shift direction: a plain right-edge `break` on the
+                // dragged x would drop still-visible unselected notes.
+                let (vt0, vt1) = tick_window(scroll_x, zoom, f32::from(w));
+                let move_dtick = match drag {
+                    Some((DragMode::Move | DragMode::Duplicate, _, dtick, _)) => dtick,
+                    _ => 0,
+                };
+                let (entry, exit) = drag_window(vt0, vt1, move_dtick);
+                let first = notes.partition_point(|n| (n.start_tick as i64) < entry);
+                for n in &notes[first..] {
+                    if (n.start_tick as i64) > exit {
+                        break;
+                    }
                     let mut st = n.start_tick as i64;
                     let mut en = n.end_tick.unwrap_or(n.start_tick + ppq / 4) as i64;
                     let mut key = n.key as i32;
@@ -206,11 +192,11 @@ impl Render for EditorView {
                     if ghost_orig {
                         // alt-drag copy: keep the source visible underneath
                         let ox = bounds.origin.x + px(n.start_tick as f32 * zoom - scroll_x);
-                        let ow = ((n.end_tick.unwrap_or(n.start_tick) - n.start_tick).max(1) as f32
+                        let ow = ((n.end_tick.unwrap_or(n.start_tick) - n.start_tick).max(1)
+                            as f32
                             * zoom)
                             .max(3.0);
-                        let oy = bounds.origin.y
-                            + px((127.0 - n.key as f32) * NOTE_H - scroll_y);
+                        let oy = bounds.origin.y + px((127.0 - n.key as f32) * NOTE_H - scroll_y);
                         window.paint_quad(fill(
                             Bounds::new(point(ox, oy + px(1.0)), size(px(ow), px(NOTE_H - 2.0))),
                             rgba(0x80808044),
@@ -220,9 +206,6 @@ impl Render for EditorView {
                     let wpx = ((en - st).max(1) as f32 * zoom).max(3.0);
                     if x + px(wpx) < bounds.origin.x {
                         continue;
-                    }
-                    if x > bounds.origin.x + w {
-                        break;
                     }
                     let y = bounds.origin.y + px((127.0 - key as f32) * NOTE_H - scroll_y);
                     if y < bounds.origin.y - px(NOTE_H) || y > bounds.origin.y + h {
@@ -274,7 +257,10 @@ impl Render for EditorView {
             dests.get(eff_dest).map(|(_, d)| d),
             Some(output::Destination::Plugin { .. })
         );
-        let sel_plugin_failed = matches!(self.plugin_state.get(&eff_dest), Some(PluginState::Failed { .. }));
+        let sel_plugin_failed = matches!(
+            self.plugin_state.get(&eff_dest),
+            Some(PluginState::Failed { .. })
+        );
 
         // --- menu bar -----------------------------------------------------------
         let open_menu = self.open_menu;
@@ -338,15 +324,13 @@ impl Render for EditorView {
             );
             mx += w;
         }
-        menu_bar = menu_bar
-            .child(div().flex_1())
-            .child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(rgb(if dirty { 0xffd24f } else { 0x9a9ab0 }))
-                    .whitespace_nowrap()
-                    .child(format!("{title}{}", if dirty { " •" } else { "" })),
-            );
+        menu_bar = menu_bar.child(div().flex_1()).child(
+            div()
+                .text_size(px(12.0))
+                .text_color(rgb(if dirty { 0xffd24f } else { 0x9a9ab0 }))
+                .whitespace_nowrap()
+                .child(format!("{title}{}", if dirty { " •" } else { "" })),
+        );
 
         // --- transport / tool bar: icon groups, DAW style -------------------------
         let transport_bar = div()
@@ -359,39 +343,85 @@ impl Render for EditorView {
             .border_b_1()
             .border_color(rgb(BORDER_C))
             // file ops
-            .child(Self::ibtn("i.new", "note_add", t("tip.new"), false, cx, |v, _e, cx| {
-                v.new_file(cx);
-            }))
-            .child(Self::ibtn("i.open", "folder_open", t("tip.open"), false, cx, |v, _e, cx| {
-                v.open_dialog(cx);
-            }))
-            .child(Self::ibtn("i.save", "save", t("tip.save"), false, cx, |v, _e, cx| {
-                v.save(cx);
-            }))
+            .child(Self::ibtn(
+                "i.new",
+                "note_add",
+                t("tip.new"),
+                false,
+                cx,
+                |v, _e, cx| {
+                    v.new_file(cx);
+                },
+            ))
+            .child(Self::ibtn(
+                "i.open",
+                "folder_open",
+                t("tip.open"),
+                false,
+                cx,
+                |v, _e, cx| {
+                    v.open_dialog(cx);
+                },
+            ))
+            .child(Self::ibtn(
+                "i.save",
+                "save",
+                t("tip.save"),
+                false,
+                cx,
+                |v, _e, cx| {
+                    v.save(cx);
+                },
+            ))
             .child(Self::vsep())
             // history
-            .child(Self::ibtn("i.undo", "undo", t("tip.undo"), false, cx, |v, _e, cx| {
-                v.undo(cx);
-            }))
-            .child(Self::ibtn("i.redo", "redo", t("tip.redo"), false, cx, |v, _e, cx| {
-                v.redo(cx);
-            }))
+            .child(Self::ibtn(
+                "i.undo",
+                "undo",
+                t("tip.undo"),
+                false,
+                cx,
+                |v, _e, cx| {
+                    v.undo(cx);
+                },
+            ))
+            .child(Self::ibtn(
+                "i.redo",
+                "redo",
+                t("tip.redo"),
+                false,
+                cx,
+                |v, _e, cx| {
+                    v.redo(cx);
+                },
+            ))
             .child(Self::vsep())
             // transport
             .child(Self::ibtn_c(
                 "i.play",
-                if self.playback.is_some() { "stop" } else { "play_arrow" },
+                if self.playback.is_some() {
+                    "stop"
+                } else {
+                    "play_arrow"
+                },
                 t("tip.play"),
                 self.playback.is_some(),
                 0x4fd08c,
                 cx,
                 |v, _e, cx| v.toggle_play(cx),
             ))
-            .child(Self::ibtn("i.stop", "stop", t("tip.stop"), false, cx, |v, _e, cx| {
-                v.stop_playback();
-                v.play_us = 0;
-                cx.notify();
-            }))
+            .child(Self::ibtn(
+                "i.stop",
+                "stop",
+                t("tip.stop"),
+                false,
+                cx,
+                |v, _e, cx| {
+                    v.stop_playback();
+                    v.play_us = 0;
+                    cx.notify();
+                },
+            ))
             .child(Self::ibtn_c(
                 "i.rec",
                 "fiber_manual_record",
@@ -401,20 +431,36 @@ impl Render for EditorView {
                 cx,
                 |v, _e, _cx| v.toggle_record(),
             ))
-            .child(Self::ibtn_c("i.loop", "loop", t("tip.loop"), loop_en, 0x9fd0ff, cx, |v, _e, _cx| {
-                {
-                    let mut sh = crate::lock_shared(&v.shared);
-                    sh.loop_enabled = !sh.loop_enabled;
-                }
-                v.persist();
-            }))
-            .child(Self::ibtn_c("i.met", "timer", t("tip.met"), met_en, 0x9fd0ff, cx, |v, _e, _cx| {
-                {
-                    let mut sh = crate::lock_shared(&v.shared);
-                    sh.metronome = !sh.metronome;
-                }
-                v.persist();
-            }))
+            .child(Self::ibtn_c(
+                "i.loop",
+                "loop",
+                t("tip.loop"),
+                loop_en,
+                0x9fd0ff,
+                cx,
+                |v, _e, _cx| {
+                    {
+                        let mut sh = crate::lock_shared(&v.shared);
+                        sh.loop_enabled = !sh.loop_enabled;
+                    }
+                    v.persist();
+                },
+            ))
+            .child(Self::ibtn_c(
+                "i.met",
+                "timer",
+                t("tip.met"),
+                met_en,
+                0x9fd0ff,
+                cx,
+                |v, _e, _cx| {
+                    {
+                        let mut sh = crate::lock_shared(&v.shared);
+                        sh.metronome = !sh.metronome;
+                    }
+                    v.persist();
+                },
+            ))
             .child(Self::vsep())
             // position + tempo + meter readouts (LCD style)
             .child(
@@ -507,23 +553,39 @@ impl Render for EditorView {
                     .flex()
                     .items_center()
                     .rounded_sm()
-                    .bg(rgb(if SNAPS[self.snap_idx].0 > 0 { BG_RAISED } else { 0x141419 }))
+                    .bg(rgb(if SNAPS[self.snap_idx].0 > 0 {
+                        BG_RAISED
+                    } else {
+                        0x141419
+                    }))
                     .border_1()
-                    .border_color(rgb(if SNAPS[self.snap_idx].0 > 0 { 0x3d5a75 } else { BORDER_C }))
+                    .border_color(rgb(if SNAPS[self.snap_idx].0 > 0 {
+                        0x3d5a75
+                    } else {
+                        BORDER_C
+                    }))
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(0x2f2f42)))
                     .tooltip(move |_w, cx| cx.new(|_| Tip(t("tip.snap").into())).into())
                     .child(icon(
                         "grid_on",
                         15.0,
-                        if SNAPS[self.snap_idx].0 > 0 { ACCENT } else { 0x55556a },
+                        if SNAPS[self.snap_idx].0 > 0 {
+                            ACCENT
+                        } else {
+                            0x55556a
+                        },
                     ))
                     .child(
                         div()
                             .pl_1()
                             .text_size(px(11.0))
                             .font_family("Cascadia Mono")
-                            .text_color(rgb(if SNAPS[self.snap_idx].0 > 0 { 0xd8d8e0 } else { 0x55556a }))
+                            .text_color(rgb(if SNAPS[self.snap_idx].0 > 0 {
+                                0xd8d8e0
+                            } else {
+                                0x55556a
+                            }))
                             .whitespace_nowrap()
                             .child(SNAPS[self.snap_idx].2),
                     )
@@ -531,37 +593,83 @@ impl Render for EditorView {
             )
             .child(Self::vsep())
             // selection ops (selection range, else whole track)
-            .child(Self::ibtn("i.quant", "compress", t("tip.quantize"), false, cx, |v, _e, cx| {
-                let g = v.snap_ticks().max(v.ppq() as i64 / 4) as u64;
-                v.apply_region_op("quantize", move |d, tr, f, to| {
-                    d.quantize_ops(tr, f, to, g, 100)
-                });
-                cx.notify();
-            }))
-            .child(Self::ibtn("i.trdn", "arrow_downward", t("tip.trdn"), false, cx, |v, _e, cx| {
-                v.apply_region_op("transpose -1", |d, t, f, to| d.transpose_ops(t, f, to, -1));
-                cx.notify();
-            }))
-            .child(Self::ibtn("i.trup", "arrow_upward", t("tip.trup"), false, cx, |v, _e, cx| {
-                v.apply_region_op("transpose +1", |d, t, f, to| d.transpose_ops(t, f, to, 1));
-                cx.notify();
-            }))
-            .child(Self::ibtn("i.vel", "tune", t("tip.vel"), false, cx, |v, e: &ClickEvent, cx| {
-                if e.modifiers().shift {
-                    v.apply_region_op("vel ×0.8", |d, t, f, to| d.scale_velocity_ops(t, f, to, 0.8));
-                } else {
-                    v.apply_region_op("vel ×1.25", |d, t, f, to| d.scale_velocity_ops(t, f, to, 1.25));
-                }
-                cx.notify();
-            }))
+            .child(Self::ibtn(
+                "i.quant",
+                "compress",
+                t("tip.quantize"),
+                false,
+                cx,
+                |v, _e, cx| {
+                    let g = v.snap_ticks().max(v.ppq() as i64 / 4) as u64;
+                    v.apply_region_op("quantize", move |d, tr, f, to| {
+                        d.quantize_ops(tr, f, to, g, 100)
+                    });
+                    cx.notify();
+                },
+            ))
+            .child(Self::ibtn(
+                "i.trdn",
+                "arrow_downward",
+                t("tip.trdn"),
+                false,
+                cx,
+                |v, _e, cx| {
+                    v.apply_region_op("transpose -1", |d, t, f, to| d.transpose_ops(t, f, to, -1));
+                    cx.notify();
+                },
+            ))
+            .child(Self::ibtn(
+                "i.trup",
+                "arrow_upward",
+                t("tip.trup"),
+                false,
+                cx,
+                |v, _e, cx| {
+                    v.apply_region_op("transpose +1", |d, t, f, to| d.transpose_ops(t, f, to, 1));
+                    cx.notify();
+                },
+            ))
+            .child(Self::ibtn(
+                "i.vel",
+                "tune",
+                t("tip.vel"),
+                false,
+                cx,
+                |v, e: &ClickEvent, cx| {
+                    if e.modifiers().shift {
+                        v.apply_region_op("vel ×0.8", |d, t, f, to| {
+                            d.scale_velocity_ops(t, f, to, 0.8)
+                        });
+                    } else {
+                        v.apply_region_op("vel ×1.25", |d, t, f, to| {
+                            d.scale_velocity_ops(t, f, to, 1.25)
+                        });
+                    }
+                    cx.notify();
+                },
+            ))
             .child(div().flex_1())
             // zoom
-            .child(Self::ibtn("i.zout", "zoom_out", t("tip.zout"), false, cx, |v, _e, cx| {
-                v.zoom_by(1.0 / 1.3, cx);
-            }))
-            .child(Self::ibtn("i.zin", "zoom_in", t("tip.zin"), false, cx, |v, _e, cx| {
-                v.zoom_by(1.3, cx);
-            }))
+            .child(Self::ibtn(
+                "i.zout",
+                "zoom_out",
+                t("tip.zout"),
+                false,
+                cx,
+                |v, _e, cx| {
+                    v.zoom_by(1.0 / 1.3, cx);
+                },
+            ))
+            .child(Self::ibtn(
+                "i.zin",
+                "zoom_in",
+                t("tip.zin"),
+                false,
+                cx,
+                |v, _e, cx| {
+                    v.zoom_by(1.3, cx);
+                },
+            ))
             .children(sel_is_plugin.then(|| {
                 Self::ibtn("i.gui", "piano", t("tip.gui"), false, cx, |v, _e, cx| {
                     v.open_plugin_gui();
@@ -590,26 +698,26 @@ impl Render for EditorView {
                     .child(format!("{} ({})", t("events.header"), self.events.len()))
                     .child(div().flex_1())
                     .children((n_diags > 0).then(|| {
-                            div()
-                                .id("fix-diags")
-                                .ml_2()
-                                .px_1()
-                                .text_size(px(10.0))
-                                .text_color(rgb(0xffb454))
-                                .cursor_pointer()
-                                .child(format!("{} {} [fix]", n_diags, t("events.issues")))
-                                .on_click(cx.listener(|v, _e, _w, cx| {
-                                    let ops = {
-                                        let mut sh = crate::lock_shared(&v.shared);
-                                        sh.doc.fix_ops(&[])
-                                    };
-                                    if !ops.is_empty() {
-                                        v.apply_tx("fix diagnostics", ops);
-                                        v.status = t("status.fixed").into();
-                                    }
-                                    cx.notify();
-                                }))
-                        })),
+                        div()
+                            .id("fix-diags")
+                            .ml_2()
+                            .px_1()
+                            .text_size(px(10.0))
+                            .text_color(rgb(0xffb454))
+                            .cursor_pointer()
+                            .child(format!("{} {} [fix]", n_diags, t("events.issues")))
+                            .on_click(cx.listener(|v, _e, _w, cx| {
+                                let ops = {
+                                    let mut sh = crate::lock_shared(&v.shared);
+                                    sh.doc.fix_ops(&[])
+                                };
+                                if !ops.is_empty() {
+                                    v.apply_tx("fix diagnostics", ops);
+                                    v.status = t("status.fixed").into();
+                                }
+                                cx.notify();
+                            }))
+                    })),
             )
             .child({
                 let events = self.events.clone();
@@ -653,104 +761,112 @@ impl Render for EditorView {
                     .text_color(rgb(0x77778a))
                     .child(t("tracks.header")),
             )
-            .children(track_names.iter().enumerate().map(|(i, name)| {
-                let sel = self.sel_track == i;
-                let muted = muted_set.contains(&i);
-                let soloed = soloed_set.contains(&i);
-                let color = TRACK_COLORS[i % TRACK_COLORS.len()];
+            .child(
+                // scrollable when a file has more tracks than fit the panel
                 div()
-                    .id(("track", i))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .h(px(22.0))
-                    .px_1()
-                    .cursor_pointer()
-                    .bg(if sel { rgb(0x2a2a3a) } else { rgb(0x1b1b24) })
-                    .hover(|s| s.bg(rgb(0x252532)))
-                    .on_click(cx.listener(move |v, _e, _w, cx| {
-                        v.sel_track = i;
-                        cx.notify();
-                    }))
-                    .child(
+                    .id("track-list")
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .children(track_names.iter().enumerate().map(|(i, name)| {
+                        let sel = self.sel_track == i;
+                        let muted = muted_set.contains(&i);
+                        let soloed = soloed_set.contains(&i);
+                        let color = TRACK_COLORS[i % TRACK_COLORS.len()];
                         div()
-                            .w(px(10.0))
-                            .h(px(10.0))
-                            .rounded_sm()
-                            .bg(rgb(if muted { 0x555560 } else { color })),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
+                            .id(("track", i))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .h(px(22.0))
                             .px_1()
-                            .text_size(px(11.0))
-                            .text_color(rgb(if muted { 0x707080 } else { 0xd8d8e0 }))
-                            .overflow_hidden()
-                            .child(name.to_string()),
-                    )
-                    .child(
-                        div()
-                            .id(("mute", i))
-                            .px_1()
-                            .text_size(px(9.0))
-                            .text_color(rgb(if muted { 0xffb454 } else { 0x707080 }))
-                            .on_click(cx.listener(move |v, _e: &ClickEvent, _w, cx| {
-                                cx.stop_propagation();
-                                {
-                                    let mut sh = crate::lock_shared(&v.shared);
-                                    if !sh.muted.remove(&i) {
-                                        sh.muted.insert(i);
-                                    }
-                                }
-                                v.persist();
+                            .cursor_pointer()
+                            .bg(if sel { rgb(0x2a2a3a) } else { rgb(0x1b1b24) })
+                            .hover(|s| s.bg(rgb(0x252532)))
+                            .on_click(cx.listener(move |v, _e, _w, cx| {
+                                v.sel_track = i;
                                 cx.notify();
                             }))
-                            .child("M"),
-                    )
-                    .child(
-                        div()
-                            .id(("solo", i))
-                            .px_1()
-                            .text_size(px(9.0))
-                            .text_color(rgb(if soloed { 0xffd24f } else { 0x707080 }))
-                            .on_click(cx.listener(move |v, _e: &ClickEvent, _w, cx| {
-                                cx.stop_propagation();
-                                {
-                                    let mut sh = crate::lock_shared(&v.shared);
-                                    if !sh.soloed.remove(&i) {
-                                        sh.soloed.insert(i);
-                                    }
-                                }
-                                v.persist();
-                                cx.notify();
-                            }))
-                            .child("S"),
-                    )
-                    .child(
-                        div()
-                            .id(("ch", i))
-                            .px_1()
-                            .text_size(px(9.0))
-                            .text_color(rgb(0x7070a0))
-                            .on_click(cx.listener(move |v, _e: &ClickEvent, _w, cx| {
-                                cx.stop_propagation();
-                                let ops = {
-                                    let mut sh = crate::lock_shared(&v.shared);
-                                    let cur = sh
-                                        .doc
-                                        .tracks
-                                        .get(i)
-                                        .map(|t| t.out_channel)
-                                        .unwrap_or(0);
-                                    sh.doc.set_track_channel_ops(i, (cur + 1) % 16)
-                                };
-                                v.apply_tx("set track channel", ops);
-                                cx.notify();
-                            }))
-                            .child(format!("c{}", track_chs.get(i).copied().unwrap_or(0) + 1)),
-                    )
-            }))
-            .child(div().flex_1())
+                            .child(div().w(px(10.0)).h(px(10.0)).rounded_sm().bg(rgb(if muted {
+                                0x555560
+                            } else {
+                                color
+                            })))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .px_1()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(if muted { 0x707080 } else { 0xd8d8e0 }))
+                                    .overflow_hidden()
+                                    .child(name.to_string()),
+                            )
+                            .child(
+                                div()
+                                    .id(("mute", i))
+                                    .px_1()
+                                    .text_size(px(9.0))
+                                    .text_color(rgb(if muted { 0xffb454 } else { 0x707080 }))
+                                    .on_click(cx.listener(move |v, _e: &ClickEvent, _w, cx| {
+                                        cx.stop_propagation();
+                                        {
+                                            let mut sh = crate::lock_shared(&v.shared);
+                                            if !sh.muted.remove(&i) {
+                                                sh.muted.insert(i);
+                                            }
+                                        }
+                                        v.persist();
+                                        cx.notify();
+                                    }))
+                                    .child("M"),
+                            )
+                            .child(
+                                div()
+                                    .id(("solo", i))
+                                    .px_1()
+                                    .text_size(px(9.0))
+                                    .text_color(rgb(if soloed { 0xffd24f } else { 0x707080 }))
+                                    .on_click(cx.listener(move |v, _e: &ClickEvent, _w, cx| {
+                                        cx.stop_propagation();
+                                        {
+                                            let mut sh = crate::lock_shared(&v.shared);
+                                            if !sh.soloed.remove(&i) {
+                                                sh.soloed.insert(i);
+                                            }
+                                        }
+                                        v.persist();
+                                        cx.notify();
+                                    }))
+                                    .child("S"),
+                            )
+                            .child(
+                                div()
+                                    .id(("ch", i))
+                                    .px_1()
+                                    .text_size(px(9.0))
+                                    .text_color(rgb(0x7070a0))
+                                    .on_click(cx.listener(move |v, _e: &ClickEvent, _w, cx| {
+                                        cx.stop_propagation();
+                                        let ops = {
+                                            let mut sh = crate::lock_shared(&v.shared);
+                                            let cur = sh
+                                                .doc
+                                                .tracks
+                                                .get(i)
+                                                .map(|t| t.out_channel)
+                                                .unwrap_or(0);
+                                            sh.doc.set_track_channel_ops(i, (cur + 1) % 16)
+                                        };
+                                        v.apply_tx("set track channel", ops);
+                                        cx.notify();
+                                    }))
+                                    .child(format!(
+                                        "c{}",
+                                        track_chs.get(i).copied().unwrap_or(0) + 1
+                                    )),
+                            )
+                    })),
+            )
             // rename field for the selected track, anchored at the panel bottom
             .child(
                 div()
@@ -777,31 +893,9 @@ impl Render for EditorView {
         let lane_sel_track = self.sel_track;
         let lane_mode = self.lane_mode;
         // control events of the selected track matching the lane mode:
-        // (event id, tick, value 0..127 or 0..16383 for PB)
-        let lane_events: Vec<(EventId, u64, i32)> = {
-            let sh = crate::lock_shared(&self.shared);
-            let tr = lane_sel_track.min(sh.doc.tracks.len().saturating_sub(1));
-            let mut v = Vec::new();
-            if let Some(t) = sh.doc.tracks.get(tr) {
-                for e in &t.events {
-                    if let EventKind::Channel { status, data, .. } = &e.kind {
-                        match (lane_mode, status & 0xF0) {
-                            (LaneMode::CC(cc), 0xB0) if data[0] == cc => {
-                                v.push((e.id, e.tick, data[1] as i32))
-                            }
-                            (LaneMode::PitchBend, 0xE0) => v.push((
-                                e.id,
-                                e.tick,
-                                ((data[1] as i32) << 7) | data[0] as i32,
-                            )),
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            v.sort_by_key(|e| e.1);
-            v
-        };
+        // (event id, tick, value 0..127 or 0..16383 for PB) — cached on
+        // (revision, track, mode) so playhead animation is allocation-free
+        let lane_events = self.lane_events_cached();
         let lane_bounds_cell = self.lane_bounds.clone();
         let lane = canvas(
             move |bounds, _window, _cx| {
@@ -814,7 +908,11 @@ impl Render for EditorView {
                 let drag_v = drag;
                 move |bounds, _state, window, _cx| {
                     let h: f32 = bounds.size.height.into();
-                    let vrange = if lane_mode == LaneMode::PitchBend { 16383.0 } else { 127.0 };
+                    let vrange = if lane_mode == LaneMode::PitchBend {
+                        16383.0
+                    } else {
+                        127.0
+                    };
                     match lane_mode {
                         LaneMode::Velocity => {
                             for n in lane_notes.iter().filter(|n| n.track == lane_sel_track) {
@@ -844,7 +942,7 @@ impl Render for EditorView {
                         _ => {
                             // stepped automation line: dot + run to next point
                             let mut prev: Option<(Pixels, Pixels)> = None;
-                            for (id, tick, val) in &lane_events {
+                            for (id, tick, val) in lane_events.iter() {
                                 let mut v = *val;
                                 if let Some((DragMode::LaneEvent, d_on, _, dkey)) = drag_v {
                                     if d_on == *id {
@@ -858,10 +956,7 @@ impl Render for EditorView {
                                     // horizontal run at previous level, then
                                     // a vertical connector at this event's x
                                     window.paint_quad(fill(
-                                        Bounds::new(
-                                            point(px_, py_),
-                                            size(x - px_, px(1.0)),
-                                        ),
+                                        Bounds::new(point(px_, py_), size(x - px_, px(1.0))),
                                         rgba(0x4fd0ff88),
                                     ));
                                     window.paint_quad(fill(
@@ -873,7 +968,10 @@ impl Render for EditorView {
                                     ));
                                 }
                                 window.paint_quad(fill(
-                                    Bounds::new(point(x - px(2.0), y - px(2.0)), size(px(4.0), px(4.0))),
+                                    Bounds::new(
+                                        point(x - px(2.0), y - px(2.0)),
+                                        size(px(4.0), px(4.0)),
+                                    ),
                                     rgb(0x4fd0ff),
                                 ));
                                 prev = Some((x, y));
@@ -882,9 +980,14 @@ impl Render for EditorView {
                             if let Some((DragMode::LaneEvent, 0, a_tick, dkey)) = drag_v {
                                 let x = bounds.origin.x + px(a_tick as f32 * zoom - scroll_x);
                                 let y = bounds.origin.y
-                                    + px((h - 4.0) * (1.0 - dkey.clamp(0, vrange as i32) as f32 / vrange) + 2.0);
+                                    + px((h - 4.0)
+                                        * (1.0 - dkey.clamp(0, vrange as i32) as f32 / vrange)
+                                        + 2.0);
                                 window.paint_quad(fill(
-                                    Bounds::new(point(x - px(2.0), y - px(2.0)), size(px(4.0), px(4.0))),
+                                    Bounds::new(
+                                        point(x - px(2.0), y - px(2.0)),
+                                        size(px(4.0), px(4.0)),
+                                    ),
                                     rgb(SEL_COLOR),
                                 ));
                             }
@@ -900,30 +1003,33 @@ impl Render for EditorView {
         let mini_notes = self.notes.clone();
         let mini_active = self.sel_track;
         let roll_bounds_cell = self.roll_bounds.clone();
-        let song_end = mini_notes
-            .iter()
-            .map(|n| n.end_tick.unwrap_or(n.start_tick))
-            .max()
-            .unwrap_or(ppq * 16)
-            .max(ppq * 16);
+        let song_end = doc_ui.song_end.max(ppq * 16);
         let mini_play = play_x_tick;
         let minimap = canvas(
             move |b, _w, _cx| mini_bounds_cell.set(b),
             move |bounds, _state, window, _cx| {
-                if playing {
+                if playing || panning {
+                    // panning: viewport rect follows; playing: playhead
                     window.request_animation_frame();
                 }
                 let w: f32 = bounds.size.width.into();
                 let h: f32 = bounds.size.height.into();
                 let sx = w / song_end as f32;
-                for n in mini_notes.iter() {
+                // overview only — decimate dense songs so this paint stays
+                // cheap at animation-frame rate
+                let stride = mini_notes.len() / 1500 + 1;
+                for n in mini_notes.iter().step_by(stride) {
                     let x = bounds.origin.x + px(n.start_tick as f32 * sx);
                     let y = bounds.origin.y + px((127.0 - n.key as f32) / 128.0 * (h - 2.0) + 1.0);
                     let nw = ((n.end_tick.unwrap_or(n.start_tick) - n.start_tick).max(1) as f32
                         * sx)
                         .max(1.5);
                     let c = TRACK_COLORS[n.track % TRACK_COLORS.len()];
-                    let c = if n.track == mini_active { c } else { blend(c, 0x111118, 0.55) };
+                    let c = if n.track == mini_active {
+                        c
+                    } else {
+                        blend(c, 0x111118, 0.55)
+                    };
                     window.paint_quad(fill(
                         Bounds::new(point(x, y), size(px(nw), px((h / 64.0).max(1.2)))),
                         rgb(c),
@@ -978,7 +1084,10 @@ impl Render for EditorView {
                 let hx = bounds.origin.x + px(ruler_play_tick as f32 * zoom - scroll_x);
                 if hx >= bounds.origin.x && hx <= bounds.origin.x + w {
                     window.paint_quad(fill(
-                        Bounds::new(point(hx - px(2.0), bounds.origin.y), size(px(4.0), px(12.0))),
+                        Bounds::new(
+                            point(hx - px(2.0), bounds.origin.y),
+                            size(px(4.0), px(12.0)),
+                        ),
                         rgb(0x50ff9f),
                     ));
                 }
@@ -991,6 +1100,26 @@ impl Render for EditorView {
                 .h_full()
                 .flex()
                 .flex_col()
+                // one wheel handler for the whole timeline (roll, ruler,
+                // minimap, lane) — the strips share the same scroll offset
+                .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _w, cx| {
+                    let d = ev.delta.pixel_delta(px(20.0));
+                    if ev.modifiers.control {
+                        // zoom around the cursor: the tick under it stays put
+                        let b = this.roll_bounds.get();
+                        let off = (f32::from(ev.position.x) - f32::from(b.origin.x))
+                            .clamp(0.0, f32::from(b.size.width));
+                        let anchor_tick = (off + this.scroll_x) / this.zoom;
+                        this.zoom =
+                            (this.zoom * (1.0 - d.y.to_f64() as f32 * 0.002)).clamp(ZOOM_MIN, ZOOM_MAX);
+                        this.scroll_x = (anchor_tick * this.zoom - off).max(0.0);
+                    } else {
+                        this.scroll_x = (this.scroll_x + d.x.to_f64() as f32).max(0.0);
+                        this.scroll_y = (this.scroll_y + d.y.to_f64() as f32).max(0.0);
+                    }
+                    this.clamp_scroll();
+                    cx.notify();
+                }))
                 .child(
                     div()
                         .h(px(20.0))
@@ -1003,22 +1132,19 @@ impl Render for EditorView {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
-                                let b = this.mini_bounds.get();
-                                let w: f32 = b.size.width.into();
-                                if w <= 0.0 {
-                                    return;
-                                }
-                                let x = f32::from(ev.position.x) - f32::from(b.origin.x);
-                                let tick = x / w;
-                                // center the clicked position in the view
-                                let send = this.doc_end_ticks();
-                                let t = tick * send as f32;
-                                let vw = f32::from(this.roll_bounds.get().size.width)
-                                    / this.zoom;
-                                this.scroll_x = ((t - vw / 2.0) * this.zoom).max(0.0);
+                                this.seek_minimap(f32::from(ev.position.x));
                                 cx.notify();
                             }),
-                        ),
+                        )
+                        .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
+                            // drag on the minimap pans the view; ignore when a
+                            // roll drag is mid-flight (cursor crossed strips)
+                            if ev.pressed_button != Some(MouseButton::Left) || this.drag.is_some() {
+                                return;
+                            }
+                            this.seek_minimap(f32::from(ev.position.x));
+                            cx.notify();
+                        })),
                 )
                 .child(
                     div()
@@ -1038,7 +1164,23 @@ impl Render for EditorView {
                                 // double-click on the ruler plays from that bar position
                                 this.seek_to_tick(tick, ev.click_count == 2, cx);
                             }),
-                        ),
+                        )
+                        .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
+                            // scrub: drag on the ruler moves the playhead.
+                            // While playing, keep the engine running — a
+                            // restart per move event would stutter audio.
+                            if ev.pressed_button != Some(MouseButton::Left)
+                                || this.drag.is_some()
+                                || this.playback.is_some()
+                            {
+                                return;
+                            }
+                            let b = this.ruler_bounds.get();
+                            let x = f32::from(ev.position.x) - f32::from(b.origin.x);
+                            let tick = ((x + this.scroll_x) / this.zoom).max(0.0) as u64;
+                            this.play_us = this.doc(|d| d.tempo_map.tick_to_us(tick));
+                            cx.notify();
+                        })),
                 )
                 // marker/lyric strip — meta 0x06/0x05 shown at their tick
                 .child(
@@ -1068,20 +1210,11 @@ impl Render for EditorView {
                         .relative()
                         .overflow_hidden()
                         .child(roll.size_full())
-                        .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _w, cx| {
-                    let d = ev.delta.pixel_delta(px(20.0));
-                    if ev.modifiers.control {
-                        this.zoom = (this.zoom * (1.0 - d.y.to_f64() as f32 * 0.002)).clamp(0.005, 0.8);
-                    } else {
-                        this.scroll_x = (this.scroll_x + d.x.to_f64() as f32).max(0.0);
-                        this.scroll_y = (this.scroll_y + d.y.to_f64() as f32).max(0.0);
-                    }
-                    cx.notify();
-                }))
-                .on_mouse_down(
+                        .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, ev: &MouseDownEvent, w, cx| {
                         w.focus(&this.focus, cx);
+                        this.mouse_pos = Some(ev.position);
                         let shift = ev.modifiers.shift;
                         // erase tool: any note under the cursor joins the stroke
                         if this.tool == Tool::Erase {
@@ -1183,67 +1316,19 @@ impl Render for EditorView {
                         cx.notify();
                     }),
                 )
-                .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
-                    if ev.pressed_button != Some(MouseButton::Left) {
-                        return;
-                    }
-                    // erase stroke: every note swept joins the pending delete set
-                    let erase_hit = if this
-                        .drag
-                        .as_ref()
-                        .map(|d| d.mode == DragMode::Erase)
-                        .unwrap_or(false)
-                    {
-                        this.note_at(ev.position)
-                            .or_else(|| this.edge_at(ev.position))
-                            .map(|n| n.on_id)
-                    } else {
-                        None
-                    };
-                    let (tick, key) = this.hit(ev.position);
-                    let Some(d) = &mut this.drag else { return };
-                    match d.mode {
-                        DragMode::Move => {
-                            d.dtick = tick - d.orig_start as i64;
-                            d.dkey = key - d.orig_key as i32;
-                        }
-                        DragMode::Resize => {
-                            d.dtick = tick - d.orig_end.unwrap_or(d.orig_start) as i64;
-                        }
-                        DragMode::Marquee => {
-                            d.b_tick = tick;
-                            d.b_key = key;
-                        }
-                        DragMode::Velocity | DragMode::LaneEvent | DragMode::Erase => {}
-                        DragMode::Duplicate => {
-                            d.dtick = tick - d.orig_start as i64;
-                            d.dkey = key - d.orig_key as i32;
-                        }
-                    }
-                    if let Some(id) = erase_hit {
-                        this.erase_ids.insert(id);
-                    }
-                    cx.notify();
-                }))
                 .on_mouse_up(
                     MouseButton::Left,
-                    cx.listener(|this, ev: &MouseUpEvent, _w, cx| {
-                        // draw tool: a drag on empty canvas draws the note the
-                        // box spans; a click is one snapped cell long
-                        let draw_commit = this.drag.as_ref().is_some_and(|d| {
-                            this.tool == Tool::Draw && d.mode == DragMode::Marquee
-                        });
-                        if draw_commit {
-                            let d = this.drag.take().unwrap();
-                            if (0..=127).contains(&d.a_key) {
-                                let (a, b) = (d.a_tick.min(d.b_tick), d.a_tick.max(d.b_tick));
-                                let len = (b - a).max(this.snap_ticks().max(1));
-                                this.insert_note_len(a.max(0) as u64, d.a_key as u8, len as u64, cx);
-                            }
-                        } else {
-                            this.commit_drag(cx);
-                        }
-                        let _ = ev;
+                    cx.listener(|this, _ev: &MouseUpEvent, _w, cx| {
+                        // draw-tool marquee → insert lives in commit_drag
+                        this.commit_drag(cx);
+                    }),
+                )
+                // a release over the ruler/lane/track column must still commit
+                // — GPUI only fires on_mouse_up for the hovered element
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(|this, _ev: &MouseUpEvent, _w, cx| {
+                        this.commit_drag(cx);
                     }),
                 )
                 )
@@ -1282,6 +1367,7 @@ impl Render for EditorView {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
+                                this.mouse_pos = Some(ev.position);
                                 let b = this.lane_bounds.get();
                                 let x = f32::from(ev.position.x) - f32::from(b.origin.x);
                                 let y = f32::from(ev.position.y) - f32::from(b.origin.y);
@@ -1291,15 +1377,20 @@ impl Render for EditorView {
                                     LaneMode::Velocity => {
                                         let vel =
                                             ((1.0 - y / h) * 127.0) as i32;
-                                        // nearest note in the selected track
+                                        // the note bar under the cursor (within
+                                        // ~6px) — a click on empty lane space
+                                        // must not edit some distant note
+                                        let bar_dx = |n: &document::Note| {
+                                            n.start_tick as f32 * this.zoom - x
+                                        };
                                         if let Some(n) = this
                                             .notes
                                             .iter()
                                             .filter(|n| n.track == this.sel_track)
-                                            .min_by_key(|n| {
-                                                let st = n.start_tick as i64;
-                                                (tick as i64 - st).abs()
+                                            .min_by(|a, b| {
+                                                bar_dx(a).abs().total_cmp(&bar_dx(b).abs())
                                             })
+                                            .filter(|n| bar_dx(n).abs() <= 6.0)
                                         {
                                             this.selection = BTreeSet::from([n.on_id]);
                                             this.drag = Some(Drag {
@@ -1376,28 +1467,16 @@ impl Render for EditorView {
                                 cx.notify();
                             }),
                         )
-                        .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
-                            let Some(d) = &mut this.drag else { return };
-                            if !matches!(d.mode, DragMode::Velocity | DragMode::LaneEvent)
-                                || ev.pressed_button != Some(MouseButton::Left)
-                            {
-                                return;
-                            }
-                            let b = this.lane_bounds.get();
-                            let y = f32::from(ev.position.y) - f32::from(b.origin.y);
-                            let h = f32::from(b.size.height);
-                            d.dkey = if d.mode == DragMode::Velocity {
-                                ((1.0 - y / h) * 127.0) as i32
-                            } else {
-                                let vrange = match this.lane_mode {
-                                    LaneMode::PitchBend => 16383.0,
-                                    _ => 127.0,
-                                };
-                                ((1.0 - y / h) * vrange) as i32
-                            };
-                            cx.notify();
-                        }))
+                        // drag deltas are forwarded by the root mouse-move
+                        // listener, so a lane drag keeps tracking even when
+                        // the cursor crosses into the ruler or roll
                         .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _ev: &MouseUpEvent, _w, cx| {
+                                this.commit_drag(cx)
+                            }),
+                        )
+                        .on_mouse_up_out(
                             MouseButton::Left,
                             cx.listener(|this, _ev: &MouseUpEvent, _w, cx| {
                                 this.commit_drag(cx)
@@ -1413,21 +1492,42 @@ impl Render for EditorView {
             Some(e) => e.label().to_string(),
         };
         let plugin_chip = if sel_is_plugin {
-            let name = dests.get(eff_dest).map(|(n, _)| n.clone()).unwrap_or_default();
+            let name = dests
+                .get(eff_dest)
+                .map(|(n, _)| n.clone())
+                .unwrap_or_default();
             let (badge, color, tip) = match self.plugin_state.get(&eff_dest) {
-                Some(PluginState::Ready { .. }) => ("●", 0x8fd0a0, t("plugin.state_ready").to_string()),
-                Some(PluginState::Loading { .. }) => ("◌ …", 0xe0b050, t("plugin.state_loading").to_string()),
-                Some(PluginState::Failed { phase, msg, .. }) => ("✕", 0xe06060, format!("{phase}: {msg}")),
+                Some(PluginState::Ready { .. }) => {
+                    ("●", 0x8fd0a0, t("plugin.state_ready").to_string())
+                }
+                Some(PluginState::Loading { .. }) => {
+                    ("◌ …", 0xe0b050, t("plugin.state_loading").to_string())
+                }
+                Some(PluginState::Failed { phase, msg, .. }) => {
+                    ("✕", 0xe06060, format!("{phase}: {msg}"))
+                }
                 _ => ("", 0x77778a, t("plugin.state_idle").to_string()),
             };
-            Some(div().id("plugin-chip").px_1().rounded_sm().cursor_pointer().text_color(rgb(color))
-                .child(format!("{badge} {name}"))
-                .tooltip(move |_w, cx| {
-                    let tip = tip.clone();
-                    cx.new(|_| Tip(tip.into())).into()
-                })
-                .on_click(cx.listener(|v, _e, _w, cx| { v.show_output_status = true; cx.notify(); })))
-        } else { None };
+            Some(
+                div()
+                    .id("plugin-chip")
+                    .px_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_color(rgb(color))
+                    .child(format!("{badge} {name}"))
+                    .tooltip(move |_w, cx| {
+                        let tip = tip.clone();
+                        cx.new(|_| Tip(tip.into())).into()
+                    })
+                    .on_click(cx.listener(|v, _e, _w, cx| {
+                        v.show_output_status = true;
+                        cx.notify();
+                    })),
+            )
+        } else {
+            None
+        };
         let status_bar = div()
             .flex()
             .items_center()
@@ -1451,15 +1551,24 @@ impl Render for EditorView {
             .child(Self::chip("st-lane", lane_mode.label(), cx, |v, _e, cx| {
                 v.set_lane(v.lane_mode.cycle(), cx);
             }))
-            .child(Self::chip("st-enc", format!("enc {enc_label}"), cx, |v, _e, cx| {
-                let next = match v.enc_override {
-                    None => Some(smf_core::TextEncoding::Utf8),
-                    Some(smf_core::TextEncoding::Utf8) => Some(smf_core::TextEncoding::ShiftJis),
-                    Some(smf_core::TextEncoding::ShiftJis) => Some(smf_core::TextEncoding::Latin1),
-                    Some(smf_core::TextEncoding::Latin1) => None,
-                };
-                v.set_enc(next, cx);
-            }))
+            .child(Self::chip(
+                "st-enc",
+                format!("enc {enc_label}"),
+                cx,
+                |v, _e, cx| {
+                    let next = match v.enc_override {
+                        None => Some(smf_core::TextEncoding::Utf8),
+                        Some(smf_core::TextEncoding::Utf8) => {
+                            Some(smf_core::TextEncoding::ShiftJis)
+                        }
+                        Some(smf_core::TextEncoding::ShiftJis) => {
+                            Some(smf_core::TextEncoding::Latin1)
+                        }
+                        Some(smf_core::TextEncoding::Latin1) => None,
+                    };
+                    v.set_enc(next, cx);
+                },
+            ))
             .child(
                 div()
                     .text_color(rgb(0x77778a))
@@ -1467,7 +1576,11 @@ impl Render for EditorView {
                     .whitespace_nowrap()
                     .child(format!("{pos}  {}", {
                         let sel = self.selection.len();
-                        if sel > 0 { format!("sel:{sel}") } else { String::new() }
+                        if sel > 0 {
+                            format!("sel:{sel}")
+                        } else {
+                            String::new()
+                        }
                     })),
             );
 
@@ -1504,9 +1617,16 @@ impl Render for EditorView {
                     })
                     .into_any_element(),
                     Self::msep().into_any_element(),
-                    Self::mi("e.selall", t("menu.select_all"), "Ctrl+A", None, cx, |v, _e, cx| {
-                        v.select_all(cx);
-                    })
+                    Self::mi(
+                        "e.selall",
+                        t("menu.select_all"),
+                        "Ctrl+A",
+                        None,
+                        cx,
+                        |v, _e, cx| {
+                            v.select_all(cx);
+                        },
+                    )
                     .into_any_element(),
                     Self::msep().into_any_element(),
                     Self::mi("e.cut", t("edit.cut"), "Ctrl+X", None, cx, |v, _e, cx| {
@@ -1517,13 +1637,27 @@ impl Render for EditorView {
                         v.copy_selected(false, cx);
                     })
                     .into_any_element(),
-                    Self::mi("e.paste", t("edit.paste"), "Ctrl+V", None, cx, |v, _e, cx| {
-                        v.paste(cx);
-                    })
+                    Self::mi(
+                        "e.paste",
+                        t("edit.paste"),
+                        "Ctrl+V",
+                        None,
+                        cx,
+                        |v, _e, cx| {
+                            v.paste(cx);
+                        },
+                    )
                     .into_any_element(),
-                    Self::mi("e.dup", t("edit.duplicate"), "Ctrl+D", None, cx, |v, _e, cx| {
-                        v.duplicate_selected(cx);
-                    })
+                    Self::mi(
+                        "e.dup",
+                        t("edit.duplicate"),
+                        "Ctrl+D",
+                        None,
+                        cx,
+                        |v, _e, cx| {
+                            v.duplicate_selected(cx);
+                        },
+                    )
                     .into_any_element(),
                     Self::mi("e.del", t("menu.delete"), "Del", None, cx, |v, _e, cx| {
                         v.delete_selected(cx);
@@ -1533,20 +1667,39 @@ impl Render for EditorView {
                     Self::mi_sub("e.tool", t("edit.tool"), Sub::Tool, cx).into_any_element(),
                     Self::mi_sub("e.snap", t("edit.snap"), Sub::Snap, cx).into_any_element(),
                     Self::msep().into_any_element(),
-                    Self::mi_sub("e.quant", t("edit.quantize"), Sub::Quant, cx)
-                        .into_any_element(),
-                    Self::mi("e.trup", t("edit.transpose_up"), "", None, cx, |v, _e, _cx| {
-                        v.apply_region_op("transpose +1", |d, t, f, to| d.transpose_ops(t, f, to, 1));
-                    })
+                    Self::mi_sub("e.quant", t("edit.quantize"), Sub::Quant, cx).into_any_element(),
+                    Self::mi(
+                        "e.trup",
+                        t("edit.transpose_up"),
+                        "",
+                        None,
+                        cx,
+                        |v, _e, _cx| {
+                            v.apply_region_op("transpose +1", |d, t, f, to| {
+                                d.transpose_ops(t, f, to, 1)
+                            });
+                        },
+                    )
                     .into_any_element(),
-                    Self::mi("e.trdn", t("edit.transpose_dn"), "", None, cx, |v, _e, _cx| {
-                        v.apply_region_op("transpose -1", |d, t, f, to| d.transpose_ops(t, f, to, -1));
-                    })
+                    Self::mi(
+                        "e.trdn",
+                        t("edit.transpose_dn"),
+                        "",
+                        None,
+                        cx,
+                        |v, _e, _cx| {
+                            v.apply_region_op("transpose -1", |d, t, f, to| {
+                                d.transpose_ops(t, f, to, -1)
+                            });
+                        },
+                    )
                     .into_any_element(),
                     Self::mi_sub("e.oct", t("edit.octave"), Sub::Oct, cx).into_any_element(),
                     Self::msep().into_any_element(),
                     Self::mi("e.human", t("edit.humanize"), "", None, cx, |v, _e, _cx| {
-                        v.apply_region_op("humanize", |d, t, f, to| d.humanize_ops(t, f, to, 12, 8));
+                        v.apply_region_op("humanize", |d, t, f, to| {
+                            d.humanize_ops(t, f, to, 12, 8)
+                        });
                     })
                     .into_any_element(),
                     Self::mi("e.legato", t("edit.legato"), "", None, cx, |v, _e, _cx| {
@@ -1558,33 +1711,64 @@ impl Render for EditorView {
                         .into_any_element(),
                     Self::msep().into_any_element(),
                     Self::mi("e.velup", t("edit.vel_up"), "", None, cx, |v, _e, _cx| {
-                        v.apply_region_op("vel ×1.25", |d, t, f, to| d.scale_velocity_ops(t, f, to, 1.25));
+                        v.apply_region_op("vel ×1.25", |d, t, f, to| {
+                            d.scale_velocity_ops(t, f, to, 1.25)
+                        });
                     })
                     .into_any_element(),
                     Self::mi("e.veldn", t("edit.vel_dn"), "", None, cx, |v, _e, _cx| {
-                        v.apply_region_op("vel ×0.8", |d, t, f, to| d.scale_velocity_ops(t, f, to, 0.8));
+                        v.apply_region_op("vel ×0.8", |d, t, f, to| {
+                            d.scale_velocity_ops(t, f, to, 0.8)
+                        });
                     })
                     .into_any_element(),
                 ],
                 TopMenu::View => vec![
-                    Self::mi("v.events", t("view.events"), "", Some(self.show_events), cx, |v, _e, _cx| {
-                        v.show_events = !v.show_events;
-                        v.persist();
-                    })
+                    Self::mi(
+                        "v.events",
+                        t("view.events"),
+                        "",
+                        Some(self.show_events),
+                        cx,
+                        |v, _e, _cx| {
+                            v.show_events = !v.show_events;
+                            v.persist();
+                        },
+                    )
                     .into_any_element(),
                     Self::msep().into_any_element(),
-                    Self::mi("v.zin", t("view.zoom_in"), "Ctrl+=", None, cx, |v, _e, cx| {
-                        v.zoom_by(1.3, cx);
-                    })
+                    Self::mi(
+                        "v.zin",
+                        t("view.zoom_in"),
+                        "Ctrl+=",
+                        None,
+                        cx,
+                        |v, _e, cx| {
+                            v.zoom_by(1.3, cx);
+                        },
+                    )
                     .into_any_element(),
-                    Self::mi("v.zout", t("view.zoom_out"), "Ctrl+-", None, cx, |v, _e, cx| {
-                        v.zoom_by(1.0 / 1.3, cx);
-                    })
+                    Self::mi(
+                        "v.zout",
+                        t("view.zoom_out"),
+                        "Ctrl+-",
+                        None,
+                        cx,
+                        |v, _e, cx| {
+                            v.zoom_by(1.0 / 1.3, cx);
+                        },
+                    )
                     .into_any_element(),
-                    Self::mi("v.z0", t("view.zoom_reset"), "Ctrl+0", None, cx, |v, _e, _cx| {
-                        v.zoom = 0.08;
-                        v.persist();
-                    })
+                    Self::mi(
+                        "v.z0",
+                        t("view.zoom_reset"),
+                        "Ctrl+0",
+                        None,
+                        cx,
+                        |v, _e, cx| {
+                            v.zoom_set(0.08, cx);
+                        },
+                    )
                     .into_any_element(),
                     Self::msep().into_any_element(),
                     Self::mi_sub("v.lane", t("view.lane"), Sub::Lane, cx).into_any_element(),
@@ -1597,38 +1781,60 @@ impl Render for EditorView {
                         })
                         .into_any_element(),
                         Self::msep().into_any_element(),
-                        Self::mi("t.mute", t("track.mute"), "", Some(muted_set.contains(&self.sel_track)), cx, |v, _e, _cx| {
-                            let t = v.sel_track;
-                            {
-                                let mut sh = crate::lock_shared(&v.shared);
-                                if !sh.muted.remove(&t) {
-                                    sh.muted.insert(t);
+                        Self::mi(
+                            "t.mute",
+                            t("track.mute"),
+                            "",
+                            Some(muted_set.contains(&self.sel_track)),
+                            cx,
+                            |v, _e, _cx| {
+                                let t = v.sel_track;
+                                {
+                                    let mut sh = crate::lock_shared(&v.shared);
+                                    if !sh.muted.remove(&t) {
+                                        sh.muted.insert(t);
+                                    }
                                 }
-                            }
-                            v.persist();
-                        })
+                                v.persist();
+                            },
+                        )
                         .into_any_element(),
-                        Self::mi("t.solo", t("track.solo"), "", Some(soloed_set.contains(&self.sel_track)), cx, |v, _e, _cx| {
-                            let t = v.sel_track;
-                            {
-                                let mut sh = crate::lock_shared(&v.shared);
-                                if !sh.soloed.remove(&t) {
-                                    sh.soloed.insert(t);
+                        Self::mi(
+                            "t.solo",
+                            t("track.solo"),
+                            "",
+                            Some(soloed_set.contains(&self.sel_track)),
+                            cx,
+                            |v, _e, _cx| {
+                                let t = v.sel_track;
+                                {
+                                    let mut sh = crate::lock_shared(&v.shared);
+                                    if !sh.soloed.remove(&t) {
+                                        sh.soloed.insert(t);
+                                    }
                                 }
-                            }
-                            v.persist();
-                        })
+                                v.persist();
+                            },
+                        )
                         .into_any_element(),
                         Self::msep().into_any_element(),
-                        Self::mi_sub("t.chan", t("track.channel"), Sub::Chan, cx).into_any_element(),
+                        Self::mi_sub("t.chan", t("track.channel"), Sub::Chan, cx)
+                            .into_any_element(),
                         Self::mi_sub("t.dest", t("track.dest"), Sub::Dest, cx).into_any_element(),
                     ];
                     if sel_is_plugin {
                         items.push(Self::msep().into_any_element());
                         items.push(
-                            Self::mi("t.gui", t("track.plugin_gui"), "", None, cx, |v, _e, _cx| {
-                                v.open_plugin_gui();
-                            })
+                            Self::mi(
+                                "t.gui",
+                                t("track.plugin_gui"),
+                                "",
+                                None,
+                                cx,
+                                |v, _e, _cx| {
+                                    v.open_plugin_gui();
+                                },
+                            )
                             .into_any_element(),
                         );
                     }
@@ -1643,13 +1849,30 @@ impl Render for EditorView {
                         Self::msep().into_any_element(),
                     ];
                     if sel_is_plugin {
-                        items.push(Self::mi("o.gui", if self.plugin_window.is_some() { t("output.editor_close") } else { t("output.editor_open") }, "", Some(self.plugin_window.is_some()), cx, |v, _e, _cx| v.open_plugin_gui()).into_any_element());
+                        items.push(
+                            Self::mi(
+                                "o.gui",
+                                if self.plugin_window.is_some() {
+                                    t("output.editor_close")
+                                } else {
+                                    t("output.editor_open")
+                                },
+                                "",
+                                Some(self.plugin_window.is_some()),
+                                cx,
+                                |v, _e, _cx| v.open_plugin_gui(),
+                            )
+                            .into_any_element(),
+                        );
                     }
                     if sel_plugin_failed {
-                        items.push(Self::mi("o.retry", t("output.retry"), "", None, cx, |v, _e, _cx| {
-                            let d = crate::lock_shared(&v.shared).dest_of(v.sel_track);
-                            v.ensure_plugin(d, true);
-                        }).into_any_element());
+                        items.push(
+                            Self::mi("o.retry", t("output.retry"), "", None, cx, |v, _e, _cx| {
+                                let d = crate::lock_shared(&v.shared).dest_of(v.sel_track);
+                                v.ensure_plugin(d, true);
+                            })
+                            .into_any_element(),
+                        );
                     }
                     items.extend([
                         Self::msep().into_any_element(),
@@ -1658,57 +1881,112 @@ impl Render for EditorView {
                             cx.notify();
                         })
                         .into_any_element(),
-                        Self::mi("o.status", t("output.host_status"), "", None, cx, |v, _e, cx| {
-                            v.show_output_status = true;
-                            cx.notify();
-                        }).into_any_element(),
+                        Self::mi(
+                            "o.status",
+                            t("output.host_status"),
+                            "",
+                            None,
+                            cx,
+                            |v, _e, cx| {
+                                v.show_output_status = true;
+                                cx.notify();
+                            },
+                        )
+                        .into_any_element(),
                     ]);
                     items
                 }
                 TopMenu::Transport => vec![
-                    Self::mi("tr.play", t("transport.play_stop"), "Space", Some(self.playback.is_some()), cx, |v, _e, cx| {
-                        v.toggle_play(cx);
-                    })
+                    Self::mi(
+                        "tr.play",
+                        t("transport.play_stop"),
+                        "Space",
+                        Some(self.playback.is_some()),
+                        cx,
+                        |v, _e, cx| {
+                            v.toggle_play(cx);
+                        },
+                    )
                     .into_any_element(),
-                    Self::mi("tr.rec", t("transport.record"), "", Some(self.rec.is_some()), cx, |v, _e, _cx| {
-                        v.toggle_record();
-                    })
+                    Self::mi(
+                        "tr.rec",
+                        t("transport.record"),
+                        "",
+                        Some(self.rec.is_some()),
+                        cx,
+                        |v, _e, _cx| {
+                            v.toggle_record();
+                        },
+                    )
                     .into_any_element(),
-                    Self::mi("tr.loop", t("transport.loop"), "", Some(loop_en), cx, |v, _e, _cx| {
-                        {
-                            let mut sh = crate::lock_shared(&v.shared);
-                            sh.loop_enabled = !sh.loop_enabled;
-                        }
-                        v.persist();
-                    })
+                    Self::mi(
+                        "tr.loop",
+                        t("transport.loop"),
+                        "",
+                        Some(loop_en),
+                        cx,
+                        |v, _e, _cx| {
+                            {
+                                let mut sh = crate::lock_shared(&v.shared);
+                                sh.loop_enabled = !sh.loop_enabled;
+                            }
+                            v.persist();
+                        },
+                    )
                     .into_any_element(),
-                    Self::mi("tr.met", t("transport.met"), "", Some(met_en), cx, |v, _e, _cx| {
-                        {
-                            let mut sh = crate::lock_shared(&v.shared);
-                            sh.metronome = !sh.metronome;
-                        }
-                        v.persist();
-                    })
+                    Self::mi(
+                        "tr.met",
+                        t("transport.met"),
+                        "",
+                        Some(met_en),
+                        cx,
+                        |v, _e, _cx| {
+                            {
+                                let mut sh = crate::lock_shared(&v.shared);
+                                sh.metronome = !sh.metronome;
+                            }
+                            v.persist();
+                        },
+                    )
                     .into_any_element(),
-                    Self::mi("tr.cin", t("transport.count_in"), "", Some(self.count_in), cx, |v, _e, _cx| {
-                        v.count_in = !v.count_in;
-                        v.save_global();
-                    })
+                    Self::mi(
+                        "tr.cin",
+                        t("transport.count_in"),
+                        "",
+                        Some(self.count_in),
+                        cx,
+                        |v, _e, _cx| {
+                            v.count_in = !v.count_in;
+                            v.save_global();
+                        },
+                    )
                     .into_any_element(),
                 ],
                 TopMenu::Help => vec![
-                    Self::mi("h.keys", t("help.shortcuts"), "F1", None, cx, |v, _e, cx| {
-                        v.help_open = !v.help_open;
-                        cx.notify();
-                    })
+                    Self::mi(
+                        "h.keys",
+                        t("help.shortcuts"),
+                        "F1",
+                        None,
+                        cx,
+                        |v, _e, cx| {
+                            v.help_open = !v.help_open;
+                            cx.notify();
+                        },
+                    )
                     .into_any_element(),
                     Self::mi("h.about", t("help.about"), "", None, cx, |v, _e, _cx| {
-                        v.status = concat!("midi-editor ", env!("CARGO_PKG_VERSION"),
-                            " — pure-SMF editor").into();
+                        v.status = concat!(
+                            "midi-editor ",
+                            env!("CARGO_PKG_VERSION"),
+                            " — pure-SMF editor"
+                        )
+                        .into();
                     })
                     .into_any_element(),
                     Self::mi("h.mcp", t("help.mcp"), "", None, cx, |v, _e, _cx| {
-                        v.status = "MCP: http://127.0.0.1:7878/mcp (mcp-bridge for stdio clients)".into();
+                        v.status =
+                            "MCP: http://127.0.0.1:7878/mcp (mcp-bridge for stdio clients)".into();
                     })
                     .into_any_element(),
                 ],
@@ -1763,8 +2041,22 @@ impl Render for EditorView {
                             .into_any_element()
                         })
                         .collect(),
-                    Sub::Dest => self.dest_rows(DestPick::Track, &dests, eff_dest, def_dest, has_track_dest, cx),
-                    Sub::DefDest => self.dest_rows(DestPick::Default, &dests, eff_dest, def_dest, has_track_dest, cx),
+                    Sub::Dest => self.dest_rows(
+                        DestPick::Track,
+                        &dests,
+                        eff_dest,
+                        def_dest,
+                        has_track_dest,
+                        cx,
+                    ),
+                    Sub::DefDest => self.dest_rows(
+                        DestPick::Default,
+                        &dests,
+                        eff_dest,
+                        def_dest,
+                        has_track_dest,
+                        cx,
+                    ),
                     Sub::InPort => {
                         let ports = midi_io::list_inputs().unwrap_or_default();
                         let mut rows: Vec<AnyElement> = vec![Self::mi_leaf(
@@ -1796,8 +2088,15 @@ impl Render for EditorView {
                         }));
                         if ports.is_empty() {
                             rows.push(
-                                Self::mi_leaf("in.none", t("output.no_inputs"), "", None, cx, |_, _, _| {})
-                                    .into_any_element(),
+                                Self::mi_leaf(
+                                    "in.none",
+                                    t("output.no_inputs"),
+                                    "",
+                                    None,
+                                    cx,
+                                    |_, _, _| {},
+                                )
+                                .into_any_element(),
                             );
                         }
                         rows
@@ -1812,7 +2111,8 @@ impl Render for EditorView {
                             LaneMode::CC(64),
                             LaneMode::PitchBend,
                         ];
-                        LANES.iter()
+                        LANES
+                            .iter()
                             .enumerate()
                             .map(|(i, lm)| {
                                 Self::mi_leaf(
@@ -1865,8 +2165,15 @@ impl Render for EditorView {
                         .collect(),
                     Sub::Recent => {
                         if self.recent.is_empty() {
-                            vec![Self::mi_leaf("recent.empty", t("menu.recent_empty"), "", None, cx, |_v, _e, _cx| {})
-                                .into_any_element()]
+                            vec![Self::mi_leaf(
+                                "recent.empty",
+                                t("menu.recent_empty"),
+                                "",
+                                None,
+                                cx,
+                                |_v, _e, _cx| {},
+                            )
+                            .into_any_element()]
                         } else {
                             self.recent
                                 .iter()
@@ -1878,9 +2185,16 @@ impl Render for EditorView {
                                         .unwrap_or(p.as_str())
                                         .to_string();
                                     let path = std::path::PathBuf::from(p.as_str());
-                                    Self::mi_leaf(("recent", i), name, "", None, cx, move |v, _e, cx| {
-                                        v.open(path.clone(), cx);
-                                    })
+                                    Self::mi_leaf(
+                                        ("recent", i),
+                                        name,
+                                        "",
+                                        None,
+                                        cx,
+                                        move |v, _e, cx| {
+                                            v.open(path.clone(), cx);
+                                        },
+                                    )
                                     .into_any_element()
                                 })
                                 .collect()
@@ -1892,20 +2206,24 @@ impl Render for EditorView {
                             .into_iter()
                             .enumerate()
                             .map(|(i, (label, str_))| {
-                                Self::mi_leaf(("quant", i), format!("Quantize {label}"), "", None, cx, move |v, _e, _cx| {
-                                    v.apply_region_op("quantize", move |d, t, f, to| {
-                                        d.quantize_ops(t, f, to, g, str_)
-                                    });
-                                })
+                                Self::mi_leaf(
+                                    ("quant", i),
+                                    format!("Quantize {label}"),
+                                    "",
+                                    None,
+                                    cx,
+                                    move |v, _e, _cx| {
+                                        v.apply_region_op("quantize", move |d, t, f, to| {
+                                            d.quantize_ops(t, f, to, g, str_)
+                                        });
+                                    },
+                                )
                                 .into_any_element()
                             })
                             .collect()
                     }
                     Sub::Oct => {
-                        let opts = [
-                            ("+1 octave", 12i32),
-                            ("-1 octave", -12),
-                        ];
+                        let opts = [("+1 octave", 12i32), ("-1 octave", -12)];
                         opts.into_iter()
                             .enumerate()
                             .map(|(i, (label, st))| {
@@ -1949,11 +2267,18 @@ impl Render for EditorView {
                         opts.into_iter()
                             .enumerate()
                             .map(|(i, (label, vel))| {
-                                Self::mi_leaf(("vset", i), label, "", None, cx, move |v, _e, _cx| {
-                                    v.apply_region_op("set velocity", move |d, t, f, to| {
-                                        d.set_velocity_ops(t, f, to, vel)
-                                    });
-                                })
+                                Self::mi_leaf(
+                                    ("vset", i),
+                                    label,
+                                    "",
+                                    None,
+                                    cx,
+                                    move |v, _e, _cx| {
+                                        v.apply_region_op("set velocity", move |d, t, f, to| {
+                                            d.set_velocity_ops(t, f, to, vel)
+                                        });
+                                    },
+                                )
                                 .into_any_element()
                             })
                             .collect()
@@ -1987,27 +2312,27 @@ impl Render for EditorView {
                 let h = desired.min(max_h);
                 let top = (y - 30.0).clamp(0.0, (vh - h - 8.0).max(0.0));
                 div()
-                        .id("sub-popup")
-                        .absolute()
-                        .top(px(top))
-                        .left(px(x2))
-                        .w(px(190.0))
-                        .h(px(h))
-                        .max_h(px(h))
-                        .overflow_y_scroll()
-                        .flex()
-                        .flex_col()
-                        .py_1()
-                        .bg(rgb(BG_RAISED))
-                        .border_1()
-                        .border_color(rgb(BORDER_C))
-                        .rounded_md()
-                        .shadow_lg()
-                        .children(rows)
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|_v, _e, _w, cx| cx.stop_propagation()),
-                        )
+                    .id("sub-popup")
+                    .absolute()
+                    .top(px(top))
+                    .left(px(x2))
+                    .w(px(190.0))
+                    .h(px(h))
+                    .max_h(px(h))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .py_1()
+                    .bg(rgb(BG_RAISED))
+                    .border_1()
+                    .border_color(rgb(BORDER_C))
+                    .rounded_md()
+                    .shadow_lg()
+                    .children(rows)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_v, _e, _w, cx| cx.stop_propagation()),
+                    )
             });
             div()
                 .id("menu-overlay")
@@ -2126,7 +2451,12 @@ impl Render for EditorView {
                     ),
                 );
                 if path.is_none() {
-                    row = row.child(div().text_size(px(11.0)).text_color(rgb(0x9999aa)).child(hint));
+                    row = row.child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(0x9999aa))
+                            .child(hint),
+                    );
                 }
                 row.into_any_element()
             };
@@ -2141,57 +2471,169 @@ impl Render for EditorView {
                 format!("{n} plugins, {mode}")
             };
             let mut rows: Vec<AnyElement> = vec![
-                diag_row(t("output.helper").into(), &diag.helper, t("output.helper_hint").into()),
-                diag_row(t("output.probe").into(), &diag.probe, t("output.helper_hint").into()),
-                div().child(format!("{}: {}", t("output.audio"), diag.audio_device.clone().unwrap_or_else(|e| e))).into_any_element(),
-                div().child(format!("{}: {}", t("output.scan"), scan)).into_any_element(),
+                diag_row(
+                    t("output.helper").into(),
+                    &diag.helper,
+                    t("output.helper_hint").into(),
+                ),
+                diag_row(
+                    t("output.probe").into(),
+                    &diag.probe,
+                    t("output.helper_hint").into(),
+                ),
+                div()
+                    .child(format!(
+                        "{}: {}",
+                        t("output.audio"),
+                        diag.audio_device.clone().unwrap_or_else(|e| e)
+                    ))
+                    .into_any_element(),
+                div()
+                    .child(format!("{}: {}", t("output.scan"), scan))
+                    .into_any_element(),
             ];
-            if let Some(note) = &self.scan_note { rows.push(div().text_color(rgb(0x9999aa)).child(note.clone()).into_any_element()); }
+            if let Some(note) = &self.scan_note {
+                rows.push(
+                    div()
+                        .text_color(rgb(0x9999aa))
+                        .child(note.clone())
+                        .into_any_element(),
+                );
+            }
             rows.push(Self::msep().into_any_element());
             rows.push(Self::mhead(t("output.cat_vst3")).into_any_element());
             for (i, (name, dest)) in dests.iter().enumerate() {
-                let output::Destination::Plugin { plugin_path } = dest else { continue };
-                let vendor = self.plugin_meta.get(plugin_path).map(|p| p.vendor.clone()).unwrap_or_default();
+                let output::Destination::Plugin { plugin_path } = dest else {
+                    continue;
+                };
+                let vendor = self
+                    .plugin_meta
+                    .get(plugin_path)
+                    .map(|p| p.vendor.clone())
+                    .unwrap_or_default();
                 let (state, color, retry, detail) = match self.plugin_state.get(&i) {
-                    Some(PluginState::Ready { .. }) => (t("plugin.state_ready"), 0x8fd0a0, false, None),
-                    Some(PluginState::Loading { .. }) => (t("plugin.state_loading"), 0xe0b050, false, None),
+                    Some(PluginState::Ready { .. }) => {
+                        (t("plugin.state_ready"), 0x8fd0a0, false, None)
+                    }
+                    Some(PluginState::Loading { .. }) => {
+                        (t("plugin.state_loading"), 0xe0b050, false, None)
+                    }
                     Some(PluginState::Failed { phase, msg, .. }) => {
                         let phase = match *phase {
                             "host" => t("plugin.phase_host"),
                             "audio" => t("plugin.phase_audio"),
                             _ => t("plugin.phase_load"),
                         };
-                        (t("plugin.state_failed"), 0xe06060, true, Some(format!("{phase}: {msg}")))
+                        (
+                            t("plugin.state_failed"),
+                            0xe06060,
+                            true,
+                            Some(format!("{phase}: {msg}")),
+                        )
                     }
                     _ => (t("plugin.state_idle"), 0x77778a, false, None),
                 };
-                let mut row = div().id(("output-status", i)).flex().flex_col().gap_1().text_color(rgb(color))
-                    .child(div().flex().gap_1().items_center().child(format!("{}  {}", name, state))
-                        .child(div().text_color(rgb(0x888899)).child(vendor)));
+                let mut row = div()
+                    .id(("output-status", i))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .text_color(rgb(color))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .items_center()
+                            .child(format!("{}  {}", name, state))
+                            .child(div().text_color(rgb(0x888899)).child(vendor)),
+                    );
                 if let Some(detail) = detail {
-                    row = row.child(div().text_size(px(11.0)).text_color(rgb(0x9999aa)).child(detail));
+                    row = row.child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(0x9999aa))
+                            .child(detail),
+                    );
                 }
-                rows.push(row.on_click(cx.listener(move |v, _e, _w, cx| {
-                    if retry { v.ensure_plugin(i, true); cx.notify(); }
-                })).into_any_element());
+                rows.push(
+                    row.on_click(cx.listener(move |v, _e, _w, cx| {
+                        if retry {
+                            v.ensure_plugin(i, true);
+                            cx.notify();
+                        }
+                    }))
+                    .into_any_element(),
+                );
             }
             let panel_content_h = 24.0 + rows.len() as f32 * 26.0 + 32.0 + 32.0;
-            let panel = div().id("output-status-panel").w(px(520.0)).flex().flex_col().gap_1()
-                .p_3().bg(rgb(0x20202c)).border_1().border_color(rgb(0x3c3c4a)).rounded_lg().shadow_lg()
+            let panel = div()
+                .id("output-status-panel")
+                .w(px(520.0))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_3()
+                .bg(rgb(0x20202c))
+                .border_1()
+                .border_color(rgb(0x3c3c4a))
+                .rounded_lg()
+                .shadow_lg()
                 .text_size(px(12.0))
-                .child(div().text_size(px(14.0)).text_color(rgb(0x9fd0ff)).child(t("output.status_title")))
+                .child(
+                    div()
+                        .text_size(px(14.0))
+                        .text_color(rgb(0x9fd0ff))
+                        .child(t("output.status_title")),
+                )
                 .children(rows)
-                .child(div().flex().justify_end().gap_2().pt_2()
-                    .child(Self::chip("status.rescan", t("output.rescan"), cx, |v, _e, cx| { v.rescan_plugins(); cx.notify(); }))
-                    .child(Self::chip("status.close", t("output.close"), cx, |v, _e, cx| { v.show_output_status = false; cx.notify(); })))
-                .on_mouse_down(MouseButton::Left, cx.listener(|_v, _e, _w, cx| cx.stop_propagation()));
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap_2()
+                        .pt_2()
+                        .child(Self::chip(
+                            "status.rescan",
+                            t("output.rescan"),
+                            cx,
+                            |v, _e, cx| {
+                                v.rescan_plugins();
+                                cx.notify();
+                            },
+                        ))
+                        .child(Self::chip(
+                            "status.close",
+                            t("output.close"),
+                            cx,
+                            |v, _e, cx| {
+                                v.show_output_status = false;
+                                cx.notify();
+                            },
+                        )),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_v, _e, _w, cx| cx.stop_propagation()),
+                );
             let panel = if panel_content_h > 520.0 {
                 panel.h(px(520.0)).max_h(px(520.0)).overflow_y_scroll()
             } else {
                 panel
             };
-            div().absolute().inset_0().flex().items_center().justify_center().bg(rgba(0x00000066))
-                .on_mouse_down(MouseButton::Left, cx.listener(|v, _e, _w, cx| { v.show_output_status = false; cx.notify(); }))
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgba(0x00000066))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|v, _e, _w, cx| {
+                        v.show_output_status = false;
+                        cx.notify();
+                    }),
+                )
                 .child(panel)
         });
 
@@ -2204,6 +2646,22 @@ impl Render for EditorView {
             .text_color(rgb(0xd8d8e0))
             .key_context("editor")
             .track_focus(&self.focus)
+            // Drag follow-through at the window level: GPUI only delivers
+            // mouse-move to the hovered element, so a roll drag must keep
+            // updating while the cursor crosses the ruler, lane, or toolbar.
+            // Also recovers a drag whose button went up outside the window.
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
+                this.mouse_pos = Some(ev.position);
+                if this.drag.is_none() {
+                    return;
+                }
+                if ev.pressed_button != Some(MouseButton::Left) {
+                    this.commit_drag(cx);
+                    return;
+                }
+                this.update_drag();
+                cx.notify();
+            }))
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
                 // typing in the track-name field must not trigger editor keys
                 if this.input.read(cx).focus_handle(cx).is_focused(w) {
@@ -2229,11 +2687,7 @@ impl Render for EditorView {
                     (true, false, "a") => this.select_all(cx),
                     (true, false, "=") | (true, false, "+") => this.zoom_by(1.3, cx),
                     (true, false, "-") => this.zoom_by(1.0 / 1.3, cx),
-                    (true, false, "0") => {
-                        this.zoom = 0.08;
-                        this.persist();
-                        cx.notify();
-                    }
+                    (true, false, "0") => this.zoom_set(0.08, cx),
                     (false, false, "escape") => {
                         this.open_menu = None;
                         this.open_sub = None;
@@ -2323,7 +2777,9 @@ impl EditorView {
                     Some(!has_track_dest),
                     cx,
                     |v, _e, _cx| {
-                        crate::lock_shared(&v.shared).track_dest.remove(&v.sel_track);
+                        crate::lock_shared(&v.shared)
+                            .track_dest
+                            .remove(&v.sel_track);
                         v.persist();
                     },
                 )
@@ -2335,43 +2791,111 @@ impl EditorView {
         let midi: Vec<(usize, String)> = dests
             .iter()
             .enumerate()
-            .filter_map(|(i, (name, d))| matches!(d, output::Destination::MidiPort { .. }).then_some((i, name.clone())))
+            .filter_map(|(i, (name, d))| {
+                matches!(d, output::Destination::MidiPort { .. }).then_some((i, name.clone()))
+            })
             .collect();
         if midi.is_empty() {
-            rows.push(Self::mi_leaf("dest.noports", t("output.no_ports"), "", None, cx, |_v, _e, _cx| {}).into_any_element());
+            rows.push(
+                Self::mi_leaf(
+                    "dest.noports",
+                    t("output.no_ports"),
+                    "",
+                    None,
+                    cx,
+                    |_v, _e, _cx| {},
+                )
+                .into_any_element(),
+            );
         } else {
             for (i, label) in midi {
-                let selected = if kind == DestPick::Track { has_track_dest && eff_dest == i } else { def_dest == i };
-                rows.push(Self::mi_leaf(("dest", i), label, "", Some(selected), cx, move |v, _e, _cx| {
-                    let mut sh = crate::lock_shared(&v.shared);
-                    if kind == DestPick::Track {
-                        sh.track_dest.insert(v.sel_track, i);
-                    } else {
-                        sh.default_dest = i;
-                    }
-                    drop(sh);
-                    v.persist();
-                }).into_any_element());
+                let selected = if kind == DestPick::Track {
+                    has_track_dest && eff_dest == i
+                } else {
+                    def_dest == i
+                };
+                rows.push(
+                    Self::mi_leaf(
+                        ("dest", i),
+                        label,
+                        "",
+                        Some(selected),
+                        cx,
+                        move |v, _e, _cx| {
+                            let mut sh = crate::lock_shared(&v.shared);
+                            if kind == DestPick::Track {
+                                sh.track_dest.insert(v.sel_track, i);
+                            } else {
+                                sh.default_dest = i;
+                            }
+                            drop(sh);
+                            v.persist();
+                        },
+                    )
+                    .into_any_element(),
+                );
             }
         }
         rows.push(Self::msep().into_any_element());
-        let plugins: Vec<(usize, String, String, String)> = dests.iter().enumerate().filter_map(|(i, (name, d))| {
-            let output::Destination::Plugin { plugin_path } = d else { return None };
-            let vendor = self.plugin_meta.get(plugin_path).map(|p| p.vendor.clone()).unwrap_or_default();
-            Some((i, name.clone(), plugin_path.clone(), vendor))
-        }).collect();
+        let plugins: Vec<(usize, String, String, String)> = dests
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (name, d))| {
+                let output::Destination::Plugin { plugin_path } = d else {
+                    return None;
+                };
+                let vendor = self
+                    .plugin_meta
+                    .get(plugin_path)
+                    .map(|p| p.vendor.clone())
+                    .unwrap_or_default();
+                Some((i, name.clone(), plugin_path.clone(), vendor))
+            })
+            .collect();
         let mut vendors = std::collections::BTreeSet::new();
-        for (_, _, _, vendor) in &plugins { if !vendor.is_empty() { vendors.insert(vendor.clone()); } }
-        rows.push(Self::mhead(format!("{} ({})", t("output.cat_vst3"), plugins.len())).into_any_element());
+        for (_, _, _, vendor) in &plugins {
+            if !vendor.is_empty() {
+                vendors.insert(vendor.clone());
+            }
+        }
+        rows.push(
+            Self::mhead(format!("{} ({})", t("output.cat_vst3"), plugins.len())).into_any_element(),
+        );
         if plugins.is_empty() {
             if self.scan_rx.is_some() {
-                rows.push(Self::mi_leaf("dest.scanning", t("status.scanning"), "", None, cx, |_v, _e, _cx| {}).into_any_element());
+                rows.push(
+                    Self::mi_leaf(
+                        "dest.scanning",
+                        t("status.scanning"),
+                        "",
+                        None,
+                        cx,
+                        |_v, _e, _cx| {},
+                    )
+                    .into_any_element(),
+                );
             } else {
-                rows.push(Self::mi_leaf("dest.noplugins", t("output.no_plugins"), "", None, cx, |_v, _e, _cx| {}).into_any_element());
+                rows.push(
+                    Self::mi_leaf(
+                        "dest.noplugins",
+                        t("output.no_plugins"),
+                        "",
+                        None,
+                        cx,
+                        |_v, _e, _cx| {},
+                    )
+                    .into_any_element(),
+                );
             }
         } else {
             let mut plugins = plugins;
-            plugins.sort_by(|a, b| if vendors.len() >= 2 { a.3.cmp(&b.3).then(a.1.cmp(&b.1)) } else { a.1.cmp(&b.1) });
+            plugins.sort_by(|a, b| {
+                if vendors.len() >= 2 {
+                    a.3.cmp(&b.3).then(a.1.cmp(&b.1))
+                } else {
+                    a.1.cmp(&b.1)
+                }
+            });
             let mut last_vendor = String::new();
             for (i, label, path, vendor) in plugins {
                 if vendors.len() >= 2 && vendor != last_vendor {
@@ -2395,16 +2919,33 @@ impl EditorView {
                     }
                     _ => None,
                 };
-                let selected = if kind == DestPick::Track { has_track_dest && eff_dest == i } else { def_dest == i };
+                let selected = if kind == DestPick::Track {
+                    has_track_dest && eff_dest == i
+                } else {
+                    def_dest == i
+                };
                 let path2 = path.clone();
-                let row = Self::mi_inner(("plugin", i), label, badge, color, Some(selected), false, cx, move |v, _e, _cx| {
-                    let mut sh = crate::lock_shared(&v.shared);
-                    if kind == DestPick::Track { sh.track_dest.insert(v.sel_track, i); } else { sh.default_dest = i; }
-                    drop(sh);
-                    v.persist();
-                    v.ensure_plugin(i, true);
-                    let _ = path2;
-                });
+                let row = Self::mi_inner(
+                    ("plugin", i),
+                    label,
+                    badge,
+                    color,
+                    Some(selected),
+                    false,
+                    cx,
+                    move |v, _e, _cx| {
+                        let mut sh = crate::lock_shared(&v.shared);
+                        if kind == DestPick::Track {
+                            sh.track_dest.insert(v.sel_track, i);
+                        } else {
+                            sh.default_dest = i;
+                        }
+                        drop(sh);
+                        v.persist();
+                        v.ensure_plugin(i, true);
+                        let _ = path2;
+                    },
+                );
                 let row = if let Some(detail) = detail {
                     row.tooltip(move |_w, cx| {
                         let detail = detail.clone();
@@ -2504,7 +3045,12 @@ impl EditorView {
     }
 
     /// Dropdown row that cascades: hovering opens its submenu at the row's y.
-    fn mi_sub(id: &'static str, label: &'static str, sub: Sub, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn mi_sub(
+        id: &'static str,
+        label: &'static str,
+        sub: Sub,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         div()
             .id(id)
             .flex()

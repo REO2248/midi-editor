@@ -3,26 +3,30 @@
 //! basic editing (draw / drag / delete) all going through
 //! `Document::apply(Transaction)` so undo is shared with MCP edits.
 
+mod geometry;
 mod i18n;
 mod icons;
 mod render;
+use geometry::{
+    clamp_move_delta, clamp_span, content_view, reanchor, roll_hit, ZOOM_MAX, ZOOM_MIN,
+};
 use i18n::{t, tf};
 
 use commands::UndoStack;
 use document::{Document, Event as DocEvent, EventId, Note, Op};
-use mcp_server::{Shared, SharedDoc};
-use std::sync::Mutex;
-use smf_core::EventKind;
-use gpui_kit::*;
 use gpui_kit::component::input::InputState;
 use gpui_kit::component::Root;
+use gpui_kit::*;
+use mcp_server::{Shared, SharedDoc};
 use midi_io::{EventSink, Playback, PortSink};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
 use smf_core::Division;
+use smf_core::EventKind;
 use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 const NOTE_H: f32 = 13.0;
 const TRACK_COLORS: [u32; 8] = [
@@ -171,12 +175,116 @@ struct Drag {
     b_key: i32,
 }
 
+/// Document-derived data the chrome (menu bar, marker strip, minimap,
+/// transport readouts) shows. Everything here is a pure function of the
+/// document revision (+ the text-encoding hint), so it is computed once per
+/// edit instead of once per frame.
+#[derive(Default)]
+struct DocUi {
+    markers: Vec<(u64, String)>,
+    n_diags: usize,
+    track_names: Vec<String>,
+    track_chs: Vec<u8>,
+    sig: String,
+    tempo0: f64,
+    /// last tick with a note — the scrollable extent of the timeline
+    song_end: u64,
+}
+
+impl DocUi {
+    /// `notes` is the already-derived note view for this revision (passed in
+    /// so the pairing pass runs once per revision, not once per consumer).
+    fn build(doc: &Document, notes: &[Note], enc_override: Option<smf_core::TextEncoding>) -> Self {
+        let hint = enc_override.or_else(|| doc.text_encoding_hint());
+        // meta 0x06/0x05 markers, from any track, at their tick
+        let mut markers = Vec::new();
+        for t in &doc.tracks {
+            for e in &t.events {
+                if let EventKind::Meta {
+                    meta_type: 0x05 | 0x06,
+                    data,
+                } = &e.kind
+                {
+                    markers.push((e.tick, smf_core::decode_text(data, hint)));
+                }
+            }
+        }
+        markers.sort_unstable();
+        let tempo0 = doc
+            .tempo_map
+            .points()
+            .first()
+            .map(|(_, mpq, _)| 60_000_000.0 / *mpq as f64)
+            .unwrap_or(120.0);
+        let sig = doc
+            .tracks
+            .first()
+            .and_then(|t| {
+                t.events.iter().find_map(|e| match &e.kind {
+                    EventKind::Meta {
+                        meta_type: 0x58,
+                        data,
+                    } if data.len() >= 2 => Some(format!("{}/{}", data[0], 1u8 << data[1])),
+                    _ => None,
+                })
+            })
+            .unwrap_or_else(|| "4/4".into());
+        let track_names = doc
+            .tracks
+            .iter()
+            .enumerate()
+            .map(|(i, tr)| {
+                tr.name
+                    .as_ref()
+                    .map(|b| smf_core::decode_text(b, hint))
+                    .unwrap_or_else(|| format!("Track {}", i + 1))
+            })
+            .collect();
+        let track_chs = doc.tracks.iter().map(|t| t.out_channel).collect();
+        Self {
+            n_diags: doc.diagnose().len(),
+            markers,
+            track_names,
+            track_chs,
+            sig,
+            tempo0,
+            song_end: notes
+                .iter()
+                .map(|n| n.end_tick.unwrap_or(n.start_tick))
+                .max()
+                .unwrap_or(0),
+        }
+    }
+}
+
 struct EditorView {
     shared: SharedDoc,
-    notes_rev: u64,
+    /// Bumped every time the whole document is swapped in (open / new file).
+    /// Every freshly parsed file reports revision 0, so caches keyed on the
+    /// revision alone cannot tell two documents apart — opening a file after
+    /// an untouched one left the roll showing the previous (often empty)
+    /// note view. Cache keys are `(doc_epoch, revision)`.
+    doc_epoch: u64,
+    notes_key: (u64, u64),
     notes: Arc<Vec<Note>>,
-    ev_rev: u64,
+    ev_key: (u64, u64),
     events: Arc<Vec<SharedString>>,
+    /// Document-derived UI data (markers, track names, diagnostics count…).
+    /// Rebuilt only when the document key or encoding hint changes — render
+    /// runs at animation-frame rate during playback and must not rescan
+    /// every event each frame.
+    doc_ui: Arc<DocUi>,
+    doc_ui_key: (u64, u64),
+    doc_ui_enc: Option<smf_core::TextEncoding>,
+    /// lane (velocity/CC/PB) points cache — keys on epoch + revision +
+    /// track + mode
+    lane_cache: Arc<Vec<(EventId, u64, i32)>>,
+    lane_key: (u64, u64),
+    lane_track: usize,
+    lane_mode_cached: LaneMode,
+    /// last window-space cursor position, kept while a roll/lane drag is
+    /// active so edge auto-scroll can keep the drag deltas current
+    mouse_pos: Option<Point<Pixels>>,
     sel_track: usize,
     /// selected note `on_id`s (marquee multi-select)
     selection: BTreeSet<EventId>,
@@ -253,9 +361,18 @@ struct EditorView {
 }
 
 enum PluginState {
-    Loading { path: PathBuf, since: std::time::Instant },
-    Ready { path: PathBuf },
-    Failed { path: PathBuf, phase: &'static str, msg: String },
+    Loading {
+        path: PathBuf,
+        since: std::time::Instant,
+    },
+    Ready {
+        path: PathBuf,
+    },
+    Failed {
+        path: PathBuf,
+        phase: &'static str,
+        msg: String,
+    },
 }
 
 /// Captured (µs, raw channel bytes) pairs from the input callback.
@@ -339,10 +456,19 @@ impl EditorView {
         let (plugin_req, plugin_evt) = output::spawn_plugin_host();
         let mut v = Self {
             shared,
-            notes_rev: u64::MAX,
+            doc_epoch: 0,
+            notes_key: (u64::MAX, u64::MAX),
             notes: Arc::new(vec![]),
-            ev_rev: u64::MAX,
+            ev_key: (u64::MAX, u64::MAX),
             events: Arc::new(vec![]),
+            doc_ui: Arc::new(DocUi::default()),
+            doc_ui_key: (u64::MAX, u64::MAX),
+            doc_ui_enc: None,
+            lane_cache: Arc::new(vec![]),
+            lane_key: (u64::MAX, u64::MAX),
+            lane_track: 0,
+            lane_mode_cached: LaneMode::Velocity,
+            mouse_pos: None,
             sel_track: 0,
             selection: BTreeSet::new(),
             drag: None,
@@ -350,10 +476,22 @@ impl EditorView {
             snap_idx: 7, // 1/16
             erase_ids: BTreeSet::new(),
             clipboard: Vec::new(),
-            roll_bounds: Rc::new(Cell::new(Bounds::new(point(px(0.0), px(0.0)), size(px(0.0), px(0.0))))),
-            ruler_bounds: Rc::new(Cell::new(Bounds::new(point(px(0.0), px(0.0)), size(px(0.0), px(0.0))))),
-            lane_bounds: Rc::new(Cell::new(Bounds::new(point(px(0.0), px(0.0)), size(px(0.0), px(0.0))))),
-            mini_bounds: Rc::new(Cell::new(Bounds::new(point(px(0.0), px(0.0)), size(px(0.0), px(0.0))))),
+            roll_bounds: Rc::new(Cell::new(Bounds::new(
+                point(px(0.0), px(0.0)),
+                size(px(0.0), px(0.0)),
+            ))),
+            ruler_bounds: Rc::new(Cell::new(Bounds::new(
+                point(px(0.0), px(0.0)),
+                size(px(0.0), px(0.0)),
+            ))),
+            lane_bounds: Rc::new(Cell::new(Bounds::new(
+                point(px(0.0), px(0.0)),
+                size(px(0.0), px(0.0)),
+            ))),
+            mini_bounds: Rc::new(Cell::new(Bounds::new(
+                point(px(0.0), px(0.0)),
+                size(px(0.0), px(0.0)),
+            ))),
             scroll_x: 0.0,
             scroll_y: (127.0 - 84.0) * NOTE_H, // show ~C3..C7
             zoom: 0.08,
@@ -421,10 +559,16 @@ impl EditorView {
             sh.soloed.clear();
             sh.track_dest.clear();
         }
+        self.doc_epoch += 1; // the fresh document reports revision 0 again
         self.selection.clear();
+        self.drag = None;
+        self.erase_ids.clear();
+        self.mouse_pos = None;
         self.sel_track = 0;
         self.enc_override = None;
+        self.play_us = 0;
         self.refresh_derived();
+        self.reset_view_to_content();
         self.status = if rec_discarded {
             format!("{} — {}", t("status.new_doc"), t("status.rec_discarded")).into()
         } else {
@@ -444,15 +588,58 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Zoom by a factor around the viewport center (toolbar buttons/keys).
     fn zoom_by(&mut self, f: f32, cx: &mut Context<Self>) {
-        self.zoom = (self.zoom * f).clamp(0.01, 1.0);
+        self.zoom_set((self.zoom * f).clamp(ZOOM_MIN, ZOOM_MAX), cx);
+    }
+
+    /// Zoom to an absolute factor, keeping the tick at the viewport center
+    /// fixed so the view doesn't lurch toward tick 0 on every change.
+    fn zoom_set(&mut self, z: f32, cx: &mut Context<Self>) {
+        let half = f32::from(self.roll_bounds.get().size.width) / 2.0;
+        self.scroll_x = reanchor(self.scroll_x, self.zoom, z, half);
+        self.zoom = z;
+        self.clamp_scroll();
         self.persist();
         cx.notify();
     }
 
+    /// Keep both scroll axes inside the content: 128 key rows vertically, the
+    /// song end horizontally. Called from render so window resizes, zooms,
+    /// and edits self-heal without every call site remembering to.
+    fn clamp_scroll(&mut self) {
+        let b = self.roll_bounds.get();
+        let w = f32::from(b.size.width);
+        let h = f32::from(b.size.height);
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        self.scroll_y = clamp_span(self.scroll_y, 128.0 * NOTE_H, h);
+        self.scroll_x = clamp_span(self.scroll_x, self.doc_end_ticks() as f32 * self.zoom, w);
+    }
+
+    /// Point the view at the current document's content (first note with a
+    /// left margin, median pitch centered). Runs on open/new-file before the
+    /// per-file sidecar is applied, so a saved position still wins — but a
+    /// first-time open never inherits the previous file's scroll offsets,
+    /// which pointed at wherever the old file happened to be looking.
+    fn reset_view_to_content(&mut self) {
+        let first = self.notes.first().map(|n| n.start_tick).unwrap_or(0);
+        let mid = if self.notes.is_empty() {
+            None
+        } else {
+            let mut keys: Vec<u8> = self.notes.iter().map(|n| n.key).collect();
+            keys.sort_unstable();
+            Some(keys[keys.len() / 2] as i32)
+        };
+        let (x, y) = content_view(first, mid, self.zoom);
+        self.scroll_x = x;
+        self.scroll_y = y;
+    }
+
     fn set_enc(&mut self, enc: Option<smf_core::TextEncoding>, cx: &mut Context<Self>) {
         self.enc_override = enc;
-        self.ev_rev = u64::MAX; // force event-row rebuild
+        self.ev_key = (u64::MAX, u64::MAX); // force event-row rebuild
         self.refresh_derived();
         self.persist();
         cx.notify();
@@ -552,15 +739,16 @@ impl EditorView {
     }
 
     fn pick_default_track(&self) -> usize {
-        self.doc(|d| d
-            .tracks
-            .iter()
-            .position(|t| {
-                t.events
-                    .iter()
-                    .any(|e| matches!(e.kind, EventKind::Channel { .. }))
-            })
-            .unwrap_or(0))
+        self.doc(|d| {
+            d.tracks
+                .iter()
+                .position(|t| {
+                    t.events
+                        .iter()
+                        .any(|e| matches!(e.kind, EventKind::Channel { .. }))
+                })
+                .unwrap_or(0)
+        })
     }
 
     fn refresh_derived(&mut self) {
@@ -570,25 +758,63 @@ impl EditorView {
     }
 
     fn refresh_derived_sh(&mut self, sh: &mut Shared) {
-        let rev = sh.doc.revision();
-        if self.notes_rev != rev {
+        let key = (self.doc_epoch, sh.doc.revision());
+        if self.notes_key != key {
             self.notes = Arc::new(sh.doc.notes());
-            self.notes_rev = rev;
+            self.notes_key = key;
         }
-        if self.ev_rev != rev {
+        if self.ev_key != key {
             self.events = Arc::new(self.build_event_rows(&sh.doc));
-            self.ev_rev = rev;
+            self.ev_key = key;
+        }
+        if self.doc_ui_key != key || self.doc_ui_enc != self.enc_override {
+            self.doc_ui = Arc::new(DocUi::build(&sh.doc, &self.notes, self.enc_override));
+            self.doc_ui_key = key;
+            self.doc_ui_enc = self.enc_override;
         }
     }
 
-    /// Tick position of the song end (for the minimap scale).
+    /// Control events of the selected track for the bottom lane, cached on
+    /// (epoch, revision, track, lane mode) — render must not rescan the
+    /// track while animating the playhead.
+    fn lane_events_cached(&mut self) -> Arc<Vec<(EventId, u64, i32)>> {
+        let key = (self.doc_epoch, self.doc(|d| d.revision()));
+        if self.lane_key != key
+            || self.lane_track != self.sel_track
+            || self.lane_mode_cached != self.lane_mode
+        {
+            let tr = self.sel_track;
+            let mode = self.lane_mode;
+            let mut v = Vec::new();
+            self.doc(|d| {
+                if let Some(t) = d.tracks.get(tr) {
+                    for e in &t.events {
+                        if let EventKind::Channel { status, data, .. } = &e.kind {
+                            match (mode, status & 0xF0) {
+                                (LaneMode::CC(cc), 0xB0) if data[0] == cc => {
+                                    v.push((e.id, e.tick, data[1] as i32))
+                                }
+                                (LaneMode::PitchBend, 0xE0) => {
+                                    v.push((e.id, e.tick, ((data[1] as i32) << 7) | data[0] as i32))
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            });
+            v.sort_by_key(|e| e.1);
+            self.lane_cache = Arc::new(v);
+            self.lane_key = key;
+            self.lane_track = tr;
+            self.lane_mode_cached = mode;
+        }
+        self.lane_cache.clone()
+    }
+
+    /// Tick position of the song end (scroll extent, minimap scale).
     fn doc_end_ticks(&self) -> u64 {
-        self.notes
-            .iter()
-            .map(|n| n.end_tick.unwrap_or(n.start_tick))
-            .max()
-            .unwrap_or(self.ppq() * 16)
-            .max(self.ppq() * 16)
+        self.doc_ui.song_end.max(self.ppq() * 16)
     }
 
     fn ppq(&self) -> u64 {
@@ -635,7 +861,11 @@ impl EditorView {
                             format!("Tempo   {:.2} bpm", 60_000_000.0 / mpq as f64)
                         }
                         0x2F => "EndOfTrack".to_string(),
-                        0x58 => format!("TimeSig {}/{}", data.first().copied().unwrap_or(4), data.get(1).copied().unwrap_or(4)),
+                        0x58 => format!(
+                            "TimeSig {}/{}",
+                            data.first().copied().unwrap_or(4),
+                            data.get(1).copied().unwrap_or(4)
+                        ),
                         0x59 => "KeySig".to_string(),
                         other @ 0x01..=0x09 => {
                             format!("Meta 0x{other:02X} {}", smf_core::decode_text(data, hint))
@@ -859,7 +1089,8 @@ impl EditorView {
             .map(|n| ClipNote {
                 dtick: (n.start_tick - lo) as i64,
                 key: n.key,
-                len: n.end_tick
+                len: n
+                    .end_tick
                     .unwrap_or(n.start_tick + ppq / 4)
                     .saturating_sub(n.start_tick)
                     .max(1),
@@ -973,7 +1204,8 @@ impl EditorView {
             .map(|n| ClipNote {
                 dtick: (n.start_tick - lo) as i64,
                 key: n.key,
-                len: n.end_tick
+                len: n
+                    .end_tick
                     .unwrap_or(n.start_tick + ppq / 4)
                     .saturating_sub(n.start_tick)
                     .max(1),
@@ -1051,6 +1283,15 @@ impl EditorView {
                 return;
             }
             DragMode::Marquee => {
+                // draw tool: the drag box (or a click's point) becomes a note
+                if self.tool == Tool::Draw {
+                    if (0..=127).contains(&d.a_key) {
+                        let (a, b) = (d.a_tick.min(d.b_tick), d.a_tick.max(d.b_tick));
+                        let len = (b - a).max(self.snap_ticks().max(1));
+                        self.insert_note_len(a.max(0) as u64, d.a_key as u8, len as u64, cx);
+                    }
+                    return;
+                }
                 // rect select: notes intersecting the rubber-band box
                 let (t0, t1) = (d.a_tick.min(d.b_tick), d.a_tick.max(d.b_tick));
                 let (k0, k1) = (d.a_key.min(d.b_key), d.a_key.max(d.b_key));
@@ -1073,7 +1314,8 @@ impl EditorView {
                     return;
                 }
                 let Some(orig_end) = d.orig_end else { return };
-                let new_end = (self.snap_round(orig_end as i64 + d.dtick)
+                let new_end = (self
+                    .snap_round(orig_end as i64 + d.dtick)
                     .max(d.orig_start as i64 + 1)) as u64;
                 let sh = lock_shared(&self.shared);
                 let mut ops = Vec::new();
@@ -1156,7 +1398,11 @@ impl EditorView {
                             tick: self.snap_down(d.a_tick).max(0) as u64,
                             seq: 0,
                             raw_body: None,
-                            kind: EventKind::Channel { status, data, len: 2 },
+                            kind: EventKind::Channel {
+                                status,
+                                data,
+                                len: 2,
+                            },
                         }],
                     });
                 } else {
@@ -1245,14 +1491,14 @@ impl EditorView {
                     events: vec![after],
                 });
             } else {
-                let before = sh
-                    .doc
-                    .tracks[ti]
+                let before = sh.doc.tracks[ti]
                     .events
                     .iter()
-                    .find(|e| e.id == {
-                        // original id is preserved on `after` for Move
-                        after.id
+                    .find(|e| {
+                        e.id == {
+                            // original id is preserved on `after` for Move
+                            after.id
+                        }
                     })
                     .cloned();
                 if let Some(before) = before {
@@ -1266,7 +1512,14 @@ impl EditorView {
         }
         drop(sh);
         if !ops.is_empty() {
-            self.apply_tx(if duplicate { "duplicate notes" } else { "move notes" }, ops);
+            self.apply_tx(
+                if duplicate {
+                    "duplicate notes"
+                } else {
+                    "move notes"
+                },
+                ops,
+            );
         }
         cx.notify();
     }
@@ -1274,7 +1527,10 @@ impl EditorView {
     fn undo(&mut self, cx: &mut Context<Self>) {
         let arc = self.shared.clone();
         let mut sh = lock_shared(&arc);
-        if let Some(l) = { let Shared { doc, undo, .. } = &mut *sh; undo.undo(doc) } {
+        if let Some(l) = {
+            let Shared { doc, undo, .. } = &mut *sh;
+            undo.undo(doc)
+        } {
             self.status = tf("status.undo", &[("label", &l)]).into();
             self.selection.clear();
             self.refresh_derived_sh(&mut sh);
@@ -1286,7 +1542,10 @@ impl EditorView {
     fn redo(&mut self, cx: &mut Context<Self>) {
         let arc = self.shared.clone();
         let mut sh = lock_shared(&arc);
-        if let Some(l) = { let Shared { doc, undo, .. } = &mut *sh; undo.redo(doc) } {
+        if let Some(l) = {
+            let Shared { doc, undo, .. } = &mut *sh;
+            undo.redo(doc)
+        } {
             self.status = tf("status.redo", &[("label", &l)]).into();
             self.selection.clear();
             self.refresh_derived_sh(&mut sh);
@@ -1380,17 +1639,28 @@ impl EditorView {
                     sh.path = Some(path.clone());
                     sh.saved_revision = sh.doc.revision();
                 }
+                // the new document also reports revision 0 — bump the epoch
+                // so revision-keyed derived views cannot stay stale
+                self.doc_epoch += 1;
                 self.sel_track = self.pick_default_track();
                 self.selection.clear();
+                self.drag = None;
+                self.erase_ids.clear();
+                self.mouse_pos = None;
+                self.enc_override = None;
+                self.play_us = 0;
                 {
                     let mut sh = lock_shared(&self.shared);
                     sh.muted.clear();
                     sh.soloed.clear();
                     sh.track_dest.clear();
                 }
+                // rebuild the derived views, then land the view on the new
+                // content — a saved per-file sidecar (applied next) overrides
+                self.refresh_derived();
+                self.reset_view_to_content();
                 self.apply_prefs(&path);
                 self.push_recent(&path);
-                self.refresh_derived();
                 let mut status = if load_warnings.is_empty() {
                     t("status.loaded").to_string()
                 } else {
@@ -1434,7 +1704,11 @@ impl EditorView {
         };
         if let Some(PluginState::Ready { path: ready_path }) = self.plugin_state.get(&d) {
             if ready_path == &path
-                && self.plugin_slots.get(&d).map(|s| s.path == path).unwrap_or(false)
+                && self
+                    .plugin_slots
+                    .get(&d)
+                    .map(|s| s.path == path)
+                    .unwrap_or(false)
             {
                 return;
             }
@@ -1492,18 +1766,25 @@ impl EditorView {
         }).collect();
         for d in timed_out {
             if let Some(PluginState::Loading { path, .. }) = self.plugin_state.remove(&d) {
-                self.plugin_state.insert(d, PluginState::Failed {
-                    path,
-                    phase: "load",
-                    msg: t("plugin.timeout").to_string(),
-                });
+                self.plugin_state.insert(
+                    d,
+                    PluginState::Failed {
+                        path,
+                        phase: "load",
+                        msg: t("plugin.timeout").to_string(),
+                    },
+                );
                 let _ = self.plugin_req.send(output::PluginReq::Drop(d));
                 changed = true;
             }
         }
         while let Ok(event) = self.plugin_evt.try_recv() {
-            let Some(PluginState::Loading { path, .. }) = self.plugin_state.get(&event.dest) else { continue };
-            if path != &event.path { continue; }
+            let Some(PluginState::Loading { path, .. }) = self.plugin_state.get(&event.dest) else {
+                continue;
+            };
+            if path != &event.path {
+                continue;
+            }
             match event.result {
                 Ok(slot) => {
                     let name = slot
@@ -1512,7 +1793,8 @@ impl EditorView {
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_default();
                     self.plugin_slots.insert(event.dest, slot);
-                    self.plugin_state.insert(event.dest, PluginState::Ready { path: event.path });
+                    self.plugin_state
+                        .insert(event.dest, PluginState::Ready { path: event.path });
                     self.status = tf("plugin.ready", &[("name", name.as_str())]).into();
                 }
                 Err(e) => {
@@ -1521,8 +1803,19 @@ impl EditorView {
                         output::PluginError::Load(_) => "load",
                         output::PluginError::Audio(_) => "audio",
                     };
-                    let name = event.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                    self.plugin_state.insert(event.dest, PluginState::Failed { path: event.path, phase, msg: e.to_string() });
+                    let name = event
+                        .path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    self.plugin_state.insert(
+                        event.dest,
+                        PluginState::Failed {
+                            path: event.path,
+                            phase,
+                            msg: e.to_string(),
+                        },
+                    );
                     self.status = tf("plugin.failed", &[("name", name.as_str())]).into();
                 }
             }
@@ -1587,7 +1880,9 @@ impl EditorView {
         let (bpm, sig_num, sig_den) = self.transport_hints();
         self.poll_plugin_events();
         for d in needed {
-            let Some((_, dest)) = dests.get(d) else { continue };
+            let Some((_, dest)) = dests.get(d) else {
+                continue;
+            };
             match dest {
                 output::Destination::MidiPort { port_name } => {
                     match midi_io::Output::open_named(port_name) {
@@ -1696,7 +1991,11 @@ impl EditorView {
             let mut sig = (4i32, 4i32);
             'find: for tr in &d.tracks {
                 for e in &tr.events {
-                    if let EventKind::Meta { meta_type: 0x58, data } = &e.kind {
+                    if let EventKind::Meta {
+                        meta_type: 0x58,
+                        data,
+                    } = &e.kind
+                    {
                         if data.len() >= 2 {
                             sig = (data[0] as i32, 1i32 << (data[1] & 0x1f));
                             break 'find;
@@ -1725,7 +2024,9 @@ impl EditorView {
             0
         };
         let cb = move |us, b: &[u8]| {
-            buf2.lock().unwrap_or_else(|e| e.into_inner()).push((us, b.to_vec()));
+            buf2.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((us, b.to_vec()));
         };
         let opened = if self.midi_in.is_empty() {
             midi_io::Input::open(0, cb)
@@ -1743,7 +2044,11 @@ impl EditorView {
                 if self.playback.is_none() {
                     self.start_playback();
                 }
-                self.status = tf("status.rec_armed", &[("n", &(self.sel_track + 1).to_string())]).into();
+                self.status = tf(
+                    "status.rec_armed",
+                    &[("n", &(self.sel_track + 1).to_string())],
+                )
+                .into();
             }
             Err(e) => self.status = format!("rec: {e}").into(),
         }
@@ -1782,10 +2087,7 @@ impl EditorView {
             if us < rec.cin_us {
                 continue;
             }
-            let tick = sh
-                .doc
-                .tempo_map
-                .us_to_tick(rec.base_us + (us - rec.cin_us));
+            let tick = sh.doc.tempo_map.us_to_tick(rec.base_us + (us - rec.cin_us));
             events.push(document::Event {
                 id: sh.doc.alloc_event_id(),
                 tick,
@@ -1829,7 +2131,22 @@ impl EditorView {
         self.scan_note = if skipped == 0 {
             None
         } else {
-            Some(report.skipped.iter().map(|(p, r)| format!("{} — {}", p.file_stem().map(|s| s.to_string_lossy()).unwrap_or_default(), r)).collect::<Vec<_>>().join("; "))
+            Some(
+                report
+                    .skipped
+                    .iter()
+                    .map(|(p, r)| {
+                        format!(
+                            "{} — {}",
+                            p.file_stem()
+                                .map(|s| s.to_string_lossy())
+                                .unwrap_or_default(),
+                            r
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            )
         };
         let fresh = build_dest_catalog(&report.plugins);
         let mut sh = lock_shared(&self.shared);
@@ -1851,12 +2168,7 @@ impl EditorView {
             .unwrap_or(0);
         sh.track_dest = old_tracks
             .into_iter()
-            .filter_map(|(t, d)| {
-                sh.dests
-                    .iter()
-                    .position(|(_, dd)| *dd == d)
-                    .map(|i| (t, i))
-            })
+            .filter_map(|(t, d)| sh.dests.iter().position(|(_, dd)| *dd == d).map(|i| (t, i)))
             .collect();
         let n = sh.dests.len();
         drop(sh);
@@ -1889,9 +2201,7 @@ impl EditorView {
             let sh = lock_shared(&self.shared);
             let d = sh.dest_of(self.sel_track);
             let p = sh.dests.get(d).and_then(|(_, dd)| match dd {
-                output::Destination::Plugin { plugin_path } => {
-                    Some(PathBuf::from(plugin_path))
-                }
+                output::Destination::Plugin { plugin_path } => Some(PathBuf::from(plugin_path)),
                 _ => None,
             });
             (d, p)
@@ -1901,11 +2211,7 @@ impl EditorView {
             Ok(a) => {
                 // adopt the live state of the playing instance so the editor
                 // shows what's actually being heard
-                if let Some(slot) = self
-                    .plugin_slots
-                    .get(&d)
-                    .filter(|s| s.path == path)
-                {
+                if let Some(slot) = self.plugin_slots.get(&d).filter(|s| s.path == path) {
                     let state = slot.plugin.lock().ok().and_then(|p| p.save_state().ok());
                     if let Some(data) = state {
                         if let Ok(mut e) = a.lock() {
@@ -1919,7 +2225,9 @@ impl EditorView {
                         self.plugin_window = Some(pw);
                         self.editor_plugin = Some((d, a));
                     }
-                    Err(e) => self.status = tf("plugin.gui_open_failed", &[("e", &e.to_string())]).into(),
+                    Err(e) => {
+                        self.status = tf("plugin.gui_open_failed", &[("e", &e.to_string())]).into()
+                    }
                 }
             }
             Err(e) => self.status = format!("{}: {e}", t("plugin.gui_failed")).into(),
@@ -1948,18 +2256,146 @@ impl EditorView {
         let b = self.roll_bounds.get();
         let x = f32::from(pos.x) - f32::from(b.origin.x);
         let y = f32::from(pos.y) - f32::from(b.origin.y);
-        let tick = ((x + self.scroll_x) / self.zoom) as i64;
-        let key = 127.0 - (y + self.scroll_y) / NOTE_H;
-        (tick.max(0), key.round() as i32)
+        roll_hit(x, y, self.scroll_x, self.scroll_y, self.zoom)
+    }
+
+    /// Center the timeline view on the minimap position under window-x
+    /// (click or drag on the overview strip).
+    fn seek_minimap(&mut self, window_x: f32) {
+        let b = self.mini_bounds.get();
+        let w = f32::from(b.size.width);
+        if w <= 0.0 {
+            return;
+        }
+        let frac = ((window_x - f32::from(b.origin.x)) / w).clamp(0.0, 1.0);
+        let t = frac * self.doc_end_ticks() as f32;
+        let vw = f32::from(self.roll_bounds.get().size.width) / self.zoom;
+        self.scroll_x = ((t - vw / 2.0) * self.zoom).max(0.0);
+        self.clamp_scroll();
+    }
+
+    /// Recompute the active drag's deltas from the last cursor position.
+    /// Called from mouse-move, and again after edge auto-scroll shifts the
+    /// view under a stationary cursor — deltas are cursor-relative, so they
+    /// change as the scroll offset does.
+    fn update_drag(&mut self) {
+        let Some(pos) = self.mouse_pos else { return };
+        let Some(mode) = self.drag.as_ref().map(|d| d.mode) else {
+            return;
+        };
+        match mode {
+            DragMode::Velocity | DragMode::LaneEvent => {
+                let b = self.lane_bounds.get();
+                let y = f32::from(pos.y) - f32::from(b.origin.y);
+                let h = f32::from(b.size.height).max(1.0);
+                let vrange = match self.lane_mode {
+                    LaneMode::PitchBend => 16383.0,
+                    _ => 127.0,
+                };
+                let val = ((1.0 - y / h) * vrange) as i32;
+                if let Some(d) = self.drag.as_mut() {
+                    d.dkey = val;
+                }
+            }
+            _ => {
+                let (tick, key) = self.hit(pos);
+                // erase stroke: every note swept joins the pending delete set
+                let erase_id = (mode == DragMode::Erase)
+                    .then(|| self.note_at(pos).or_else(|| self.edge_at(pos)))
+                    .flatten()
+                    .map(|n| n.on_id);
+                if let Some(d) = self.drag.as_mut() {
+                    match d.mode {
+                        DragMode::Move | DragMode::Duplicate => {
+                            let (dt, dk) = clamp_move_delta(
+                                tick - d.orig_start as i64,
+                                d.orig_start,
+                                key - d.orig_key as i32,
+                                d.orig_key,
+                            );
+                            d.dtick = dt;
+                            d.dkey = dk;
+                        }
+                        DragMode::Resize => {
+                            d.dtick = tick - d.orig_end.unwrap_or(d.orig_start) as i64;
+                        }
+                        DragMode::Marquee => {
+                            d.b_tick = tick;
+                            d.b_key = key;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(id) = erase_id {
+                    self.erase_ids.insert(id);
+                }
+            }
+        }
+    }
+
+    /// While a drag is active and the cursor rests near a canvas edge, pan
+    /// the view a step per animation frame (classic DAW edge-scroll). Returns
+    /// whether the view moved, so the caller knows to keep animating.
+    fn drag_auto_pan(&mut self) -> bool {
+        const EDGE: f32 = 28.0;
+        const SPEED: f32 = 14.0;
+        const SLOP: f32 = 96.0;
+        let Some(mode) = self.drag.as_ref().map(|d| d.mode) else {
+            return false;
+        };
+        let Some(pos) = self.mouse_pos else {
+            return false;
+        };
+        let b = self.roll_bounds.get();
+        let (x, y) = (f32::from(pos.x), f32::from(pos.y));
+        let (bx, by) = (f32::from(b.origin.x), f32::from(b.origin.y));
+        let (w, h) = (f32::from(b.size.width), f32::from(b.size.height));
+        if w <= 0.0 || h <= 0.0 {
+            return false;
+        }
+        let mut dx = 0.0f32;
+        let mut dy = 0.0f32;
+        if x < bx + EDGE && x > bx - SLOP {
+            dx = -SPEED;
+        }
+        if x > bx + w - EDGE && x < bx + w + SLOP {
+            dx = SPEED;
+        }
+        // vertical panning only makes sense for roll-space drags — lane
+        // drags map the y axis to a value, not to pitch
+        if !matches!(mode, DragMode::Velocity | DragMode::LaneEvent) {
+            if y < by + EDGE && y > by - SLOP {
+                dy = -SPEED;
+            }
+            if y > by + h - EDGE && y < by + h + SLOP {
+                dy = SPEED;
+            }
+        }
+        if dx == 0.0 && dy == 0.0 {
+            return false;
+        }
+        let before = (self.scroll_x, self.scroll_y);
+        self.scroll_x = (self.scroll_x + dx).max(0.0);
+        self.scroll_y = (self.scroll_y + dy).max(0.0);
+        self.clamp_scroll();
+        let moved = (self.scroll_x, self.scroll_y) != before;
+        if moved {
+            self.update_drag();
+        }
+        moved
     }
 
     fn note_at(&self, pos: Point<Pixels>) -> Option<Note> {
         let (tick, key) = self.hit(pos);
-        self.notes.iter().rev().find(|n| {
-            n.key as i32 == key
-                && tick >= n.start_tick as i64
-                && tick <= n.end_tick.unwrap_or(n.start_tick + self.ppq() / 4) as i64
-        }).cloned()
+        self.notes
+            .iter()
+            .rev()
+            .find(|n| {
+                n.key as i32 == key
+                    && tick >= n.start_tick as i64
+                    && tick <= n.end_tick.unwrap_or(n.start_tick + self.ppq() / 4) as i64
+            })
+            .cloned()
     }
 
     /// Note whose right edge is within ~6px of `pos` — a resize target.
@@ -1979,7 +2415,11 @@ impl EditorView {
     }
 
     #[allow(dead_code)]
-    fn button(label: &'static str, cx: &Context<Self>, on: impl Fn(&mut Self, &mut Context<Self>) + 'static) -> Stateful<Div> {
+    fn button(
+        label: &'static str,
+        cx: &Context<Self>,
+        on: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+    ) -> Stateful<Div> {
         div()
             .id(label)
             .px_2()
@@ -2014,8 +2454,6 @@ impl EditorView {
             .on_click(cx.listener(move |this, ev, _w, cx| on(this, ev, cx)))
     }
 }
-
-
 
 fn load_document(path: &std::path::Path) -> Result<(Document, Vec<String>), String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
@@ -2133,14 +2571,22 @@ impl EditorView {
             sh.metronome = p.metronome;
             sh.loop_enabled = p.loop_enabled;
         }
+        // a hand-edited or corrupted sidecar must not blank the roll: a NaN
+        // or non-positive zoom makes every coordinate NaN (nothing paints)
         if let Some(z) = p.zoom {
-            self.zoom = z;
+            if z.is_finite() && z > 0.0 {
+                self.zoom = z.clamp(ZOOM_MIN, ZOOM_MAX);
+            }
         }
         if let Some(x) = p.scroll_x {
-            self.scroll_x = x;
+            if x.is_finite() {
+                self.scroll_x = x.max(0.0);
+            }
         }
         if let Some(y) = p.scroll_y {
-            self.scroll_y = y;
+            if y.is_finite() {
+                self.scroll_y = y.max(0.0);
+            }
         }
         if let Some(t) = p.sel_track {
             let n = self.doc(|d| d.tracks.len());
@@ -2242,9 +2688,6 @@ impl EditorView {
     }
 }
 
-
-
-
 fn main() {
     output::init_env();
     std::panic::set_hook(Box::new(|i| eprintln!("panic: {i}")));
@@ -2261,9 +2704,8 @@ fn main() {
         let path = path.clone();
         cx.spawn(async move |cx| {
             cx.open_window(WindowOptions::default(), move |window, cx| {
-                let input = cx.new(|cx| {
-                    InputState::new(window, cx).placeholder(t("field.track_name"))
-                });
+                let input =
+                    cx.new(|cx| InputState::new(window, cx).placeholder(t("field.track_name")));
                 let view = cx.new(|cx| {
                     let v = EditorView::new(path.clone(), input, cx);
                     spawn_mcp(v.shared.clone());
@@ -2284,7 +2726,10 @@ fn main() {
 /// loopback only). `mcp-bridge` is the stdio frontend for stdio-only clients.
 fn spawn_mcp(shared: SharedDoc) {
     std::thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
             Ok(rt) => rt,
             Err(e) => {
                 eprintln!("mcp http: failed to build tokio runtime: {e}");
@@ -2385,7 +2830,8 @@ fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
                             v.sync_editor_state_into_slot();
                         }
                     }
-                    if dirty || plugin_changed || v.playback.is_some() || v.plugin_window.is_some() {
+                    if dirty || plugin_changed || v.playback.is_some() || v.plugin_window.is_some()
+                    {
                         cx.notify();
                     }
                 });
@@ -2395,4 +2841,19 @@ fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
         }
     })
     .detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::empty_doc;
+
+    /// Every freshly parsed document reports revision 0, so the derived-view
+    /// caches must not key on the revision alone: before `doc_epoch` existed,
+    /// opening a file right after an untouched document (also revision 0)
+    /// skipped the cache rebuild and the roll stayed empty until the next
+    /// edit happened to bump the revision.
+    #[test]
+    fn fresh_documents_share_revision_zero() {
+        assert_eq!(empty_doc().revision(), empty_doc().revision());
+    }
 }
