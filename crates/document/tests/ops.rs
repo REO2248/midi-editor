@@ -351,3 +351,69 @@ fn update_revert_restores_raw_body() {
     assert_eq!(back.tick, 0);
     assert_eq!(back.raw_body.as_deref(), Some(&[0x90, 0x3C, 0x64][..]));
 }
+
+#[test]
+fn humanize_is_deterministic_and_bounded() {
+    let mut d = doc(vec![vec![
+        chan(480, 0x90, 60, 100),
+        chan(960, 0x80, 60, 0),
+        chan(1440, 0x90, 64, 90),
+        chan(1920, 0x80, 64, 0),
+    ]]);
+    let ops_a = d.humanize_ops(0, 0, u64::MAX, 10, 8);
+    let ops_b = d.humanize_ops(0, 0, u64::MAX, 10, 8);
+    let ticks_a: Vec<u64> = ops_a
+        .iter()
+        .map(|o| match o {
+            Op::UpdateEvent { after, .. } => after.tick,
+            _ => 0,
+        })
+        .collect();
+    let ticks_b: Vec<u64> = ops_b
+        .iter()
+        .map(|o| match o {
+            Op::UpdateEvent { after, .. } => after.tick,
+            _ => 0,
+        })
+        .collect();
+    assert_eq!(ticks_a, ticks_b);
+    apply(&mut d, ops_a);
+    for n in notes_on(&d, 0) {
+        assert!(n.end_tick.unwrap() - n.start_tick == 480, "length preserved");
+    }
+}
+
+#[test]
+fn legato_extends_same_key_only() {
+    // 60 at 0..240, 64 at 480..600, 60 at 720..800:
+    // key60 first note → end moves to 720; key64 untouched (next same-key)
+    let mut d = doc(vec![vec![
+        chan(0, 0x90, 60, 100),
+        chan(240, 0x80, 60, 0),
+        chan(480, 0x90, 64, 100),
+        chan(600, 0x80, 64, 0),
+        chan(720, 0x90, 60, 100),
+        chan(800, 0x80, 60, 0),
+    ]]);
+    let ops = d.legato_ops(0, 0, u64::MAX);
+    apply(&mut d, ops);
+    let ns = notes_on(&d, 0);
+    let k60: Vec<&Note> = ns.iter().filter(|n| n.key == 60).collect();
+    assert_eq!(k60[0].end_tick, Some(720));
+    assert_eq!(ns.iter().find(|n| n.key == 64).unwrap().end_tick, Some(600));
+}
+
+#[test]
+fn set_length_and_velocity() {
+    let mut d = doc(vec![vec![
+        chan(0, 0x90, 60, 100),
+        chan(480, 0x80, 60, 0),
+    ]]);
+    let ops = d.set_length_ops(0, 0, u64::MAX, 120);
+    apply(&mut d, ops);
+    let ops = d.set_velocity_ops(0, 0, u64::MAX, 64);
+    apply(&mut d, ops);
+    let n = &notes_on(&d, 0)[0];
+    assert_eq!(n.end_tick, Some(120));
+    assert_eq!(n.vel, 64);
+}

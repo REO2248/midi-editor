@@ -751,6 +751,166 @@ impl Document {
         ops
     }
 
+    /// Deterministic pseudo-random jitter for note starts/velocities in
+    /// [from,to). `timing` = max |tick shift|, `vel` = max |velocity delta|.
+    /// Seeded by event id — same document produces the same take (undo and
+    /// MCP diffs stay reproducible).
+    pub fn humanize_ops(
+        &mut self,
+        track: usize,
+        from: u64,
+        to: u64,
+        timing: i64,
+        vel: i32,
+    ) -> Vec<Op> {
+        let mut ops = Vec::new();
+        for n in self
+            .notes()
+            .into_iter()
+            .filter(|n| n.track == track && n.start_tick >= from && n.start_tick < to)
+        {
+            let mut r = (n.on_id as u64)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(0xA076_1D64_78BD_642F);
+            let mut next = || {
+                r ^= r << 13;
+                r ^= r >> 7;
+                r ^= r << 17;
+                r
+            };
+            let dt = if timing > 0 {
+                (next() % (timing as u64 * 2 + 1)) as i64 - timing
+            } else {
+                0
+            };
+            let dv = if vel > 0 {
+                (next() % (vel as u64 * 2 + 1)) as i32 - vel
+            } else {
+                0
+            };
+            if dt == 0 && dv == 0 {
+                continue;
+            }
+            for id in [Some(n.on_id), n.off_id].into_iter().flatten() {
+                if let Some((ti, ei)) = self.by_id.get(&id).copied() {
+                    let before = self.tracks[ti].events[ei].clone();
+                    let mut after = before.clone();
+                    after.tick = after.tick.saturating_add_signed(dt);
+                    if id == n.on_id && dv != 0 {
+                        if let EventKind::Channel { data, .. } = &mut after.kind {
+                            data[1] = (data[1] as i32 + dv).clamp(1, 127) as u8;
+                        }
+                    }
+                    ops.push(Op::UpdateEvent {
+                        track: ti,
+                        before,
+                        after,
+                    });
+                }
+            }
+        }
+        ops
+    }
+
+    /// Extend each note's end to the start of the next note ON THE SAME KEY
+    /// (per-pitch legato — chord voicings stay intact).
+    pub fn legato_ops(&mut self, track: usize, from: u64, to: u64) -> Vec<Op> {
+        let mut notes: Vec<Note> = self
+            .notes()
+            .into_iter()
+            .filter(|n| n.track == track && n.start_tick >= from && n.start_tick < to)
+            .collect();
+        notes.sort_by_key(|n| (n.key, n.start_tick));
+        let mut ops = Vec::new();
+        for w in notes.windows(2) {
+            let (cur, nxt) = (&w[0], &w[1]);
+            if cur.key != nxt.key {
+                continue;
+            }
+            let Some(off_id) = cur.off_id else { continue };
+            let cur_end = cur.end_tick.unwrap_or(cur.start_tick);
+            if nxt.start_tick <= cur_end {
+                continue;
+            }
+            if let Some((ti, ei)) = self.by_id.get(&off_id).copied() {
+                let before = self.tracks[ti].events[ei].clone();
+                let mut after = before.clone();
+                after.tick = nxt.start_tick;
+                ops.push(Op::UpdateEvent {
+                    track: ti,
+                    before,
+                    after,
+                });
+            }
+        }
+        ops
+    }
+
+    /// Set every note in [from,to) to exactly `ticks` long.
+    pub fn set_length_ops(
+        &mut self,
+        track: usize,
+        from: u64,
+        to: u64,
+        ticks: u64,
+    ) -> Vec<Op> {
+        let mut ops = Vec::new();
+        for n in self
+            .notes()
+            .into_iter()
+            .filter(|n| n.track == track && n.start_tick >= from && n.start_tick < to)
+        {
+            let Some(off_id) = n.off_id else { continue };
+            if let Some((ti, ei)) = self.by_id.get(&off_id).copied() {
+                let before = self.tracks[ti].events[ei].clone();
+                if before.tick == n.start_tick + ticks {
+                    continue;
+                }
+                let mut after = before.clone();
+                after.tick = n.start_tick + ticks.max(1);
+                ops.push(Op::UpdateEvent {
+                    track: ti,
+                    before,
+                    after,
+                });
+            }
+        }
+        ops
+    }
+
+    /// Set every noteOn velocity in [from,to) to `vel`.
+    pub fn set_velocity_ops(
+        &mut self,
+        track: usize,
+        from: u64,
+        to: u64,
+        vel: u8,
+    ) -> Vec<Op> {
+        let mut ops = Vec::new();
+        for n in self
+            .notes()
+            .into_iter()
+            .filter(|n| n.track == track && n.start_tick >= from && n.start_tick < to)
+        {
+            if n.vel == vel {
+                continue;
+            }
+            if let Some((ti, ei)) = self.by_id.get(&n.on_id).copied() {
+                let before = self.tracks[ti].events[ei].clone();
+                let mut after = before.clone();
+                if let EventKind::Channel { data, .. } = &mut after.kind {
+                    data[1] = vel.clamp(1, 127);
+                }
+                ops.push(Op::UpdateEvent {
+                    track: ti,
+                    before,
+                    after,
+                });
+            }
+        }
+        ops
+    }
+
     /// Retarget every channel event in [from,to) to `channel` (0-indexed).
     pub fn set_channel_ops(
         &mut self,

@@ -7,6 +7,7 @@
 use crate::*;
 use crate::i18n::t;
 use crate::icons::icon;
+use std::any::Any;
 use commands::UndoStack;
 use document::{Document, Event as DocEvent, EventId, Note, Op};
 use gpui_kit::component::input::{Input, InputState};
@@ -23,6 +24,14 @@ const BG_BAR: u32 = 0x0f0f15;
 const BG_PANEL: u32 = 0x17171d;
 const BG_RAISED: u32 = 0x20202c;
 const BORDER_C: u32 = 0x2a2a35;
+/// Linear blend of two 0xRRGGBB colors — ghost-track dimming.
+fn blend(c: u32, to: u32, f: f32) -> u32 {
+    let r = (((c >> 16) & 0xFF) as f32 * (1.0 - f) + ((to >> 16) & 0xFF) as f32 * f) as u32;
+    let g = (((c >> 8) & 0xFF) as f32 * (1.0 - f) + ((to >> 8) & 0xFF) as f32 * f) as u32;
+    let b = ((c & 0xFF) as f32 * (1.0 - f) + (to & 0xFF) as f32 * f) as u32;
+    (r << 16) | (g << 8) | b
+}
+
 const ACCENT: u32 = 0x9fd0ff;
 
 impl Render for EditorView {
@@ -147,6 +156,7 @@ impl Render for EditorView {
         let bounds_cell = self.roll_bounds.clone();
         let playing = self.playback.is_some();
         let play_x_tick = playhead_tick;
+        let active_track = self.sel_track;
 
         let roll = canvas(
             move |bounds, _window, _cx| {
@@ -242,7 +252,12 @@ impl Render for EditorView {
                     } else if n.end_tick.is_none() {
                         DANGLING_COLOR
                     } else {
-                        TRACK_COLORS[n.track % TRACK_COLORS.len()]
+                        let c = TRACK_COLORS[n.track % TRACK_COLORS.len()];
+                        if n.track == active_track {
+                            c
+                        } else {
+                            blend(c, 0x12121a, 0.62)
+                        }
                     };
                     window.paint_quad(fill(
                         Bounds::new(point(x, y + px(1.0)), size(px(wpx), px(NOTE_H - 2.0))),
@@ -527,14 +542,14 @@ impl Render for EditorView {
                             .font_family("Cascadia Mono")
                             .text_color(rgb(if SNAPS[self.snap_idx].0 > 0 { 0xd8d8e0 } else { 0x55556a }))
                             .whitespace_nowrap()
-                            .child(SNAPS[self.snap_idx].1),
+                            .child(SNAPS[self.snap_idx].2),
                     )
                     .on_click(cx.listener(|v, _e, _w, cx| v.cycle_snap(cx))),
             )
             .child(Self::vsep())
             // selection ops (selection range, else whole track)
             .child(Self::ibtn("i.quant", "compress", t("tip.quantize"), false, cx, |v, _e, cx| {
-                let g = v.ppq() / 4;
+                let g = v.snap_ticks().max(v.ppq() as i64 / 4) as u64;
                 v.apply_region_op("quantize", move |d, tr, f, to| {
                     d.quantize_ops(tr, f, to, g, 100)
                 });
@@ -946,6 +961,66 @@ impl Render for EditorView {
         );
 
         // seek ruler: bar ticks/numbers, click positions the playhead
+        // minimap: whole-song overview with viewport rectangle
+        let mini_bounds_cell = self.mini_bounds.clone();
+        let mini_notes = self.notes.clone();
+        let mini_active = self.sel_track;
+        let roll_bounds_cell = self.roll_bounds.clone();
+        let song_end = mini_notes
+            .iter()
+            .map(|n| n.end_tick.unwrap_or(n.start_tick))
+            .max()
+            .unwrap_or(ppq * 16)
+            .max(ppq * 16);
+        let mini_play = play_x_tick;
+        let minimap = canvas(
+            move |b, _w, _cx| mini_bounds_cell.set(b),
+            move |bounds, _state, window, _cx| {
+                if playing {
+                    window.request_animation_frame();
+                }
+                let w: f32 = bounds.size.width.into();
+                let h: f32 = bounds.size.height.into();
+                let sx = w / song_end as f32;
+                for n in mini_notes.iter() {
+                    let x = bounds.origin.x + px(n.start_tick as f32 * sx);
+                    let y = bounds.origin.y + px((127.0 - n.key as f32) / 128.0 * (h - 2.0) + 1.0);
+                    let nw = ((n.end_tick.unwrap_or(n.start_tick) - n.start_tick).max(1) as f32
+                        * sx)
+                        .max(1.5);
+                    let c = TRACK_COLORS[n.track % TRACK_COLORS.len()];
+                    let c = if n.track == mini_active { c } else { blend(c, 0x111118, 0.55) };
+                    window.paint_quad(fill(
+                        Bounds::new(point(x, y), size(px(nw), px((h / 64.0).max(1.2)))),
+                        rgb(c),
+                    ));
+                }
+                // viewport rectangle
+                let vt0 = scroll_x / zoom;
+                let vw_ticks = f32::from(roll_bounds_cell.get().size.width) / zoom;
+                let vx = bounds.origin.x + px(vt0 * sx);
+                let vw = px((vw_ticks * sx).max(6.0));
+                window.paint_quad(fill(
+                    Bounds::new(point(vx, bounds.origin.y), size(vw, px(h))),
+                    rgba(0x9fd0ff1c),
+                ));
+                window.paint_quad(fill(
+                    Bounds::new(point(vx, bounds.origin.y), size(vw, px(1.0))),
+                    rgb(0x4f7fb0),
+                ));
+                window.paint_quad(fill(
+                    Bounds::new(point(vx, bounds.origin.y + px(h - 1.0)), size(vw, px(1.0))),
+                    rgb(0x4f7fb0),
+                ));
+                // playhead
+                let pxx = bounds.origin.x + px(mini_play as f32 * sx);
+                window.paint_quad(fill(
+                    Bounds::new(point(pxx, bounds.origin.y), size(px(1.0), px(h))),
+                    rgb(0x50ff9f),
+                ));
+            },
+        );
+
         let ruler_bounds_cell = self.ruler_bounds.clone();
         let ruler_play_tick = playhead_tick;
         let ruler = canvas(
@@ -984,6 +1059,35 @@ impl Render for EditorView {
                 .flex_col()
                 .child(
                     div()
+                        .h(px(20.0))
+                        .w_full()
+                        .bg(rgb(0x111118))
+                        .border_b_1()
+                        .border_color(rgb(BORDER_C))
+                        .cursor_pointer()
+                        .child(minimap.size_full())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
+                                let b = this.mini_bounds.get();
+                                let w: f32 = b.size.width.into();
+                                if w <= 0.0 {
+                                    return;
+                                }
+                                let x = f32::from(ev.position.x) - f32::from(b.origin.x);
+                                let tick = x / w;
+                                // center the clicked position in the view
+                                let send = this.doc_end_ticks();
+                                let t = tick * send as f32;
+                                let vw = f32::from(this.roll_bounds.get().size.width)
+                                    / this.zoom;
+                                this.scroll_x = ((t - vw / 2.0) * this.zoom).max(0.0);
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .child(
+                    div()
                         .h(px(26.0))
                         .w_full()
                         .bg(rgb(0x17171d))
@@ -997,16 +1101,8 @@ impl Render for EditorView {
                                 let b = this.ruler_bounds.get();
                                 let x = f32::from(ev.position.x) - f32::from(b.origin.x);
                                 let tick = ((x + this.scroll_x) / this.zoom).max(0.0) as u64;
-                                let us = this.doc(|d| d.tempo_map.tick_to_us(tick));
-                                let was_playing = this.playback.is_some();
-                                if was_playing {
-                                    this.stop_playback();
-                                }
-                                this.play_us = us;
-                                if was_playing {
-                                    this.start_playback();
-                                }
-                                cx.notify();
+                                // double-click on the ruler plays from that bar position
+                                this.seek_to_tick(tick, ev.click_count == 2, cx);
                             }),
                         ),
                 )
@@ -1436,6 +1532,7 @@ impl Render for EditorView {
                         v.open_dialog(cx);
                     })
                     .into_any_element(),
+                    Self::mi_sub("f.recent", t("menu.recent"), Sub::Recent, cx).into_any_element(),
                     Self::msep().into_any_element(),
                     Self::mi("f.save", t("menu.save"), "Ctrl+S", None, cx, |v, _e, cx| {
                         v.save(cx);
@@ -1460,6 +1557,23 @@ impl Render for EditorView {
                         v.select_all(cx);
                     })
                     .into_any_element(),
+                    Self::msep().into_any_element(),
+                    Self::mi("e.cut", t("edit.cut"), "Ctrl+X", None, cx, |v, _e, cx| {
+                        v.copy_selected(true, cx);
+                    })
+                    .into_any_element(),
+                    Self::mi("e.copy", t("edit.copy"), "Ctrl+C", None, cx, |v, _e, cx| {
+                        v.copy_selected(false, cx);
+                    })
+                    .into_any_element(),
+                    Self::mi("e.paste", t("edit.paste"), "Ctrl+V", None, cx, |v, _e, cx| {
+                        v.paste(cx);
+                    })
+                    .into_any_element(),
+                    Self::mi("e.dup", t("edit.duplicate"), "Ctrl+D", None, cx, |v, _e, cx| {
+                        v.duplicate_selected(cx);
+                    })
+                    .into_any_element(),
                     Self::mi("e.del", t("menu.delete"), "Del", None, cx, |v, _e, cx| {
                         v.delete_selected(cx);
                     })
@@ -1468,13 +1582,8 @@ impl Render for EditorView {
                     Self::mi_sub("e.tool", t("edit.tool"), Sub::Tool, cx).into_any_element(),
                     Self::mi_sub("e.snap", t("edit.snap"), Sub::Snap, cx).into_any_element(),
                     Self::msep().into_any_element(),
-                    Self::mi("e.quant", t("edit.quantize"), "", None, cx, |v, _e, _cx| {
-                        let g = v.ppq() / 4;
-                        v.apply_region_op("quantize", move |d, t, f, to| {
-                            d.quantize_ops(t, f, to, g, 100)
-                        });
-                    })
-                    .into_any_element(),
+                    Self::mi_sub("e.quant", t("edit.quantize"), Sub::Quant, cx)
+                        .into_any_element(),
                     Self::mi("e.trup", t("edit.transpose_up"), "", None, cx, |v, _e, _cx| {
                         v.apply_region_op("transpose +1", |d, t, f, to| d.transpose_ops(t, f, to, 1));
                     })
@@ -1483,6 +1592,19 @@ impl Render for EditorView {
                         v.apply_region_op("transpose -1", |d, t, f, to| d.transpose_ops(t, f, to, -1));
                     })
                     .into_any_element(),
+                    Self::mi_sub("e.oct", t("edit.octave"), Sub::Oct, cx).into_any_element(),
+                    Self::msep().into_any_element(),
+                    Self::mi("e.human", t("edit.humanize"), "", None, cx, |v, _e, _cx| {
+                        v.apply_region_op("humanize", |d, t, f, to| d.humanize_ops(t, f, to, 12, 8));
+                    })
+                    .into_any_element(),
+                    Self::mi("e.legato", t("edit.legato"), "", None, cx, |v, _e, _cx| {
+                        v.apply_region_op("legato", |d, t, f, to| d.legato_ops(t, f, to));
+                    })
+                    .into_any_element(),
+                    Self::mi_sub("e.len", t("edit.set_length"), Sub::LenSet, cx).into_any_element(),
+                    Self::mi_sub("e.velset", t("edit.set_velocity"), Sub::VelSet, cx)
+                        .into_any_element(),
                     Self::msep().into_any_element(),
                     Self::mi("e.velup", t("edit.vel_up"), "", None, cx, |v, _e, _cx| {
                         v.apply_region_op("vel ×1.25", |d, t, f, to| d.scale_velocity_ops(t, f, to, 1.25));
@@ -1586,8 +1708,18 @@ impl Render for EditorView {
                         v.persist();
                     })
                     .into_any_element(),
+                    Self::mi("tr.cin", t("transport.count_in"), "", Some(self.count_in), cx, |v, _e, _cx| {
+                        v.count_in = !v.count_in;
+                        v.save_global();
+                    })
+                    .into_any_element(),
                 ],
                 TopMenu::Help => vec![
+                    Self::mi("h.keys", t("help.shortcuts"), "F1", None, cx, |v, _e, cx| {
+                        v.help_open = !v.help_open;
+                        cx.notify();
+                    })
+                    .into_any_element(),
                     Self::mi("h.about", t("help.about"), "", None, cx, |v, _e, _cx| {
                         v.status = concat!("midi-editor ", env!("CARGO_PKG_VERSION"),
                             " — pure-SMF editor").into();
@@ -1725,7 +1857,7 @@ impl Render for EditorView {
                     Sub::Snap => SNAPS
                         .iter()
                         .enumerate()
-                        .map(|(i, (_div, label))| {
+                        .map(|(i, (_div, _trip, label))| {
                             Self::mi(
                                 ("snap", i),
                                 *label,
@@ -1737,6 +1869,101 @@ impl Render for EditorView {
                             .into_any_element()
                         })
                         .collect(),
+                    Sub::Recent => {
+                        if self.recent.is_empty() {
+                            vec![Self::mi("recent.empty", t("menu.recent_empty"), "", None, cx, |_v, _e, _cx| {})
+                                .into_any_element()]
+                        } else {
+                            self.recent
+                                .iter()
+                                .enumerate()
+                                .map(|(i, p)| {
+                                    let name = p
+                                        .rsplit(['\\', '/'])
+                                        .next()
+                                        .unwrap_or(p.as_str())
+                                        .to_string();
+                                    let path = std::path::PathBuf::from(p.as_str());
+                                    Self::mi(("recent", i), name, "", None, cx, move |v, _e, cx| {
+                                        v.open(path.clone(), cx);
+                                    })
+                                    .into_any_element()
+                                })
+                                .collect()
+                        }
+                    }
+                    Sub::Quant => {
+                        let g = self.snap_ticks().max(self.ppq() as i64 / 4) as u64;
+                        [("100%", 100u32), ("75%", 75), ("50%", 50)]
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, (label, str_))| {
+                                Self::mi(("quant", i), format!("Quantize {label}"), "", None, cx, move |v, _e, _cx| {
+                                    v.apply_region_op("quantize", move |d, t, f, to| {
+                                        d.quantize_ops(t, f, to, g, str_)
+                                    });
+                                })
+                                .into_any_element()
+                            })
+                            .collect()
+                    }
+                    Sub::Oct => {
+                        let opts = [
+                            ("+1 octave", 12i32),
+                            ("-1 octave", -12),
+                        ];
+                        opts.into_iter()
+                            .enumerate()
+                            .map(|(i, (label, st))| {
+                                Self::mi(("oct", i), label, "", None, cx, move |v, _e, _cx| {
+                                    v.apply_region_op("octave", move |d, t, f, to| {
+                                        d.transpose_ops(t, f, to, st)
+                                    });
+                                })
+                                .into_any_element()
+                            })
+                            .collect()
+                    }
+                    Sub::LenSet => {
+                        let ppq = self.ppq();
+                        let opts: [(&str, u64); 5] = [
+                            ("1/32", ppq / 8),
+                            ("1/16", ppq / 4),
+                            ("1/8", ppq / 2),
+                            ("1/4", ppq),
+                            ("1 bar", ppq * 4),
+                        ];
+                        opts.into_iter()
+                            .enumerate()
+                            .map(|(i, (label, ticks))| {
+                                Self::mi(("len", i), label, "", None, cx, move |v, _e, _cx| {
+                                    v.apply_region_op("set length", move |d, t, f, to| {
+                                        d.set_length_ops(t, f, to, ticks)
+                                    });
+                                })
+                                .into_any_element()
+                            })
+                            .collect()
+                    }
+                    Sub::VelSet => {
+                        let opts = [
+                            ("pianissimo (32)", 32u8),
+                            ("mezzo (72)", 72),
+                            ("forte (100)", 100),
+                            ("max (127)", 127),
+                        ];
+                        opts.into_iter()
+                            .enumerate()
+                            .map(|(i, (label, vel))| {
+                                Self::mi(("vset", i), label, "", None, cx, move |v, _e, _cx| {
+                                    v.apply_region_op("set velocity", move |d, t, f, to| {
+                                        d.set_velocity_ops(t, f, to, vel)
+                                    });
+                                })
+                                .into_any_element()
+                            })
+                            .collect()
+                    }
                     Sub::Enc => {
                         let opts: [(Option<smf_core::TextEncoding>, &str); 4] = [
                             (None, "auto"),
@@ -1803,6 +2030,86 @@ impl Render for EditorView {
                 .children(sub_popup)
         });
 
+        // shortcuts overlay (F1 / Help > Keyboard Shortcuts)
+        let help_layer = self.help_open.then(|| {
+            const ROWS: [(&str, &str); 21] = [
+                ("Space", "Play / stop"),
+                ("F1", "This panel"),
+                ("Esc", "Close menus / clear selection"),
+                ("Ctrl+N / O / S", "New / Open / Save"),
+                ("Ctrl+Z / Y", "Undo / redo"),
+                ("Ctrl+A", "Select all notes"),
+                ("Ctrl+X / C / V", "Cut / copy / paste"),
+                ("Ctrl+D", "Duplicate selection"),
+                ("Del", "Delete selection"),
+                ("1 / 2 / 3", "Select / draw / erase tool"),
+                ("← →", "Nudge by grid step"),
+                ("Shift+← →", "Nudge by 1 tick"),
+                ("↑ ↓", "Transpose by semitone"),
+                ("Shift+↑ ↓", "Transpose by octave"),
+                ("Alt+drag note", "Duplicate note(s)"),
+                ("Right-edge drag", "Resize note"),
+                ("Click ruler", "Seek playhead"),
+                ("Double-click ruler", "Play from here"),
+                ("Click minimap", "Jump to position"),
+                ("Ctrl+wheel", "Zoom timeline"),
+                ("Drag .mid file", "Drop to open"),
+            ];
+            let panel = div()
+                .id("help-panel")
+                .flex()
+                .flex_col()
+                .w(px(420.0))
+                .py_2()
+                .px_3()
+                .bg(rgb(0x20202c))
+                .border_1()
+                .border_color(rgb(0x3c3c4a))
+                .rounded_lg()
+                .shadow_lg()
+                .text_size(px(12.0))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_v, _e, _w, cx| cx.stop_propagation()),
+                )
+                .child(
+                    div()
+                        .text_size(px(14.0))
+                        .text_color(rgb(0x9fd0ff))
+                        .pb_2()
+                        .child(t("help.shortcuts")),
+                )
+                .children(ROWS.iter().map(|(k, v)| {
+                    div()
+                        .flex()
+                        .h(px(20.0))
+                        .items_center()
+                        .child(
+                            div()
+                                .w(px(150.0))
+                                .font_family("Cascadia Mono")
+                                .text_color(rgb(0x8fd0a0))
+                                .child(*k),
+                        )
+                        .child(div().text_color(rgb(0xd8d8e0)).child(*v))
+                }));
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgba(0x00000066))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|v, _e, _w, cx| {
+                        v.help_open = false;
+                        cx.notify();
+                    }),
+                )
+                .child(panel)
+        });
+
         div()
             .flex()
             .flex_col()
@@ -1820,6 +2127,14 @@ impl Render for EditorView {
                 let k = ev.keystroke.key.as_str();
                 let ctrl = ev.keystroke.modifiers.control;
                 let shift = ev.keystroke.modifiers.shift;
+                let st = {
+                    let s = this.snap_ticks();
+                    if s > 0 {
+                        s
+                    } else {
+                        this.ppq() as i64 / 8
+                    }
+                };
                 match (ctrl, shift, k) {
                     (true, false, "z") => this.undo(cx),
                     (true, false, "y") | (true, true, "z") => this.redo(cx),
@@ -1837,7 +2152,24 @@ impl Render for EditorView {
                     (false, false, "escape") => {
                         this.open_menu = None;
                         this.open_sub = None;
+                        this.help_open = false;
                         this.selection.clear();
+                        cx.notify();
+                    }
+                    (true, false, "x") => this.copy_selected(true, cx),
+                    (true, false, "c") => this.copy_selected(false, cx),
+                    (true, false, "v") => this.paste(cx),
+                    (true, false, "d") => this.duplicate_selected(cx),
+                    (false, false, "left") => this.nudge(-st, 0, cx),
+                    (false, false, "right") => this.nudge(st, 0, cx),
+                    (false, true, "left") => this.nudge(-1, 0, cx),
+                    (false, true, "right") => this.nudge(1, 0, cx),
+                    (false, false, "up") => this.nudge(0, 1, cx),
+                    (false, false, "down") => this.nudge(0, -1, cx),
+                    (false, true, "up") => this.nudge(0, 12, cx),
+                    (false, true, "down") => this.nudge(0, -12, cx),
+                    (false, false, "f1") => {
+                        this.help_open = !this.help_open;
                         cx.notify();
                     }
                     (false, false, "delete") | (false, false, "backspace") => {
@@ -1855,6 +2187,20 @@ impl Render for EditorView {
             .child(body)
             .child(status_bar)
             .children(menu_layer)
+            .children(help_layer)
+            // drag a .mid file anywhere to open it
+            .can_drop(|drag: &dyn Any, _w, _cx| drag.is::<ExternalPaths>())
+            .drag_over::<ExternalPaths>(|s, _p, _w, _cx| s.bg(rgb(0x16202e)))
+            .on_drop(cx.listener(|v, paths: &ExternalPaths, _w, cx| {
+                if let Some(p) = paths.paths().iter().find(|p| {
+                    matches!(
+                        p.extension().and_then(|e| e.to_str()),
+                        Some("mid") | Some("smf") | Some("midi")
+                    )
+                }) {
+                    v.open(p.clone(), cx);
+                }
+            }))
     }
 }
 

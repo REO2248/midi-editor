@@ -6,7 +6,7 @@
 mod i18n;
 mod icons;
 mod render;
-use i18n::t;
+use i18n::{t, tf};
 
 use commands::UndoStack;
 use document::{Document, Event as DocEvent, EventId, Note, Op};
@@ -17,7 +17,7 @@ use gpui_kit::*;
 use gpui_kit::component::input::InputState;
 use gpui_kit::component::Root;
 use midi_io::{EventSink, Playback, PortSink};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use smf_core::Division;
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -64,18 +64,17 @@ enum TopMenu {
 /// Second-level (cascading) menu that is open inside a dropdown.
 #[derive(Clone, Copy, PartialEq)]
 enum Sub {
-    /// Track > Output Channel (16 items)
     Chan,
-    /// Track > Output Destination (ports + plugins)
     Dest,
-    /// View > Lane
     Lane,
-    /// View > Text Encoding
     Enc,
-    /// Edit > Tool (select / draw / erase)
     Tool,
-    /// Edit > Snap (grid sizes)
     Snap,
+    Recent,
+    Quant,
+    LenSet,
+    VelSet,
+    Oct,
 }
 
 /// What the bottom lane edits for the selected track.
@@ -108,6 +107,17 @@ impl LaneMode {
     }
 }
 
+/// One clipboard note — tick offset from the copy anchor.
+#[derive(Clone)]
+struct ClipNote {
+    dtick: i64,
+    key: u8,
+    len: u64,
+    vel: u8,
+    ch: u8,
+    track: usize,
+}
+
 /// Piano-roll edit tool — the toolbar's radio group.
 #[derive(Clone, Copy, PartialEq)]
 enum Tool {
@@ -120,14 +130,17 @@ enum Tool {
 }
 
 /// Snap grid divisors of a whole note; 0 = snap off.
-const SNAPS: [(u32, &str); 7] = [
-    (0, "off"),
-    (1, "1"),
-    (2, "1/2"),
-    (4, "1/4"),
-    (8, "1/8"),
-    (16, "1/16"),
-    (32, "1/32"),
+const SNAPS: [(u32, bool, &'static str); 10] = [
+    (0, false, "off"),
+    (1, false, "1"),
+    (2, false, "1/2"),
+    (4, false, "1/4"),
+    (4, true, "1/4T"),
+    (8, false, "1/8"),
+    (8, true, "1/8T"),
+    (16, false, "1/16"),
+    (16, true, "1/16T"),
+    (32, false, "1/32"),
 ];
 
 struct Drag {
@@ -165,12 +178,15 @@ struct EditorView {
     snap_idx: usize,
     /// on_ids swept by the erase tool during a drag; deleted as one tx
     erase_ids: BTreeSet<EventId>,
+    /// note clipboard (cut/copy/paste)
+    clipboard: Vec<ClipNote>,
     /// canvas bounds as painted last frame — for hit-testing
     roll_bounds: Rc<Cell<Bounds<Pixels>>>,
     /// seek-ruler strip bounds
     ruler_bounds: Rc<Cell<Bounds<Pixels>>>,
     /// velocity lane bounds — same trick for the lane's hit-testing
     lane_bounds: Rc<Cell<Bounds<Pixels>>>,
+    mini_bounds: Rc<Cell<Bounds<Pixels>>>,
     scroll_x: f32,
     scroll_y: f32,
     zoom: f32,
@@ -199,6 +215,12 @@ struct EditorView {
     open_sub: Option<(Sub, f32)>,
     /// right-docked event list panel visibility
     show_events: bool,
+    /// F1 keyboard-shortcuts overlay
+    help_open: bool,
+    /// one-bar count-in before MIDI recording starts (global pref)
+    count_in: bool,
+    /// recently opened files (global pref, newest first)
+    recent: Vec<SharedString>,
     focus: FocusHandle,
     input: Entity<InputState>,
     status: SharedString,
@@ -210,6 +232,8 @@ struct Rec {
     buf: std::sync::Arc<Mutex<Vec<(u64, Vec<u8>)>>>,
     /// document time (µs) corresponding to Input's t=0
     base_us: u64,
+    /// count-in duration — input before this is discarded
+    cin_us: u64,
 }
 
 fn empty_doc() -> Document {
@@ -257,6 +281,7 @@ impl EditorView {
                 },
             ));
         }
+        let g = GlobalPrefs::load();
         let shared = Arc::new(Mutex::new(sh));
         let mut v = Self {
             shared,
@@ -268,11 +293,13 @@ impl EditorView {
             selection: BTreeSet::new(),
             drag: None,
             tool: Tool::Select,
-            snap_idx: 5, // 1/16
+            snap_idx: 7, // 1/16
             erase_ids: BTreeSet::new(),
+            clipboard: Vec::new(),
             roll_bounds: Rc::new(Cell::new(Bounds::new(point(px(0.0), px(0.0)), size(px(0.0), px(0.0))))),
             ruler_bounds: Rc::new(Cell::new(Bounds::new(point(px(0.0), px(0.0)), size(px(0.0), px(0.0))))),
             lane_bounds: Rc::new(Cell::new(Bounds::new(point(px(0.0), px(0.0)), size(px(0.0), px(0.0))))),
+            mini_bounds: Rc::new(Cell::new(Bounds::new(point(px(0.0), px(0.0)), size(px(0.0), px(0.0))))),
             scroll_x: 0.0,
             scroll_y: (127.0 - 84.0) * NOTE_H, // show ~C3..C7
             zoom: 0.08,
@@ -286,6 +313,9 @@ impl EditorView {
             lane_mode: LaneMode::Velocity,
             rec: None,
             open_menu: None,
+            help_open: false,
+            count_in: g.count_in,
+            recent: g.recent.iter().map(|p| p.as_str().into()).collect(),
             open_sub: None,
             show_events: true,
             focus: cx.focus_handle(),
@@ -296,6 +326,7 @@ impl EditorView {
         v.refresh_derived();
         if let Some(p) = &path {
             v.apply_prefs(p);
+            v.push_recent(p);
         }
         v
     }
@@ -358,12 +389,18 @@ impl EditorView {
     }
 
     /// snap interval in ticks (0 = off)
+    /// Current snap step in ticks (0 = off). Triplet entries are 2/3 of the
+    /// duple cell — 1/8T = a third of a quarter note.
     fn snap_ticks(&self) -> i64 {
-        let d = SNAPS[self.snap_idx].0;
-        if d == 0 {
-            0
+        let (div, trip, _) = SNAPS[self.snap_idx];
+        if div == 0 {
+            return 0;
+        }
+        let base = (self.ppq() as i64 * 4) / div as i64;
+        if trip {
+            base * 2 / 3
         } else {
-            (self.ppq() * 4 / d as u64) as i64
+            base
         }
     }
 
@@ -466,6 +503,16 @@ impl EditorView {
             self.events = Arc::new(self.build_event_rows(&sh.doc));
             self.ev_rev = rev;
         }
+    }
+
+    /// Tick position of the song end (for the minimap scale).
+    fn doc_end_ticks(&self) -> u64 {
+        self.notes
+            .iter()
+            .map(|n| n.end_tick.unwrap_or(n.start_tick))
+            .max()
+            .unwrap_or(self.ppq() * 16)
+            .max(self.ppq() * 16)
     }
 
     fn ppq(&self) -> u64 {
@@ -713,6 +760,206 @@ impl EditorView {
             self.apply_tx("delete notes", ops);
         }
         self.selection.clear();
+        cx.notify();
+    }
+
+    /// Copy the selection into the note clipboard (`cut` also deletes it).
+    fn copy_selected(&mut self, cut: bool, cx: &mut Context<Self>) {
+        let ppq = self.ppq();
+        let sel: Vec<Note> = self
+            .notes
+            .iter()
+            .filter(|n| self.selection.contains(&n.on_id))
+            .cloned()
+            .collect();
+        if sel.is_empty() {
+            self.status = t("status.nosel").into();
+            cx.notify();
+            return;
+        }
+        let lo = sel.iter().map(|n| n.start_tick).min().unwrap();
+        self.clipboard = sel
+            .iter()
+            .map(|n| ClipNote {
+                dtick: (n.start_tick - lo) as i64,
+                key: n.key,
+                len: n.end_tick
+                    .unwrap_or(n.start_tick + ppq / 4)
+                    .saturating_sub(n.start_tick)
+                    .max(1),
+                vel: n.vel,
+                ch: n.channel,
+                track: n.track,
+            })
+            .collect();
+        let n = self.clipboard.len();
+        if cut {
+            self.delete_selected(cx);
+        }
+        self.status = tf("status.copied", &[("n", &n.to_string())]).into();
+        cx.notify();
+    }
+
+    /// Insert `items` as fresh notes at `anchor` — shared by paste/duplicate.
+    fn insert_clip(
+        &mut self,
+        items: &[ClipNote],
+        anchor: u64,
+        label: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if items.is_empty() {
+            return;
+        }
+        let mut ops = Vec::new();
+        let mut sel_ids = Vec::new();
+        {
+            let mut sh = self.shared.lock().unwrap();
+            let ntr = sh.doc.tracks.len();
+            let mut per_track: BTreeMap<usize, Vec<DocEvent>> = BTreeMap::new();
+            for c in items {
+                let track = c.track.min(ntr.saturating_sub(1));
+                let tick = (anchor as i64 + c.dtick).max(0) as u64;
+                let ch = c.ch & 0x0F;
+                let on_id = sh.doc.alloc_event_id();
+                let off_id = sh.doc.alloc_event_id();
+                sel_ids.push(on_id);
+                per_track.entry(track).or_default().extend([
+                    DocEvent {
+                        id: on_id,
+                        tick,
+                        seq: u32::MAX / 2,
+                        raw_body: None,
+                        kind: EventKind::Channel {
+                            status: 0x90 | ch,
+                            data: [c.key, c.vel],
+                            len: 2,
+                        },
+                    },
+                    DocEvent {
+                        id: off_id,
+                        tick: tick + c.len,
+                        seq: u32::MAX / 2,
+                        raw_body: None,
+                        kind: EventKind::Channel {
+                            status: 0x80 | ch,
+                            data: [c.key, 0],
+                            len: 2,
+                        },
+                    },
+                ]);
+            }
+            for (track, events) in per_track {
+                ops.push(Op::InsertEvents { track, events });
+            }
+        }
+        self.apply_tx(label, ops);
+        self.selection = sel_ids.into_iter().collect();
+        cx.notify();
+    }
+
+    /// Paste the clipboard at the edit cursor (playhead), snapped to the grid.
+    fn paste(&mut self, cx: &mut Context<Self>) {
+        if self.clipboard.is_empty() {
+            self.status = t("status.noclip").into();
+            cx.notify();
+            return;
+        }
+        let anchor = self
+            .snap_down(self.doc(|d| d.tempo_map.us_to_tick(self.play_us)) as i64)
+            .max(0) as u64;
+        let src = self.clipboard.clone();
+        self.insert_clip(&src, anchor, "paste notes", cx);
+    }
+
+    /// Duplicate the selection, tiled immediately after it (Ctrl+D).
+    fn duplicate_selected(&mut self, cx: &mut Context<Self>) {
+        let ppq = self.ppq();
+        let sel: Vec<Note> = self
+            .notes
+            .iter()
+            .filter(|n| self.selection.contains(&n.on_id))
+            .cloned()
+            .collect();
+        if sel.is_empty() {
+            self.status = t("status.nosel").into();
+            cx.notify();
+            return;
+        }
+        let lo = sel.iter().map(|n| n.start_tick).min().unwrap();
+        let hi = sel
+            .iter()
+            .map(|n| n.end_tick.unwrap_or(n.start_tick))
+            .max()
+            .unwrap();
+        let items: Vec<ClipNote> = sel
+            .iter()
+            .map(|n| ClipNote {
+                dtick: (n.start_tick - lo) as i64,
+                key: n.key,
+                len: n.end_tick
+                    .unwrap_or(n.start_tick + ppq / 4)
+                    .saturating_sub(n.start_tick)
+                    .max(1),
+                vel: n.vel,
+                ch: n.channel,
+                track: n.track,
+            })
+            .collect();
+        self.insert_clip(&items, hi, "duplicate notes", cx);
+    }
+
+    /// Move every selected note by (dtick, dkey) — arrow-key nudge.
+    fn nudge(&mut self, dtick: i64, dkey: i32, cx: &mut Context<Self>) {
+        if self.selection.is_empty() {
+            return;
+        }
+        let mut ops = Vec::new();
+        {
+            let sh = self.shared.lock().unwrap();
+            for n in self
+                .notes
+                .iter()
+                .filter(|n| self.selection.contains(&n.on_id))
+            {
+                let nk = (n.key as i32 + dkey).clamp(0, 127) as u8;
+                if dtick == 0 && nk == n.key {
+                    continue;
+                }
+                for (ei, e) in sh.doc.tracks[n.track].events.iter().enumerate() {
+                    if e.id != n.on_id && n.off_id != Some(e.id) {
+                        continue;
+                    }
+                    let mut after = e.clone();
+                    after.tick = after.tick.saturating_add_signed(dtick);
+                    if e.id == n.on_id {
+                        if let EventKind::Channel { data, .. } = &mut after.kind {
+                            data[0] = nk;
+                        }
+                    }
+                    let _ = ei;
+                    ops.push(Op::UpdateEvent {
+                        track: n.track,
+                        before: e.clone(),
+                        after,
+                    });
+                }
+            }
+        }
+        if !ops.is_empty() {
+            self.apply_tx("nudge", ops);
+        }
+        cx.notify();
+    }
+
+    /// Move the playhead to `tick`; `play` (or an already-playing transport)
+    /// restarts the engine from there.
+    fn seek_to_tick(&mut self, tick: u64, play: bool, cx: &mut Context<Self>) {
+        self.play_us = self.doc(|d| d.tempo_map.tick_to_us(tick));
+        if play || self.playback.is_some() {
+            self.stop_playback();
+            self.start_playback();
+        }
         cx.notify();
     }
 
@@ -1043,6 +1290,7 @@ impl EditorView {
                     sh.track_dest.clear();
                 }
                 self.apply_prefs(&path);
+                self.push_recent(&path);
                 self.refresh_derived();
                 self.status = if load_warnings.is_empty() {
                     "loaded".into()
@@ -1189,6 +1437,12 @@ impl EditorView {
         }
         let buf = std::sync::Arc::new(Mutex::new(Vec::new()));
         let buf2 = buf.clone();
+        // optional one-bar count-in: capture starts after it elapses
+        let cin_us = if self.count_in {
+            self.doc(|d| d.tempo_map.tick_to_us(self.ppq() * 4))
+        } else {
+            0
+        };
         match midi_io::Input::open(0, move |us, b| {
             buf2.lock().unwrap().push((us, b.to_vec()));
         }) {
@@ -1197,6 +1451,7 @@ impl EditorView {
                     _input: input,
                     buf,
                     base_us: self.play_us,
+                    cin_us,
                 });
                 if self.playback.is_none() {
                     self.start_playback();
@@ -1233,7 +1488,13 @@ impl EditorView {
             if b.len() < 1 + len as usize {
                 continue;
             }
-            let tick = sh.doc.tempo_map.us_to_tick(rec.base_us + us);
+            if us < rec.cin_us {
+                continue;
+            }
+            let tick = sh
+                .doc
+                .tempo_map
+                .us_to_tick(rec.base_us + (us - rec.cin_us));
             events.push(document::Event {
                 id: sh.doc.alloc_event_id(),
                 tick,
@@ -1378,6 +1639,38 @@ fn load_document(path: &PathBuf) -> Result<(Document, Vec<String>), String> {
     Ok((Document::from_file(file), warnings))
 }
 
+/// App-wide preferences: recent files + record count-in. Stored at
+/// %APPDATA%/midi-editor/prefs.json (unlike the per-song sidecar).
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct GlobalPrefs {
+    recent: Vec<String>,
+    count_in: bool,
+}
+
+impl GlobalPrefs {
+    fn path() -> PathBuf {
+        let base = std::env::var("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        base.join("midi-editor")
+    }
+
+    fn load() -> Self {
+        std::fs::read_to_string(Self::path().join("prefs.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self) {
+        let dir = Self::path();
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(s) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(dir.join("prefs.json"), s);
+        }
+    }
+}
+
 /// Session state that cannot live inside the SMF: per-track output
 /// assignments (by stable destination identity, not runtime index), mute/solo,
 /// metronome/loop, view transform. Written next to the document as
@@ -1492,6 +1785,23 @@ impl EditorView {
         if let Some(i) = p.snap {
             self.snap_idx = i.min(SNAPS.len() - 1);
         }
+    }
+
+    /// MRU update + persist to the app-wide prefs file.
+    fn push_recent(&mut self, path: &PathBuf) {
+        let s = path.to_string_lossy().into_owned();
+        self.recent.retain(|r| r.as_str() != s);
+        self.recent.insert(0, s.as_str().into());
+        self.recent.truncate(10);
+        self.save_global();
+    }
+
+    fn save_global(&self) {
+        GlobalPrefs {
+            recent: self.recent.iter().map(|r| r.to_string()).collect(),
+            count_in: self.count_in,
+        }
+        .save();
     }
 
     fn persist(&self) {
