@@ -4,6 +4,7 @@
 //! `Document::apply(Transaction)` so undo is shared with MCP edits.
 
 mod i18n;
+mod icons;
 mod render;
 use i18n::t;
 
@@ -45,6 +46,8 @@ enum DragMode {
     LaneEvent,
     /// alt-drag: copy the selection instead of moving it
     Duplicate,
+    /// erase tool: every note touched joins `erase_ids`, deleted on commit
+    Erase,
 }
 
 /// Menubar dropdown that is currently open.
@@ -69,6 +72,10 @@ enum Sub {
     Lane,
     /// View > Text Encoding
     Enc,
+    /// Edit > Tool (select / draw / erase)
+    Tool,
+    /// Edit > Snap (grid sizes)
+    Snap,
 }
 
 /// What the bottom lane edits for the selected track.
@@ -101,6 +108,28 @@ impl LaneMode {
     }
 }
 
+/// Piano-roll edit tool — the toolbar's radio group.
+#[derive(Clone, Copy, PartialEq)]
+enum Tool {
+    /// click/drag selects notes; note-edge drags resize
+    Select,
+    /// click or drag on empty canvas draws a note
+    Draw,
+    /// click or sweep over notes deletes them (one undo step per stroke)
+    Erase,
+}
+
+/// Snap grid divisors of a whole note; 0 = snap off.
+const SNAPS: [(u32, &str); 7] = [
+    (0, "off"),
+    (1, "1"),
+    (2, "1/2"),
+    (4, "1/4"),
+    (8, "1/8"),
+    (16, "1/16"),
+    (32, "1/32"),
+];
+
 struct Drag {
     mode: DragMode,
     on_id: EventId,
@@ -130,6 +159,12 @@ struct EditorView {
     /// selected note `on_id`s (marquee multi-select)
     selection: BTreeSet<EventId>,
     drag: Option<Drag>,
+    /// active piano-roll tool
+    tool: Tool,
+    /// index into SNAPS — grid snap divisor of a whole note
+    snap_idx: usize,
+    /// on_ids swept by the erase tool during a drag; deleted as one tx
+    erase_ids: BTreeSet<EventId>,
     /// canvas bounds as painted last frame — for hit-testing
     roll_bounds: Rc<Cell<Bounds<Pixels>>>,
     /// seek-ruler strip bounds
@@ -232,6 +267,9 @@ impl EditorView {
             sel_track: 0,
             selection: BTreeSet::new(),
             drag: None,
+            tool: Tool::Select,
+            snap_idx: 5, // 1/16
+            erase_ids: BTreeSet::new(),
             roll_bounds: Rc::new(Cell::new(Bounds::new(point(px(0.0), px(0.0)), size(px(0.0), px(0.0))))),
             ruler_bounds: Rc::new(Cell::new(Bounds::new(point(px(0.0), px(0.0)), size(px(0.0), px(0.0))))),
             lane_bounds: Rc::new(Cell::new(Bounds::new(point(px(0.0), px(0.0)), size(px(0.0), px(0.0))))),
@@ -316,6 +354,80 @@ impl EditorView {
     fn set_lane(&mut self, m: LaneMode, cx: &mut Context<Self>) {
         self.lane_mode = m;
         self.persist();
+        cx.notify();
+    }
+
+    /// snap interval in ticks (0 = off)
+    fn snap_ticks(&self) -> i64 {
+        let d = SNAPS[self.snap_idx].0;
+        if d == 0 {
+            0
+        } else {
+            (self.ppq() * 4 / d as u64) as i64
+        }
+    }
+
+    /// floor `t` onto the snap grid (used for note starts)
+    fn snap_down(&self, t: i64) -> i64 {
+        let s = self.snap_ticks();
+        if s <= 0 {
+            t
+        } else {
+            t - t.rem_euclid(s)
+        }
+    }
+
+    /// nearest grid point (used for note ends / dragged positions)
+    fn snap_round(&self, t: i64) -> i64 {
+        let s = self.snap_ticks();
+        if s <= 0 {
+            t
+        } else {
+            ((t.max(0) + s / 2) / s) * s
+        }
+    }
+
+    fn set_tool(&mut self, tool: Tool, cx: &mut Context<Self>) {
+        self.tool = tool;
+        self.persist();
+        cx.notify();
+    }
+
+    fn set_snap(&mut self, idx: usize, cx: &mut Context<Self>) {
+        self.snap_idx = idx;
+        self.persist();
+        cx.notify();
+    }
+
+    fn cycle_snap(&mut self, cx: &mut Context<Self>) {
+        self.snap_idx = (self.snap_idx + 1) % SNAPS.len();
+        self.persist();
+        cx.notify();
+    }
+
+    /// delete the notes whose on_ids are in `erase_ids` as one undo step
+    fn commit_erase(&mut self, cx: &mut Context<Self>) {
+        let ids = std::mem::take(&mut self.erase_ids);
+        if ids.is_empty() {
+            return;
+        }
+        let sh = self.shared.lock().unwrap();
+        let mut ops = Vec::new();
+        for &on_id in &ids {
+            let off_id = self
+                .notes
+                .iter()
+                .find(|n| n.on_id == on_id)
+                .and_then(|n| n.off_id);
+            if let Some(op) = Self::remove_note_op(&sh, on_id, off_id) {
+                ops.push(op);
+            }
+        }
+        drop(sh);
+        if !ops.is_empty() {
+            self.apply_tx("erase notes", ops);
+        }
+        self.selection.clear();
         cx.notify();
     }
 
@@ -506,15 +618,19 @@ impl EditorView {
         self.apply_tx("set time signature", ops);
     }
 
+    #[allow(dead_code)]
     fn insert_note(&mut self, tick: u64, key: u8, cx: &mut Context<Self>) {
-        let ppq = self.ppq();
+        let len = self.snap_ticks().max(self.ppq() as i64 / 4) as u64;
+        self.insert_note_len(tick, key, len, cx);
+    }
+
+    fn insert_note_len(&mut self, tick: u64, key: u8, len: u64, cx: &mut Context<Self>) {
         let (on_id, off_id, track) = {
             let mut sh = self.shared.lock().unwrap();
             let track = self.sel_track.min(sh.doc.tracks.len().saturating_sub(1));
             (sh.doc.alloc_event_id(), sh.doc.alloc_event_id(), track)
         };
-        let snap = ppq / 4;
-        let tick = (tick / snap) * snap;
+        let tick = self.snap_down(tick as i64).max(0) as u64;
         let on = DocEvent {
             id: on_id,
             tick,
@@ -528,7 +644,7 @@ impl EditorView {
         };
         let off = DocEvent {
             id: off_id,
-            tick: tick + ppq,
+            tick: tick + len,
             seq: u32::MAX / 2,
             raw_body: None,
             kind: EventKind::Channel {
@@ -603,6 +719,10 @@ impl EditorView {
     fn commit_drag(&mut self, cx: &mut Context<Self>) {
         let Some(d) = self.drag.take() else { return };
         match d.mode {
+            DragMode::Erase => {
+                self.commit_erase(cx);
+                return;
+            }
             DragMode::Marquee => {
                 // rect select: notes intersecting the rubber-band box
                 let (t0, t1) = (d.a_tick.min(d.b_tick), d.a_tick.max(d.b_tick));
@@ -626,7 +746,8 @@ impl EditorView {
                     return;
                 }
                 let Some(orig_end) = d.orig_end else { return };
-                let new_end = ((orig_end as i64 + d.dtick).max(d.orig_start as i64 + 1)) as u64;
+                let new_end = (self.snap_round(orig_end as i64 + d.dtick)
+                    .max(d.orig_start as i64 + 1)) as u64;
                 let sh = self.shared.lock().unwrap();
                 let mut ops = Vec::new();
                 if let Some(off_id) = d.off_id {
@@ -696,7 +817,7 @@ impl EditorView {
                         track: d.track,
                         events: vec![DocEvent {
                             id,
-                            tick: d.a_tick.max(0) as u64,
+                            tick: self.snap_down(d.a_tick).max(0) as u64,
                             seq: 0,
                             raw_body: None,
                             kind: EventKind::Channel { status, data, len: 2 },
@@ -734,6 +855,14 @@ impl EditorView {
                 return;
             }
         }
+        if d.dtick == 0 && d.dkey == 0 {
+            return;
+        }
+        // magnet: the dragged note's resulting start snaps to the grid
+        let d = Drag {
+            dtick: self.snap_round(d.orig_start as i64 + d.dtick) - d.orig_start as i64,
+            ..d
+        };
         if d.dtick == 0 && d.dkey == 0 {
             return;
         }
@@ -1203,6 +1332,7 @@ impl EditorView {
             .cloned()
     }
 
+    #[allow(dead_code)]
     fn button(label: &'static str, cx: &Context<Self>, on: impl Fn(&mut Self, &mut Context<Self>) + 'static) -> Stateful<Div> {
         div()
             .id(label)
@@ -1267,6 +1397,8 @@ struct Prefs {
     enc: Option<String>,
     lane: Option<String>,
     show_events: Option<bool>,
+    tool: Option<String>,
+    snap: Option<usize>,
 }
 
 fn prefs_path(doc_path: &PathBuf) -> PathBuf {
@@ -1352,6 +1484,14 @@ impl EditorView {
         if let Some(v) = p.show_events {
             self.show_events = v;
         }
+        self.tool = match p.tool.as_deref() {
+            Some("draw") => Tool::Draw,
+            Some("erase") => Tool::Erase,
+            _ => Tool::Select,
+        };
+        if let Some(i) = p.snap {
+            self.snap_idx = i.min(SNAPS.len() - 1);
+        }
     }
 
     fn persist(&self) {
@@ -1388,6 +1528,15 @@ impl EditorView {
                 LaneMode::PitchBend => "pb".into(),
             }),
             show_events: Some(self.show_events),
+            tool: Some(
+                match self.tool {
+                    Tool::Select => "select",
+                    Tool::Draw => "draw",
+                    Tool::Erase => "erase",
+                }
+                .into(),
+            ),
+            snap: Some(self.snap_idx),
         };
         if let Ok(text) = serde_json::to_string_pretty(&prefs) {
             let _ = std::fs::write(prefs_path(&path), text);
