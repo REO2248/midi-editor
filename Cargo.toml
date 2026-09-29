@@ -37,6 +37,11 @@ cpal = "0.18.2"
 # GUI (gpui via gpui-kit facade; gpui is gpui-pre 0.3.6 underneath)
 gpui-kit = "0.6"
 
+# window capture + GIF encode for replay recording
+screenshots = "0.8"
+gif = "0.13"
+image = { version = "0.24", default-features = false, features = ["png", "jpeg"] }
+
 # MCP server
 rmcp = { version = "3.4", features = ["client", "server", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "macros", "schemars"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time"] }

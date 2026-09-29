@@ -129,6 +129,18 @@ impl Render for EditorView {
             format!("{bar}.{beat}.{:>3}", playhead_tick % ppq)
         };
 
+        // keep the replay capture rectangle glued to the window
+        if let Some(rec) = &self.recorder {
+            let sf = _window.scale_factor() as f64;
+            let b = _window.window_bounds().get_bounds();
+            rec.update_region(
+                f32::from(b.origin.x) as f64 * sf,
+                f32::from(b.origin.y) as f64 * sf,
+                f32::from(b.size.width) as f64 * sf,
+                f32::from(b.size.height) as f64 * sf,
+            );
+        }
+
         // --- piano roll canvas -------------------------------------------------
         let notes = self.notes.clone();
         let (scroll_x, scroll_y, zoom) = (self.scroll_x, self.scroll_y, self.zoom);
@@ -1436,6 +1448,18 @@ impl Render for EditorView {
                     .text_color(rgb(0x77778a))
                     .child(format!("{}", self.status)),
             )
+            .children(self.recorder.is_some().then(|| {
+                div()
+                    .text_color(rgb(0xff4f4f))
+                    .whitespace_nowrap()
+                    .child(format!(
+                        "● REC {}s",
+                        self.recorder
+                            .as_ref()
+                            .map(|r| r.elapsed_secs())
+                            .unwrap_or(0)
+                    ))
+            }))
             .child(Self::chip("st-lane", lane_mode.label(), cx, |v, _e, cx| {
                 v.set_lane(v.lane_mode.cycle(), cx);
             }))
@@ -1686,6 +1710,20 @@ impl Render for EditorView {
                         v.count_in = !v.count_in;
                         v.save_global();
                     })
+                    .into_any_element(),
+                    Self::msep().into_any_element(),
+                    Self::mi(
+                        "tr.replay",
+                        if self.recorder.is_some() {
+                            t("transport.replay_stop")
+                        } else {
+                            t("transport.replay_rec")
+                        },
+                        "",
+                        Some(self.recorder.is_some()),
+                        cx,
+                        |v, w, _cx| v.toggle_replay(w),
+                    )
                     .into_any_element(),
                 ],
                 TopMenu::Help => vec![
