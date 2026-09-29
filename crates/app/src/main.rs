@@ -1777,6 +1777,12 @@ impl EditorView {
         };
         let fresh = build_dest_catalog(&report.plugins);
         let mut sh = self.shared.lock().unwrap();
+        if fresh == sh.dests {
+            let ns = sh.dests.len().to_string();
+            drop(sh);
+            self.status = tf("status.rescan", &[("n", ns.as_str())]).into();
+            return;
+        }
         let old_default = sh.dests.get(sh.default_dest).map(|(_, d)| d.clone());
         let old_tracks: Vec<(usize, midi_io::Destination)> = sh
             .track_dest

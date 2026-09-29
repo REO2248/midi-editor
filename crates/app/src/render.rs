@@ -2124,14 +2124,14 @@ impl Render for EditorView {
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| t("output.missing").to_string());
                 let mut row = div().flex().flex_col().gap_1().child(
-                    div().child(label).child(": ").child(
+                    div().flex().gap_1().child(format!("{label}:")).child(
                         div()
                             .text_color(rgb(if path.is_some() { 0xd8d8e0 } else { 0xe06060 }))
                             .child(value),
                     ),
                 );
                 if path.is_none() {
-                    row = row.child(div().text_color(rgb(0x9999aa)).child(hint));
+                    row = row.child(div().text_size(px(11.0)).text_color(rgb(0x9999aa)).child(hint));
                 }
                 row.into_any_element()
             };
@@ -2152,6 +2152,8 @@ impl Render for EditorView {
                 div().child(format!("{}: {}", t("output.scan"), scan)).into_any_element(),
             ];
             if let Some(note) = &self.scan_note { rows.push(div().text_color(rgb(0x9999aa)).child(note.clone()).into_any_element()); }
+            rows.push(Self::msep().into_any_element());
+            rows.push(Self::mhead(t("output.cat_vst3")).into_any_element());
             for (i, (name, dest)) in dests.iter().enumerate() {
                 let output::Destination::Plugin { plugin_path } = dest else { continue };
                 let vendor = self.plugin_meta.get(plugin_path).map(|p| p.vendor.clone()).unwrap_or_default();
@@ -2172,19 +2174,21 @@ impl Render for EditorView {
                     .child(div().flex().gap_1().items_center().child(format!("{}  {}", name, state))
                         .child(div().text_color(rgb(0x888899)).child(vendor)));
                 if let Some(detail) = detail {
-                    row = row.child(div().text_color(rgb(0x9999aa)).child(detail));
+                    row = row.child(div().text_size(px(11.0)).text_color(rgb(0x9999aa)).child(detail));
                 }
                 rows.push(row.on_click(cx.listener(move |v, _e, _w, cx| {
                     if retry { v.ensure_plugin(i, true); cx.notify(); }
                 })).into_any_element());
             }
-            let panel = div().w(px(520.0)).max_h(px(520.0)).overflow_y_scrollbar().flex().flex_col().gap_1()
+            let panel = div().id("output-status-panel").w(px(520.0)).max_h(px(520.0)).overflow_y_scrollbar().flex().flex_col().gap_1()
                 .p_3().bg(rgb(0x20202c)).border_1().border_color(rgb(0x3c3c4a)).rounded_lg().shadow_lg()
+                .text_size(px(12.0))
                 .child(div().text_size(px(14.0)).text_color(rgb(0x9fd0ff)).child(t("output.status_title")))
                 .children(rows)
-                .child(div().flex().gap_2().pt_2()
-                    .child(Self::mi("status.rescan", t("output.rescan"), "", None, cx, |v, _e, cx| { v.rescan_plugins(); cx.notify(); }))
-                    .child(Self::mi("status.close", t("output.close"), "", None, cx, |v, _e, cx| { v.show_output_status = false; cx.notify(); })));
+                .child(div().flex().justify_end().gap_2().pt_2()
+                    .child(Self::chip("status.rescan", t("output.rescan"), cx, |v, _e, cx| { v.rescan_plugins(); cx.notify(); }))
+                    .child(Self::chip("status.close", t("output.close"), cx, |v, _e, cx| { v.show_output_status = false; cx.notify(); })))
+                .on_mouse_down(MouseButton::Left, cx.listener(|_v, _e, _w, cx| cx.stop_propagation()));
             div().absolute().inset_0().flex().items_center().justify_center().bg(rgba(0x00000066))
                 .on_mouse_down(MouseButton::Left, cx.listener(|v, _e, _w, cx| { v.show_output_status = false; cx.notify(); }))
                 .child(panel)
