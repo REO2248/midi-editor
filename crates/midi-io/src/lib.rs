@@ -22,6 +22,8 @@ pub enum Error {
     Init(String),
     #[error("connect failed: {0}")]
     Connect(String),
+    #[error("send failed: {0}")]
+    Send(String),
 }
 
 #[derive(Debug, Clone)]
@@ -100,7 +102,7 @@ impl Output {
     pub fn send(&mut self, bytes: &[u8]) -> Result<(), Error> {
         self.conn
             .send(bytes)
-            .map_err(|e| Error::Connect(format!("{e}")))
+            .map_err(|e| Error::Send(format!("{e}")))
     }
 
     /// All-notes-off + reset all controllers on every channel (panic).
@@ -194,17 +196,28 @@ pub trait EventSink: Send {
 /// `EventSink` over a `MidiOutputConnection`.
 pub struct PortSink {
     out: Output,
+    /// a port that disappeared mid-play would otherwise fail every event;
+    /// one log line is enough to notice it
+    warned_dead: bool,
 }
 
 impl PortSink {
     pub fn new(out: Output) -> Self {
-        Self { out }
+        Self {
+            out,
+            warned_dead: false,
+        }
     }
 }
 
 impl EventSink for PortSink {
     fn send_at(&mut self, bytes: &[u8], _rem_us: u64) {
-        let _ = self.out.send(bytes);
+        if let Err(e) = self.out.send(bytes) {
+            if !self.warned_dead {
+                self.warned_dead = true;
+                tracing::warn!("midi port '{}' stopped accepting events: {e}", self.out.name);
+            }
+        }
     }
     fn panic(&mut self) {
         self.out.panic();

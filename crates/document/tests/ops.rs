@@ -417,3 +417,152 @@ fn set_length_and_velocity() {
     assert_eq!(n.end_tick, Some(120));
     assert_eq!(n.vel, 64);
 }
+
+// ---- regressions: edits must survive save + reload ----
+// The writer prefers an event's raw_body over its kind, so any edit that
+// changes `kind` must also drop raw_body — otherwise the edit shows in the
+// UI but the saved file re-emits the original bytes.
+
+/// format-1 file with a conductor tempo and one named, two-note track,
+/// parsed strictly so every event carries a raw_body.
+fn parsed_doc() -> Document {
+    let mut f = Vec::new();
+    f.extend_from_slice(b"MThd\x00\x00\x00\x06\x00\x01\x00\x02\x01\xE0");
+    let t0 = [
+        0x00, 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20, // tempo 120bpm
+        0x00, 0xFF, 0x2F, 0x00,
+    ];
+    let t1 = [
+        0x00, 0xFF, 0x03, 0x04, b'L', b'e', b'a', b'd', // track name
+        0x00, 0x90, 0x3C, 0x64, // note on C4 vel 100
+        0x60, 0x3C, 0x00,       // running-status note off
+        0x00, 0x90, 0x40, 0x40, // note on E4 vel 64
+        0x60, 0x40, 0x00,
+        0x00, 0xFF, 0x2F, 0x00,
+    ];
+    for t in [&t0[..], &t1[..]] {
+        f.extend_from_slice(b"MTrk");
+        f.extend_from_slice(&(t.len() as u32).to_be_bytes());
+        f.extend_from_slice(t);
+    }
+    Document::from_file(smf_core::parse(&f).unwrap())
+}
+
+fn save_reload(d: &Document) -> Document {
+    let bytes = d.serialize(smf_core::WriteOptions::default());
+    Document::from_file(smf_core::parse(&bytes).unwrap())
+}
+
+#[test]
+fn kind_edits_survive_save_reload() {
+    // transpose + set_velocity + set_channel all rewrite kind data
+    let mut d = parsed_doc();
+    assert!(d.tracks[1].events.iter().all(|e| e.raw_body.is_some()));
+
+    let ops = d.transpose_ops(1, 0, u64::MAX, 12);
+    apply(&mut d, ops);
+    let ops = d.set_velocity_ops(1, 0, u64::MAX, 33);
+    apply(&mut d, ops);
+    let ops = d.set_channel_ops(1, 0, u64::MAX, 5);
+    apply(&mut d, ops);
+
+    let re = save_reload(&d);
+    let mut keys: Vec<u8> = notes_on(&re, 1).iter().map(|n| n.key).collect();
+    keys.sort();
+    assert_eq!(keys, vec![72, 76], "transposed keys must survive save+reload");
+    for n in notes_on(&re, 1) {
+        assert_eq!(n.vel, 33, "edited velocity must survive save+reload");
+        assert_eq!(n.channel, 5, "edited channel must survive save+reload");
+    }
+}
+
+#[test]
+fn tempo_and_name_replace_survive_save_reload() {
+    let mut d = parsed_doc();
+    let ops = d.set_tempo_ops(0, 240.0); // replaces the tick-0 tempo
+    apply(&mut d, ops);
+    let ops = d.set_track_name_ops(1, "Bass");
+    apply(&mut d, ops);
+
+    let re = save_reload(&d);
+    let mpq = re.tracks[0].events.iter().find_map(|e| match &e.kind {
+        EventKind::Meta { meta_type: 0x51, data } => {
+            Some(u32::from_be_bytes([0, data[0], data[1], data[2]]))
+        }
+        _ => None,
+    });
+    assert_eq!(mpq, Some(250_000), "240bpm tempo must survive save+reload");
+    assert_eq!(re.tracks[1].name.as_deref(), Some(b"Bass" as &[u8]));
+}
+
+#[test]
+fn tick_only_edit_preserves_raw_body() {
+    // a move that doesn't touch the kind keeps the verbatim body bytes —
+    // only the delta VLQ is regenerated
+    let mut d = parsed_doc();
+    let ev = d.tracks[1].events[1].clone(); // note on with full-status body
+    assert!(ev.raw_body.as_deref() == Some(&[0x90, 0x3C, 0x64][..]));
+    let mut after = ev.clone();
+    after.tick = 960;
+    apply(&mut d, vec![Op::UpdateEvent { track: 1, before: ev, after }]);
+    let re = save_reload(&d);
+    let moved = re.tracks[1].events.iter().find(|e| e.tick == 960).unwrap();
+    assert_eq!(moved.raw_body.as_deref(), Some(&[0x90, 0x3C, 0x64][..]));
+}
+
+#[test]
+fn apply_is_atomic_on_unknown_track() {
+    let mut d = doc(vec![vec![chan(0, 0x90, 60, 100)]]);
+    let rev = d.revision();
+    let new_ev = Event {
+        id: d.alloc_event_id(),
+        tick: 100,
+        seq: 0,
+        raw_body: None,
+        kind: EventKind::Channel { status: 0x90, data: [64, 90], len: 2 },
+    };
+    let tx = Transaction {
+        label: "bad".into(),
+        base: rev,
+        ops: vec![
+            Op::InsertEvents { track: 0, events: vec![new_ev.clone()] },
+            Op::InsertEvents { track: 9, events: vec![new_ev.clone()] },
+        ],
+    };
+    match d.apply(tx) {
+        Err(ApplyError::UnknownTrack(9)) => {}
+        other => panic!("expected UnknownTrack(9), got {other:?}"),
+    }
+    assert_eq!(d.revision(), rev, "failed apply must not bump the revision");
+    assert_eq!(d.tracks[0].events.len(), 1, "op 1 must not be half-applied");
+    // the id index stays consistent: a follow-up edit at the same base works
+    apply(&mut d, vec![Op::InsertEvents { track: 0, events: vec![new_ev] }]);
+    assert_eq!(d.tracks[0].events.len(), 2);
+}
+
+#[test]
+fn duplicate_whole_track_range_does_not_overflow() {
+    let mut d = doc(vec![vec![chan(100, 0x90, 60, 100)]]);
+    let ops = d.duplicate_range_ops(0, 0, u64::MAX); // span = u64::MAX
+    apply(&mut d, ops);
+    assert_eq!(d.tracks[0].events.len(), 2, "saturates instead of wrapping");
+}
+
+#[test]
+fn set_length_huge_ticks_saturates() {
+    let mut d = doc(vec![vec![chan(0, 0x90, 60, 100), chan(480, 0x80, 60, 0)]]);
+    let ops = d.set_length_ops(0, 0, u64::MAX, u64::MAX);
+    apply(&mut d, ops);
+    assert_eq!(notes_on(&d, 0)[0].end_tick, Some(u64::MAX));
+}
+
+#[test]
+fn smpte_tempo_map_uses_frames_not_ppq() {
+    // 30fps * 100 tpf = 3000 ticks/s → 3000 ticks = 1s
+    let mut d = doc(vec![vec![]]);
+    d.division = Division::Smpte { fps: 30, ticks_per_frame: 100 };
+    d.tempo_map = TempoMap::build(&d.tracks, d.division);
+    assert_eq!(d.tempo_map.tick_to_us(3000), 1_000_000);
+    assert_eq!(d.tempo_map.tick_to_us(1500), 500_000);
+    assert_eq!(d.tempo_map.us_to_tick(1_000_000), 3000);
+}

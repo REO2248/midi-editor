@@ -180,7 +180,9 @@ impl Document {
         }
     }
 
-    /// The single edit entry point shared by GUI and MCP.
+    /// The single edit entry point shared by GUI and MCP. Atomic: either
+    /// every op applies and the revision advances, or an error leaves the
+    /// document (and its id index) exactly as it was.
     pub fn apply(&mut self, tx: Transaction) -> Result<Revision, ApplyError> {
         if tx.base != self.revision {
             return Err(ApplyError::StaleRevision {
@@ -188,61 +190,11 @@ impl Document {
                 got: tx.base,
             });
         }
+        let mut tracks = self.tracks.clone();
         for op in &tx.ops {
-            match op {
-                Op::InsertEvents { track, events } => {
-                    let t = self.tracks.get_mut(*track).ok_or(ApplyError::UnknownTrack(*track))?;
-                    for e in events {
-                        let pos = t
-                            .events
-                            .binary_search_by_key(&(e.tick, e.seq), |x| (x.tick, x.seq))
-                            .unwrap_or_else(|p| p);
-                        t.events.insert(pos, e.clone());
-                    }
-                }
-                Op::RemoveEvents { track, .. } => {
-                    let t = self.tracks.get_mut(*track).ok_or(ApplyError::UnknownTrack(*track))?;
-                    for (_, e) in &op_removed(op) {
-                        if let Some(pos) = t.events.iter().position(|x| x.id == e.id) {
-                            t.events.remove(pos);
-                        }
-                    }
-                }
-                Op::UpdateEvent { track, after, .. } => {
-                    let t = self.tracks.get_mut(*track).ok_or(ApplyError::UnknownTrack(*track))?;
-                    if let Some(pos) = t.events.iter().position(|x| x.id == after.id) {
-                        t.events[pos] = after.clone();
-                        t.events.sort_by_key(|e| (e.tick, e.seq));
-                    }
-                }
-                Op::InsertTrack { index, track } => {
-                    self.tracks
-                        .insert((*index).min(self.tracks.len()), track.clone());
-                }
-                Op::RemoveTrack { index, .. } => {
-                    if *index < self.tracks.len() {
-                        self.tracks.remove(*index);
-                    }
-                }
-                Op::UpdateTrack { index, after, .. } => {
-                    if let Some(t) = self.tracks.get_mut(*index) {
-                        *t = after.clone();
-                    }
-                }
-            }
-            // keep the track's cached conventional metas honest
-            let ti = match op {
-                Op::InsertEvents { track, .. }
-                | Op::RemoveEvents { track, .. }
-                | Op::UpdateEvent { track, .. } => Some(*track),
-                Op::InsertTrack { index, .. }
-                | Op::RemoveTrack { index, .. }
-                | Op::UpdateTrack { index, .. } => Some(*index),
-            };
-            if let Some(ti) = ti {
-                self.refresh_track_meta(ti);
-            }
+            apply_op(&mut tracks, op)?;
         }
+        self.tracks = tracks;
         self.revision += 1;
         self.rebuild_index();
         self.tempo_map = TempoMap::build(&self.tracks, self.division);
@@ -305,32 +257,12 @@ impl Document {
                 | Op::UpdateTrack { index, .. } => Some(*index),
             };
             if let Some(ti) = ti {
-                self.refresh_track_meta(ti);
+                refresh_track_meta(&mut self.tracks, ti);
             }
         }
         self.revision += 1;
         self.rebuild_index();
         self.tempo_map = TempoMap::build(&self.tracks, self.division);
-    }
-
-    /// Rescan the first name/out-port/out-channel metas after an edit so the
-    /// `Track` cache fields stay correct without callers doing it.
-    fn refresh_track_meta(&mut self, ti: usize) {
-        if let Some(t) = self.tracks.get_mut(ti) {
-            t.name = None;
-            t.out_port = 0;
-            t.out_channel = 0;
-            for e in &t.events {
-                if let EventKind::Meta { meta_type, data } = &e.kind {
-                    match *meta_type {
-                        0x03 if t.name.is_none() => t.name = Some(data.clone()),
-                        0x21 if !data.is_empty() => t.out_port = data[0],
-                        0x20 if !data.is_empty() => t.out_channel = data[0],
-                        _ => {}
-                    }
-                }
-            }
-        }
     }
 
     /// File-wide text-encoding hint from an XF `FF 09` charset marker
@@ -432,7 +364,8 @@ impl Document {
                         events: vec![Event {
                             id,
                             tick: d.tick,
-                            seq: u32::MAX,
+                            // after every existing event at the final tick
+                            seq: self.next_seq(d.track, d.tick),
                             raw_body: None,
                             kind: EventKind::Meta {
                                 meta_type: 0x2F,
@@ -530,10 +463,88 @@ impl Document {
     }
 }
 
-fn op_removed(op: &Op) -> Vec<(usize, Event)> {
+/// Apply one op to a working track list. Fails only on `UnknownTrack` /
+/// before any partial state is visible — `Document::apply` commits only when
+/// every op of the transaction succeeded.
+fn apply_op(tracks: &mut Vec<Track>, op: &Op) -> Result<(), ApplyError> {
     match op {
-        Op::RemoveEvents { removed, .. } => removed.clone(),
-        _ => vec![],
+        Op::InsertEvents { track, events } => {
+            let t = tracks.get_mut(*track).ok_or(ApplyError::UnknownTrack(*track))?;
+            for e in events {
+                let pos = t
+                    .events
+                    .binary_search_by_key(&(e.tick, e.seq), |x| (x.tick, x.seq))
+                    .unwrap_or_else(|p| p);
+                t.events.insert(pos, e.clone());
+            }
+        }
+        Op::RemoveEvents { track, removed } => {
+            let t = tracks.get_mut(*track).ok_or(ApplyError::UnknownTrack(*track))?;
+            for (_, e) in removed {
+                if let Some(pos) = t.events.iter().position(|x| x.id == e.id) {
+                    t.events.remove(pos);
+                }
+            }
+        }
+        Op::UpdateEvent { track, after, .. } => {
+            let t = tracks.get_mut(*track).ok_or(ApplyError::UnknownTrack(*track))?;
+            if let Some(pos) = t.events.iter().position(|x| x.id == after.id) {
+                let mut after = after.clone();
+                // a modified kind must be re-encoded on save; a stale raw_body
+                // would silently revert the edit at serialize time
+                if after.kind != t.events[pos].kind {
+                    after.raw_body = None;
+                }
+                t.events[pos] = after;
+                t.events.sort_by_key(|e| (e.tick, e.seq));
+            }
+        }
+        Op::InsertTrack { index, track } => {
+            tracks.insert((*index).min(tracks.len()), track.clone());
+        }
+        Op::RemoveTrack { index, .. } => {
+            if *index < tracks.len() {
+                tracks.remove(*index);
+            }
+        }
+        Op::UpdateTrack { index, after, .. } => {
+            if let Some(t) = tracks.get_mut(*index) {
+                *t = after.clone();
+            }
+        }
+    }
+    // keep the track's cached conventional metas honest
+    let ti = match op {
+        Op::InsertEvents { track, .. }
+        | Op::RemoveEvents { track, .. }
+        | Op::UpdateEvent { track, .. } => Some(*track),
+        Op::InsertTrack { index, .. }
+        | Op::RemoveTrack { index, .. }
+        | Op::UpdateTrack { index, .. } => Some(*index),
+    };
+    if let Some(ti) = ti {
+        refresh_track_meta(tracks, ti);
+    }
+    Ok(())
+}
+
+/// Rescan the first name/out-port/out-channel metas after an edit so the
+/// `Track` cache fields stay correct without callers doing it.
+fn refresh_track_meta(tracks: &mut [Track], ti: usize) {
+    if let Some(t) = tracks.get_mut(ti) {
+        t.name = None;
+        t.out_port = 0;
+        t.out_channel = 0;
+        for e in &t.events {
+            if let EventKind::Meta { meta_type, data } = &e.kind {
+                match *meta_type {
+                    0x03 if t.name.is_none() => t.name = Some(data.clone()),
+                    0x21 if !data.is_empty() => t.out_port = data[0],
+                    0x20 if !data.is_empty() => t.out_channel = data[0],
+                    _ => {}
+                }
+            }
+        }
     }
 }
 
@@ -769,7 +780,7 @@ impl Document {
             .into_iter()
             .filter(|n| n.track == track && n.start_tick >= from && n.start_tick < to)
         {
-            let mut r = (n.on_id as u64)
+            let mut r = n.on_id
                 .wrapping_mul(0x9E37_79B9_7F4A_7C15)
                 .wrapping_add(0xA076_1D64_78BD_642F);
             let mut next = || {
@@ -862,12 +873,13 @@ impl Document {
         {
             let Some(off_id) = n.off_id else { continue };
             if let Some((ti, ei)) = self.by_id.get(&off_id).copied() {
+                let new_end = n.start_tick.saturating_add(ticks.max(1));
                 let before = self.tracks[ti].events[ei].clone();
-                if before.tick == n.start_tick + ticks {
+                if before.tick == new_end {
                     continue;
                 }
                 let mut after = before.clone();
-                after.tick = n.start_tick + ticks.max(1);
+                after.tick = new_end;
                 ops.push(Op::UpdateEvent {
                     track: ti,
                     before,
@@ -961,7 +973,7 @@ impl Document {
         let mut mk = |kind: EventKind| Event {
             id: self.alloc_event_id(),
             tick,
-            seq: { let s = seq; seq += 1; s },
+            seq: { let s = seq; seq = seq.saturating_add(1); s },
             raw_body: None,
             kind,
         };
@@ -1183,7 +1195,7 @@ impl Document {
             .collect();
         events.extend(extra_offs);
         for e in &mut events {
-            e.tick += span;
+            e.tick = e.tick.saturating_add(span);
             e.id = self.alloc_event_id();
         }
         if events.is_empty() {
@@ -1366,14 +1378,28 @@ impl TempoMap {
     pub fn ppq(&self) -> u64 {
         match self.division {
             Division::Metrical(p) => p.max(1) as u64,
+            // SMPTE has no quarter note; 480 keeps UI grid math sane
             Division::Smpte { .. } => 480,
         }
     }
 
+    /// Ticks per second for SMPTE timing (tempo events don't apply there).
+    fn smpte_tps(&self) -> u64 {
+        match self.division {
+            Division::Smpte { fps, ticks_per_frame } => {
+                fps.max(1) as u64 * ticks_per_frame.max(1) as u64
+            }
+            Division::Metrical(_) => 0,
+        }
+    }
+
     pub fn tick_to_us(&self, tick: u64) -> u64 {
+        if let Division::Smpte { .. } = self.division {
+            return ((tick as u128 * 1_000_000) / self.smpte_tps() as u128) as u64;
+        }
         let ppq = match self.division {
             Division::Metrical(p) => p.max(1) as u64,
-            Division::Smpte { .. } => return tick, // SMPTE handled separately
+            Division::Smpte { .. } => unreachable!(),
         };
         let (t0, mpq, cum) = match self.points.binary_search_by_key(&tick, |p| p.0) {
             Ok(i) => self.points[i],
@@ -1385,9 +1411,12 @@ impl TempoMap {
 
     /// Inverse of `tick_to_us` — for playhead positioning.
     pub fn us_to_tick(&self, us: u64) -> u64 {
+        if let Division::Smpte { .. } = self.division {
+            return ((us as u128 * self.smpte_tps() as u128) / 1_000_000) as u64;
+        }
         let ppq = match self.division {
             Division::Metrical(p) => p.max(1) as u64,
-            Division::Smpte { .. } => return us,
+            Division::Smpte { .. } => unreachable!(),
         };
         // last breakpoint whose cumulative time is <= us
         let i = match self.points.binary_search_by(|p| p.2.cmp(&us)) {

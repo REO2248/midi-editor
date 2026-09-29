@@ -80,7 +80,12 @@ async fn main() -> anyhow::Result<()> {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--url" => url = args.next().unwrap_or(url),
-            "--token" => token = Some(args.next().unwrap_or_default()),
+            // an empty bearer token is never valid — a missing value must
+            // fail loudly, not silently send "Bearer "
+            "--token" => match args.next() {
+                Some(t) if !t.is_empty() => token = Some(t),
+                _ => anyhow::bail!("--token requires a value"),
+            },
             "--file" => file = args.next().map(PathBuf::from),
             _ => {}
         }

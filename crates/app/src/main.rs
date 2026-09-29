@@ -139,7 +139,7 @@ enum Tool {
 }
 
 /// Snap grid divisors of a whole note; 0 = snap off.
-const SNAPS: [(u32, bool, &'static str); 10] = [
+const SNAPS: [(u32, bool, &str); 10] = [
     (0, false, "off"),
     (1, false, "1"),
     (2, false, "1/2"),
@@ -258,10 +258,13 @@ enum PluginState {
     Failed { path: PathBuf, phase: &'static str, msg: String },
 }
 
+/// Captured (µs, raw channel bytes) pairs from the input callback.
+type RecBuf = std::sync::Arc<Mutex<Vec<(u64, Vec<u8>)>>>;
+
 /// Armed recording: timestamps channel messages against the playhead's µs base.
 struct Rec {
     _input: midi_io::Input,
-    buf: std::sync::Arc<Mutex<Vec<(u64, Vec<u8>)>>>,
+    buf: RecBuf,
     /// document time (µs) corresponding to Input's t=0
     base_us: u64,
     /// count-in duration — input before this is discarded
@@ -292,6 +295,13 @@ fn build_dest_catalog(plugins: &[output::PluginInfo]) -> Vec<(String, midi_io::D
     dests
 }
 
+/// Lock the shared editor state, surviving a poisoned mutex — one panic
+/// inside a critical section must not brick every later lock on the UI and
+/// MCP threads.
+pub(crate) fn lock_shared(m: &Mutex<Shared>) -> std::sync::MutexGuard<'_, Shared> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn empty_doc() -> Document {
     let f = smf_core::File {
         format: 1,
@@ -304,16 +314,20 @@ fn empty_doc() -> Document {
 
 impl EditorView {
     fn new(path: Option<PathBuf>, input: Entity<InputState>, cx: &mut Context<Self>) -> Self {
-        let loaded = path.as_ref().map(load_document);
+        let loaded = path.as_deref().map(load_document);
         // the warning(s) belong in the status line, not swallowed
         let (doc, status): (Document, SharedString) = match loaded {
             Some(Ok((d, w))) if !w.is_empty() => (
                 d,
-                format!("loaded — {} warning(s): {}", w.len(), w.join("; ")).into(),
+                tf(
+                    "status.loaded_warn",
+                    &[("n", &w.len().to_string()), ("w", &w.join("; "))],
+                )
+                .into(),
             ),
-            Some(Ok((d, _))) => (d, "loaded".into()),
-            Some(Err(e)) => (empty_doc(), format!("load failed: {e}").into()),
-            None => (empty_doc(), "new document".into()),
+            Some(Ok((d, _))) => (d, t("status.loaded").into()),
+            Some(Err(e)) => (empty_doc(), tf("status.load_failed", &[("e", &e)]).into()),
+            None => (empty_doc(), t("status.new_doc").into()),
         };
         let mut sh = Shared::new(doc);
         sh.path = path.clone();
@@ -387,15 +401,18 @@ impl EditorView {
     }
 
     fn doc<R>(&self, f: impl FnOnce(&Document) -> R) -> R {
-        let sh = self.shared.lock().unwrap();
+        let sh = lock_shared(&self.shared);
         f(&sh.doc)
     }
 
     /// New untitled document in place.
     fn new_file(&mut self, cx: &mut Context<Self>) {
+        // an armed recording belongs to the document being replaced — drop
+        // it with a warning instead of silently losing the take
+        let rec_discarded = self.rec.take().is_some();
         self.stop_playback();
         {
-            let mut sh = self.shared.lock().unwrap();
+            let mut sh = lock_shared(&self.shared);
             sh.doc = empty_doc();
             sh.undo = UndoStack::new(512);
             sh.path = None;
@@ -408,7 +425,11 @@ impl EditorView {
         self.sel_track = 0;
         self.enc_override = None;
         self.refresh_derived();
-        self.status = "new document".into();
+        self.status = if rec_discarded {
+            format!("{} — {}", t("status.new_doc"), t("status.rec_discarded")).into()
+        } else {
+            t("status.new_doc").into()
+        };
         cx.notify();
     }
 
@@ -503,7 +524,7 @@ impl EditorView {
         if ids.is_empty() {
             return;
         }
-        let sh = self.shared.lock().unwrap();
+        let sh = lock_shared(&self.shared);
         let mut ops = Vec::new();
         for &on_id in &ids {
             let off_id = self
@@ -544,7 +565,7 @@ impl EditorView {
 
     fn refresh_derived(&mut self) {
         let arc = self.shared.clone();
-        let mut sh = arc.lock().unwrap();
+        let mut sh = lock_shared(&arc);
         self.refresh_derived_sh(&mut sh);
     }
 
@@ -634,10 +655,10 @@ impl EditorView {
 
     fn apply_tx(&mut self, label: &str, ops: Vec<Op>) {
         let arc = self.shared.clone();
-        let mut sh = arc.lock().unwrap();
+        let mut sh = lock_shared(&arc);
         match sh.apply(label, ops) {
             Ok(_) => self.refresh_derived_sh(&mut sh),
-            Err(e) => self.status = format!("apply: {e}").into(),
+            Err(e) => self.status = tf("status.apply_failed", &[("e", &e.to_string())]).into(),
         }
     }
 
@@ -665,7 +686,7 @@ impl EditorView {
             (tracks.into_iter().collect::<Vec<_>>(), lo, hi + 1)
         };
         let ops = {
-            let mut sh = self.shared.lock().unwrap();
+            let mut sh = lock_shared(&self.shared);
             tracks
                 .into_iter()
                 .flat_map(|t| f(&mut sh.doc, t, from, to))
@@ -689,7 +710,7 @@ impl EditorView {
                 .unwrap_or(120.0)
         });
         let ops = {
-            let mut sh = self.shared.lock().unwrap();
+            let mut sh = lock_shared(&self.shared);
             sh.doc.set_tempo_ops(0, (cur + delta).clamp(10.0, 400.0))
         };
         self.apply_tx("set tempo", ops);
@@ -714,7 +735,7 @@ impl EditorView {
             None => SIGS[1],
         };
         let ops = {
-            let mut sh = self.shared.lock().unwrap();
+            let mut sh = lock_shared(&self.shared);
             sh.doc.set_time_sig_ops(0, next.0, next.1)
         };
         self.apply_tx("set time signature", ops);
@@ -728,7 +749,7 @@ impl EditorView {
 
     fn insert_note_len(&mut self, tick: u64, key: u8, len: u64, cx: &mut Context<Self>) {
         let (on_id, off_id, track) = {
-            let mut sh = self.shared.lock().unwrap();
+            let mut sh = lock_shared(&self.shared);
             let track = self.sel_track.min(sh.doc.tracks.len().saturating_sub(1));
             (sh.doc.alloc_event_id(), sh.doc.alloc_event_id(), track)
         };
@@ -798,7 +819,7 @@ impl EditorView {
         if self.selection.is_empty() {
             return;
         }
-        let sh = self.shared.lock().unwrap();
+        let sh = lock_shared(&self.shared);
         let mut ops = Vec::new();
         for &on_id in &self.selection {
             let off_id = self
@@ -869,7 +890,7 @@ impl EditorView {
         let mut ops = Vec::new();
         let mut sel_ids = Vec::new();
         {
-            let mut sh = self.shared.lock().unwrap();
+            let mut sh = lock_shared(&self.shared);
             let ntr = sh.doc.tracks.len();
             let mut per_track: BTreeMap<usize, Vec<DocEvent>> = BTreeMap::new();
             for c in items {
@@ -971,7 +992,7 @@ impl EditorView {
         }
         let mut ops = Vec::new();
         {
-            let sh = self.shared.lock().unwrap();
+            let sh = lock_shared(&self.shared);
             for n in self
                 .notes
                 .iter()
@@ -981,7 +1002,12 @@ impl EditorView {
                 if dtick == 0 && nk == n.key {
                     continue;
                 }
-                for (ei, e) in sh.doc.tracks[n.track].events.iter().enumerate() {
+                // the track may have been removed by an MCP edit/undo since
+                // the note view was built — skip instead of indexing into it
+                let Some(track) = sh.doc.tracks.get(n.track) else {
+                    continue;
+                };
+                for e in track.events.iter() {
                     if e.id != n.on_id && n.off_id != Some(e.id) {
                         continue;
                     }
@@ -992,7 +1018,6 @@ impl EditorView {
                             data[0] = nk;
                         }
                     }
-                    let _ = ei;
                     ops.push(Op::UpdateEvent {
                         track: n.track,
                         before: e.clone(),
@@ -1050,19 +1075,21 @@ impl EditorView {
                 let Some(orig_end) = d.orig_end else { return };
                 let new_end = (self.snap_round(orig_end as i64 + d.dtick)
                     .max(d.orig_start as i64 + 1)) as u64;
-                let sh = self.shared.lock().unwrap();
+                let sh = lock_shared(&self.shared);
                 let mut ops = Vec::new();
                 if let Some(off_id) = d.off_id {
-                    for e in &sh.doc.tracks[d.track].events {
-                        if e.id == off_id {
-                            let mut after = e.clone();
-                            after.tick = new_end;
-                            after.raw_body = None;
-                            ops.push(Op::UpdateEvent {
-                                track: d.track,
-                                before: e.clone(),
-                                after,
-                            });
+                    // the track may be gone (MCP remove/undo during the drag)
+                    if let Some(track) = sh.doc.tracks.get(d.track) {
+                        for e in &track.events {
+                            if e.id == off_id {
+                                let mut after = e.clone();
+                                after.tick = new_end;
+                                ops.push(Op::UpdateEvent {
+                                    track: d.track,
+                                    before: e.clone(),
+                                    after,
+                                });
+                            }
                         }
                     }
                 }
@@ -1075,20 +1102,21 @@ impl EditorView {
             }
             DragMode::Velocity => {
                 let vel = d.dkey.clamp(1, 127) as u8;
-                let sh = self.shared.lock().unwrap();
+                let sh = lock_shared(&self.shared);
                 let mut ops = Vec::new();
-                for e in &sh.doc.tracks[d.track].events {
-                    if e.id == d.on_id {
-                        let mut after = e.clone();
-                        if let EventKind::Channel { data, .. } = &mut after.kind {
-                            data[1] = vel;
+                if let Some(track) = sh.doc.tracks.get(d.track) {
+                    for e in &track.events {
+                        if e.id == d.on_id {
+                            let mut after = e.clone();
+                            if let EventKind::Channel { data, .. } = &mut after.kind {
+                                data[1] = vel;
+                            }
+                            ops.push(Op::UpdateEvent {
+                                track: d.track,
+                                before: e.clone(),
+                                after,
+                            });
                         }
-                        after.raw_body = None;
-                        ops.push(Op::UpdateEvent {
-                            track: d.track,
-                            before: e.clone(),
-                            after,
-                        });
                     }
                 }
                 drop(sh);
@@ -1102,10 +1130,16 @@ impl EditorView {
             DragMode::LaneEvent => {
                 // CC/PB lane: update an existing event's value, or insert a
                 // new one when the drag started on empty lane space
-                let mut sh = self.shared.lock().unwrap();
+                let mut sh = lock_shared(&self.shared);
                 let mut ops = Vec::new();
+                // the track may be gone (MCP remove/undo during the drag)
+                let Some(track_events) = sh.doc.tracks.get(d.track) else {
+                    drop(sh);
+                    cx.notify();
+                    return;
+                };
                 if d.on_id == 0 {
-                    let ch = sh.doc.tracks[d.track].out_channel & 0x0F;
+                    let ch = track_events.out_channel & 0x0F;
                     let (status, data) = match self.lane_mode {
                         LaneMode::CC(cc) => (0xB0 | ch, [cc, d.dkey.clamp(0, 127) as u8]),
                         LaneMode::PitchBend => {
@@ -1126,7 +1160,7 @@ impl EditorView {
                         }],
                     });
                 } else {
-                    for e in &sh.doc.tracks[d.track].events {
+                    for e in &track_events.events {
                         if e.id == d.on_id {
                             let mut after = e.clone();
                             if let EventKind::Channel { data, .. } = &mut after.kind {
@@ -1140,7 +1174,6 @@ impl EditorView {
                                     LaneMode::Velocity => unreachable!(),
                                 }
                             }
-                            after.raw_body = None;
                             ops.push(Op::UpdateEvent {
                                 track: d.track,
                                 before: e.clone(),
@@ -1177,7 +1210,7 @@ impl EditorView {
         };
         let notes = self.notes.clone();
         let duplicate = d.mode == DragMode::Duplicate;
-        let mut sh = self.shared.lock().unwrap();
+        let mut sh = lock_shared(&self.shared);
         // two passes: shift-and-clone while iterating immutably, mint ids after
         let mut staged: Vec<(usize, document::Event, bool)> = Vec::new();
         for (ti, t) in sh.doc.tracks.iter().enumerate() {
@@ -1198,7 +1231,8 @@ impl EditorView {
                 if let EventKind::Channel { data, .. } = &mut after.kind {
                     data[0] = (n.key as i32 + d.dkey).clamp(0, 127) as u8;
                 }
-                after.raw_body = None; // re-encode from kind
+                // raw_body is dropped centrally when the kind changed; a
+                // pure time move keeps the verbatim body bytes
                 staged.push((ti, after, is_on));
             }
         }
@@ -1239,9 +1273,9 @@ impl EditorView {
 
     fn undo(&mut self, cx: &mut Context<Self>) {
         let arc = self.shared.clone();
-        let mut sh = arc.lock().unwrap();
+        let mut sh = lock_shared(&arc);
         if let Some(l) = { let Shared { doc, undo, .. } = &mut *sh; undo.undo(doc) } {
-            self.status = format!("undo {l}").into();
+            self.status = tf("status.undo", &[("label", &l)]).into();
             self.selection.clear();
             self.refresh_derived_sh(&mut sh);
             drop(sh);
@@ -1251,9 +1285,9 @@ impl EditorView {
 
     fn redo(&mut self, cx: &mut Context<Self>) {
         let arc = self.shared.clone();
-        let mut sh = arc.lock().unwrap();
+        let mut sh = lock_shared(&arc);
         if let Some(l) = { let Shared { doc, undo, .. } = &mut *sh; undo.redo(doc) } {
-            self.status = format!("redo {l}").into();
+            self.status = tf("status.redo", &[("label", &l)]).into();
             self.selection.clear();
             self.refresh_derived_sh(&mut sh);
             drop(sh);
@@ -1263,26 +1297,33 @@ impl EditorView {
 
     fn save(&mut self, cx: &mut Context<Self>) {
         let path = {
-            let sh = self.shared.lock().unwrap();
+            let sh = lock_shared(&self.shared);
             sh.path.clone()
         };
-        match path {
-            Some(p) => {
-                let mut sh = self.shared.lock().unwrap();
-                let bytes = sh.doc.serialize(smf_core::WriteOptions {
+        let Some(p) = path else {
+            self.save_as(cx);
+            return;
+        };
+        // serialize under the lock, write outside it — and remember the
+        // revision the bytes were taken at so concurrent edits stay dirty
+        let (bytes, rev) = {
+            let sh = lock_shared(&self.shared);
+            (
+                sh.doc.serialize(smf_core::WriteOptions {
                     running_status: false,
-                });
-                match std::fs::write(&p, bytes) {
-                    Ok(_) => {
-                        sh.saved_revision = sh.doc.revision();
-                        self.status = t("status.saved").into();
-                    }
-                    Err(e) => self.status = format!("{e}").into(),
-                }
+                }),
+                sh.doc.revision(),
+            )
+        };
+        match mcp_server::write_atomic(&p, &bytes) {
+            Ok(()) => {
+                let mut sh = lock_shared(&self.shared);
+                sh.saved_revision = rev;
                 drop(sh);
+                self.status = t("status.saved").into();
                 self.persist();
             }
-            None => self.save_as(cx),
+            Err(e) => self.status = format!("{e}").into(),
         }
         cx.notify();
     }
@@ -1296,7 +1337,7 @@ impl EditorView {
             if let Ok(Ok(Some(path))) = rx.await {
                 if let Some(this) = this.upgrade() {
                     this.update(cx, |v, cx| {
-                        v.shared.lock().unwrap().path = Some(path);
+                        crate::lock_shared(&v.shared).path = Some(path);
                         v.save(cx);
                     });
                 }
@@ -1327,10 +1368,13 @@ impl EditorView {
     fn open(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         match load_document(&path) {
             Ok((d, load_warnings)) => {
+                // an armed recording belongs to the previous document —
+                // drop it with a warning instead of silently losing the take
+                let rec_discarded = self.rec.take().is_some();
                 self.stop_playback();
                 // swap the document in place — the MCP server holds this same Arc
                 {
-                    let mut sh = self.shared.lock().unwrap();
+                    let mut sh = lock_shared(&self.shared);
                     sh.doc = d;
                     sh.undo = UndoStack::new(512);
                     sh.path = Some(path.clone());
@@ -1339,7 +1383,7 @@ impl EditorView {
                 self.sel_track = self.pick_default_track();
                 self.selection.clear();
                 {
-                    let mut sh = self.shared.lock().unwrap();
+                    let mut sh = lock_shared(&self.shared);
                     sh.muted.clear();
                     sh.soloed.clear();
                     sh.track_dest.clear();
@@ -1347,15 +1391,23 @@ impl EditorView {
                 self.apply_prefs(&path);
                 self.push_recent(&path);
                 self.refresh_derived();
-                self.status = if load_warnings.is_empty() {
-                    "loaded".into()
+                let mut status = if load_warnings.is_empty() {
+                    t("status.loaded").to_string()
                 } else {
-                    format!("loaded — {} warning(s): {}",
-                        load_warnings.len(),
-                        load_warnings.join("; ")).into()
+                    tf(
+                        "status.loaded_warn",
+                        &[
+                            ("n", &load_warnings.len().to_string()),
+                            ("w", &load_warnings.join("; ")),
+                        ],
+                    )
                 };
+                if rec_discarded {
+                    status = format!("{status} — {}", t("status.rec_discarded"));
+                }
+                self.status = status.into();
             }
-            Err(e) => self.status = e.to_string().into(),
+            Err(e) => self.status = tf("status.load_failed", &[("e", &e.to_string())]).into(),
         }
         cx.notify();
     }
@@ -1374,7 +1426,7 @@ impl EditorView {
     /// `refresh_plugins` — Play then never pays the load stall.
     fn ensure_plugin(&mut self, d: usize, force: bool) {
         let path = {
-            let sh = self.shared.lock().unwrap();
+            let sh = lock_shared(&self.shared);
             match sh.dests.get(d).map(|(_, dest)| dest) {
                 Some(output::Destination::Plugin { plugin_path }) => PathBuf::from(plugin_path),
                 _ => return,
@@ -1422,7 +1474,7 @@ impl EditorView {
     /// currently resolves to. Cheap to call often — no-ops once satisfied.
     fn refresh_plugins(&mut self) {
         let idxs: Vec<usize> = {
-            let sh = self.shared.lock().unwrap();
+            let sh = lock_shared(&self.shared);
             let mut v: Vec<usize> = sh.track_dest.values().copied().collect();
             v.push(sh.default_dest);
             v
@@ -1478,7 +1530,7 @@ impl EditorView {
         }
         if self.play_pending {
             let needed_loading = {
-                let sh = self.shared.lock().unwrap();
+                let sh = lock_shared(&self.shared);
                 sh.doc.tracks.iter().enumerate().any(|(t, _)| {
                     let d = sh.dest_of(t);
                     matches!(self.plugin_state.get(&d), Some(PluginState::Loading { .. }))
@@ -1496,7 +1548,7 @@ impl EditorView {
     fn start_playback(&mut self) {
         // snapshot routing state so no lock is held while opening sinks
         let (dests, dest_of_track, muted, soloed, metronome, loop_enabled) = {
-            let sh = self.shared.lock().unwrap();
+            let sh = lock_shared(&self.shared);
             let map: HashMap<usize, usize> = (0..sh.doc.tracks.len())
                 .map(|t| (t, sh.dest_of(t)))
                 .collect();
@@ -1673,7 +1725,7 @@ impl EditorView {
             0
         };
         let cb = move |us, b: &[u8]| {
-            buf2.lock().unwrap().push((us, b.to_vec()));
+            buf2.lock().unwrap_or_else(|e| e.into_inner()).push((us, b.to_vec()));
         };
         let opened = if self.midi_in.is_empty() {
             midi_io::Input::open(0, cb)
@@ -1691,7 +1743,7 @@ impl EditorView {
                 if self.playback.is_none() {
                     self.start_playback();
                 }
-                self.status = format!("rec → T{}", self.sel_track + 1).into();
+                self.status = tf("status.rec_armed", &[("n", &(self.sel_track + 1).to_string())]).into();
             }
             Err(e) => self.status = format!("rec: {e}").into(),
         }
@@ -1703,11 +1755,15 @@ impl EditorView {
         let Some(rec) = self.rec.take() else {
             return;
         };
-        let msgs = std::mem::take(&mut *rec.buf.lock().unwrap());
-        let mut sh = self.shared.lock().unwrap();
+        let msgs = std::mem::take(&mut *rec.buf.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut sh = lock_shared(&self.shared);
         if sh.doc.tracks.is_empty() {
             let ops = sh.doc.add_track_ops(None);
-            let _ = sh.apply("add track", ops);
+            if let Err(e) = sh.apply("add track", ops) {
+                drop(sh);
+                self.status = tf("status.apply_failed", &[("e", &e.to_string())]).into();
+                return;
+            }
         }
         let track = self.sel_track.min(sh.doc.tracks.len().saturating_sub(1));
         let mut events = Vec::new();
@@ -1745,11 +1801,11 @@ impl EditorView {
         let n = events.len();
         drop(sh);
         if n == 0 {
-            self.status = "rec: no events".into();
+            self.status = t("status.rec_no_events").into();
             return;
         }
         self.apply_tx("record", vec![Op::InsertEvents { track, events }]);
-        self.status = format!("rec: {n} events").into();
+        self.status = tf("status.rec_done", &[("n", &n.to_string())]).into();
     }
 
     fn rescan_plugins(&mut self) {
@@ -1776,7 +1832,7 @@ impl EditorView {
             Some(report.skipped.iter().map(|(p, r)| format!("{} — {}", p.file_stem().map(|s| s.to_string_lossy()).unwrap_or_default(), r)).collect::<Vec<_>>().join("; "))
         };
         let fresh = build_dest_catalog(&report.plugins);
-        let mut sh = self.shared.lock().unwrap();
+        let mut sh = lock_shared(&self.shared);
         if fresh == sh.dests {
             let ns = sh.dests.len().to_string();
             drop(sh);
@@ -1830,7 +1886,7 @@ impl EditorView {
             return;
         }
         let (d, path) = {
-            let sh = self.shared.lock().unwrap();
+            let sh = lock_shared(&self.shared);
             let d = sh.dest_of(self.sel_track);
             let p = sh.dests.get(d).and_then(|(_, dd)| match dd {
                 output::Destination::Plugin { plugin_path } => {
@@ -1863,7 +1919,7 @@ impl EditorView {
                         self.plugin_window = Some(pw);
                         self.editor_plugin = Some((d, a));
                     }
-                    Err(e) => self.status = format!("plugin GUI: {e}").into(),
+                    Err(e) => self.status = tf("plugin.gui_open_failed", &[("e", &e.to_string())]).into(),
                 }
             }
             Err(e) => self.status = format!("{}: {e}", t("plugin.gui_failed")).into(),
@@ -1961,7 +2017,7 @@ impl EditorView {
 
 
 
-fn load_document(path: &PathBuf) -> Result<(Document, Vec<String>), String> {
+fn load_document(path: &std::path::Path) -> Result<(Document, Vec<String>), String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     let file = smf_core::parse(&bytes).map_err(|e| e.to_string())?;
     let warnings = file.warnings.clone();
@@ -2025,7 +2081,7 @@ struct Prefs {
     snap: Option<usize>,
 }
 
-fn prefs_path(doc_path: &PathBuf) -> PathBuf {
+fn prefs_path(doc_path: &std::path::Path) -> PathBuf {
     PathBuf::from(format!("{}.editor.json", doc_path.display()))
 }
 
@@ -2048,13 +2104,10 @@ impl EditorView {
     /// into `shared.dests`. Unavailable ports/plugins keep their identity —
     /// the assignment stays visible and plays again once the device is back.
     fn resolve_dest(&mut self, d: &output::Destination) -> usize {
-        self.shared
-            .lock()
-            .unwrap()
-            .ensure_dest(&dest_label(d), d.clone())
+        lock_shared(&self.shared).ensure_dest(&dest_label(d), d.clone())
     }
 
-    fn apply_prefs(&mut self, doc_path: &PathBuf) {
+    fn apply_prefs(&mut self, doc_path: &std::path::Path) {
         let Ok(text) = std::fs::read_to_string(prefs_path(doc_path)) else {
             return;
         };
@@ -2063,7 +2116,7 @@ impl EditorView {
         };
         if let Some(d) = &p.default_dest {
             let i = self.resolve_dest(d);
-            self.shared.lock().unwrap().default_dest = i;
+            lock_shared(&self.shared).default_dest = i;
         }
         let overrides: Vec<(usize, usize)> = p
             .track_dest
@@ -2071,7 +2124,7 @@ impl EditorView {
             .map(|(t, d)| (*t, self.resolve_dest(d)))
             .collect();
         {
-            let mut sh = self.shared.lock().unwrap();
+            let mut sh = lock_shared(&self.shared);
             for (t, d) in overrides {
                 sh.track_dest.insert(t, d);
             }
@@ -2090,7 +2143,8 @@ impl EditorView {
             self.scroll_y = y;
         }
         if let Some(t) = p.sel_track {
-            self.sel_track = t;
+            let n = self.doc(|d| d.tracks.len());
+            self.sel_track = t.min(n.saturating_sub(1));
         }
         self.enc_override = p.enc.as_deref().map(|e| match e {
             "utf8" => smf_core::TextEncoding::Utf8,
@@ -2121,7 +2175,7 @@ impl EditorView {
     }
 
     /// MRU update + persist to the app-wide prefs file.
-    fn push_recent(&mut self, path: &PathBuf) {
+    fn push_recent(&mut self, path: &std::path::Path) {
         let s = path.to_string_lossy().into_owned();
         self.recent.retain(|r| r.as_str() != s);
         self.recent.insert(0, s.as_str().into());
@@ -2139,7 +2193,7 @@ impl EditorView {
     }
 
     fn persist(&self) {
-        let sh = self.shared.lock().unwrap();
+        let sh = lock_shared(&self.shared);
         let Some(path) = sh.path.clone() else {
             return;
         };
@@ -2256,7 +2310,7 @@ fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
                 .timer(std::time::Duration::from_millis(150))
                 .await;
             let (cur, reqs) = {
-                let mut sh = shared.lock().unwrap();
+                let mut sh = lock_shared(&shared);
                 (
                     sh.gui_notify.load(std::sync::atomic::Ordering::Relaxed),
                     std::mem::take(&mut sh.transport_req),

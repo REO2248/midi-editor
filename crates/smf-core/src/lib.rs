@@ -19,7 +19,7 @@ pub enum Error {
     Panic,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum EventKind {
     /// channel voice/mode event; status byte includes channel nibble
     Channel { status: u8, data: [u8; 2], len: u8 },
@@ -75,13 +75,17 @@ pub fn parse(raw: &[u8]) -> Result<File, Error> {
     let map = match catch_unwind(AssertUnwindSafe(|| SmfBytemap::parse(raw))) {
         Ok(Ok(m)) => m,
         Ok(Err(e)) => {
-            return parse_lenient(raw).map(|mut f| {
-                f.warnings.insert(
-                    0,
-                    format!("strict parse failed ({e}); lenient recovery used"),
-                );
-                f
-            });
+            // keep the strict-parser reason even when lenient recovery also
+            // fails — "no MTrk chunks" alone hides the real defect
+            return parse_lenient(raw)
+                .map(|mut f| {
+                    f.warnings.insert(
+                        0,
+                        format!("strict parse failed ({e}); lenient recovery used"),
+                    );
+                    f
+                })
+                .map_err(|_| Error::Parse(format!("{e} (lenient recovery also failed)")));
         }
         Err(_) => {
             return parse_lenient(raw).map(|mut f| {
@@ -139,6 +143,14 @@ pub fn parse(raw: &[u8]) -> Result<File, Error> {
 }
 
 fn detect_extra_chunks(raw: &[u8], warnings: &mut Vec<String>) {
+    if raw.len() >= 4 && &raw[0..4] == b"RIFF" {
+        // midly unwraps the RMID container; the writer emits bare SMF, so
+        // the container is lost on round trip — say so instead of silence
+        warnings.push(
+            "RIFF/RMID container: the SMF payload is unwrapped on load; saving writes a bare SMF file".into(),
+        );
+        return;
+    }
     if raw.len() < 14 || raw[0..4] != *b"MThd" {
         return;
     }
@@ -220,7 +232,9 @@ fn read_vlq_lenient(data: &[u8], mut p: usize) -> (u64, usize) {
         match data.get(p) {
             Some(&b) => {
                 p += 1;
-                v = (v << 7) | (b & 0x7f) as u64;
+                // wrapping: a hostile 10-byte VLQ must not overflow; the
+                // value is clamped to the buffer by callers anyway
+                v = v.wrapping_shl(7) | (b & 0x7f) as u64;
                 if b & 0x80 == 0 {
                     break;
                 }
@@ -253,8 +267,15 @@ fn track_lenient(data: &[u8], tno: usize, warnings: &mut Vec<String>) -> Track {
             p += 1;
             let (l, np) = read_vlq_lenient(data, p);
             p = np;
-            let end = p.saturating_add(l as usize).min(data.len());
-            if end < p + l as usize {
+            // u64 math: a corrupt VLQ length can exceed usize and must not
+            // overflow the pointer arithmetic
+            let overruns = l > (data.len() - p) as u64;
+            let end = if overruns {
+                data.len()
+            } else {
+                p + l as usize
+            };
+            if overruns {
                 warnings.push(format!(
                     "track {tno}: meta 0x{mt:02x} payload overruns chunk (clamped)"
                 ));
@@ -272,8 +293,9 @@ fn track_lenient(data: &[u8], tno: usize, warnings: &mut Vec<String>) -> Track {
             p += 1;
             let (l, np) = read_vlq_lenient(data, p);
             p = np;
-            let end = p.saturating_add(l as usize).min(data.len());
-            if end < p + l as usize {
+            let overruns = l > (data.len() - p) as u64;
+            let end = if overruns { data.len() } else { p + l as usize };
+            if overruns {
                 warnings.push(format!(
                     "track {tno}: sysex/escape payload overruns chunk (clamped)"
                 ));
@@ -498,7 +520,12 @@ pub fn write(format_req: u16, division: Division, tracks: &[Track], opts: WriteO
         Division::Smpte {
             fps,
             ticks_per_frame,
-        } => (((-(fps as i8)) as u8 as u16) << 8) | ticks_per_frame as u16,
+        } => {
+            // fps is stored negated in the header; going through i16 keeps
+            // the degenerate fps=128 (from the lenient parser) from
+            // overflowing the i8 negation
+            (((fps as i16).wrapping_neg()) as u8 as u16) << 8 | ticks_per_frame as u16
+        }
     };
     let ntrks = tracks.len() as u16;
     // preserve the source's declared format; only upgrade when the track
@@ -707,5 +734,85 @@ mod tests {
         let mut bad = fixture();
         bad.truncate(bad.len() - 3);
         let _ = parse(&bad); // must not panic
+    }
+
+    /// minimal bare SMF used by the wrapper/parse tests below
+    fn tiny_smf() -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(b"MThd\x00\x00\x00\x06\x00\x00\x00\x01\x01\xE0");
+        let t = [0x00, 0x90, 0x3C, 0x64, 0x00, 0xFF, 0x2F, 0x00];
+        f.extend_from_slice(b"MTrk");
+        f.extend_from_slice(&(t.len() as u32).to_be_bytes());
+        f.extend_from_slice(&t);
+        f
+    }
+
+    #[test]
+    fn hostile_vlq_length_does_not_panic() {
+        // meta length declared as a 10-byte VLQ — must not overflow in debug
+        let mut f = Vec::new();
+        f.extend_from_slice(b"MThd\x00\x00\x00\x06\x00\x00\x00\x01\x01\xE0");
+        let t: Vec<u8> = [
+            &[0x00u8, 0xFF, 0x01][..],
+            &[0xFF; 10][..], // length VLQ: ten continuation bytes
+            &[0x41, 0x42][..],
+        ]
+        .concat();
+        f.extend_from_slice(b"MTrk");
+        f.extend_from_slice(&(t.len() as u32).to_be_bytes());
+        f.extend_from_slice(&t);
+        assert!(parse(&f).is_ok(), "lenient recovery must handle it");
+    }
+
+    #[test]
+    fn smpte_degenerate_fps_roundtrips() {
+        // division byte 0x80 is not a legal SMPTE fps; the lenient parser
+        // keeps fps=128 and the writer must re-emit it without overflowing
+        let mut f = tiny_smf();
+        f[12] = 0x80;
+        f[13] = 0x64;
+        let parsed = parse(&f).unwrap();
+        assert_eq!(
+            parsed.division,
+            Division::Smpte {
+                fps: 128,
+                ticks_per_frame: 0x64
+            }
+        );
+        let out = write(
+            parsed.format,
+            parsed.division,
+            &parsed.tracks,
+            WriteOptions::default(),
+        );
+        assert_eq!(&out[12..14], &[0x80, 0x64]);
+    }
+
+    #[test]
+    fn riff_rmid_container_is_warned() {
+        let smf = tiny_smf();
+        let mut f = Vec::new();
+        f.extend_from_slice(b"RIFF");
+        let riff_len = 4 + 8 + smf.len();
+        f.extend_from_slice(&(riff_len as u32).to_be_bytes());
+        f.extend_from_slice(b"RMID");
+        f.extend_from_slice(b"data");
+        f.extend_from_slice(&(smf.len() as u32).to_be_bytes());
+        f.extend_from_slice(&smf);
+        let parsed = parse(&f).unwrap();
+        assert_eq!(parsed.tracks.len(), 1);
+        assert!(
+            parsed.warnings.iter().any(|w| w.contains("RIFF/RMID")),
+            "container loss must be surfaced: {:?}",
+            parsed.warnings
+        );
+    }
+
+    #[test]
+    fn strict_failure_reason_survives_lenient_failure() {
+        // MThd that is too short for both parsers — the error must carry the
+        // strict reason, not just "no MTrk chunks"
+        let err = parse(b"MThd\x00\x00\x00\x06\x00\x00\x00\x05").unwrap_err();
+        assert!(err.to_string().contains("lenient recovery also failed"));
     }
 }

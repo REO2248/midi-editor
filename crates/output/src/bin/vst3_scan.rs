@@ -84,8 +84,9 @@ fn main() {
                         let bytes = std::fs::read(wav).unwrap_or_default();
                         let n = bytes.len();
                         let floats: Vec<f32> = bytes[44..]
-                            .chunks_exact(4)
-                            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                            .chunks(4)
+                            .filter_map(|c| c.try_into().ok())
+                            .map(|c: [u8; 4]| f32::from_le_bytes(c))
                             .collect();
                         let peak = floats.iter().map(|f| f.abs()).fold(0.0f32, f32::max);
                         println!("rendered {n}B wav, {peak:.4} peak amplitude");

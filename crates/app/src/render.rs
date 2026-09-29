@@ -2,24 +2,17 @@
 //! piano roll canvas, lane, event list) plus the chip/button helpers.
 //! Private items are visible here because this is a child module of the
 //! crate root where EditorView is defined.
-#![allow(unused_imports)]
 
 use crate::*;
 use crate::i18n::t;
 use crate::icons::icon;
 use std::any::Any;
-use commands::UndoStack;
-use document::{Document, Event as DocEvent, EventId, Note, Op};
-use gpui_kit::component::input::{Input, InputState};
+use document::EventId;
+use gpui_kit::component::input::Input;
 use gpui_kit::*;
-use gpui_kit::component::scroll::ScrollableElement;
-use mcp_server::{Shared, SharedDoc};
 use smf_core::EventKind;
-use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::rc::Rc;
-use std::sync::{Arc, Mutex, Weak};
 
 const BG_BAR: u32 = 0x0f0f15;
 const BG_PANEL: u32 = 0x17171d;
@@ -51,7 +44,7 @@ impl Render for EditorView {
             }
         }
         let (playhead_tick, title, dirty, n_diags, track_names, dests, eff_dest, def_dest, loop_en, met_en, muted_set, soloed_set, has_track_dest, markers, tempo0, sig, track_chs) = {
-            let sh = self.shared.lock().unwrap();
+            let sh = crate::lock_shared(&self.shared);
             let hint = self.enc_override.or(sh.doc.text_encoding_hint());
             let markers: Vec<(u64, String)> = sh
                 .doc
@@ -410,14 +403,14 @@ impl Render for EditorView {
             ))
             .child(Self::ibtn_c("i.loop", "loop", t("tip.loop"), loop_en, 0x9fd0ff, cx, |v, _e, _cx| {
                 {
-                    let mut sh = v.shared.lock().unwrap();
+                    let mut sh = crate::lock_shared(&v.shared);
                     sh.loop_enabled = !sh.loop_enabled;
                 }
                 v.persist();
             }))
             .child(Self::ibtn_c("i.met", "timer", t("tip.met"), met_en, 0x9fd0ff, cx, |v, _e, _cx| {
                 {
-                    let mut sh = v.shared.lock().unwrap();
+                    let mut sh = crate::lock_shared(&v.shared);
                     sh.metronome = !sh.metronome;
                 }
                 v.persist();
@@ -607,7 +600,7 @@ impl Render for EditorView {
                                 .child(format!("{} {} [fix]", n_diags, t("events.issues")))
                                 .on_click(cx.listener(|v, _e, _w, cx| {
                                     let ops = {
-                                        let mut sh = v.shared.lock().unwrap();
+                                        let mut sh = crate::lock_shared(&v.shared);
                                         sh.doc.fix_ops(&[])
                                     };
                                     if !ops.is_empty() {
@@ -704,7 +697,7 @@ impl Render for EditorView {
                             .on_click(cx.listener(move |v, _e: &ClickEvent, _w, cx| {
                                 cx.stop_propagation();
                                 {
-                                    let mut sh = v.shared.lock().unwrap();
+                                    let mut sh = crate::lock_shared(&v.shared);
                                     if !sh.muted.remove(&i) {
                                         sh.muted.insert(i);
                                     }
@@ -723,7 +716,7 @@ impl Render for EditorView {
                             .on_click(cx.listener(move |v, _e: &ClickEvent, _w, cx| {
                                 cx.stop_propagation();
                                 {
-                                    let mut sh = v.shared.lock().unwrap();
+                                    let mut sh = crate::lock_shared(&v.shared);
                                     if !sh.soloed.remove(&i) {
                                         sh.soloed.insert(i);
                                     }
@@ -742,7 +735,7 @@ impl Render for EditorView {
                             .on_click(cx.listener(move |v, _e: &ClickEvent, _w, cx| {
                                 cx.stop_propagation();
                                 let ops = {
-                                    let mut sh = v.shared.lock().unwrap();
+                                    let mut sh = crate::lock_shared(&v.shared);
                                     let cur = sh
                                         .doc
                                         .tracks
@@ -772,7 +765,7 @@ impl Render for EditorView {
                     .child(Self::chip("rename", "rename", cx, |v, _e, cx| {
                         let name = v.input.read(cx).value().to_string();
                         let ops = {
-                            let mut sh = v.shared.lock().unwrap();
+                            let mut sh = crate::lock_shared(&v.shared);
                             sh.doc.set_track_name_ops(v.sel_track, &name)
                         };
                         v.apply_tx("set track name", ops);
@@ -786,7 +779,7 @@ impl Render for EditorView {
         // control events of the selected track matching the lane mode:
         // (event id, tick, value 0..127 or 0..16383 for PB)
         let lane_events: Vec<(EventId, u64, i32)> = {
-            let sh = self.shared.lock().unwrap();
+            let sh = crate::lock_shared(&self.shared);
             let tr = lane_sel_track.min(sh.doc.tracks.len().saturating_sub(1));
             let mut v = Vec::new();
             if let Some(t) = sh.doc.tracks.get(tr) {
@@ -1339,7 +1332,7 @@ impl Render for EditorView {
                                             ((1.0 - y / h) * vrange) as i32;
                                         let tr = this.sel_track;
                                         let found = {
-                                            let sh = this.shared.lock().unwrap();
+                                            let sh = crate::lock_shared(&this.shared);
                                             sh.doc.tracks.get(tr).and_then(|t| {
                                                 t.events
                                                     .iter()
@@ -1412,7 +1405,7 @@ impl Render for EditorView {
                         ),
                 ),
         );
-        let body = body.children(self.show_events.then(|| events_panel));
+        let body = body.children(self.show_events.then_some(events_panel));
 
         // --- status bar ---------------------------------------------------------
         let enc_label = match self.enc_override {
@@ -1607,7 +1600,7 @@ impl Render for EditorView {
                         Self::mi("t.mute", t("track.mute"), "", Some(muted_set.contains(&self.sel_track)), cx, |v, _e, _cx| {
                             let t = v.sel_track;
                             {
-                                let mut sh = v.shared.lock().unwrap();
+                                let mut sh = crate::lock_shared(&v.shared);
                                 if !sh.muted.remove(&t) {
                                     sh.muted.insert(t);
                                 }
@@ -1618,7 +1611,7 @@ impl Render for EditorView {
                         Self::mi("t.solo", t("track.solo"), "", Some(soloed_set.contains(&self.sel_track)), cx, |v, _e, _cx| {
                             let t = v.sel_track;
                             {
-                                let mut sh = v.shared.lock().unwrap();
+                                let mut sh = crate::lock_shared(&v.shared);
                                 if !sh.soloed.remove(&t) {
                                     sh.soloed.insert(t);
                                 }
@@ -1654,7 +1647,7 @@ impl Render for EditorView {
                     }
                     if sel_plugin_failed {
                         items.push(Self::mi("o.retry", t("output.retry"), "", None, cx, |v, _e, _cx| {
-                            let d = v.shared.lock().unwrap().dest_of(v.sel_track);
+                            let d = crate::lock_shared(&v.shared).dest_of(v.sel_track);
                             v.ensure_plugin(d, true);
                         }).into_any_element());
                     }
@@ -1683,7 +1676,7 @@ impl Render for EditorView {
                     .into_any_element(),
                     Self::mi("tr.loop", t("transport.loop"), "", Some(loop_en), cx, |v, _e, _cx| {
                         {
-                            let mut sh = v.shared.lock().unwrap();
+                            let mut sh = crate::lock_shared(&v.shared);
                             sh.loop_enabled = !sh.loop_enabled;
                         }
                         v.persist();
@@ -1691,7 +1684,7 @@ impl Render for EditorView {
                     .into_any_element(),
                     Self::mi("tr.met", t("transport.met"), "", Some(met_en), cx, |v, _e, _cx| {
                         {
-                            let mut sh = v.shared.lock().unwrap();
+                            let mut sh = crate::lock_shared(&v.shared);
                             sh.metronome = !sh.metronome;
                         }
                         v.persist();
@@ -1746,7 +1739,7 @@ impl Render for EditorView {
                     cx.listener(|_v, _e, _w, cx| cx.stop_propagation()),
                 );
             // cascading submenu (also inside the overlay so clicks elsewhere close all)
-            let sub_popup = self.open_sub.and_then(|(s, y)| {
+            let sub_popup = self.open_sub.map(|(s, y)| {
                 let x2 = mx + 208.0;
                 let rows: Vec<AnyElement> = match s {
                     Sub::Chan => (0u8..16)
@@ -1761,7 +1754,7 @@ impl Render for EditorView {
                                 move |v, _e, _cx| {
                                     let tr = v.sel_track;
                                     let ops = {
-                                        let mut sh = v.shared.lock().unwrap();
+                                        let mut sh = crate::lock_shared(&v.shared);
                                         sh.doc.set_track_channel_ops(tr, ch)
                                     };
                                     v.apply_tx("set track channel", ops);
@@ -1993,8 +1986,7 @@ impl Render for EditorView {
                 let max_h = (vh - 40.0).max(120.0);
                 let h = desired.min(max_h);
                 let top = (y - 30.0).clamp(0.0, (vh - h - 8.0).max(0.0));
-                Some(
-                    div()
+                div()
                         .id("sub-popup")
                         .absolute()
                         .top(px(top))
@@ -2015,8 +2007,7 @@ impl Render for EditorView {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|_v, _e, _w, cx| cx.stop_propagation()),
-                        ),
-                )
+                        )
             });
             div()
                 .id("menu-overlay")
@@ -2332,7 +2323,7 @@ impl EditorView {
                     Some(!has_track_dest),
                     cx,
                     |v, _e, _cx| {
-                        v.shared.lock().unwrap().track_dest.remove(&v.sel_track);
+                        crate::lock_shared(&v.shared).track_dest.remove(&v.sel_track);
                         v.persist();
                     },
                 )
@@ -2352,7 +2343,7 @@ impl EditorView {
             for (i, label) in midi {
                 let selected = if kind == DestPick::Track { has_track_dest && eff_dest == i } else { def_dest == i };
                 rows.push(Self::mi_leaf(("dest", i), label, "", Some(selected), cx, move |v, _e, _cx| {
-                    let mut sh = v.shared.lock().unwrap();
+                    let mut sh = crate::lock_shared(&v.shared);
                     if kind == DestPick::Track {
                         sh.track_dest.insert(v.sel_track, i);
                     } else {
@@ -2407,7 +2398,7 @@ impl EditorView {
                 let selected = if kind == DestPick::Track { has_track_dest && eff_dest == i } else { def_dest == i };
                 let path2 = path.clone();
                 let row = Self::mi_inner(("plugin", i), label, badge, color, Some(selected), false, cx, move |v, _e, _cx| {
-                    let mut sh = v.shared.lock().unwrap();
+                    let mut sh = crate::lock_shared(&v.shared);
                     if kind == DestPick::Track { sh.track_dest.insert(v.sel_track, i); } else { sh.default_dest = i; }
                     drop(sh);
                     v.persist();
@@ -2432,6 +2423,7 @@ impl EditorView {
     /// Clicking closes the whole menu and runs `f`. Dropdown rows clear the
     /// open cascade on hover; submenu leaf rows (`mi_leaf`) must NOT clear it,
     /// or hovering a submenu item unmounts its own submenu before the click.
+    #[allow(clippy::too_many_arguments)] // GPUI builder plumbing, not logic
     fn mi_inner(
         id: impl Into<ElementId>,
         label: impl Into<SharedString>,

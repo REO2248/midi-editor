@@ -30,6 +30,18 @@ static EN: &[(&str, &str)] = &[
     ("status.no_file", "untitled"),
     ("status.saved", "saved"),
     ("status.failed", "error"),
+    ("status.new_doc", "new document"),
+    ("status.loaded", "loaded"),
+    ("status.loaded_warn", "loaded — {n} warning(s): {w}"),
+    ("status.load_failed", "load failed: {e}"),
+    ("status.rec_discarded", "recording discarded"),
+    ("status.apply_failed", "apply: {e}"),
+    ("status.undo", "undo: {label}"),
+    ("status.redo", "redo: {label}"),
+    ("status.rec_armed", "rec → T{n}"),
+    ("status.rec_no_events", "rec: no events"),
+    ("status.rec_done", "rec: {n} events"),
+    ("plugin.gui_open_failed", "plugin GUI: {e}"),
     ("events.header", "Events"),
     ("events.issues", "issues"),
     ("status.fixed", "diagnostics fixed"),
@@ -164,6 +176,7 @@ static EN: &[(&str, &str)] = &[
 ];
 
 static JA: &[(&str, &str)] = &[
+    ("app.title", "midi-editor"),
     ("menu.open", "開く…"),
     ("menu.save", "保存"),
     ("menu.save_as", "名前を付けて保存…"),
@@ -178,6 +191,18 @@ static JA: &[(&str, &str)] = &[
     ("status.no_file", "無題"),
     ("status.saved", "保存しました"),
     ("status.failed", "エラー"),
+    ("status.new_doc", "新規ドキュメント"),
+    ("status.loaded", "読み込みました"),
+    ("status.loaded_warn", "読み込み — 警告 {n} 件: {w}"),
+    ("status.load_failed", "読み込みに失敗: {e}"),
+    ("status.rec_discarded", "録音を破棄しました"),
+    ("status.apply_failed", "適用エラー: {e}"),
+    ("status.undo", "元に戻す: {label}"),
+    ("status.redo", "やり直し: {label}"),
+    ("status.rec_armed", "録音 → T{n}"),
+    ("status.rec_no_events", "録音: イベントなし"),
+    ("status.rec_done", "録音: {n} イベント"),
+    ("plugin.gui_open_failed", "プラグインGUI: {e}"),
     ("events.header", "イベント"),
     ("events.issues", "件の問題"),
     ("status.fixed", "診断を修正しました"),
@@ -341,8 +366,47 @@ pub fn tf(key: &'static str, args: &[(&str, &str)]) -> String {
     s
 }
 
+
 #[allow(dead_code)]
 /// Current locale id ("en", "ja").
 pub fn lang() -> &'static str {
     detect_lang()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// The invariant from AGENTS.md: every key exists in BOTH tables. A key
+    /// that only exists in EN silently ships English to JA users; a key only
+    /// in JA is unreachable in EN and dead.
+    #[test]
+    fn en_ja_tables_have_identical_keys() {
+        let en: HashSet<_> = EN.iter().map(|(k, _)| *k).collect();
+        let ja: HashSet<_> = JA.iter().map(|(k, _)| *k).collect();
+        let mut en_only: Vec<_> = en.difference(&ja).collect();
+        let mut ja_only: Vec<_> = ja.difference(&en).collect();
+        en_only.sort();
+        ja_only.sort();
+        assert!(en_only.is_empty(), "missing from JA table: {en_only:?}");
+        assert!(ja_only.is_empty(), "missing from EN table: {ja_only:?}");
+    }
+
+    /// Duplicate keys silently shadow earlier entries — catch them here.
+    #[test]
+    fn tables_have_no_duplicate_keys() {
+        for (name, table) in [("EN", EN), ("JA", JA)] {
+            let set: HashSet<_> = table.iter().map(|(k, _)| *k).collect();
+            assert_eq!(set.len(), table.len(), "{name} has duplicate keys");
+        }
+    }
+
+    #[test]
+    fn tf_substitutes_placeholders() {
+        // exercise the EN path explicitly (t() depends on the test env lang)
+        let s = tf("status.rec_done", &[("n", "42")]);
+        assert!(s.contains("42"), "placeholder substituted: {s}");
+    }
+}
+

@@ -128,16 +128,25 @@ impl MidiService {
 }
 
 fn tool(name: &'static str, description: &str, schema: serde_json::Value) -> Tool {
-    Tool::new(name, description.to_string(), Arc::new(schema.as_object().unwrap().clone()))
+    let obj = schema.as_object().cloned().unwrap_or_default();
+    Tool::new(name, description.to_string(), Arc::new(obj))
 }
 
 fn object_schema(props: serde_json::Value) -> serde_json::Value {
     serde_json::json!({ "type": "object", "properties": props })
 }
 
+/// Cap on hex-encoded payloads accepted from a request — hex_to_bytes on an
+/// unbounded string would let one request allocate arbitrarily much.
+const MAX_HEX_BYTES: usize = 1 << 20; // 1 MiB decoded
+/// Cap on the number of events one apply_patch op may insert.
+const MAX_INSERT_EVENTS: usize = 10_000;
+/// Cap on the number of rows a read tool may return in one call.
+const MAX_QUERY_LIMIT: usize = 10_000;
+
 fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
     let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) || s.len() / 2 > MAX_HEX_BYTES {
         return None;
     }
     (0..s.len())
@@ -180,12 +189,7 @@ fn note_json(n: &document::Note) -> serde_json::Value {
 }
 
 fn summary_json(d: &Document, path: &Option<PathBuf>, saved_rev: u64) -> serde_json::Value {
-    let last_tick = d
-        .tracks
-        .iter()
-        .flat_map(|t| t.events.iter().map(|e| e.tick))
-        .max()
-        .unwrap_or(0);
+    let last_tick = doc_last_tick(d);
     serde_json::json!({
         "format": d.format,
         "division": format!("{:?}", d.division),
@@ -222,12 +226,27 @@ fn find_event(doc: &Document, id: EventId) -> Option<(usize, usize)> {
 /// via `doc.alloc_event_id`, before-images looked up here so the client only
 /// specifies intent).
 fn build_ops(doc: &mut Document, ops: &[serde_json::Value]) -> Result<Vec<Op>, PatchError> {
+    /// Required, in-range track index — destructive ops must never silently
+    /// fall back to track 0.
+    fn track_arg(doc: &Document, op: &serde_json::Value) -> Result<usize, PatchError> {
+        let t = op["track"]
+            .as_u64()
+            .ok_or_else(|| PatchError::Msg("'track' is required".into()))? as usize;
+        if t >= doc.tracks.len() {
+            return Err(PatchError::Msg(format!(
+                "no track {t} (document has {})",
+                doc.tracks.len()
+            )));
+        }
+        Ok(t)
+    }
+
     let mut out = Vec::new();
     for op in ops {
         let kind = op.get("op").and_then(|v| v.as_str()).unwrap_or("");
         match kind {
             "insert_note" => {
-                let track = op["track"].as_u64().unwrap_or(0) as usize;
+                let track = track_arg(doc, op)?;
                 let key = op["key"].as_u64().unwrap_or(60).clamp(0, 127) as u8;
                 let vel = op["vel"].as_u64().unwrap_or(100).clamp(1, 127) as u8;
                 let start = op["start"].as_u64().unwrap_or(0);
@@ -251,7 +270,7 @@ fn build_ops(doc: &mut Document, ops: &[serde_json::Value]) -> Result<Vec<Op>, P
                         },
                         Event {
                             id: off_id,
-                            tick: start + dur,
+                            tick: start.saturating_add(dur),
                             seq: u32::MAX / 2,
                             raw_body: None,
                             kind: EventKind::Channel {
@@ -264,9 +283,16 @@ fn build_ops(doc: &mut Document, ops: &[serde_json::Value]) -> Result<Vec<Op>, P
                 });
             }
             "insert_events" => {
-                let track = op["track"].as_u64().unwrap_or(0) as usize;
+                let track = track_arg(doc, op)?;
+                let events_json = op["events"].as_array().cloned().unwrap_or_default();
+                if events_json.len() > MAX_INSERT_EVENTS {
+                    return Err(PatchError::Msg(format!(
+                        "too many events in one op ({} > {MAX_INSERT_EVENTS})",
+                        events_json.len()
+                    )));
+                }
                 let mut events = Vec::new();
-                for ev in op["events"].as_array().cloned().unwrap_or_default() {
+                for ev in events_json {
                     let tick = ev["tick"].as_u64().unwrap_or(0);
                     let seq = ev["seq"].as_u64().unwrap_or(u32::MAX as u64 / 2) as u32;
                     let kind_json = &ev["kind"];
@@ -279,12 +305,14 @@ fn build_ops(doc: &mut Document, ops: &[serde_json::Value]) -> Result<Vec<Op>, P
                         EventKind::Channel {
                             status,
                             data: [data.first().copied().unwrap_or(0), data.get(1).copied().unwrap_or(0)],
-                            len: data.len().min(2).max(1) as u8,
+                            len: data.len().clamp(1, 2) as u8,
                         }
                     } else if let Some(m) = kind_json.get("meta") {
                         let mt = m["type"].as_u64().unwrap_or(0) as u8;
                         let data = if let Some(h) = m["data_hex"].as_str() {
-                            hex_to_bytes(h).unwrap_or_default()
+                            hex_to_bytes(h).ok_or_else(|| {
+                                PatchError::Msg("invalid or oversized data_hex".into())
+                            })?
                         } else if let Some(u) = m["data_utf8"].as_str() {
                             u.as_bytes().to_vec()
                         } else {
@@ -295,7 +323,10 @@ fn build_ops(doc: &mut Document, ops: &[serde_json::Value]) -> Result<Vec<Op>, P
                             data: Bytes::from(data),
                         }
                     } else if let Some(h) = kind_json["sysex_hex"].as_str() {
-                        EventKind::SysEx(Bytes::from(hex_to_bytes(h).unwrap_or_default()))
+                        EventKind::SysEx(Bytes::from(
+                            hex_to_bytes(h)
+                                .ok_or_else(|| PatchError::Msg("invalid or oversized sysex_hex".into()))?,
+                        ))
                     } else {
                         return Err(PatchError::Msg("bad event kind".into()));
                     };
@@ -332,16 +363,18 @@ fn build_ops(doc: &mut Document, ops: &[serde_json::Value]) -> Result<Vec<Op>, P
                 let dtick = op["dtick"].as_i64().unwrap_or(0);
                 let dkey = op["dkey"].as_i64().unwrap_or(0) as i32;
                 let dlen = op["dur_dtick"].as_i64().unwrap_or(0);
-                let Some((ti, on_i)) = find_event(doc, on_id) else {
+                if find_event(doc, on_id).is_none() {
                     return Err(PatchError::Msg(format!("unknown on_id {on_id}")));
-                };
+                }
                 let notes = doc.notes();
                 let Some(note) = notes.iter().find(|n| n.on_id == on_id) else {
                     return Err(PatchError::Msg(format!("event {on_id} is not a NoteOn")));
                 };
-                let mv = |eid: EventId, base_tick: u64| {
-                    let (_, ei) = find_event(doc, eid).unwrap();
-                    let before = doc.tracks[ti].events[ei].clone();
+                let mv = |eid: EventId, base_tick: u64| -> Result<Op, PatchError> {
+                    let (et, ei) = find_event(doc, eid).ok_or_else(|| {
+                        PatchError::Msg(format!("event {eid} vanished while building ops"))
+                    })?;
+                    let before = doc.tracks[et].events[ei].clone();
                     let mut after = before.clone();
                     after.tick = (base_tick as i64
                         + dtick
@@ -351,16 +384,15 @@ fn build_ops(doc: &mut Document, ops: &[serde_json::Value]) -> Result<Vec<Op>, P
                         data[0] = (note.key as i32 + dkey).clamp(0, 127) as u8;
                     }
                     after.raw_body = None;
-                    Op::UpdateEvent {
-                        track: ti,
+                    Ok(Op::UpdateEvent {
+                        track: et,
                         before,
                         after,
-                    }
+                    })
                 };
-                let _ = on_i;
-                out.push(mv(on_id, note.start_tick));
+                out.push(mv(on_id, note.start_tick)?);
                 if let Some(off_id) = note.off_id {
-                    out.push(mv(off_id, note.end_tick.unwrap_or(note.start_tick)));
+                    out.push(mv(off_id, note.end_tick.unwrap_or(note.start_tick))?);
                 }
             }
             "set_tempo" => {
@@ -789,7 +821,9 @@ fn dispatch(
     args: &serde_json::Value,
     shared: SharedDoc,
 ) -> CallToolResponse {
-    let mut sh = shared.lock().unwrap();
+    // recover from a poisoned lock: a panic in an earlier critical section
+    // must not take down every later request
+    let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
     match name {
         "document_summary" => ok_json(summary_json(&sh.doc, &sh.path, sh.saved_revision)),
         "diagnostics" => {
@@ -828,7 +862,7 @@ fn dispatch(
             let track = args["track"].as_u64().map(|v| v as usize);
             let from = args["from_tick"].as_u64().unwrap_or(0);
             let to = args["to_tick"].as_u64().unwrap_or(u64::MAX);
-            let limit = args["limit"].as_u64().unwrap_or(500) as usize;
+            let limit = args["limit"].as_u64().unwrap_or(500).min(MAX_QUERY_LIMIT as u64) as usize;
             let notes: Vec<_> = sh
                 .doc
                 .notes()
@@ -846,27 +880,29 @@ fn dispatch(
             let track = args["track"].as_u64().map(|v| v as usize);
             let from = args["from_tick"].as_u64().unwrap_or(0);
             let to = args["to_tick"].as_u64().unwrap_or(u64::MAX);
-            let limit = args["limit"].as_u64().unwrap_or(500) as usize;
+            let limit = args["limit"].as_u64().unwrap_or(500).min(MAX_QUERY_LIMIT as u64) as usize;
             let offset = args["offset"].as_u64().unwrap_or(0) as usize;
-            let mut evs = Vec::new();
+            // collect light (tick, seq, track, idx) refs only; JSON encoding
+            // happens for the offset/limit window, not for every match
+            let mut hits: Vec<(u64, u32, usize, usize)> = Vec::new();
             for (ti, t) in sh.doc.tracks.iter().enumerate() {
                 if track.is_some() && track != Some(ti) {
                     continue;
                 }
-                for e in &t.events {
+                for (ei, e) in t.events.iter().enumerate() {
                     if e.tick >= from && e.tick <= to {
-                        evs.push((ti, e));
+                        hits.push((e.tick, e.seq, ti, ei));
                     }
                 }
             }
-            evs.sort_by_key(|(_, e)| (e.tick, e.seq));
-            let total = evs.len();
-            let evs: Vec<_> = evs
+            hits.sort_by_key(|h| (h.0, h.1));
+            let total = hits.len();
+            let evs: Vec<_> = hits
                 .into_iter()
                 .skip(offset)
                 .take(limit)
-                .map(|(ti, e)| {
-                    let mut j = event_json(e);
+                .map(|(_, _, ti, ei)| {
+                    let mut j = event_json(&sh.doc.tracks[ti].events[ei]);
                     j["track"] = ti.into();
                     j
                 })
@@ -919,39 +955,54 @@ fn dispatch(
                 Err(e) => err_json(e.to_string()),
             }
         }
-        "undo" => match { let Shared { doc, undo, .. } = &mut *sh; undo.undo(doc) } {
-            Some(l) => {
-                sh.gui_notify.fetch_add(1, Ordering::Relaxed);
-                ok_json(serde_json::json!({"undone": l, "revision": sh.doc.revision()}))
+        "undo" => {
+            let res = {
+                let Shared { doc, undo, .. } = &mut *sh;
+                undo.undo(doc)
+            };
+            match res {
+                Some(l) => {
+                    sh.gui_notify.fetch_add(1, Ordering::Relaxed);
+                    ok_json(serde_json::json!({"undone": l, "revision": sh.doc.revision()}))
+                }
+                None => err_json("nothing to undo"),
             }
-            None => err_json("nothing to undo"),
-        },
-        "redo" => match { let Shared { doc, undo, .. } = &mut *sh; undo.redo(doc) } {
-            Some(l) => {
-                sh.gui_notify.fetch_add(1, Ordering::Relaxed);
-                ok_json(serde_json::json!({"redone": l, "revision": sh.doc.revision()}))
+        }
+        "redo" => {
+            let res = {
+                let Shared { doc, undo, .. } = &mut *sh;
+                undo.redo(doc)
+            };
+            match res {
+                Some(l) => {
+                    sh.gui_notify.fetch_add(1, Ordering::Relaxed);
+                    ok_json(serde_json::json!({"redone": l, "revision": sh.doc.revision()}))
+                }
+                None => err_json("nothing to redo"),
             }
-            None => err_json("nothing to redo"),
-        },
+        }
         "save" => {
             let path = args["path"]
                 .as_str()
                 .map(PathBuf::from)
                 .or_else(|| sh.path.clone());
-            match path {
-                Some(p) => {
-                    let bytes = sh.doc.serialize(smf_core::WriteOptions {
-                        running_status: false,
-                    });
-                    match std::fs::write(&p, bytes) {
-                        Ok(_) => {
-                            sh.saved_revision = sh.doc.revision();
-                            ok_json(serde_json::json!({"saved": p.to_string_lossy(), "revision": sh.saved_revision}))
-                        }
-                        Err(e) => err_json(e.to_string()),
-                    }
+            let Some(p) = path else {
+                return err_json("no path — pass one or open a file in the editor");
+            };
+            let (bytes, rev) = (
+                sh.doc.serialize(smf_core::WriteOptions {
+                    running_status: false,
+                }),
+                sh.doc.revision(),
+            );
+            drop(sh); // never hold the editor lock across disk I/O
+            match write_atomic(&p, &bytes) {
+                Ok(()) => {
+                    let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    sh.saved_revision = rev;
+                    ok_json(serde_json::json!({"saved": p.to_string_lossy(), "revision": rev}))
                 }
-                None => err_json("no path — pass one or open a file in the editor"),
+                Err(e) => err_json(e.to_string()),
             }
         }
         "get_tempo_map" => {
@@ -1030,6 +1081,7 @@ fn dispatch(
             }))
         }
         "list_midi_ports" => {
+            drop(sh); // WinMM enumeration must not stall the editor
             let outs = midi_io::list_outputs()
                 .unwrap_or_default()
                 .iter()
@@ -1100,8 +1152,12 @@ fn dispatch(
             let (from, to) = region(args);
             let grid = args["grid"].as_u64().unwrap_or_else(|| sh.doc.tempo_map.ppq() / 4);
             let strength = args["strength"].as_u64().unwrap_or(100) as u32;
+            let tracks = match sel_tracks(&sh, args) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
             let mut ops = Vec::new();
-            for t in sel_tracks(&sh, args) {
+            for t in tracks {
                 ops.extend(sh.doc.quantize_ops(t, from, to, grid, strength));
             }
             apply_ops(&mut sh, "quantize", ops)
@@ -1112,8 +1168,12 @@ fn dispatch(
             }
             let (from, to) = region(args);
             let st = args["semitones"].as_i64().unwrap_or(0) as i32;
+            let tracks = match sel_tracks(&sh, args) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
             let mut ops = Vec::new();
-            for t in sel_tracks(&sh, args) {
+            for t in tracks {
                 ops.extend(sh.doc.transpose_ops(t, from, to, st));
             }
             apply_ops(&mut sh, "transpose", ops)
@@ -1124,8 +1184,12 @@ fn dispatch(
             }
             let (from, to) = region(args);
             let f = args["factor"].as_f64().unwrap_or(1.0);
+            let tracks = match sel_tracks(&sh, args) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
             let mut ops = Vec::new();
-            for t in sel_tracks(&sh, args) {
+            for t in tracks {
                 ops.extend(sh.doc.scale_velocity_ops(t, from, to, f));
             }
             apply_ops(&mut sh, "scale velocity", ops)
@@ -1135,9 +1199,13 @@ fn dispatch(
                 return r;
             }
             let (from, to) = region(args);
-            let ch = args["channel"].as_u64().unwrap_or(1).max(1).min(16) as u8 - 1;
+            let ch = args["channel"].as_u64().unwrap_or(1).clamp(1, 16) as u8 - 1;
+            let tracks = match sel_tracks(&sh, args) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
             let mut ops = Vec::new();
-            for t in sel_tracks(&sh, args) {
+            for t in tracks {
                 ops.extend(sh.doc.set_channel_ops(t, from, to, ch));
             }
             apply_ops(&mut sh, "set channel", ops)
@@ -1146,11 +1214,14 @@ fn dispatch(
             if let Some(r) = check_base(&sh, args) {
                 return r;
             }
-            let track = args["track"].as_u64().unwrap_or(0) as usize;
+            let track = match req_track(&sh, args) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
             let tick = args["tick"].as_u64().unwrap_or(0);
             let ch = args["channel"]
                 .as_u64()
-                .map(|c| (c.max(1).min(16) - 1) as u8)
+                .map(|c| (c.clamp(1, 16) - 1) as u8)
                 .unwrap_or_else(|| sh.doc.tracks.get(track).map(|t| t.out_channel).unwrap_or(0));
             let ops = sh.doc.set_program_ops(
                 track,
@@ -1166,10 +1237,13 @@ fn dispatch(
             if let Some(r) = check_base(&sh, args) {
                 return r;
             }
-            let track = args["track"].as_u64().unwrap_or(0) as usize;
+            let track = match req_track(&sh, args) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
             let ch = args["channel"]
                 .as_u64()
-                .map(|c| (c.max(1).min(16) - 1) as u8)
+                .map(|c| (c.clamp(1, 16) - 1) as u8)
                 .unwrap_or_else(|| sh.doc.tracks.get(track).map(|t| t.out_channel).unwrap_or(0));
             let mut ops = Vec::new();
             if let Some(points) = args["points"].as_array() {
@@ -1197,10 +1271,13 @@ fn dispatch(
             if let Some(r) = check_base(&sh, args) {
                 return r;
             }
-            let track = args["track"].as_u64().unwrap_or(0) as usize;
+            let track = match req_track(&sh, args) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
             let ch = args["channel"]
                 .as_u64()
-                .map(|c| (c.max(1).min(16) - 1) as u8)
+                .map(|c| (c.clamp(1, 16) - 1) as u8)
                 .unwrap_or_else(|| sh.doc.tracks.get(track).map(|t| t.out_channel).unwrap_or(0));
             let ops = sh.doc.set_pitch_bend_ops(
                 track,
@@ -1235,9 +1312,13 @@ fn dispatch(
             if let Some(r) = check_base(&sh, args) {
                 return r;
             }
+            let track = match req_track(&sh, args) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
             let ops = sh.doc.set_track_channel_ops(
-                args["track"].as_u64().unwrap_or(0) as usize,
-                (args["channel"].as_u64().unwrap_or(1).max(1).min(16) - 1) as u8,
+                track,
+                (args["channel"].as_u64().unwrap_or(1).clamp(1, 16) - 1) as u8,
             );
             apply_ops(&mut sh, "set track channel", ops)
         }
@@ -1245,10 +1326,11 @@ fn dispatch(
             if let Some(r) = check_base(&sh, args) {
                 return r;
             }
-            let ops = sh.doc.set_track_name_ops(
-                args["track"].as_u64().unwrap_or(0) as usize,
-                args["name"].as_str().unwrap_or(""),
-            );
+            let track = match req_track(&sh, args) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
+            let ops = sh.doc.set_track_name_ops(track, args["name"].as_str().unwrap_or(""));
             apply_ops(&mut sh, "set track name", ops)
         }
         "add_track" => {
@@ -1262,27 +1344,38 @@ fn dispatch(
             if let Some(r) = check_base(&sh, args) {
                 return r;
             }
-            let ops = sh.doc.remove_track_ops(args["track"].as_u64().unwrap_or(0) as usize);
+            let track = match req_track(&sh, args) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
+            let ops = sh.doc.remove_track_ops(track);
             apply_ops(&mut sh, "remove track", ops)
         }
         "delete_range" => {
             if let Some(r) = check_base(&sh, args) {
                 return r;
             }
+            let track = match req_track(&sh, args) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
             let (from, to) = region(args);
-            let ops = sh
-                .doc
-                .delete_range_ops(args["track"].as_u64().unwrap_or(0) as usize, from, to);
+            let ops = sh.doc.delete_range_ops(track, from, to);
             apply_ops(&mut sh, "delete range", ops)
         }
         "duplicate_range" => {
             if let Some(r) = check_base(&sh, args) {
                 return r;
             }
-            let (from, to) = region(args);
-            let ops = sh
-                .doc
-                .duplicate_range_ops(args["track"].as_u64().unwrap_or(0) as usize, from, to);
+            let track = match req_track(&sh, args) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
+            let from = args["from"].as_u64().unwrap_or(0);
+            // default `to` = end of song: a full u64::MAX span would push
+            // every copy to a nonsense saturated tick
+            let to = args["to"].as_u64().unwrap_or_else(|| doc_last_tick(&sh.doc));
+            let ops = sh.doc.duplicate_range_ops(track, from, to);
             apply_ops(&mut sh, "duplicate range", ops)
         }
         _ => err_json(format!("unknown tool '{name}'")),
@@ -1299,6 +1392,52 @@ fn check_base(sh: &Shared, args: &serde_json::Value) -> Option<CallToolResponse>
     }
 }
 
+/// Required, in-range `track` argument for destructive tools — a missing or
+/// invalid index must error, never silently fall back to track 0.
+// CallToolResponse is rmcp's own (large) enum; error returns are exceptional
+// and don't justify boxing
+#[allow(clippy::result_large_err)]
+fn req_track(sh: &Shared, args: &serde_json::Value) -> Result<usize, CallToolResponse> {
+    match args["track"].as_u64() {
+        None => Err(err_json("'track' is required")),
+        Some(t) if (t as usize) < sh.doc.tracks.len() => Ok(t as usize),
+        Some(t) => Err(err_json(format!(
+            "no track {t} (document has {})",
+            sh.doc.tracks.len()
+        ))),
+    }
+}
+
+fn doc_last_tick(d: &Document) -> u64 {
+    d.tracks
+        .iter()
+        .flat_map(|t| t.events.iter().map(|e| e.tick))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Write via temp file + rename so a crash mid-save can't truncate the
+/// target (std::fs::rename replaces an existing destination on Windows).
+pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    let stem = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = dir.join(format!(".{stem}.sav{}", std::process::id()));
+    std::fs::write(&tmp, bytes)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
 fn region(args: &serde_json::Value) -> (u64, u64) {
     (
         args["from"].as_u64().unwrap_or(0),
@@ -1306,11 +1445,16 @@ fn region(args: &serde_json::Value) -> (u64, u64) {
     )
 }
 
-/// track arg -> [track]; omitted -> all tracks
-fn sel_tracks(sh: &Shared, args: &serde_json::Value) -> Vec<usize> {
+/// track arg -> [track]; omitted -> all tracks; out-of-range -> error
+#[allow(clippy::result_large_err)] // see req_track
+fn sel_tracks(sh: &Shared, args: &serde_json::Value) -> Result<Vec<usize>, CallToolResponse> {
     match args["track"].as_u64() {
-        Some(t) => vec![t as usize],
-        None => (0..sh.doc.tracks.len()).collect(),
+        None => Ok((0..sh.doc.tracks.len()).collect()),
+        Some(t) if (t as usize) < sh.doc.tracks.len() => Ok(vec![t as usize]),
+        Some(t) => Err(err_json(format!(
+            "no track {t} (document has {})",
+            sh.doc.tracks.len()
+        ))),
     }
 }
 
@@ -1422,4 +1566,190 @@ pub async fn serve_http(
     eprintln!("mcp http listening on {addr}");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn shared() -> SharedDoc {
+        let note = |tick: u64, status: u8, d0: u8, d1: u8| smf_core::Event {
+            tick,
+            seq: 0,
+            raw_body: None,
+            kind: EventKind::Channel {
+                status,
+                data: [d0, d1],
+                len: 2,
+            },
+        };
+        let f = smf_core::File {
+            format: 1,
+            division: smf_core::Division::Metrical(480),
+            tracks: vec![
+                smf_core::Track { events: vec![] },
+                smf_core::Track {
+                    events: vec![note(0, 0x90, 60, 100), note(480, 0x80, 60, 0)],
+                },
+            ],
+            warnings: vec![],
+        };
+        Arc::new(Mutex::new(Shared::new(Document::from_file(f))))
+    }
+
+    /// dispatch a tool and decode its (is_error, first text block as JSON)
+    fn call(shared: &SharedDoc, name: &str, args: serde_json::Value) -> (bool, serde_json::Value) {
+        match dispatch(name, &args, shared.clone()) {
+            CallToolResponse::Complete(r) => {
+                let is_err = r.is_error.unwrap_or(false);
+                let text = match r.content.first() {
+                    Some(ContentBlock::Text(t)) => t.text.clone(),
+                    other => panic!("expected text content, got {other:?}"),
+                };
+                (is_err, serde_json::from_str(&text).unwrap_or(json!(null)))
+            }
+            other => panic!("unexpected response kind: {other:?}"),
+        }
+    }
+
+    fn note_count(shared: &SharedDoc) -> usize {
+        shared.lock().unwrap().doc.notes().len()
+    }
+
+    #[test]
+    fn document_summary_reports_tracks() {
+        let sh = shared();
+        let (err, v) = call(&sh, "document_summary", json!({}));
+        assert!(!err);
+        assert_eq!(v["tracks"].as_array().unwrap().len(), 2);
+        assert_eq!(v["events"], 2);
+    }
+
+    #[test]
+    fn remove_track_requires_valid_track() {
+        let sh = shared();
+        let (err, _) = call(&sh, "remove_track", json!({}));
+        assert!(err, "missing track must error, not delete track 0");
+        let (err, _) = call(&sh, "remove_track", json!({"track": 99}));
+        assert!(err);
+        assert_eq!(sh.lock().unwrap().doc.tracks.len(), 2, "nothing deleted");
+    }
+
+    #[test]
+    fn apply_patch_failure_is_atomic() {
+        let sh = shared();
+        let rev0 = sh.lock().unwrap().doc.revision();
+        // second op targets a nonexistent track — nothing may be applied
+        let (err, _) = call(
+            &sh,
+            "apply_patch",
+            json!({"ops": [
+                {"op": "insert_note", "track": 1, "key": 64, "start": 480, "dur": 240},
+                {"op": "insert_note", "track": 99, "key": 65, "start": 0, "dur": 240},
+            ]}),
+        );
+        assert!(err);
+        let shg = sh.lock().unwrap();
+        assert_eq!(shg.doc.revision(), rev0, "no revision bump on failure");
+        assert_eq!(shg.doc.tracks[1].events.len(), 2, "op 1 not half-applied");
+        drop(shg);
+        // a valid patch at the same base revision still works
+        let (err, v) = call(
+            &sh,
+            "apply_patch",
+            json!({
+                "base_revision": rev0,
+                "ops": [{"op": "insert_note", "track": 1, "key": 64, "start": 480, "dur": 240}]
+            }),
+        );
+        assert!(!err);
+        assert_eq!(v["applied"], true);
+        assert_eq!(note_count(&sh), 2);
+        // undo (shared with GUI) reverts it
+        let (err, _) = call(&sh, "undo", json!({}));
+        assert!(!err);
+        assert_eq!(note_count(&sh), 1);
+    }
+
+    #[test]
+    fn insert_note_rejects_unknown_track() {
+        let sh = shared();
+        let (err, _) = call(
+            &sh,
+            "apply_patch",
+            json!({"ops": [{"op": "insert_note", "track": 5}]}),
+        );
+        assert!(err, "unknown track must error before any op applies");
+    }
+
+    #[test]
+    fn duplicate_range_defaults_to_song_end() {
+        let sh = shared();
+        // single note 0..480 (off at 480); omitting `to` duplicates to the
+        // end of song instead of a u64::MAX span
+        let (err, _) = call(&sh, "duplicate_range", json!({"track": 1, "from": 0}));
+        assert!(!err);
+        let ticks: Vec<(u64, u8)> = sh.lock().unwrap().doc.tracks[1]
+            .events
+            .iter()
+            .map(|e| {
+                let EventKind::Channel { status, .. } = &e.kind else {
+                    unreachable!()
+                };
+                (e.tick, *status)
+            })
+            .collect();
+        // original on/off at 0/480 plus the copy on/off at 480/960 (the
+        // copy-on shares tick+seq with the original off — inserted first)
+        assert_eq!(
+            ticks,
+            vec![(0, 0x90), (480, 0x90), (480, 0x80), (960, 0x80)]
+        );
+    }
+
+    #[test]
+    fn query_events_pages_without_materializing_json() {
+        let sh = shared();
+        let (err, v) = call(&sh, "query_events", json!({"limit": 1, "offset": 1}));
+        assert!(!err);
+        assert_eq!(v["total"], 2);
+        assert_eq!(v["events"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn hex_payloads_are_capped() {
+        assert!(hex_to_bytes("ab").is_some());
+        assert!(hex_to_bytes(&"ab".repeat(MAX_HEX_BYTES + 1)).is_none());
+        assert!(hex_to_bytes("abc").is_none(), "odd length rejected");
+        // oversized hex in a request is an error, not a silent empty payload
+        let sh = shared();
+        let big = "ab".repeat(MAX_HEX_BYTES + 1);
+        let (err, _) = call(
+            &sh,
+            "apply_patch",
+            json!({"ops": [{"op": "insert_events", "track": 0, "events": [
+                {"tick": 0, "kind": {"meta": {"type": 1, "data_hex": big}}}
+            ]}]}),
+        );
+        assert!(err);
+    }
+
+    #[test]
+    fn write_atomic_replaces_existing_file() {
+        let dir = std::env::temp_dir().join("midi-editor-mcp-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("savetest.mid");
+        std::fs::write(&p, b"old").unwrap();
+        write_atomic(&p, b"new contents").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"new contents");
+        // no temp litter left beside the target
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".savetest"))
+            .collect();
+        assert!(leftovers.is_empty());
+        let _ = std::fs::remove_file(&p);
+    }
 }
