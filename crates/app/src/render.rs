@@ -2184,8 +2184,8 @@ impl Render for EditorView {
                     if retry { v.ensure_plugin(i, true); cx.notify(); }
                 })).into_any_element());
             }
-            let panel_h = (rows.len() as f32 * 24.0 + 16.0).min(520.0);
-            let panel = div().id("output-status-panel").w(px(520.0)).h(px(panel_h)).max_h(px(520.0)).overflow_y_scroll().flex().flex_col().gap_1()
+            let panel_content_h = 24.0 + rows.len() as f32 * 26.0 + 32.0 + 32.0;
+            let panel = div().id("output-status-panel").w(px(520.0)).flex().flex_col().gap_1()
                 .p_3().bg(rgb(0x20202c)).border_1().border_color(rgb(0x3c3c4a)).rounded_lg().shadow_lg()
                 .text_size(px(12.0))
                 .child(div().text_size(px(14.0)).text_color(rgb(0x9fd0ff)).child(t("output.status_title")))
@@ -2194,6 +2194,11 @@ impl Render for EditorView {
                     .child(Self::chip("status.rescan", t("output.rescan"), cx, |v, _e, cx| { v.rescan_plugins(); cx.notify(); }))
                     .child(Self::chip("status.close", t("output.close"), cx, |v, _e, cx| { v.show_output_status = false; cx.notify(); })))
                 .on_mouse_down(MouseButton::Left, cx.listener(|_v, _e, _w, cx| cx.stop_propagation()));
+            let panel = if panel_content_h > 520.0 {
+                panel.h(px(520.0)).max_h(px(520.0)).overflow_y_scroll()
+            } else {
+                panel
+            };
             div().absolute().inset_0().flex().items_center().justify_center().bg(rgba(0x00000066))
                 .on_mouse_down(MouseButton::Left, cx.listener(|v, _e, _w, cx| { v.show_output_status = false; cx.notify(); }))
                 .child(panel)
