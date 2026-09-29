@@ -1721,14 +1721,17 @@ impl Render for EditorView {
                 ],
             };
             // dropdown panel under the clicked label
+            let popup_max_h = (f32::from(window.viewport_size().height) - 40.0).max(120.0);
+            let popup_h = (items.len() as f32 * 24.0 + 16.0).min(popup_max_h);
             let popup = div()
                 .id("menu-popup")
                 .absolute()
                 .top(px(0.0))
                 .left(px(mx))
                 .w(px(210.0))
-                .max_h(px((f32::from(window.viewport_size().height) - 40.0).max(120.0)))
-                .overflow_y_scrollbar()
+                .h(px(popup_h))
+                .max_h(px(popup_max_h))
+                .overflow_y_scroll()
                 .flex()
                 .flex_col()
                 .py_1()
@@ -1997,8 +2000,9 @@ impl Render for EditorView {
                         .top(px(top))
                         .left(px(x2))
                         .w(px(190.0))
+                        .h(px(h))
                         .max_h(px(h))
-                        .overflow_y_scrollbar()
+                        .overflow_y_scroll()
                         .flex()
                         .flex_col()
                         .py_1()
@@ -2180,7 +2184,8 @@ impl Render for EditorView {
                     if retry { v.ensure_plugin(i, true); cx.notify(); }
                 })).into_any_element());
             }
-            let panel = div().id("output-status-panel").w(px(520.0)).max_h(px(520.0)).overflow_y_scrollbar().flex().flex_col().gap_1()
+            let panel_h = (rows.len() as f32 * 24.0 + 16.0).min(520.0);
+            let panel = div().id("output-status-panel").w(px(520.0)).h(px(panel_h)).max_h(px(520.0)).overflow_y_scroll().flex().flex_col().gap_1()
                 .p_3().bg(rgb(0x20202c)).border_1().border_color(rgb(0x3c3c4a)).rounded_lg().shadow_lg()
                 .text_size(px(12.0))
                 .child(div().text_size(px(14.0)).text_color(rgb(0x9fd0ff)).child(t("output.status_title")))
