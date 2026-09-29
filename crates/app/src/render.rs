@@ -12,6 +12,7 @@ use commands::UndoStack;
 use document::{Document, Event as DocEvent, EventId, Note, Op};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::*;
+use gpui_kit::component::scroll::ScrollableElement;
 use mcp_server::{Shared, SharedDoc};
 use smf_core::EventKind;
 use std::cell::Cell;
@@ -35,7 +36,7 @@ fn blend(c: u32, to: u32, f: f32) -> u32 {
 const ACCENT: u32 = 0x9fd0ff;
 
 impl Render for EditorView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // the plugin editor lives in the helper subprocess's own window —
         // no native event queue to pump here
         self.refresh_derived();
@@ -280,6 +281,7 @@ impl Render for EditorView {
             dests.get(eff_dest).map(|(_, d)| d),
             Some(output::Destination::Plugin { .. })
         );
+        let sel_plugin_failed = matches!(self.plugin_state.get(&eff_dest), Some(PluginState::Failed { .. }));
 
         // --- menu bar -----------------------------------------------------------
         let open_menu = self.open_menu;
@@ -1417,6 +1419,22 @@ impl Render for EditorView {
             None => "auto".to_string(),
             Some(e) => e.label().to_string(),
         };
+        let plugin_chip = if sel_is_plugin {
+            let name = dests.get(eff_dest).map(|(n, _)| n.clone()).unwrap_or_default();
+            let (badge, color, tip) = match self.plugin_state.get(&eff_dest) {
+                Some(PluginState::Ready { .. }) => ("●", 0x8fd0a0, t("plugin.state_ready").to_string()),
+                Some(PluginState::Loading { .. }) => ("◌ …", 0xe0b050, t("plugin.state_loading").to_string()),
+                Some(PluginState::Failed { phase, msg, .. }) => ("✕", 0xe06060, format!("{phase}: {msg}")),
+                _ => ("", 0x77778a, t("plugin.state_idle").to_string()),
+            };
+            Some(div().id("plugin-chip").px_1().rounded_sm().cursor_pointer().text_color(rgb(color))
+                .child(format!("{badge} {name}"))
+                .tooltip(move |_w, cx| {
+                    let tip = tip.clone();
+                    cx.new(|_| Tip(tip.into())).into()
+                })
+                .on_click(cx.listener(|v, _e, _w, cx| { v.show_output_status = true; cx.notify(); })))
+        } else { None };
         let status_bar = div()
             .flex()
             .items_center()
@@ -1436,6 +1454,7 @@ impl Render for EditorView {
                     .text_color(rgb(0x77778a))
                     .child(format!("{}", self.status)),
             )
+            .children(plugin_chip)
             .child(Self::chip("st-lane", lane_mode.label(), cx, |v, _e, cx| {
                 v.set_lane(v.lane_mode.cycle(), cx);
             }))
@@ -1629,32 +1648,28 @@ impl Render for EditorView {
                         Self::mi_sub("o.in", t("output.midi_in"), Sub::InPort, cx)
                             .into_any_element(),
                         Self::msep().into_any_element(),
+                    ];
+                    if sel_is_plugin {
+                        items.push(Self::mi("o.gui", if self.plugin_window.is_some() { t("output.editor_close") } else { t("output.editor_open") }, "", Some(self.plugin_window.is_some()), cx, |v, _e, _cx| v.open_plugin_gui()).into_any_element());
+                    }
+                    if sel_plugin_failed {
+                        items.push(Self::mi("o.retry", t("output.retry"), "", None, cx, |v, _e, _cx| {
+                            let d = v.shared.lock().unwrap().dest_of(v.sel_track);
+                            v.ensure_plugin(d, true);
+                        }).into_any_element());
+                    }
+                    items.extend([
+                        Self::msep().into_any_element(),
                         Self::mi("o.rescan", t("output.rescan"), "", None, cx, |v, _e, cx| {
                             v.rescan_plugins();
                             cx.notify();
                         })
                         .into_any_element(),
-                    ];
-                    if sel_is_plugin {
-                        items.push(Self::msep().into_any_element());
-                        items.push(
-                            Self::mi(
-                                "o.gui",
-                                if self.plugin_window.is_some() {
-                                    t("output.editor_close")
-                                } else {
-                                    t("output.editor_open")
-                                },
-                                "",
-                                Some(self.plugin_window.is_some()),
-                                cx,
-                                |v, _e, _cx| {
-                                    v.open_plugin_gui();
-                                },
-                            )
-                            .into_any_element(),
-                        );
-                    }
+                        Self::mi("o.status", t("output.host_status"), "", None, cx, |v, _e, cx| {
+                            v.show_output_status = true;
+                            cx.notify();
+                        }).into_any_element(),
+                    ]);
                     items
                 }
                 TopMenu::Transport => vec![
@@ -1712,6 +1727,8 @@ impl Render for EditorView {
                 .top(px(0.0))
                 .left(px(mx))
                 .w(px(210.0))
+                .max_h(px((f32::from(window.viewport_size().height) - 40.0).max(120.0)))
+                .overflow_y_scrollbar()
                 .flex()
                 .flex_col()
                 .py_1()
@@ -1750,58 +1767,8 @@ impl Render for EditorView {
                             .into_any_element()
                         })
                         .collect(),
-                    Sub::Dest => {
-                        let mut rows: Vec<AnyElement> = vec![Self::mi_leaf(
-                            "dest.inherit",
-                            t("track.default_dest"),
-                            "",
-                            Some(!has_track_dest),
-                            cx,
-                            |v, _e, _cx| {
-                                v.shared.lock().unwrap().track_dest.remove(&v.sel_track);
-                                v.persist();
-                            },
-                        )
-                        .into_any_element()];
-                        rows.extend(dests.iter().enumerate().map(|(i, (label, _))| {
-                            Self::mi_leaf(
-                                ("dest", i),
-                                label.clone(),
-                                "",
-                                Some(has_track_dest && eff_dest == i),
-                                cx,
-                                move |v, _e, _cx| {
-                                    let mut sh = v.shared.lock().unwrap();
-                                    sh.track_dest.insert(v.sel_track, i);
-                                    sh.default_dest = i;
-                                    drop(sh);
-                                    v.persist();
-                                    v.ensure_plugin(i);
-                                },
-                            )
-                            .into_any_element()
-                        }));
-                        rows
-                    }
-                    Sub::DefDest => dests
-                        .iter()
-                        .enumerate()
-                        .map(|(i, (label, _))| {
-                            Self::mi_leaf(
-                                ("defdest", i),
-                                label.clone(),
-                                "",
-                                Some(def_dest == i),
-                                cx,
-                                move |v, _e, _cx| {
-                                    v.shared.lock().unwrap().default_dest = i;
-                                    v.persist();
-                                    v.ensure_plugin(i);
-                                },
-                            )
-                            .into_any_element()
-                        })
-                        .collect(),
+                    Sub::Dest => self.dest_rows(DestPick::Track, &dests, eff_dest, def_dest, has_track_dest, cx),
+                    Sub::DefDest => self.dest_rows(DestPick::Default, &dests, eff_dest, def_dest, has_track_dest, cx),
                     Sub::InPort => {
                         let ports = midi_io::list_inputs().unwrap_or_default();
                         let mut rows: Vec<AnyElement> = vec![Self::mi_leaf(
@@ -2018,15 +1985,20 @@ impl Render for EditorView {
                             .collect()
                     }
                 };
+                let vh = f32::from(window.viewport_size().height);
+                let desired = rows.len() as f32 * 24.0 + 16.0;
+                let max_h = (vh - 40.0).max(120.0);
+                let h = desired.min(max_h);
+                let top = (y - 30.0).clamp(0.0, (vh - h - 8.0).max(0.0));
                 Some(
                     div()
                         .id("sub-popup")
                         .absolute()
-                        .top(px((y - 30.0).max(0.0)))
+                        .top(px(top))
                         .left(px(x2))
                         .w(px(190.0))
-                        .max_h(px(360.0))
-                        .overflow_hidden()
+                        .max_h(px(h))
+                        .overflow_y_scrollbar()
                         .flex()
                         .flex_col()
                         .py_1()
@@ -2144,6 +2116,80 @@ impl Render for EditorView {
                 .child(panel)
         });
 
+        let output_status = self.show_output_status.then(|| {
+            let diag = &self.host_diag;
+            let diag_row = |label: SharedString, path: &Option<PathBuf>, hint: SharedString| {
+                let value = path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| t("output.missing").to_string());
+                let mut row = div().flex().flex_col().gap_1().child(
+                    div().child(label).child(": ").child(
+                        div()
+                            .text_color(rgb(if path.is_some() { 0xd8d8e0 } else { 0xe06060 }))
+                            .child(value),
+                    ),
+                );
+                if path.is_none() {
+                    row = row.child(div().text_color(rgb(0x9999aa)).child(hint));
+                }
+                row.into_any_element()
+            };
+            let scan = if self.scan_rx.is_some() {
+                t("status.scanning").to_string()
+            } else {
+                let n = self.plugin_meta.len();
+                let mode = match self.scan_probe_used {
+                    Some(true) => t("output.probe_used"),
+                    _ => t("output.probe_unused"),
+                };
+                format!("{n} plugins, {mode}")
+            };
+            let mut rows: Vec<AnyElement> = vec![
+                diag_row(t("output.helper").into(), &diag.helper, t("output.helper_hint").into()),
+                diag_row(t("output.probe").into(), &diag.probe, t("output.helper_hint").into()),
+                div().child(format!("{}: {}", t("output.audio"), diag.audio_device.clone().unwrap_or_else(|e| e))).into_any_element(),
+                div().child(format!("{}: {}", t("output.scan"), scan)).into_any_element(),
+            ];
+            if let Some(note) = &self.scan_note { rows.push(div().text_color(rgb(0x9999aa)).child(note.clone()).into_any_element()); }
+            for (i, (name, dest)) in dests.iter().enumerate() {
+                let output::Destination::Plugin { plugin_path } = dest else { continue };
+                let vendor = self.plugin_meta.get(plugin_path).map(|p| p.vendor.clone()).unwrap_or_default();
+                let (state, color, retry, detail) = match self.plugin_state.get(&i) {
+                    Some(PluginState::Ready { .. }) => (t("plugin.state_ready"), 0x8fd0a0, false, None),
+                    Some(PluginState::Loading { .. }) => (t("plugin.state_loading"), 0xe0b050, false, None),
+                    Some(PluginState::Failed { phase, msg, .. }) => {
+                        let phase = match *phase {
+                            "host" => t("plugin.phase_host"),
+                            "audio" => t("plugin.phase_audio"),
+                            _ => t("plugin.phase_load"),
+                        };
+                        (t("plugin.state_failed"), 0xe06060, true, Some(format!("{phase}: {msg}")))
+                    }
+                    _ => (t("plugin.state_idle"), 0x77778a, false, None),
+                };
+                let mut row = div().id(("output-status", i)).flex().flex_col().gap_1().text_color(rgb(color))
+                    .child(div().flex().gap_1().items_center().child(format!("{}  {}", name, state))
+                        .child(div().text_color(rgb(0x888899)).child(vendor)));
+                if let Some(detail) = detail {
+                    row = row.child(div().text_color(rgb(0x9999aa)).child(detail));
+                }
+                rows.push(row.on_click(cx.listener(move |v, _e, _w, cx| {
+                    if retry { v.ensure_plugin(i, true); cx.notify(); }
+                })).into_any_element());
+            }
+            let panel = div().w(px(520.0)).max_h(px(520.0)).overflow_y_scrollbar().flex().flex_col().gap_1()
+                .p_3().bg(rgb(0x20202c)).border_1().border_color(rgb(0x3c3c4a)).rounded_lg().shadow_lg()
+                .child(div().text_size(px(14.0)).text_color(rgb(0x9fd0ff)).child(t("output.status_title")))
+                .children(rows)
+                .child(div().flex().gap_2().pt_2()
+                    .child(Self::mi("status.rescan", t("output.rescan"), "", None, cx, |v, _e, cx| { v.rescan_plugins(); cx.notify(); }))
+                    .child(Self::mi("status.close", t("output.close"), "", None, cx, |v, _e, cx| { v.show_output_status = false; cx.notify(); })));
+            div().absolute().inset_0().flex().items_center().justify_center().bg(rgba(0x00000066))
+                .on_mouse_down(MouseButton::Left, cx.listener(|v, _e, _w, cx| { v.show_output_status = false; cx.notify(); }))
+                .child(panel)
+        });
+
         div()
             .flex()
             .flex_col()
@@ -2187,6 +2233,7 @@ impl Render for EditorView {
                         this.open_menu = None;
                         this.open_sub = None;
                         this.help_open = false;
+                        this.show_output_status = false;
                         this.selection.clear();
                         cx.notify();
                     }
@@ -2222,6 +2269,7 @@ impl Render for EditorView {
             .child(status_bar)
             .children(menu_layer)
             .children(help_layer)
+            .children(output_status)
             // drag a .mid file anywhere to open it
             .can_drop(|drag: &dyn Any, _w, _cx| drag.is::<ExternalPaths>())
             .drag_over::<ExternalPaths>(|s, _p, _w, _cx| s.bg(rgb(0x16202e)))
@@ -2241,6 +2289,131 @@ impl Render for EditorView {
 // --- menubar helpers -----------------------------------------------------------
 
 impl EditorView {
+    fn mhead(label: impl Into<SharedString>) -> Div {
+        div()
+            .h(px(18.0))
+            .px_2()
+            .mx_1()
+            .text_size(px(9.5))
+            .text_color(rgb(0x7a7a90))
+            .child(label.into())
+    }
+
+    fn dest_rows(
+        &self,
+        kind: DestPick,
+        dests: &[(String, midi_io::Destination)],
+        eff_dest: usize,
+        def_dest: usize,
+        has_track_dest: bool,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let mut rows = Vec::new();
+        if kind == DestPick::Track {
+            rows.push(
+                Self::mi_leaf(
+                    "dest.default",
+                    t("track.default_dest"),
+                    "",
+                    Some(!has_track_dest),
+                    cx,
+                    |v, _e, _cx| {
+                        v.shared.lock().unwrap().track_dest.remove(&v.sel_track);
+                        v.persist();
+                    },
+                )
+                .into_any_element(),
+            );
+            rows.push(Self::msep().into_any_element());
+        }
+        rows.push(Self::mhead(t("output.cat_midi")).into_any_element());
+        let midi: Vec<(usize, String)> = dests
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (name, d))| matches!(d, output::Destination::MidiPort { .. }).then_some((i, name.clone())))
+            .collect();
+        if midi.is_empty() {
+            rows.push(Self::mi_leaf("dest.noports", t("output.no_ports"), "", None, cx, |_v, _e, _cx| {}).into_any_element());
+        } else {
+            for (i, label) in midi {
+                let selected = if kind == DestPick::Track { has_track_dest && eff_dest == i } else { def_dest == i };
+                rows.push(Self::mi_leaf(("dest", i), label, "", Some(selected), cx, move |v, _e, _cx| {
+                    let mut sh = v.shared.lock().unwrap();
+                    if kind == DestPick::Track {
+                        sh.track_dest.insert(v.sel_track, i);
+                    } else {
+                        sh.default_dest = i;
+                    }
+                    drop(sh);
+                    v.persist();
+                }).into_any_element());
+            }
+        }
+        rows.push(Self::msep().into_any_element());
+        let plugins: Vec<(usize, String, String, String)> = dests.iter().enumerate().filter_map(|(i, (name, d))| {
+            let output::Destination::Plugin { plugin_path } = d else { return None };
+            let vendor = self.plugin_meta.get(plugin_path).map(|p| p.vendor.clone()).unwrap_or_default();
+            Some((i, name.clone(), plugin_path.clone(), vendor))
+        }).collect();
+        let mut vendors = std::collections::BTreeSet::new();
+        for (_, _, _, vendor) in &plugins { if !vendor.is_empty() { vendors.insert(vendor.clone()); } }
+        rows.push(Self::mhead(format!("{} ({})", t("output.cat_vst3"), plugins.len())).into_any_element());
+        if plugins.is_empty() {
+            if self.scan_rx.is_some() {
+                rows.push(Self::mi_leaf("dest.scanning", t("status.scanning"), "", None, cx, |_v, _e, _cx| {}).into_any_element());
+            } else {
+                rows.push(Self::mi_leaf("dest.noplugins", t("output.no_plugins"), "", None, cx, |_v, _e, _cx| {}).into_any_element());
+            }
+        } else {
+            let mut plugins = plugins;
+            plugins.sort_by(|a, b| if vendors.len() >= 2 { a.3.cmp(&b.3).then(a.1.cmp(&b.1)) } else { a.1.cmp(&b.1) });
+            let mut last_vendor = String::new();
+            for (i, label, path, vendor) in plugins {
+                if vendors.len() >= 2 && vendor != last_vendor {
+                    last_vendor = vendor.clone();
+                    rows.push(Self::mhead(format!("  {vendor}")).into_any_element());
+                }
+                let (badge, color) = match self.plugin_state.get(&i) {
+                    Some(PluginState::Ready { .. }) => ("●", Some(0x8fd0a0)),
+                    Some(PluginState::Loading { .. }) => ("◌ …", Some(0xe0b050)),
+                    Some(PluginState::Failed { .. }) => ("✕", Some(0xe06060)),
+                    _ => ("", None),
+                };
+                let detail = match self.plugin_state.get(&i) {
+                    Some(PluginState::Failed { phase, msg, .. }) => {
+                        let phase = match *phase {
+                            "host" => t("plugin.phase_host"),
+                            "audio" => t("plugin.phase_audio"),
+                            _ => t("plugin.phase_load"),
+                        };
+                        Some(format!("{phase}: {msg}"))
+                    }
+                    _ => None,
+                };
+                let selected = if kind == DestPick::Track { has_track_dest && eff_dest == i } else { def_dest == i };
+                let path2 = path.clone();
+                let row = Self::mi_inner(("plugin", i), label, badge, color, Some(selected), false, cx, move |v, _e, _cx| {
+                    let mut sh = v.shared.lock().unwrap();
+                    if kind == DestPick::Track { sh.track_dest.insert(v.sel_track, i); } else { sh.default_dest = i; }
+                    drop(sh);
+                    v.persist();
+                    v.ensure_plugin(i, true);
+                    let _ = path2;
+                });
+                let row = if let Some(detail) = detail {
+                    row.tooltip(move |_w, cx| {
+                        let detail = detail.clone();
+                        cx.new(|_| Tip(detail.into())).into()
+                    })
+                } else {
+                    row
+                };
+                rows.push(row.into_any_element());
+            }
+        }
+        rows
+    }
+
     /// One dropdown row: optional check glyph, label, right-aligned shortcut.
     /// Clicking closes the whole menu and runs `f`. Dropdown rows clear the
     /// open cascade on hover; submenu leaf rows (`mi_leaf`) must NOT clear it,
@@ -2248,7 +2421,8 @@ impl EditorView {
     fn mi_inner(
         id: impl Into<ElementId>,
         label: impl Into<SharedString>,
-        shortcut: &'static str,
+        shortcut: impl Into<SharedString>,
+        badge_color: Option<u32>,
         check: Option<bool>,
         clears_sub: bool,
         cx: &mut Context<Self>,
@@ -2278,9 +2452,9 @@ impl EditorView {
             .child(
                 div()
                     .pl_2()
-                    .text_color(rgb(0x666677))
+                    .text_color(rgb(badge_color.unwrap_or(0x666677)))
                     .text_size(px(10.0))
-                    .child(shortcut),
+                    .child(shortcut.into()),
             )
             .on_mouse_move(cx.listener(move |v, _e: &MouseMoveEvent, _w, cx| {
                 // leaving a submenu parent closes the cascade
@@ -2308,7 +2482,7 @@ impl EditorView {
         cx: &mut Context<Self>,
         f: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> Stateful<Div> {
-        Self::mi_inner(id, label, shortcut, check, true, cx, f)
+        Self::mi_inner(id, label, shortcut, None, check, true, cx, f)
     }
 
     /// Submenu leaf row — must not clear the cascade it lives in.
@@ -2320,7 +2494,7 @@ impl EditorView {
         cx: &mut Context<Self>,
         f: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> Stateful<Div> {
-        Self::mi_inner(id, label, shortcut, check, false, cx, f)
+        Self::mi_inner(id, label, shortcut, None, check, false, cx, f)
     }
 
     /// Dropdown row that cascades: hovering opens its submenu at the row's y.

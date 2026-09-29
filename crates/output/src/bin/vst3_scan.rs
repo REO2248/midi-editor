@@ -6,10 +6,10 @@ use midi_io::EventSink;
 fn main() {
     let found = output::discover_plugins();
     println!("== discovered VST3 bundles ==");
-    for p in &found {
+    for p in &found.plugins {
         println!("  {} @ {}", p.name, p.path.display());
     }
-    if found.is_empty() {
+    if found.plugins.is_empty() {
         println!("  (none installed)");
     }
 
@@ -30,7 +30,7 @@ fn main() {
         Err(e) => eprintln!("vst3-host discovery error: {e}"),
     }
 
-    if let Some(first) = found.first() {
+    if let Some(first) = found.plugins.first() {
         println!("== attempting load: {} ==", first.path.display());
         match vst3_host::simple::load_plugin(&first.path) {
             Ok(mut plugin) => {
@@ -51,7 +51,7 @@ fn main() {
 
     // full realtime path needs an audio device (none on a headless VM); do an
     // offline render instead — exercises load->process->WAV with no hardware
-    if let Some(first) = found.first() {
+    if let Some(first) = found.plugins.first() {
         println!("== PluginOutput::open: {} ==", first.path.display());
         match output::PluginOutput::open(&first.path) {
             Ok(out) => {

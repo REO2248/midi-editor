@@ -12,17 +12,73 @@ pub use midi_io::Destination;
 pub struct PluginInfo {
     pub name: String,
     pub path: std::path::PathBuf,
+    pub vendor: String,
+}
+
+pub fn sidecar_binary(stem: &str) -> Option<std::path::PathBuf> {
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let exe = dir.join(format!("{stem}.exe"));
+    if exe.exists() {
+        return Some(exe);
+    }
+    let plain = dir.join(stem);
+    plain.exists().then_some(plain)
+}
+
+pub fn init_env() {
+    for (env, stem) in [
+        ("VST3_HOST_PROBE_PATH", "vst3-host-probe"),
+        ("VST3_HOST_HELPER_PATH", "vst3-host-helper"),
+    ] {
+        if std::env::var_os(env).is_none() {
+            if let Some(path) = sidecar_binary(stem) {
+                #[allow(unused_unsafe)]
+                unsafe {
+                    std::env::set_var(env, path);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct HostDiag {
+    pub helper: Option<std::path::PathBuf>,
+    pub probe: Option<std::path::PathBuf>,
+    pub audio_device: Result<String, String>,
+}
+
+pub fn host_diag() -> HostDiag {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    let audio_device = cpal::default_host()
+        .default_output_device()
+        .ok_or_else(|| "no default output device".to_string())
+        .and_then(|device| {
+            device
+                .description()
+                .map(|d| d.name().to_string())
+                .map_err(|e| e.to_string())
+        });
+    HostDiag {
+        helper: sidecar_binary("vst3-host-helper"),
+        probe: sidecar_binary("vst3-host-probe"),
+        audio_device,
+    }
 }
 
 /// VST3 host factory: plugins load into `vst3-host-helper` subprocesses so a
 /// crashing or hanging plugin cannot take the app down. `auto_recover`
 /// respawns the helper and retries control-plane commands transparently.
 fn new_host() -> Result<vst3_host::Vst3Host, PluginError> {
-    vst3_host::Vst3Host::builder()
+    let mut builder = vst3_host::Vst3Host::builder()
         .scan_default_paths()
         .with_process_isolation(true)
         .auto_recover_plugins(true)
-        .auto_recover_max_retries(1)
+        .auto_recover_max_retries(1);
+    if let Some(path) = sidecar_binary("vst3-host-helper") {
+        builder = builder.helper_path(path);
+    }
+    builder
         .build()
         .map_err(|e| PluginError::Host(e.to_string()))
 }
@@ -41,28 +97,60 @@ fn new_host_in_process() -> Result<vst3_host::Vst3Host, PluginError> {
 /// Scan the standard VST3 install locations. Prefers the crash-resistant probe
 /// (each bundle is introspected in a subprocess); falls back to listing
 /// filenames when the probe binary isn't shipped alongside the app.
-pub fn discover_plugins() -> Vec<PluginInfo> {
+#[derive(Debug)]
+pub struct ScanReport {
+    pub plugins: Vec<PluginInfo>,
+    pub probe_used: bool,
+    pub skipped: Vec<(std::path::PathBuf, String)>,
+}
+
+pub fn discover_plugins() -> ScanReport {
     if let Ok(host) = new_host() {
         let report = host.discover_plugins_safe();
-        if report.scan_ran() && !report.plugins.is_empty() {
+        if report.scan_ran() {
             let mut found: Vec<PluginInfo> = report
                 .plugins
                 .iter()
                 .map(|p| PluginInfo {
                     name: p.info.name.clone(),
                     path: p.info.path.clone(),
+                    vendor: p.info.vendor.clone(),
                 })
                 .collect();
             found.sort_by(|a, b| a.name.cmp(&b.name));
             found.dedup_by(|a, b| a.path == b.path);
-            return found;
+            let skipped = report
+                .skipped
+                .iter()
+                .map(|s| {
+                    let reason = match s {
+                        vst3_host::SafeDiscoverySkip::Crashed { detail, .. } => {
+                            format!("crashed: {detail}")
+                        }
+                        vst3_host::SafeDiscoverySkip::TimedOut { .. } => "timed out".into(),
+                        vst3_host::SafeDiscoverySkip::Failed { detail, .. } => {
+                            format!("failed: {detail}")
+                        }
+                    };
+                    (s.path().to_path_buf(), reason)
+                })
+                .collect();
+            return ScanReport {
+                plugins: found,
+                probe_used: true,
+                skipped,
+            };
         }
     }
-    discover_plugin_paths()
+    ScanReport {
+        plugins: discover_plugin_paths(),
+        probe_used: false,
+        skipped: Vec::new(),
+    }
 }
 
 /// Fallback scan: enumerate `.vst3` bundles without loading them.
-fn discover_plugin_paths() -> Vec<PluginInfo> {
+pub fn discover_plugin_paths() -> Vec<PluginInfo> {
     let mut found = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for dir in vst3_scan_dirs() {
@@ -82,6 +170,7 @@ fn discover_plugin_paths() -> Vec<PluginInfo> {
                             .map(|s| s.to_string_lossy().into_owned())
                             .unwrap_or_else(|| "unknown".into()),
                         path: p,
+                        vendor: String::new(),
                     });
                 }
             }
@@ -230,16 +319,22 @@ pub enum PluginReq {
     Shutdown,
 }
 
+pub struct PluginEvent {
+    pub dest: usize,
+    pub path: std::path::PathBuf,
+    pub result: Result<PluginSlot, PluginError>,
+}
+
 /// Spawn the plugin host thread. It owns every `PluginOutput` (their
 /// `AudioHandle`s are not `Send`); the app talks to it through the request
 /// channel and receives `PluginSlot` handles on the returned receiver.
 /// Requests are processed in order; `Open` replies carry `(dest, result)`.
 pub fn spawn_plugin_host() -> (
     std::sync::mpsc::Sender<PluginReq>,
-    std::sync::mpsc::Receiver<(usize, Result<PluginSlot, String>)>,
+    std::sync::mpsc::Receiver<PluginEvent>,
 ) {
     let (req_tx, req_rx) = std::sync::mpsc::channel::<PluginReq>();
-    let (evt_tx, evt_rx) = std::sync::mpsc::channel::<(usize, Result<PluginSlot, String>)>();
+    let (evt_tx, evt_rx) = std::sync::mpsc::channel::<PluginEvent>();
     std::thread::spawn(move || {
         let mut owned: std::collections::HashMap<usize, PluginOutput> =
             std::collections::HashMap::new();
@@ -253,10 +348,18 @@ pub fn spawn_plugin_host() -> (
                             path,
                         };
                         owned.insert(d, p);
-                        let _ = evt_tx.send((d, Ok(slot)));
+                        let _ = evt_tx.send(PluginEvent {
+                            dest: d,
+                            path: slot.path.clone(),
+                            result: Ok(slot),
+                        });
                     }
                     Err(e) => {
-                        let _ = evt_tx.send((d, Err(e.to_string())));
+                        let _ = evt_tx.send(PluginEvent {
+                            dest: d,
+                            path,
+                            result: Err(e),
+                        });
                     }
                 },
                 PluginReq::Drop(d) => {

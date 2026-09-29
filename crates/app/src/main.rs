@@ -80,6 +80,12 @@ enum Sub {
     Oct,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum DestPick {
+    Track,
+    Default,
+}
+
 /// What the bottom lane edits for the selected track.
 #[derive(Clone, Copy, PartialEq)]
 enum LaneMode {
@@ -199,9 +205,16 @@ struct EditorView {
     /// change, rescan, or app exit unloads them.
     plugin_slots: HashMap<usize, output::PluginSlot>,
     /// dest index → bundle path currently being loaded by the host thread
-    plugin_loading: HashMap<usize, PathBuf>,
+    plugin_state: HashMap<usize, PluginState>,
     plugin_req: std::sync::mpsc::Sender<output::PluginReq>,
-    plugin_evt: std::sync::mpsc::Receiver<(usize, Result<output::PluginSlot, String>)>,
+    plugin_evt: std::sync::mpsc::Receiver<output::PluginEvent>,
+    play_pending: bool,
+    plugin_meta: HashMap<String, output::PluginInfo>,
+    scan_rx: Option<std::sync::mpsc::Receiver<output::ScanReport>>,
+    scan_note: Option<String>,
+    scan_probe_used: Option<bool>,
+    host_diag: output::HostDiag,
+    show_output_status: bool,
     /// Standalone window hosting the open plugin editor (in-process
     /// instance — isolated plugins cannot host a GUI on Windows).
     plugin_window: Option<vst3_host::PluginWindow>,
@@ -239,6 +252,12 @@ struct EditorView {
     status: SharedString,
 }
 
+enum PluginState {
+    Loading { path: PathBuf, since: std::time::Instant },
+    Ready { path: PathBuf },
+    Failed { path: PathBuf, phase: &'static str, msg: String },
+}
+
 /// Armed recording: timestamps channel messages against the playhead's µs base.
 struct Rec {
     _input: midi_io::Input,
@@ -251,7 +270,7 @@ struct Rec {
 
 /// Output destination catalog: real MIDI ports by name, then discovered
 /// VST3s. Rebuilt on `Output ▸ Rescan Plugins`.
-fn build_dest_catalog() -> Vec<(String, midi_io::Destination)> {
+fn build_dest_catalog(plugins: &[output::PluginInfo]) -> Vec<(String, midi_io::Destination)> {
     let mut dests: Vec<(String, midi_io::Destination)> = midi_io::list_outputs()
         .unwrap_or_default()
         .into_iter()
@@ -262,9 +281,9 @@ fn build_dest_catalog() -> Vec<(String, midi_io::Destination)> {
             )
         })
         .collect();
-    for p in output::discover_plugins() {
+    for p in plugins {
         dests.push((
-            format!("{} [VST3]", p.name),
+            p.name.clone(),
             midi_io::Destination::Plugin {
                 plugin_path: p.path.to_string_lossy().into_owned(),
             },
@@ -299,7 +318,8 @@ impl EditorView {
         let mut sh = Shared::new(doc);
         sh.path = path.clone();
         sh.saved_revision = sh.doc.revision();
-        sh.dests = build_dest_catalog();
+        let initial_plugins = output::discover_plugin_paths();
+        sh.dests = build_dest_catalog(&initial_plugins);
         let g = GlobalPrefs::load();
         let shared = Arc::new(Mutex::new(sh));
         let (plugin_req, plugin_evt) = output::spawn_plugin_host();
@@ -324,9 +344,19 @@ impl EditorView {
             scroll_y: (127.0 - 84.0) * NOTE_H, // show ~C3..C7
             zoom: 0.08,
             plugin_slots: HashMap::new(),
-            plugin_loading: HashMap::new(),
+            plugin_state: HashMap::new(),
             plugin_req,
             plugin_evt,
+            play_pending: false,
+            plugin_meta: initial_plugins
+                .into_iter()
+                .map(|p| (p.path.to_string_lossy().into_owned(), p))
+                .collect(),
+            scan_rx: None,
+            scan_note: None,
+            scan_probe_used: None,
+            host_diag: output::host_diag(),
+            show_output_status: false,
             plugin_window: None,
             editor_plugin: None,
             enc_override: None,
@@ -352,6 +382,7 @@ impl EditorView {
             v.apply_prefs(p);
             v.push_recent(p);
         }
+        v.rescan_plugins();
         v
     }
 
@@ -1341,7 +1372,7 @@ impl EditorView {
     /// If dest `d` is a VST3 bundle not already loaded/loading, ask the host
     /// thread to warm it. Called when a destination is assigned and from
     /// `refresh_plugins` — Play then never pays the load stall.
-    fn ensure_plugin(&mut self, d: usize) {
+    fn ensure_plugin(&mut self, d: usize, force: bool) {
         let path = {
             let sh = self.shared.lock().unwrap();
             match sh.dests.get(d).map(|(_, dest)| dest) {
@@ -1349,7 +1380,13 @@ impl EditorView {
                 _ => return,
             }
         };
-        if self
+        if let Some(PluginState::Ready { path: ready_path }) = self.plugin_state.get(&d) {
+            if ready_path == &path
+                && self.plugin_slots.get(&d).map(|s| s.path == path).unwrap_or(false)
+            {
+                return;
+            }
+        } else if self
             .plugin_slots
             .get(&d)
             .map(|s| s.path == path)
@@ -1357,19 +1394,27 @@ impl EditorView {
         {
             return;
         }
-        if self.plugin_loading.get(&d) == Some(&path) {
-            return;
+        match self.plugin_state.get(&d) {
+            Some(PluginState::Loading { path: p, .. }) if p == &path => return,
+            Some(PluginState::Failed { path: p, .. }) if p == &path && !force => return,
+            _ => {}
         }
         // index now points at a different bundle — retire the old instance
         if self.plugin_slots.remove(&d).is_some() {
             let _ = self.plugin_req.send(output::PluginReq::Drop(d));
         }
-        self.plugin_loading.insert(d, path.clone());
+        self.plugin_state.insert(
+            d,
+            PluginState::Loading {
+                path: path.clone(),
+                since: std::time::Instant::now(),
+            },
+        );
         let name = path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        self.status = format!("loading {name}…").into();
+        self.status = tf("plugin.loading", &[("name", name.as_str())]).into();
         let _ = self.plugin_req.send(output::PluginReq::Open(d, path));
     }
 
@@ -1383,43 +1428,69 @@ impl EditorView {
             v
         };
         for d in idxs {
-            self.ensure_plugin(d);
+            self.ensure_plugin(d, false);
         }
     }
 
-    /// Drain host-thread replies into `plugin_slots`/`plugin_loading`.
-    fn poll_plugin_events(&mut self) {
-        while let Ok((d, r)) = self.plugin_evt.try_recv() {
-            self.plugin_loading.remove(&d);
-            match r {
+    fn poll_plugin_events(&mut self) -> bool {
+        let mut changed = false;
+        let now = std::time::Instant::now();
+        let timed_out: Vec<usize> = self.plugin_state.iter().filter_map(|(&d, s)| {
+            matches!(s, PluginState::Loading { since, .. } if now.duration_since(*since) >= std::time::Duration::from_secs(20)).then_some(d)
+        }).collect();
+        for d in timed_out {
+            if let Some(PluginState::Loading { path, .. }) = self.plugin_state.remove(&d) {
+                self.plugin_state.insert(d, PluginState::Failed {
+                    path,
+                    phase: "load",
+                    msg: t("plugin.timeout").to_string(),
+                });
+                let _ = self.plugin_req.send(output::PluginReq::Drop(d));
+                changed = true;
+            }
+        }
+        while let Ok(event) = self.plugin_evt.try_recv() {
+            let Some(PluginState::Loading { path, .. }) = self.plugin_state.get(&event.dest) else { continue };
+            if path != &event.path { continue; }
+            match event.result {
                 Ok(slot) => {
                     let name = slot
                         .path
                         .file_stem()
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    self.plugin_slots.insert(d, slot);
-                    self.status = format!("{name} ready").into();
+                    self.plugin_slots.insert(event.dest, slot);
+                    self.plugin_state.insert(event.dest, PluginState::Ready { path: event.path });
+                    self.status = tf("plugin.ready", &[("name", name.as_str())]).into();
                 }
-                Err(e) => self.status = format!("plugin: {e}").into(),
+                Err(e) => {
+                    let phase = match e {
+                        output::PluginError::Host(_) => "host",
+                        output::PluginError::Load(_) => "load",
+                        output::PluginError::Audio(_) => "audio",
+                    };
+                    let name = event.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                    self.plugin_state.insert(event.dest, PluginState::Failed { path: event.path, phase, msg: e.to_string() });
+                    self.status = tf("plugin.failed", &[("name", name.as_str())]).into();
+                }
+            }
+            changed = true;
+        }
+        if self.play_pending {
+            let needed_loading = {
+                let sh = self.shared.lock().unwrap();
+                sh.doc.tracks.iter().enumerate().any(|(t, _)| {
+                    let d = sh.dest_of(t);
+                    matches!(self.plugin_state.get(&d), Some(PluginState::Loading { .. }))
+                })
+            };
+            if !needed_loading {
+                self.play_pending = false;
+                self.start_playback();
+                changed = true;
             }
         }
-    }
-
-    /// Bounded UI-thread wait for dest `d`'s instance — used at Play press.
-    /// Returns true when a live slot exists.
-    fn wait_plugin(&mut self, d: usize) -> bool {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        loop {
-            self.poll_plugin_events();
-            if self.plugin_slots.contains_key(&d) {
-                return true;
-            }
-            if !self.plugin_loading.contains_key(&d) || std::time::Instant::now() >= deadline {
-                return false;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(40));
-        }
+        changed
     }
 
     fn start_playback(&mut self) {
@@ -1476,8 +1547,16 @@ impl EditorView {
                     }
                 }
                 output::Destination::Plugin { .. } => {
-                    self.ensure_plugin(d);
-                    if self.wait_plugin(d) {
+                    self.ensure_plugin(d, false);
+                    if matches!(self.plugin_state.get(&d), Some(PluginState::Loading { .. })) {
+                        let name = dests[d].0.clone();
+                        self.play_pending = true;
+                        self.status = tf("plugin.waiting", &[("name", name.as_str())]).into();
+                        return;
+                    }
+                    if self.plugin_slots.contains_key(&d)
+                        && matches!(self.plugin_state.get(&d), Some(PluginState::Ready { .. }))
+                    {
                         let slot = self.plugin_slots.get(&d).expect("slot just loaded");
                         sink_of.insert(d, sinks.len());
                         sinks.push(Box::new(slot.sink.clone()));
@@ -1486,8 +1565,8 @@ impl EditorView {
                             let _ = p.set_time_signature(sig_num, sig_den);
                             let _ = p.set_playing(true);
                         }
-                    } else {
-                        self.status = t("status.plugin_fail").into();
+                    } else if let Some(PluginState::Failed { .. }) = self.plugin_state.get(&d) {
+                        self.status = tf("plugin.failed", &[("name", dests[d].0.as_str())]).into();
                     }
                 }
             }
@@ -1535,6 +1614,7 @@ impl EditorView {
     }
 
     fn stop_playback(&mut self) {
+        self.play_pending = false;
         if let Some(mut p) = self.playback.take() {
             self.play_us = p.position_us();
             p.stop();
@@ -1672,11 +1752,30 @@ impl EditorView {
         self.status = format!("rec: {n} events").into();
     }
 
-    /// Rebuild the output destination catalog (Output ▸ Rescan Plugins).
-    /// Selections are indices into `dests`; remap them onto the rebuilt list
-    /// by `Destination` equality so assignments survive port/plugin churn.
     fn rescan_plugins(&mut self) {
-        let fresh = build_dest_catalog();
+        self.status = t("status.scanning").into();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.scan_rx = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(output::discover_plugins());
+        });
+    }
+
+    fn apply_catalog(&mut self, report: output::ScanReport) {
+        let skipped = report.skipped.len();
+        self.scan_probe_used = Some(report.probe_used);
+        self.plugin_meta = report
+            .plugins
+            .iter()
+            .cloned()
+            .map(|p| (p.path.to_string_lossy().into_owned(), p))
+            .collect();
+        self.scan_note = if skipped == 0 {
+            None
+        } else {
+            Some(report.skipped.iter().map(|(p, r)| format!("{} — {}", p.file_stem().map(|s| s.to_string_lossy()).unwrap_or_default(), r)).collect::<Vec<_>>().join("; "))
+        };
+        let fresh = build_dest_catalog(&report.plugins);
         let mut sh = self.shared.lock().unwrap();
         let old_default = sh.dests.get(sh.default_dest).map(|(_, d)| d.clone());
         let old_tracks: Vec<(usize, midi_io::Destination)> = sh
@@ -1705,7 +1804,7 @@ impl EditorView {
         self.editor_plugin = None;
         // dest indices were just remapped — every slot is stale
         self.plugin_slots.clear();
-        self.plugin_loading.clear();
+        self.plugin_state.clear();
         let _ = self.plugin_req.send(output::PluginReq::Clear);
         self.refresh_plugins();
         let ns = n.to_string();
@@ -1761,7 +1860,7 @@ impl EditorView {
                     Err(e) => self.status = format!("plugin GUI: {e}").into(),
                 }
             }
-            Err(_) => self.status = "plugin load failed".into(),
+            Err(e) => self.status = format!("{}: {e}", t("plugin.gui_failed")).into(),
         }
     }
 
@@ -2087,6 +2186,7 @@ impl EditorView {
 
 
 fn main() {
+    output::init_env();
     std::panic::set_hook(Box::new(|i| eprintln!("panic: {i}")));
     let path = std::env::args().nth(1).map(PathBuf::from);
     gpui_kit::application().run(move |cx| {
@@ -2179,7 +2279,14 @@ fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
                             _ => {}
                         }
                     }
-                    v.poll_plugin_events();
+                    let plugin_changed = v.poll_plugin_events();
+                    if let Some(rx) = &v.scan_rx {
+                        if let Ok(report) = rx.try_recv() {
+                            v.scan_rx = None;
+                            v.apply_catalog(report);
+                            cx.notify();
+                        }
+                    }
                     if dirty {
                         v.refresh_derived();
                         // cover routing changes that came from MCP tools —
@@ -2218,7 +2325,7 @@ fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
                             v.sync_editor_state_into_slot();
                         }
                     }
-                    if dirty || v.playback.is_some() || v.plugin_window.is_some() {
+                    if dirty || plugin_changed || v.playback.is_some() || v.plugin_window.is_some() {
                         cx.notify();
                     }
                 });
