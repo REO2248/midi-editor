@@ -36,14 +36,8 @@ const ACCENT: u32 = 0x9fd0ff;
 
 impl Render for EditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // pump the plugin editor window's native event queue while it's open
-        if let Some(w) = &mut self.plugin_window {
-            let _ = w.service_platform_events();
-            if w.closed_by_user() {
-                self.plugin_window = None;
-                self.gui_plugin = None;
-            }
-        }
+        // the plugin editor lives in the helper subprocess's own window —
+        // no native event queue to pump here
         self.refresh_derived();
 
         // advance playhead / auto-stop (looping happens inside the
@@ -55,7 +49,7 @@ impl Render for EditorView {
                 self.play_us = 0;
             }
         }
-        let (playhead_tick, title, dirty, n_diags, track_names, dests, eff_dest, loop_en, met_en, muted_set, soloed_set, has_track_dest, markers, tempo0, sig, track_chs) = {
+        let (playhead_tick, title, dirty, n_diags, track_names, dests, eff_dest, def_dest, loop_en, met_en, muted_set, soloed_set, has_track_dest, markers, tempo0, sig, track_chs) = {
             let sh = self.shared.lock().unwrap();
             let hint = self.enc_override.or(sh.doc.text_encoding_hint());
             let markers: Vec<(u64, String)> = sh
@@ -116,6 +110,7 @@ impl Render for EditorView {
                     .collect::<Vec<String>>(),
                 sh.dests.clone(),
                 sh.dest_of(self.sel_track),
+                sh.default_dest,
                 sh.loop_enabled,
                 sh.metronome,
                 sh.muted.clone(),
@@ -296,11 +291,12 @@ impl Render for EditorView {
 
         // --- menu bar -----------------------------------------------------------
         let open_menu = self.open_menu;
-        let menus: [(TopMenu, &str, f32); 6] = [
+        let menus: [(TopMenu, &str, f32); 7] = [
             (TopMenu::File, "menu.file", 46.0),
             (TopMenu::Edit, "menu.edit", 46.0),
             (TopMenu::View, "menu.view", 52.0),
             (TopMenu::Track, "menu.track", 58.0),
+            (TopMenu::Output, "menu.output", 62.0),
             (TopMenu::Transport, "menu.transport", 90.0),
             (TopMenu::Help, "menu.help", 50.0),
         ];
@@ -600,31 +596,10 @@ impl Render for EditorView {
                     .whitespace_nowrap()
                     .child(port_label)
                     .child(div().pl_1().child(icon("keyboard_arrow_down", 14.0, 0x77778a)))
-                    .on_click(cx.listener(|v, _e, _w, cx| {
-                        {
-                            let mut sh = v.shared.lock().unwrap();
-                            if !sh.dests.is_empty() {
-                                // cycles the SELECTED track's assignment through
-                                // [inherit default] -> dest 0..n -> inherit
-                                let n = sh.dests.len();
-                                let tr = v.sel_track;
-                                match sh.track_dest.get(&tr).copied() {
-                                    None => {
-                                        sh.track_dest.insert(tr, 0);
-                                    }
-                                    Some(d) if d + 1 < n => {
-                                        sh.track_dest.insert(tr, d + 1);
-                                    }
-                                    Some(_) => {
-                                        sh.track_dest.remove(&tr);
-                                    }
-                                }
-                                if let Some(&d) = sh.track_dest.get(&tr) {
-                                    sh.default_dest = d;
-                                }
-                            }
-                        }
-                        v.persist();
+                    .on_click(cx.listener(|v, e: &ClickEvent, _w, cx| {
+                        // shows the current destination; the picker itself
+                        // lives in the Output menubar dropdown
+                        v.open_menu = Some((TopMenu::Output, e.position().x.into()));
                         cx.notify();
                     })),
             )
@@ -1683,6 +1658,41 @@ impl Render for EditorView {
                     }
                     items
                 }
+                TopMenu::Output => {
+                    let mut items = vec![
+                        Self::mi_sub("o.def", t("output.default_dest"), Sub::DefDest, cx)
+                            .into_any_element(),
+                        Self::mi_sub("o.in", t("output.midi_in"), Sub::InPort, cx)
+                            .into_any_element(),
+                        Self::msep().into_any_element(),
+                        Self::mi("o.rescan", t("output.rescan"), "", None, cx, |v, _e, cx| {
+                            v.rescan_plugins();
+                            cx.notify();
+                        })
+                        .into_any_element(),
+                    ];
+                    if sel_is_plugin {
+                        items.push(Self::msep().into_any_element());
+                        items.push(
+                            Self::mi(
+                                "o.gui",
+                                if self.plugin_window.is_some() {
+                                    t("output.editor_close")
+                                } else {
+                                    t("output.editor_open")
+                                },
+                                "",
+                                Some(self.plugin_window.is_some()),
+                                cx,
+                                |v, _e, _cx| {
+                                    v.open_plugin_gui();
+                                },
+                            )
+                            .into_any_element(),
+                        );
+                    }
+                    items
+                }
                 TopMenu::Transport => vec![
                     Self::mi("tr.play", t("transport.play_stop"), "Space", Some(self.playback.is_some()), cx, |v, _e, cx| {
                         v.toggle_play(cx);
@@ -1758,7 +1768,7 @@ impl Render for EditorView {
                     Sub::Chan => (0u8..16)
                         .map(|ch| {
                             let cur = track_chs.get(self.sel_track).copied().unwrap_or(0);
-                            Self::mi(
+                            Self::mi_leaf(
                                 ("chan", ch as usize),
                                 format!("Channel {}", ch + 1),
                                 "",
@@ -1777,7 +1787,7 @@ impl Render for EditorView {
                         })
                         .collect(),
                     Sub::Dest => {
-                        let mut rows: Vec<AnyElement> = vec![Self::mi(
+                        let mut rows: Vec<AnyElement> = vec![Self::mi_leaf(
                             "dest.inherit",
                             t("track.default_dest"),
                             "",
@@ -1790,7 +1800,7 @@ impl Render for EditorView {
                         )
                         .into_any_element()];
                         rows.extend(dests.iter().enumerate().map(|(i, (label, _))| {
-                            Self::mi(
+                            Self::mi_leaf(
                                 ("dest", i),
                                 label.clone(),
                                 "",
@@ -1808,6 +1818,61 @@ impl Render for EditorView {
                         }));
                         rows
                     }
+                    Sub::DefDest => dests
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (label, _))| {
+                            Self::mi_leaf(
+                                ("defdest", i),
+                                label.clone(),
+                                "",
+                                Some(def_dest == i),
+                                cx,
+                                move |v, _e, _cx| {
+                                    v.shared.lock().unwrap().default_dest = i;
+                                    v.persist();
+                                },
+                            )
+                            .into_any_element()
+                        })
+                        .collect(),
+                    Sub::InPort => {
+                        let ports = midi_io::list_inputs().unwrap_or_default();
+                        let mut rows: Vec<AnyElement> = vec![Self::mi_leaf(
+                            "in.default",
+                            t("output.first_input"),
+                            "",
+                            Some(self.midi_in.is_empty()),
+                            cx,
+                            |v, _e, _cx| {
+                                v.midi_in = "".into();
+                                v.save_global();
+                            },
+                        )
+                        .into_any_element()];
+                        rows.extend(ports.iter().enumerate().map(|(i, p)| {
+                            let name = p.name.clone();
+                            Self::mi_leaf(
+                                ("inport", i),
+                                name.clone(),
+                                "",
+                                Some(self.midi_in.as_str() == name),
+                                cx,
+                                move |v, _e, _cx| {
+                                    v.midi_in = name.clone().into();
+                                    v.save_global();
+                                },
+                            )
+                            .into_any_element()
+                        }));
+                        if ports.is_empty() {
+                            rows.push(
+                                Self::mi_leaf("in.none", t("output.no_inputs"), "", None, cx, |_, _, _| {})
+                                    .into_any_element(),
+                            );
+                        }
+                        rows
+                    }
                     Sub::Lane => {
                         const LANES: [LaneMode; 7] = [
                             LaneMode::Velocity,
@@ -1821,7 +1886,7 @@ impl Render for EditorView {
                         LANES.iter()
                             .enumerate()
                             .map(|(i, lm)| {
-                                Self::mi(
+                                Self::mi_leaf(
                                     ("lane", i),
                                     lm.label(),
                                     "",
@@ -1842,7 +1907,7 @@ impl Render for EditorView {
                         opts.into_iter()
                             .enumerate()
                             .map(|(i, (key, tool, label))| {
-                                Self::mi(
+                                Self::mi_leaf(
                                     ("tool", i),
                                     t(label),
                                     key,
@@ -1858,7 +1923,7 @@ impl Render for EditorView {
                         .iter()
                         .enumerate()
                         .map(|(i, (_div, _trip, label))| {
-                            Self::mi(
+                            Self::mi_leaf(
                                 ("snap", i),
                                 *label,
                                 "",
@@ -1871,7 +1936,7 @@ impl Render for EditorView {
                         .collect(),
                     Sub::Recent => {
                         if self.recent.is_empty() {
-                            vec![Self::mi("recent.empty", t("menu.recent_empty"), "", None, cx, |_v, _e, _cx| {})
+                            vec![Self::mi_leaf("recent.empty", t("menu.recent_empty"), "", None, cx, |_v, _e, _cx| {})
                                 .into_any_element()]
                         } else {
                             self.recent
@@ -1884,7 +1949,7 @@ impl Render for EditorView {
                                         .unwrap_or(p.as_str())
                                         .to_string();
                                     let path = std::path::PathBuf::from(p.as_str());
-                                    Self::mi(("recent", i), name, "", None, cx, move |v, _e, cx| {
+                                    Self::mi_leaf(("recent", i), name, "", None, cx, move |v, _e, cx| {
                                         v.open(path.clone(), cx);
                                     })
                                     .into_any_element()
@@ -1898,7 +1963,7 @@ impl Render for EditorView {
                             .into_iter()
                             .enumerate()
                             .map(|(i, (label, str_))| {
-                                Self::mi(("quant", i), format!("Quantize {label}"), "", None, cx, move |v, _e, _cx| {
+                                Self::mi_leaf(("quant", i), format!("Quantize {label}"), "", None, cx, move |v, _e, _cx| {
                                     v.apply_region_op("quantize", move |d, t, f, to| {
                                         d.quantize_ops(t, f, to, g, str_)
                                     });
@@ -1915,7 +1980,7 @@ impl Render for EditorView {
                         opts.into_iter()
                             .enumerate()
                             .map(|(i, (label, st))| {
-                                Self::mi(("oct", i), label, "", None, cx, move |v, _e, _cx| {
+                                Self::mi_leaf(("oct", i), label, "", None, cx, move |v, _e, _cx| {
                                     v.apply_region_op("octave", move |d, t, f, to| {
                                         d.transpose_ops(t, f, to, st)
                                     });
@@ -1936,7 +2001,7 @@ impl Render for EditorView {
                         opts.into_iter()
                             .enumerate()
                             .map(|(i, (label, ticks))| {
-                                Self::mi(("len", i), label, "", None, cx, move |v, _e, _cx| {
+                                Self::mi_leaf(("len", i), label, "", None, cx, move |v, _e, _cx| {
                                     v.apply_region_op("set length", move |d, t, f, to| {
                                         d.set_length_ops(t, f, to, ticks)
                                     });
@@ -1955,7 +2020,7 @@ impl Render for EditorView {
                         opts.into_iter()
                             .enumerate()
                             .map(|(i, (label, vel))| {
-                                Self::mi(("vset", i), label, "", None, cx, move |v, _e, _cx| {
+                                Self::mi_leaf(("vset", i), label, "", None, cx, move |v, _e, _cx| {
                                     v.apply_region_op("set velocity", move |d, t, f, to| {
                                         d.set_velocity_ops(t, f, to, vel)
                                     });
@@ -1974,7 +2039,7 @@ impl Render for EditorView {
                         opts.into_iter()
                             .enumerate()
                             .map(|(i, (e, label))| {
-                                Self::mi(
+                                Self::mi_leaf(
                                     ("enc", i),
                                     label,
                                     "",
@@ -2021,6 +2086,9 @@ impl Render for EditorView {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|v, _e, _w, cx| {
+                        // click-outside only dismisses the menu — the click
+                        // must not fall through to the canvas underneath
+                        cx.stop_propagation();
                         v.open_menu = None;
                         v.open_sub = None;
                         cx.notify();
@@ -2208,12 +2276,15 @@ impl Render for EditorView {
 
 impl EditorView {
     /// One dropdown row: optional check glyph, label, right-aligned shortcut.
-    /// Clicking closes the whole menu and runs `f`.
-    fn mi(
+    /// Clicking closes the whole menu and runs `f`. Dropdown rows clear the
+    /// open cascade on hover; submenu leaf rows (`mi_leaf`) must NOT clear it,
+    /// or hovering a submenu item unmounts its own submenu before the click.
+    fn mi_inner(
         id: impl Into<ElementId>,
         label: impl Into<SharedString>,
         shortcut: &'static str,
         check: Option<bool>,
+        clears_sub: bool,
         cx: &mut Context<Self>,
         f: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> Stateful<Div> {
@@ -2245,9 +2316,9 @@ impl EditorView {
                     .text_size(px(10.0))
                     .child(shortcut),
             )
-            .on_mouse_move(cx.listener(|v, _e: &MouseMoveEvent, _w, cx| {
+            .on_mouse_move(cx.listener(move |v, _e: &MouseMoveEvent, _w, cx| {
                 // leaving a submenu parent closes the cascade
-                if v.open_sub.is_some() {
+                if clears_sub && v.open_sub.is_some() {
                     v.open_sub = None;
                     cx.notify();
                 }
@@ -2260,6 +2331,30 @@ impl EditorView {
                 f(v, w, cx);
                 cx.notify();
             }))
+    }
+
+    /// Dropdown row — clears the open cascade when hovered.
+    fn mi(
+        id: impl Into<ElementId>,
+        label: impl Into<SharedString>,
+        shortcut: &'static str,
+        check: Option<bool>,
+        cx: &mut Context<Self>,
+        f: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> Stateful<Div> {
+        Self::mi_inner(id, label, shortcut, check, true, cx, f)
+    }
+
+    /// Submenu leaf row — must not clear the cascade it lives in.
+    fn mi_leaf(
+        id: impl Into<ElementId>,
+        label: impl Into<SharedString>,
+        shortcut: &'static str,
+        check: Option<bool>,
+        cx: &mut Context<Self>,
+        f: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> Stateful<Div> {
+        Self::mi_inner(id, label, shortcut, check, false, cx, f)
     }
 
     /// Dropdown row that cascades: hovering opens its submenu at the row's y.
@@ -2287,8 +2382,12 @@ impl EditorView {
                     .child("▸"),
             )
             .on_mouse_move(cx.listener(move |v, e: &MouseMoveEvent, _w, cx| {
+                // Only hover-open when no cascade is up: once one is open, a
+                // diagonal cursor path toward a submenu item would cross the
+                // sibling rows and replace the submenu mid-flight (classic
+                // "safe triangle" problem). Siblings still switch via click.
                 let y = f32::from(e.position.y);
-                if v.open_sub.map(|(s, _)| s) != Some(sub) {
+                if v.open_sub.is_none() {
                     v.open_sub = Some((sub, y));
                     cx.notify();
                 }

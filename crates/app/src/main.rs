@@ -57,6 +57,7 @@ enum TopMenu {
     Edit,
     View,
     Track,
+    Output,
     Transport,
     Help,
 }
@@ -66,6 +67,8 @@ enum TopMenu {
 enum Sub {
     Chan,
     Dest,
+    DefDest,
+    InPort,
     Lane,
     Enc,
     Tool,
@@ -193,11 +196,9 @@ struct EditorView {
     /// Plugin instances opened for the current playback, keyed by dest index;
     /// dropping them stops their audio streams.
     active_plugins: Vec<(usize, output::PluginOutput)>,
-    /// Standalone native window showing a plugin's GUI editor.
+    /// Standalone window hosting the open plugin editor (in-process
+    /// instance — isolated plugins cannot host a GUI on Windows).
     plugin_window: Option<vst3_host::PluginWindow>,
-    /// GUI-only plugin instance (loaded without audio when not playing);
-    /// kept alive so the editor window stays valid.
-    gui_plugin: Option<std::sync::Arc<std::sync::Mutex<vst3_host::Plugin>>>,
     /// Manual text-encoding override for display decoding (None = auto/XF hint)
     enc_override: Option<smf_core::TextEncoding>,
     playback: Option<Playback>,
@@ -221,6 +222,8 @@ struct EditorView {
     count_in: bool,
     /// recently opened files (global pref, newest first)
     recent: Vec<SharedString>,
+    /// recording source — MIDI input port name; empty = first available
+    midi_in: SharedString,
     focus: FocusHandle,
     input: Entity<InputState>,
     status: SharedString,
@@ -234,6 +237,30 @@ struct Rec {
     base_us: u64,
     /// count-in duration — input before this is discarded
     cin_us: u64,
+}
+
+/// Output destination catalog: real MIDI ports by name, then discovered
+/// VST3s. Rebuilt on `Output ▸ Rescan Plugins`.
+fn build_dest_catalog() -> Vec<(String, midi_io::Destination)> {
+    let mut dests: Vec<(String, midi_io::Destination)> = midi_io::list_outputs()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| {
+            (
+                p.name.clone(),
+                midi_io::Destination::MidiPort { port_name: p.name },
+            )
+        })
+        .collect();
+    for p in output::discover_plugins() {
+        dests.push((
+            format!("{} [VST3]", p.name),
+            midi_io::Destination::Plugin {
+                plugin_path: p.path.to_string_lossy().into_owned(),
+            },
+        ));
+    }
+    dests
 }
 
 fn empty_doc() -> Document {
@@ -262,25 +289,7 @@ impl EditorView {
         let mut sh = Shared::new(doc);
         sh.path = path.clone();
         sh.saved_revision = sh.doc.revision();
-        // destination catalog: real MIDI ports by name, then discovered VST3s
-        sh.dests = midi_io::list_outputs()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|p| {
-                (
-                    p.name.clone(),
-                    midi_io::Destination::MidiPort { port_name: p.name },
-                )
-            })
-            .collect();
-        for p in output::discover_plugins() {
-            sh.dests.push((
-                format!("{} [VST3]", p.name),
-                midi_io::Destination::Plugin {
-                    plugin_path: p.path.to_string_lossy().into_owned(),
-                },
-            ));
-        }
+        sh.dests = build_dest_catalog();
         let g = GlobalPrefs::load();
         let shared = Arc::new(Mutex::new(sh));
         let mut v = Self {
@@ -305,7 +314,6 @@ impl EditorView {
             zoom: 0.08,
             active_plugins: Vec::new(),
             plugin_window: None,
-            gui_plugin: None,
             enc_override: None,
             playback: None,
             play_us: 0,
@@ -316,6 +324,7 @@ impl EditorView {
             help_open: false,
             count_in: g.count_in,
             recent: g.recent.iter().map(|p| p.as_str().into()).collect(),
+            midi_in: g.midi_in.clone().into(),
             open_sub: None,
             show_events: true,
             focus: cx.focus_handle(),
@@ -1443,9 +1452,15 @@ impl EditorView {
         } else {
             0
         };
-        match midi_io::Input::open(0, move |us, b| {
+        let cb = move |us, b: &[u8]| {
             buf2.lock().unwrap().push((us, b.to_vec()));
-        }) {
+        };
+        let opened = if self.midi_in.is_empty() {
+            midi_io::Input::open(0, cb)
+        } else {
+            midi_io::Input::open_named(&self.midi_in, cb)
+        };
+        match opened {
             Ok(input) => {
                 self.rec = Some(Rec {
                     _input: input,
@@ -1517,44 +1532,70 @@ impl EditorView {
         self.status = format!("rec: {n} events").into();
     }
 
-    /// Open the selected destination's plugin GUI in its own native window.
-    /// Reuses the live playback instance when one exists.
+    /// Rebuild the output destination catalog (Output ▸ Rescan Plugins).
+    /// Selections are indices into `dests`; remap them onto the rebuilt list
+    /// by `Destination` equality so assignments survive port/plugin churn.
+    fn rescan_plugins(&mut self) {
+        let fresh = build_dest_catalog();
+        let mut sh = self.shared.lock().unwrap();
+        let old_default = sh.dests.get(sh.default_dest).map(|(_, d)| d.clone());
+        let old_tracks: Vec<(usize, midi_io::Destination)> = sh
+            .track_dest
+            .iter()
+            .filter_map(|(t, i)| sh.dests.get(*i).map(|(_, d)| (*t, d.clone())))
+            .collect();
+        sh.dests = fresh;
+        sh.default_dest = old_default
+            .and_then(|d| sh.dests.iter().position(|(_, dd)| *dd == d))
+            .unwrap_or(0);
+        sh.track_dest = old_tracks
+            .into_iter()
+            .filter_map(|(t, d)| {
+                sh.dests
+                    .iter()
+                    .position(|(_, dd)| *dd == d)
+                    .map(|i| (t, i))
+            })
+            .collect();
+        let n = sh.dests.len();
+        drop(sh);
+        if let Some(mut pw) = self.plugin_window.take() {
+            pw.close();
+        }
+        let ns = n.to_string();
+        self.status = tf("status.rescan", &[("n", ns.as_str())]).into();
+    }
+
+    /// Toggle the selected destination's plugin editor. Process-isolated
+    /// plugins cannot host a GUI on Windows (the helper's GUI loop is
+    /// macOS-only), so the editor always loads a separate in-process
+    /// instance inside a `PluginWindow` — a standalone Win32 window that
+    /// hosts the plugin's editor view.
     fn open_plugin_gui(&mut self) {
-        let (d, path) = {
+        if let Some(mut pw) = self.plugin_window.take() {
+            pw.close();
+            return;
+        }
+        let path = {
             let sh = self.shared.lock().unwrap();
             let d = sh.dest_of(self.sel_track);
-            let path = sh.dests.get(d).and_then(|(_, dd)| match dd {
+            sh.dests.get(d).and_then(|(_, dd)| match dd {
                 output::Destination::Plugin { plugin_path } => {
                     Some(PathBuf::from(plugin_path))
                 }
                 _ => None,
-            });
-            (d, path)
+            })
         };
         let Some(path) = path else { return };
-        let live = self
-            .active_plugins
-            .iter()
-            .find(|(i, _)| *i == d)
-            .map(|(_, p)| p.plugin_handle());
-        let (arc, is_live) = match live {
-            Some(a) => (Some(a), true),
-            None => (output::load_for_gui(&path).ok(), false),
-        };
-        match arc {
-            Some(a) => {
-                let mut w = vst3_host::PluginWindow::new(a.clone());
-                match w.open() {
-                    Ok(()) => {
-                        if !is_live {
-                            self.gui_plugin = Some(a);
-                        }
-                        self.plugin_window = Some(w);
-                    }
+        match output::load_for_gui(&path) {
+            Ok(a) => {
+                let mut pw = vst3_host::PluginWindow::new(a);
+                match pw.open() {
+                    Ok(()) => self.plugin_window = Some(pw),
                     Err(e) => self.status = format!("plugin GUI: {e}").into(),
                 }
             }
-            None => self.status = "plugin load failed".into(),
+            Err(_) => self.status = "plugin load failed".into(),
         }
     }
 
@@ -1639,12 +1680,14 @@ fn load_document(path: &PathBuf) -> Result<(Document, Vec<String>), String> {
     Ok((Document::from_file(file), warnings))
 }
 
-/// App-wide preferences: recent files + record count-in. Stored at
-/// %APPDATA%/midi-editor/prefs.json (unlike the per-song sidecar).
+/// App-wide preferences: recent files + record count-in + recording source.
+/// Stored at %APPDATA%/midi-editor/prefs.json (unlike the per-song sidecar).
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct GlobalPrefs {
     recent: Vec<String>,
     count_in: bool,
+    /// MIDI input port name to record from; empty = first available port
+    midi_in: String,
 }
 
 impl GlobalPrefs {
@@ -1800,6 +1843,7 @@ impl EditorView {
         GlobalPrefs {
             recent: self.recent.iter().map(|r| r.to_string()).collect(),
             count_in: self.count_in,
+            midi_in: self.midi_in.to_string(),
         }
         .save();
     }
@@ -1958,6 +2002,14 @@ fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
                     // repaint while playing so the playhead/counter advance;
                     // also while a plugin editor is open so its native event
                     // queue gets serviced even when the app is idle
+                    // keep repainting while a plugin editor is open so its
+                    // platform events get pumped and user-close is noticed
+                    if let Some(pw) = &v.plugin_window {
+                        let _ = pw.service_platform_events();
+                        if pw.closed_by_user() {
+                            v.plugin_window = None;
+                        }
+                    }
                     if dirty || v.playback.is_some() || v.plugin_window.is_some() {
                         cx.notify();
                     }

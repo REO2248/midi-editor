@@ -14,8 +14,55 @@ pub struct PluginInfo {
     pub path: std::path::PathBuf,
 }
 
-/// Scan the standard VST3 install locations without loading plugins.
+/// VST3 host factory: plugins load into `vst3-host-helper` subprocesses so a
+/// crashing or hanging plugin cannot take the app down. `auto_recover`
+/// respawns the helper and retries control-plane commands transparently.
+fn new_host() -> Result<vst3_host::Vst3Host, PluginError> {
+    vst3_host::Vst3Host::builder()
+        .scan_default_paths()
+        .with_process_isolation(true)
+        .auto_recover_plugins(true)
+        .auto_recover_max_retries(1)
+        .build()
+        .map_err(|e| PluginError::Host(e.to_string()))
+}
+
+/// In-process host for editor windows only. vst3-host's isolated GUI loop is
+/// macOS-only — on Windows an isolated plugin cannot open its editor, so the
+/// editor instance loads in-process instead. Used solely for `load_for_gui`;
+/// playback always goes through `new_host()`.
+fn new_host_in_process() -> Result<vst3_host::Vst3Host, PluginError> {
+    vst3_host::Vst3Host::builder()
+        .scan_default_paths()
+        .build()
+        .map_err(|e| PluginError::Host(e.to_string()))
+}
+
+/// Scan the standard VST3 install locations. Prefers the crash-resistant probe
+/// (each bundle is introspected in a subprocess); falls back to listing
+/// filenames when the probe binary isn't shipped alongside the app.
 pub fn discover_plugins() -> Vec<PluginInfo> {
+    if let Ok(host) = new_host() {
+        let report = host.discover_plugins_safe();
+        if report.scan_ran() && !report.plugins.is_empty() {
+            let mut found: Vec<PluginInfo> = report
+                .plugins
+                .iter()
+                .map(|p| PluginInfo {
+                    name: p.info.name.clone(),
+                    path: p.info.path.clone(),
+                })
+                .collect();
+            found.sort_by(|a, b| a.name.cmp(&b.name));
+            found.dedup_by(|a, b| a.path == b.path);
+            return found;
+        }
+    }
+    discover_plugin_paths()
+}
+
+/// Fallback scan: enumerate `.vst3` bundles without loading them.
+fn discover_plugin_paths() -> Vec<PluginInfo> {
     let mut found = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for dir in vst3_scan_dirs() {
@@ -89,8 +136,7 @@ impl PluginOutput {
     /// Load `path` (a .vst3 bundle), start its audio stream on the default
     /// output device via cpal, and return a playable destination.
     pub fn open(path: &std::path::Path) -> Result<Self, PluginError> {
-        let mut host =
-            vst3_host::Vst3Host::new().map_err(|e| PluginError::Host(e.to_string()))?;
+        let mut host = new_host()?;
         let plugin = host
             .load_plugin(path)
             .map_err(|e| PluginError::Load(e.to_string()))?;
@@ -144,11 +190,12 @@ impl PluginOutput {
 
 /// Load a plugin just for its GUI — no audio stream. The returned instance
 /// is not wired to any output; use it to inspect/edit the editor, or hand it
-/// to `vst3_host::PluginWindow`.
+/// to `vst3_host::PluginWindow`. Runs in-process because process-isolated
+/// plugins cannot host editors on Windows.
 pub fn load_for_gui(
     path: &std::path::Path,
 ) -> Result<std::sync::Arc<std::sync::Mutex<vst3_host::Plugin>>, PluginError> {
-    let mut host = vst3_host::Vst3Host::new().map_err(|e| PluginError::Host(e.to_string()))?;
+    let mut host = new_host_in_process()?;
     let plugin = host
         .load_plugin(path)
         .map_err(|e| PluginError::Load(e.to_string()))?;
