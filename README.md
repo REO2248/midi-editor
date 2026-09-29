@@ -7,8 +7,6 @@ A modern, pure-SMF MIDI file editor with an embedded MCP server — a "VSCode fo
 - Track destinations: built-in GM synth / MIDI out ports (loopMIDI, physical) / hosted VST3
 - MCP-native: humans and LLM agents edit the same document through one transaction path
 
-Design docs live in `docs/research/` — start with `00-synthesis.md`.
-
 Status: functional. File open/save (byte-exact SMF round-trip), piano roll +
 event list, note editing (draw/drag/edge-resize/marquee multi-select/Alt-drag
 duplicate), undo/redo, multi-destination playback (MIDI port or hosted VST3
