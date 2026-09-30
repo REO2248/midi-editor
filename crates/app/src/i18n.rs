@@ -173,6 +173,7 @@ static EN: &[(&str, &str)] = &[
     ("plugin.phase_host", "host init"),
     ("plugin.phase_load", "plugin load"),
     ("plugin.phase_audio", "audio start"),
+    ("plugin.latency", "latency {n} smp (~{ms} ms), compensated"),
     ("status.rescan", "rescanned: {n} destination(s)"),
 ];
 
@@ -290,6 +291,7 @@ static JA: &[(&str, &str)] = &[
     ("plugin.phase_host", "ホスト初期化"),
     ("plugin.phase_load", "プラグイン読み込み"),
     ("plugin.phase_audio", "オーディオ開始"),
+    ("plugin.latency", "レイテンシ {n} サンプル（約{ms} ms）— 先行送出で補正"),
     ("status.rescan", "再スキャン: {n} 件の出力先"),
     ("edit.legato", "レガート"),
     ("edit.set_length", "長さを統一"),

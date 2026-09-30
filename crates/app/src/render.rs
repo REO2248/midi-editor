@@ -2530,7 +2530,15 @@ impl Render for EditorView {
                     .unwrap_or_default();
                 let (state, color, retry, detail) = match self.plugin_state.get(&i) {
                     Some(PluginState::Ready { .. }) => {
-                        (t("plugin.state_ready"), 0x8fd0a0, false, None)
+                        let detail = self.plugin_slots.get(&i).map(|slot| {
+                            let n = slot.latency.samples().to_string();
+                            let ms = format!("{:.1}", slot.latency.as_us() as f64 / 1000.0);
+                            crate::i18n::tf(
+                                "plugin.latency",
+                                &[("n", n.as_str()), ("ms", ms.as_str())],
+                            )
+                        });
+                        (t("plugin.state_ready"), 0x8fd0a0, false, detail)
                     }
                     Some(PluginState::Loading { .. }) => {
                         (t("plugin.state_loading"), 0xe0b050, false, None)
