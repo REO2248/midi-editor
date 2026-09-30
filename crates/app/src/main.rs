@@ -318,6 +318,11 @@ struct EditorView {
     play_pending: bool,
     plugin_meta: HashMap<String, output::PluginInfo>,
     scan_rx: Option<std::sync::mpsc::Receiver<output::ScanReport>>,
+    /// in-flight save worker — at most one: a second Ctrl+S while a slow
+    /// save runs is ignored rather than queued
+    save_rx: Option<
+        std::sync::mpsc::Receiver<Result<mcp_server::service::SaveOutcome, String>>,
+    >,
     scan_note: Option<String>,
     scan_probe_used: Option<bool>,
     host_diag: output::HostDiag,
@@ -506,6 +511,7 @@ impl EditorView {
                 .map(|p| (p.path.to_string_lossy().into_owned(), p))
                 .collect(),
             scan_rx: None,
+            save_rx: None,
             scan_note: None,
             scan_probe_used: None,
             host_diag: output::host_diag(),
@@ -1550,12 +1556,29 @@ impl EditorView {
     }
 
     fn save(&mut self, cx: &mut Context<Self>) {
-        // the same persistence core MCP save uses — serialize under the
-        // lock, write outside it, mark saved only after the replace lands
-        match mcp_server::service::save_document(&self.shared, Default::default()) {
-            Ok(_) => {
-                self.status = t("status.saved").into();
-                self.persist();
+        if self.save_rx.is_some() {
+            return; // one save in flight — a second Ctrl+S isn't queued
+        }
+        // the same persistence core MCP save uses: snapshot under a short
+        // lock, then serialize+write on a worker so a slow save never
+        // freezes the UI. The revision is marked saved only after the
+        // durable replace lands; edits meanwhile stay dirty.
+        match mcp_server::service::begin_save(&self.shared, Default::default()) {
+            Ok(ticket) => {
+                // non-modal progress only when the save can be perceptible
+                if ticket.event_count() > 100_000 {
+                    self.status = t("status.saving").into();
+                }
+                let shared = self.shared.clone();
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(
+                        mcp_server::service::finish_save(ticket)
+                            .map_err(|e| e.to_string()),
+                    );
+                    drop(shared);
+                });
+                self.save_rx = Some(rx);
             }
             Err(mcp_server::service::SaveError::NoPath) => {
                 self.save_as(cx);
@@ -2907,6 +2930,22 @@ fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
                         if let Ok(report) = rx.try_recv() {
                             v.scan_rx = None;
                             v.apply_catalog(report);
+                            cx.notify();
+                        }
+                    }
+                    if let Some(rx) = &v.save_rx {
+                        if let Ok(done) = rx.try_recv() {
+                            v.save_rx = None;
+                            match done {
+                                // committed=false means the document was
+                                // swapped mid-save — its state governs
+                                Ok(out) if out.committed => {
+                                    v.status = t("status.saved").into();
+                                    v.persist();
+                                }
+                                Ok(_) => {}
+                                Err(e) => v.status = e.into(),
+                            }
                             cx.notify();
                         }
                     }

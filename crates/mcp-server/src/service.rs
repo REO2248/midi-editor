@@ -72,49 +72,102 @@ pub struct SaveOutcome {
     /// false when the document was swapped while the write was in flight:
     /// the bytes are on disk but the *current* document is not marked saved
     pub committed: bool,
+    /// how long the snapshot critical section held the editor lock —
+    /// the number `begin_save` keeps small (clone, not serialize+write)
+    pub lock_held: std::time::Duration,
 }
 
-/// The single save path every frontend shares: snapshot under the lock,
-/// durable write without it, then mark the revision saved only after the
-/// replace landed — and only if the document wasn't swapped meanwhile.
-pub fn save_document(shared: &SharedDoc, req: SaveRequest) -> Result<SaveOutcome, SaveError> {
-    // 1. serialize under the lock and remember the revision the bytes came
-    //    from — edits applied after this stay dirty
-    let (bytes, rev, gen, path) = {
-        let sh = lock(shared);
-        let path = req
-            .path
-            .map(PathBuf::from)
-            .or_else(|| sh.path.clone())
-            .ok_or(SaveError::NoPath)?;
-        let rev = sh.doc.revision();
-        if let Some(expected) = req.expect_revision {
-            if rev != expected {
-                return Err(SaveError::Conflict {
-                    expected,
-                    actual: rev,
-                });
-            }
-        }
-        (sh.doc.serialize(save_options()), rev, sh.generation, path)
-    };
-    // 2. durable write — never hold the editor lock across disk I/O
-    persist::write_atomic(&path, &bytes)?;
-    // 3. commit: mark saved only now, and only for the document we
-    //    actually serialized (a swapped-in doc stays at its own state)
-    let mut sh = lock(shared);
-    let committed = sh.generation == gen;
-    if committed {
-        sh.saved_revision = rev;
+/// A save in flight between `begin_save` and `finish_save`: the snapshot
+/// bytes will be serialized from, plus the revision bookkeeping needed to
+/// commit safely. `Send` — the GUI moves it to a worker thread so a slow
+/// save never runs on the UI critical path.
+pub struct SaveTicket {
+    shared: SharedDoc,
+    path: PathBuf,
+    snapshot: document::DocSnapshot,
+    revision: u64,
+    generation: u64,
+    /// how long `begin_save` held the editor lock (benchmark signal)
+    lock_held: std::time::Duration,
+}
+
+impl SaveTicket {
+    /// the snapshot's event count — e.g. to gate save-progress UI on
+    /// whether the save is likely to be perceptible at all
+    pub fn event_count(&self) -> usize {
+        self.snapshot.event_count()
     }
-    let leftovers = persist::temp_siblings(&path);
+
+    /// the snapshot this save will write — e.g. to time serialization
+    /// separately in benchmarks
+    pub fn snapshot(&self) -> &document::DocSnapshot {
+        &self.snapshot
+    }
+}
+
+/// The single save path every frontend shares, in two steps: `begin_save`
+/// takes a snapshot under one short lock; `finish_save` serializes and
+/// writes without the editor lock, so a slow save never freezes edits.
+/// `save_document` composes both for synchronous callers (MCP/stdio).
+pub fn begin_save(shared: &SharedDoc, req: SaveRequest) -> Result<SaveTicket, SaveError> {
+    // resolve the path, check the optimistic guard, and clone the snapshot
+    // — all under one short lock. Edits applied after this stay dirty.
+    let t0 = std::time::Instant::now();
+    let sh = lock(shared);
+    let path = req
+        .path
+        .map(PathBuf::from)
+        .or_else(|| sh.path.clone())
+        .ok_or(SaveError::NoPath)?;
+    let rev = sh.doc.revision();
+    if let Some(expected) = req.expect_revision {
+        if rev != expected {
+            return Err(SaveError::Conflict {
+                expected,
+                actual: rev,
+            });
+        }
+    }
+    Ok(SaveTicket {
+        shared: shared.clone(),
+        path,
+        snapshot: sh.doc.snapshot(),
+        revision: rev,
+        generation: sh.generation,
+        lock_held: t0.elapsed(),
+    })
+}
+
+/// Serialize the snapshot and write it durably — no editor lock held.
+/// Marks the revision saved only after the replace landed, and only if
+/// the document wasn't swapped meanwhile.
+pub fn finish_save(ticket: SaveTicket) -> Result<SaveOutcome, SaveError> {
+    // 1. serialize + durable write — never hold the editor lock across
+    //    encode or disk I/O
+    let bytes = ticket.snapshot.serialize(save_options());
+    persist::write_atomic(&ticket.path, &bytes)?;
+    // 2. commit: mark saved only now, and only for the document we
+    //    actually snapshotted (a swapped-in doc stays at its own state)
+    let mut sh = lock(&ticket.shared);
+    let committed = sh.generation == ticket.generation;
+    if committed {
+        sh.saved_revision = ticket.revision;
+    }
+    let leftovers = persist::temp_siblings(&ticket.path);
     drop(sh);
     Ok(SaveOutcome {
-        path,
-        revision: rev,
+        path: ticket.path,
+        revision: ticket.revision,
         leftovers,
         committed,
+        lock_held: ticket.lock_held,
     })
+}
+
+/// Synchronous save — the same begin/finish core MCP, stdio, and the GUI's
+/// save worker all route through.
+pub fn save_document(shared: &SharedDoc, req: SaveRequest) -> Result<SaveOutcome, SaveError> {
+    finish_save(begin_save(shared, req)?)
 }
 
 /// Replace the shared document in place — the MCP server and GUI hold the
@@ -274,6 +327,51 @@ mod tests {
         assert_eq!(out.revision, lock(&sh).doc.revision());
         let g = lock(&sh);
         assert_eq!(g.saved_revision, g.doc.revision());
+    }
+
+    #[test]
+    fn snapshot_serializes_identical_bytes() {
+        // DocSnapshot::serialize must be the same bytes Document::serialize
+        // produced — the split path is a pure move, not a format change
+        let sh = shared();
+        let opts = save_options();
+        let g = lock(&sh);
+        let a = g.doc.serialize(opts);
+        let b = g.doc.snapshot().serialize(opts);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn finish_save_marks_only_the_snapshotted_revision() {
+        // an edit landing after begin_save must stay dirty: saved_revision
+        // only covers the revision the bytes came from
+        let sh = shared();
+        let p = testdir("finish_save_marks_only_the_snapshotted_revision").join("a.mid");
+        lock(&sh).path = Some(p.clone());
+        let ticket = begin_save(&sh, SaveRequest::default()).unwrap();
+        // concurrent edit while the save is in flight
+        lock(&sh)
+            .apply(
+                "t",
+                vec![Op::InsertTrack {
+                    index: 1,
+                    track: document::Track {
+                        name: None,
+                        out_port: 0,
+                        out_channel: 0,
+                        events: vec![],
+                    },
+                }],
+            )
+            .unwrap();
+        let out = finish_save(ticket).unwrap();
+        assert!(out.committed);
+        let g = lock(&sh);
+        assert_eq!(g.saved_revision, out.revision);
+        assert!(
+            g.doc.revision() > g.saved_revision,
+            "post-snapshot edit stays dirty"
+        );
     }
 
     #[test]
