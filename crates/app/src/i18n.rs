@@ -132,6 +132,8 @@ static EN: &[(&str, &str)] = &[
     ("events.nudge_dn", "Event value −1"),
     ("events.nudge_up", "Event value +1"),
     ("view.lane", "Lane"),
+    ("view.lane.add", "Add lane"),
+    ("view.lane.remove", "Remove lane"),
     ("view.encoding", "Text Encoding"),
     ("enc.auto", "Auto"),
     // Track
@@ -536,6 +538,8 @@ static JA: &[(&str, &str)] = &[
     ("events.nudge_dn", "イベント値 −1"),
     ("events.nudge_up", "イベント値 +1"),
     ("view.lane", "レーン"),
+    ("view.lane.add", "レーン追加"),
+    ("view.lane.remove", "レーン削除"),
     ("view.encoding", "文字エンコーディング"),
     ("enc.auto", "自動"),
     ("track.rename", "名前を変更…"),
