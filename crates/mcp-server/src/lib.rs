@@ -1479,7 +1479,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ),
         spec(
             "get_tempo_map",
-            "Tempo breakpoints: [{tick, us_per_quarter, bpm, cumulative_us}] + ppq. Read before editing tempo or converting ticks<->time.",
+            "Tempo breakpoints: [{tick, us_per_quarter, bpm, cumulative_us}] + ppq (null for SMPTE — fps/ticks_per_frame are reported instead). Read before editing tempo or converting ticks<->time.",
             object_schema(serde_json::json!({})),
         ),
         spec(
@@ -1533,7 +1533,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ),
         spec(
             "quantize",
-            "Snap note onsets to a grid (duration preserved). Args: track? (all when omitted), from?, to?, grid? (ticks, default ppq/4), strength? (0-100, default 100). Optional base_revision.",
+            "Snap note onsets to a grid (duration preserved). Args: track? (all when omitted), from?, to?, grid? (ticks, default ppq/4 metrical / one frame SMPTE), strength? (0-100, default 100). Optional base_revision.",
             object_schema(serde_json::json!({
                 "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
                 "grid": {"type": "integer"}, "strength": {"type": "integer"},
@@ -2065,8 +2065,20 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
         }
         "get_tempo_map" => {
             let tm = &sh.view().tempo_map;
+            let (fps, tpf) = match sh.view().division {
+                smf_core::Division::Smpte {
+                    fps,
+                    ticks_per_frame,
+                } => (Some(fps), Some(ticks_per_frame)),
+                smf_core::Division::Metrical(_) => (None, None),
+            };
             ok_json(serde_json::json!({
+                // None for SMPTE: there is no quarter note — use
+                // fps*ticks_per_frame for tick<->time math instead
                 "ppq": tm.ppq(),
+                "fps": fps,
+                "ticks_per_frame": tpf,
+                "ticks_per_second": fps.map(|f| f as u64 * tpf.unwrap_or(1) as u64),
                 "points": tm.points().iter().map(|(tick, mpq, cum)| serde_json::json!({
                     "tick": tick, "us_per_quarter": mpq,
                     "bpm": (60_000_000.0 / *mpq as f64 * 100.0).round() / 100.0,
@@ -2271,9 +2283,11 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
                 return r;
             }
             let (from, to) = region(args);
+            // default grid: a 16th note for metrical, one frame for SMPTE
+            // — never a pretend PPQ
             let grid = args["grid"]
                 .as_u64()
-                .unwrap_or_else(|| sh.view().tempo_map.ppq() / 4);
+                .unwrap_or_else(|| sh.view().time_display().min_grid_ticks());
             let strength = args["strength"].as_u64().unwrap_or(100) as u32;
             let tracks = match sel_tracks(&sh, args) {
                 Ok(t) => t,

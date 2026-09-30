@@ -12,6 +12,9 @@ use smf_core::{Division, EventKind};
 use std::collections::HashMap;
 use thiserror::Error;
 
+mod timing;
+pub use timing::TimeDisplay;
+
 pub type EventId = u64;
 pub type Revision = u64;
 
@@ -717,6 +720,27 @@ impl Document {
             }
         }
         out
+    }
+
+    /// How the UI should present this document's timing (bar/beat grid
+    /// vs SMPTE timecode) — straight from the division, never a fake PPQ.
+    pub fn time_display(&self) -> TimeDisplay {
+        TimeDisplay::of(self.division)
+    }
+
+    /// Last event tick in one track — a sequence's own duration. Matters
+    /// for format 2, where each track is an independent sequence rather
+    /// than a lane of one shared timeline.
+    pub fn track_end_tick(&self, track: usize) -> u64 {
+        self.tracks
+            .get(track)
+            .and_then(|t| t.events.iter().map(|e| e.tick).max())
+            .unwrap_or(0)
+    }
+
+    /// Whether this file declares format 2 (independent sequences).
+    pub fn is_sequential(&self) -> bool {
+        self.format == 2
     }
 
     pub fn serialize(&self, opts: smf_core::WriteOptions) -> Vec<u8> {
@@ -1750,11 +1774,15 @@ impl TempoMap {
         &self.points
     }
 
-    pub fn ppq(&self) -> u64 {
+    /// Ticks per quarter note for metrical divisions; `None` for SMPTE —
+    /// there is no quarter note to derive one from, and returning a
+    /// pretend value puts invented bar/beat positions in front of users.
+    /// Callers needing a display grid should use
+    /// [`Document::time_display`].
+    pub fn ppq(&self) -> Option<u64> {
         match self.division {
-            Division::Metrical(p) => p.max(1) as u64,
-            // SMPTE has no quarter note; 480 keeps UI grid math sane
-            Division::Smpte { .. } => 480,
+            Division::Metrical(p) => Some(p.max(1) as u64),
+            Division::Smpte { .. } => None,
         }
     }
 
