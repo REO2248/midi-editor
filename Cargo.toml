@@ -43,6 +43,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net",
 axum = "0.8"
 http = "1"
 
+# testing
+proptest = "1"
+
 [profile.dev]
 # faster link times during spike work
 incremental = true

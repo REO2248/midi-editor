@@ -1098,12 +1098,16 @@ impl Document {
                 r
             };
             let dt = if timing > 0 {
-                (next() % (timing as u64 * 2 + 1)) as i64 - timing
+                // i64-wide math: the modulo result can exceed i64::MAX/2
+                let t = timing.min(i64::MAX / 2);
+                (next() % (t as u64 * 2 + 1)) as i64 - t
             } else {
                 0
             };
             let dv = if vel > 0 {
-                (next() % (vel as u64 * 2 + 1)) as i32 - vel
+                // u64 span can't overflow (vel <= i32::MAX), but the modulo
+                // result does exceed i32::MAX — subtract in i64, then narrow
+                ((next() % (vel as u64 * 2 + 1)) as i64 - vel as i64) as i32
             } else {
                 0
             };
@@ -1370,19 +1374,39 @@ impl Document {
                 after,
             }];
         }
-        vec![Op::InsertEvents {
+        self.conductor_insert_ops(tick, EventKind::Meta {
+            meta_type: 0x51,
+            data,
+        })
+    }
+
+    /// Shared tail for conductor-track (track 0) single-event builders:
+    /// inserts the event on track 0, creating the track first when the
+    /// document has none — otherwise the transaction fails UnknownTrack(0).
+    fn conductor_insert_ops(&mut self, tick: u64, kind: EventKind) -> Vec<Op> {
+        let mut ops = Vec::new();
+        if self.tracks.is_empty() {
+            ops.push(Op::InsertTrack {
+                index: 0,
+                track: Track {
+                    name: None,
+                    out_port: 0,
+                    out_channel: 0,
+                    events: vec![],
+                },
+            });
+        }
+        ops.push(Op::InsertEvents {
             track: 0,
             events: vec![Event {
                 id: self.alloc_event_id(),
                 tick,
                 seq: self.next_seq(0, tick),
                 raw_body: None,
-                kind: EventKind::Meta {
-                    meta_type: 0x51,
-                    data,
-                },
+                kind,
             }],
-        }]
+        });
+        ops
     }
 
     /// Set/replace the time signature at `tick` on track 0 (denominator given
@@ -1411,19 +1435,10 @@ impl Document {
                 after,
             }];
         }
-        vec![Op::InsertEvents {
-            track: 0,
-            events: vec![Event {
-                id: self.alloc_event_id(),
-                tick,
-                seq: self.next_seq(0, tick),
-                raw_body: None,
-                kind: EventKind::Meta {
-                    meta_type: 0x58,
-                    data,
-                },
-            }],
-        }]
+        self.conductor_insert_ops(tick, EventKind::Meta {
+            meta_type: 0x58,
+            data,
+        })
     }
 
     /// Set the track's output channel meta (`FF 20`): update the existing

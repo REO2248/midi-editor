@@ -8,3 +8,6 @@ description = "Edit commands and undo stack over document Transactions"
 document.workspace = true
 smf-core.workspace = true
 bytes.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
