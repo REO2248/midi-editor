@@ -26,3 +26,28 @@ jobs:
         run: cargo test -p smf-core -p document -p commands -p mcp-server --locked
       - name: Build workspace (gpui app needs Windows)
         run: cargo build --workspace --locked
+
+  fuzz-smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Cache fuzz target
+        uses: actions/cache@v4
+        with:
+          path: fuzz/target
+          key: ${{ runner.os }}-fuzz-${{ hashFiles('fuzz/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-fuzz-
+      - name: Fuzz smoke (45s per target)
+        working-directory: fuzz
+        shell: pwsh
+        run: |
+          foreach ($t in 'parse_strict','parse_lenient','parse_write','write_parse','normalize_fixpoint') {
+            New-Item -ItemType Directory -Force "corpus/$t" | Out-Null
+            cargo fuzz run $t "corpus/$t" corpus/shared corpus/not_strict -- -max_total_time=45 -rss_limit_mb=2048
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }

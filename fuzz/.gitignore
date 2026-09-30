@@ -1,0 +1,9 @@
+target/
+artifacts/
+# fuzzer-grown coverage entries are regenerable — only the committed seeds
+# (corpus/shared, corpus/not_strict) and crash regressions live in git
+corpus/parse_strict/
+corpus/parse_lenient/
+corpus/parse_write/
+corpus/write_parse/
+corpus/normalize_fixpoint/

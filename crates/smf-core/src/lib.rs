@@ -72,12 +72,12 @@ pub struct File {
 }
 
 pub fn parse(raw: &[u8]) -> Result<File, Error> {
-    let map = match catch_unwind(AssertUnwindSafe(|| SmfBytemap::parse(raw))) {
-        Ok(Ok(m)) => m,
+    match catch_unwind(AssertUnwindSafe(|| SmfBytemap::parse(raw))) {
+        Ok(Ok(m)) => Ok(file_from_map(raw, m)),
         Ok(Err(e)) => {
             // keep the strict-parser reason even when lenient recovery also
             // fails — "no MTrk chunks" alone hides the real defect
-            return parse_lenient(raw)
+            parse_lenient(raw)
                 .map(|mut f| {
                     f.warnings.insert(
                         0,
@@ -85,17 +85,26 @@ pub fn parse(raw: &[u8]) -> Result<File, Error> {
                     );
                     f
                 })
-                .map_err(|_| Error::Parse(format!("{e} (lenient recovery also failed)")));
+                .map_err(|_| Error::Parse(format!("{e} (lenient recovery also failed)")))
         }
-        Err(_) => {
-            return parse_lenient(raw).map(|mut f| {
-                f.warnings
-                    .insert(0, "strict parser panicked; lenient recovery used".into());
-                f
-            });
-        }
-    };
+        Err(_) => parse_lenient(raw).map(|mut f| {
+            f.warnings
+                .insert(0, "strict parser panicked; lenient recovery used".into());
+            f
+        }),
+    }
+}
 
+/// The strict (midly-backed) parse alone: no `catch_unwind` guard and no
+/// lenient fallback, so errors — and panics — reach the caller unfiltered.
+/// `parse` is the guarded entry point for untrusted input; this one exists
+/// for fuzzers and validators that must see the raw behavior.
+pub fn parse_strict(raw: &[u8]) -> Result<File, Error> {
+    let map = SmfBytemap::parse(raw).map_err(|e| Error::Parse(format!("{e}")))?;
+    Ok(file_from_map(raw, map))
+}
+
+fn file_from_map(raw: &[u8], map: SmfBytemap<'_>) -> File {
     let mut warnings = Vec::new();
     detect_extra_chunks(raw, &mut warnings);
 
@@ -134,12 +143,12 @@ pub fn parse(raw: &[u8]) -> Result<File, Error> {
         })
         .collect();
 
-    Ok(File {
+    File {
         format,
         division,
         tracks,
         warnings,
-    })
+    }
 }
 
 fn detect_extra_chunks(raw: &[u8], warnings: &mut Vec<String>) {
@@ -178,8 +187,9 @@ fn detect_extra_chunks(raw: &[u8], warnings: &mut Vec<String>) {
 /// the common real-world violations: running status surviving meta/sysex
 /// events, payload lengths over-running the chunk, and truncated tails.
 /// Output is normalized on write (full status bytes), so the pipeline stays a
-/// fixpoint even though byte-exactness is lost.
-fn parse_lenient(raw: &[u8]) -> Result<File, Error> {
+/// fixpoint even though byte-exactness is lost. Public so fuzzers can target
+/// the recovery path directly; `parse` remains the normal entry point.
+pub fn parse_lenient(raw: &[u8]) -> Result<File, Error> {
     if raw.len() < 14 || &raw[0..4] != b"MThd" {
         return Err(Error::Parse("missing MThd header".into()));
     }
@@ -266,6 +276,12 @@ fn track_lenient(data: &[u8], tno: usize, warnings: &mut Vec<String>) -> Track {
             let Some(&mt) = data.get(p) else { break };
             p += 1;
             let (l, np) = read_vlq_lenient(data, p);
+            if np == p {
+                // chunk ends before the length VLQ — the raw isn't
+                // self-delimiting, so verbatim re-emission would let the next
+                // reader consume the following byte as the length
+                clean = false;
+            }
             p = np;
             // u64 math: a corrupt VLQ length can exceed usize and must not
             // overflow the pointer arithmetic
@@ -292,6 +308,9 @@ fn track_lenient(data: &[u8], tno: usize, warnings: &mut Vec<String>) -> Track {
             let is_sysex = st == 0xF0;
             p += 1;
             let (l, np) = read_vlq_lenient(data, p);
+            if np == p {
+                clean = false; // missing length VLQ — see meta branch
+            }
             p = np;
             let overruns = l > (data.len() - p) as u64;
             let end = if overruns { data.len() } else { p + l as usize };
@@ -308,7 +327,7 @@ fn track_lenient(data: &[u8], tno: usize, warnings: &mut Vec<String>) -> Track {
                 EventKind::Escape(payload)
             };
             p = end;
-        } else if st >= 0x80 {
+        } else if st >= 0x80 && st < 0xF0 {
             running = Some(st);
             p += 1;
             let want = if matches!(st >> 4, 0xC | 0xD) { 1 } else { 2 };
@@ -322,6 +341,19 @@ fn track_lenient(data: &[u8], tno: usize, warnings: &mut Vec<String>) -> Track {
                 len: want as u8,
             };
             p += want;
+        } else if st > 0xF0 {
+            // F1-F6 system common / F8-FE realtime: not channel events and
+            // have their own (often zero) data widths, so consuming them as
+            // two-byte channel data corrupts the stream — and would make
+            // lenient's channel set disagree with the writer's (0x80..0xF0).
+            // Keep each byte as an opaque event so it round-trips verbatim.
+            // Realtime bytes legally interleave inside running-status events,
+            // which is why `running` is left untouched.
+            warnings.push(format!(
+                "track {tno}: system byte 0x{st:02x} kept as opaque event"
+            ));
+            kind = EventKind::Escape(Bytes::new());
+            p += 1;
         } else {
             let Some(st) = running else {
                 warnings.push(format!(
@@ -477,10 +509,14 @@ pub fn write_vlq(mut v: u64, out: &mut Vec<u8>) {
 
 fn encode_body(kind: &EventKind, out: &mut Vec<u8>) {
     match kind {
-        EventKind::Channel { status, data, len } => {
+        EventKind::Channel { status, data, len: _ } => {
             out.push(*status);
             out.push(data[0]);
-            if *len == 2 {
+            // program change (0xC0..) and channel pressure (0xD0..) carry
+            // exactly one data byte, every other channel status two — the
+            // stored len can't be trusted: emitting the wrong count
+            // desynchronizes the stream for conforming readers
+            if !(0xC0..0xE0).contains(status) {
                 out.push(data[1]);
             }
         }
@@ -516,7 +552,9 @@ fn implied_status(kind: &EventKind) -> Option<u8> {
 /// present; ordering is by (tick, seq). Byte-verbatim when nothing was edited.
 pub fn write(format_req: u16, division: Division, tracks: &[Track], opts: WriteOptions) -> Vec<u8> {
     let division_raw = match division {
-        Division::Metrical(t) => t,
+        // the field is 15 bits; masking keeps write() from emitting a
+        // header that reparses as SMPTE timecode (and panics midly at 0x80)
+        Division::Metrical(t) => t & 0x7FFF,
         Division::Smpte {
             fps,
             ticks_per_frame,
@@ -529,8 +567,8 @@ pub fn write(format_req: u16, division: Division, tracks: &[Track], opts: WriteO
     };
     let ntrks = tracks.len() as u16;
     // preserve the source's declared format; only upgrade when the track
-    // count makes it invalid (format 0 forbids >1 track)
-    let format = if format_req == 0 && ntrks > 1 {
+    // count makes it invalid (format 0 requires exactly one track)
+    let format = if format_req == 0 && ntrks != 1 {
         1
     } else {
         format_req
@@ -786,6 +824,60 @@ mod tests {
             WriteOptions::default(),
         );
         assert_eq!(&out[12..14], &[0x80, 0x64]);
+    }
+
+    #[test]
+    fn metrical_division_masked_to_15_bits() {
+        // a Metrical division with bit 15 set is out of contract; the writer
+        // masks it rather than emit a header that reparses as SMPTE
+        let out = write(
+            0,
+            Division::Metrical(0x8000),
+            &[Track { events: vec![] }],
+            WriteOptions::default(),
+        );
+        assert_eq!(&out[12..14], &[0x00, 0x00]);
+        let back = parse(&out).unwrap();
+        assert_eq!(back.division, Division::Metrical(0));
+    }
+
+    #[test]
+    fn format0_with_zero_tracks_upgrades() {
+        // format 0 requires exactly one track; an empty document would emit
+        // a header every parser (including ours) rejects
+        let out = write(
+            0,
+            Division::Metrical(480),
+            &[],
+            WriteOptions::default(),
+        );
+        assert_eq!(&out[8..10], &[0x00, 0x01]);
+        assert_eq!(parse(&out).unwrap().tracks.len(), 0);
+    }
+
+    #[test]
+    fn channel_len_follows_status() {
+        // a stored len inconsistent with the status nibble must not reach
+        // the byte stream — readers derive the data count from the status
+        // and misalign everything after it
+        let mk = |status, len| Event {
+            tick: 0,
+            seq: 0,
+            raw_body: None,
+            kind: EventKind::Channel {
+                status,
+                data: [0x40, 0x41],
+                len,
+            },
+        };
+        let one_track = |events| vec![Track { events }];
+        // 0xD0 pressure is 1 data byte even when len says 2
+        let out = write(1, Division::Metrical(480), &one_track(vec![mk(0xD3, 2)]), WriteOptions::default());
+        assert!(out.windows(2).any(|w| w == [0xD3, 0x40]));
+        assert!(!out.windows(3).any(|w| w == [0xD3, 0x40, 0x41]));
+        // 0x90 note-on is 2 data bytes even when len says 1
+        let out = write(1, Division::Metrical(480), &one_track(vec![mk(0x90, 1)]), WriteOptions::default());
+        assert!(out.windows(3).any(|w| w == [0x90, 0x40, 0x41]));
     }
 
     #[test]
