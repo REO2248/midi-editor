@@ -18,6 +18,7 @@ serde_json.workspace = true
 bytes.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+tracing-appender.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
 

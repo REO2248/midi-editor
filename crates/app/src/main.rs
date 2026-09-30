@@ -3,6 +3,7 @@
 //! basic editing (draw / drag / delete) all going through
 //! `Document::apply(Transaction)` so undo is shared with MCP edits.
 
+mod diagnostics;
 mod geometry;
 mod i18n;
 mod icons;
@@ -454,6 +455,14 @@ impl EditorView {
         let g = GlobalPrefs::load();
         let shared = Arc::new(Mutex::new(sh));
         let (plugin_req, plugin_evt) = output::spawn_plugin_host();
+        tracing::info!("plugin host worker spawned");
+        let hd = output::host_diag();
+        tracing::info!(
+            helper = ?hd.helper,
+            probe = ?hd.probe,
+            audio_device = ?hd.audio_device,
+            "host diagnostics"
+        );
         let mut v = Self {
             shared,
             doc_epoch: 0,
@@ -507,7 +516,7 @@ impl EditorView {
             scan_rx: None,
             scan_note: None,
             scan_probe_used: None,
-            host_diag: output::host_diag(),
+            host_diag: hd,
             show_output_status: false,
             plugin_window: None,
             editor_plugin: None,
@@ -1579,10 +1588,14 @@ impl EditorView {
                 let mut sh = lock_shared(&self.shared);
                 sh.saved_revision = rev;
                 drop(sh);
+                tracing::info!(path = %p.display(), rev, "document saved");
                 self.status = t("status.saved").into();
                 self.persist();
             }
-            Err(e) => self.status = format!("{e}").into(),
+            Err(e) => {
+                tracing::error!(path = %p.display(), error = %e, "save failed");
+                self.status = format!("{e}").into();
+            }
         }
         cx.notify();
     }
@@ -1603,6 +1616,58 @@ impl EditorView {
             }
         })
         .detach();
+    }
+
+    /// Help → Open Logs: reveal the rolling log directory in Explorer.
+    fn open_logs(&mut self, cx: &mut Context<Self>) {
+        let dir = diagnostics::log_dir();
+        if std::fs::create_dir_all(&dir).is_ok() {
+            diagnostics::open_in_explorer(&dir);
+            self.status = tf("status.logs_dir", &[("p", &dir.display().to_string())]).into();
+        } else {
+            self.status = t("status.logs_open_failed").into();
+        }
+        cx.notify();
+    }
+
+    /// Help → Export Diagnostics Bundle: sanitized env facts + redacted
+    /// tails of the retained logs, one attachable text file.
+    fn export_diagnostics(&mut self, cx: &mut Context<Self>) {
+        let (dests, mcp_auth) = {
+            let sh = lock_shared(&self.shared);
+            (
+                sh.dests
+                    .iter()
+                    .map(|(_, d)| format!("{d:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                std::env::var("MIDI_MCP_TOKEN").is_ok(),
+            )
+        };
+        let hd = output::host_diag();
+        let host_lines = format!(
+            "app_version={}\naudio_device={:?}\nhelper={:?}\nprobe={:?}\ndests={}\nmcp_auth={}\ncount_in={} midi_in={}",
+            env!("CARGO_PKG_VERSION"),
+            hd.audio_device,
+            hd.helper,
+            hd.probe,
+            dests,
+            mcp_auth,
+            self.count_in,
+            self.midi_in,
+        );
+        let dir = diagnostics::app_data_dir().join("diagnostics");
+        match diagnostics::export_bundle(&dir, &host_lines) {
+            Ok(p) => {
+                self.status = tf("status.bundle_written", &[("p", &p.display().to_string())]).into();
+                diagnostics::reveal_file(&p);
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "diagnostics bundle export failed");
+                self.status = tf("status.bundle_failed", &[("e", &e.to_string())]).into();
+            }
+        }
+        cx.notify();
     }
 
     fn open_dialog(&mut self, cx: &mut Context<Self>) {
@@ -1627,6 +1692,11 @@ impl EditorView {
     fn open(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         match load_document(&path) {
             Ok((d, load_warnings)) => {
+                tracing::info!(
+                    path = %path.display(),
+                    warnings = load_warnings.len(),
+                    "document opened"
+                );
                 // an armed recording belongs to the previous document —
                 // drop it with a warning instead of silently losing the take
                 let rec_discarded = self.rec.take().is_some();
@@ -1677,7 +1747,10 @@ impl EditorView {
                 }
                 self.status = status.into();
             }
-            Err(e) => self.status = tf("status.load_failed", &[("e", &e.to_string())]).into(),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "open failed");
+                self.status = tf("status.load_failed", &[("e", &e.to_string())]).into();
+            }
         }
         cx.notify();
     }
@@ -1766,6 +1839,7 @@ impl EditorView {
         }).collect();
         for d in timed_out {
             if let Some(PluginState::Loading { path, .. }) = self.plugin_state.remove(&d) {
+                tracing::warn!(dest = d, path = %path.display(), "plugin load timed out");
                 self.plugin_state.insert(
                     d,
                     PluginState::Failed {
@@ -1792,6 +1866,7 @@ impl EditorView {
                         .file_stem()
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_default();
+                    tracing::info!(dest = event.dest, plugin = %name, "plugin ready");
                     self.plugin_slots.insert(event.dest, slot);
                     self.plugin_state
                         .insert(event.dest, PluginState::Ready { path: event.path });
@@ -1808,6 +1883,13 @@ impl EditorView {
                         .file_stem()
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_default();
+                    tracing::warn!(
+                        dest = event.dest,
+                        plugin = %name,
+                        phase,
+                        error = %e,
+                        "plugin load failed"
+                    );
                     self.plugin_state.insert(
                         event.dest,
                         PluginState::Failed {
@@ -2184,6 +2266,12 @@ impl EditorView {
             )
         };
         let fresh = build_dest_catalog(&report.plugins);
+        tracing::info!(
+            dests = fresh.len(),
+            skipped,
+            probe_used = report.probe_used,
+            "destination catalog applied"
+        );
         let mut sh = lock_shared(&self.shared);
         if fresh == sh.dests {
             let ns = sh.dests.len().to_string();
@@ -2731,7 +2819,10 @@ impl EditorView {
 
 fn main() {
     output::init_env();
-    std::panic::set_hook(Box::new(|i| eprintln!("panic: {i}")));
+    let log_dir = diagnostics::init_logging();
+    diagnostics::install_panic_hook();
+    diagnostics::log_boot();
+    tracing::info!(log_dir = %log_dir.display(), "logging initialized");
     let path = std::env::args().nth(1).map(PathBuf::from);
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
@@ -2779,7 +2870,10 @@ fn spawn_mcp(shared: SharedDoc) {
         };
         rt.block_on(async move {
             let token = std::env::var("MIDI_MCP_TOKEN").ok();
+            // auth mode is safe to log; the token value never is
+            tracing::info!(auth = token.is_some(), "mcp http listening on 127.0.0.1:7878");
             if let Err(e) = mcp_server::serve_http(shared, "127.0.0.1:7878", token).await {
+                tracing::error!(error = %e, "mcp http stopped");
                 eprintln!("mcp http: {e}");
             }
         });

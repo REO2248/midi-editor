@@ -121,6 +121,16 @@ Text metas decode by heuristic: UTF-8 → Shift-JIS → Latin-1, with the XF
 `FF 09` "JP" charset marker acting as a file-wide hint. Raw bytes are never
 rewritten — round-trip stays byte-exact.
 
+## Diagnostics
+
+Structured logs write to `%APPDATA%\midi-editor\logs\midi-editor.log.<date>`
+(daily rotation, last 7 files kept, non-blocking writes so audio/playback never
+stalls). Panic location + backtrace land there too. Help → **Open Logs Folder**
+reveals them; Help → **Export Diagnostics Bundle** writes a single
+`midi-editor-diagnostics-<ts>.txt` under `%APPDATA%\midi-editor\diagnostics\`
+containing environment facts and redacted log tails — token/secret-shaped
+values are masked, and no MIDI file content is ever included.
+
 ## i18n
 
 UI strings live in `crates/app/src/i18n.rs` (English default, Japanese bundled).

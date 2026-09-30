@@ -174,6 +174,12 @@ static EN: &[(&str, &str)] = &[
     ("plugin.phase_load", "plugin load"),
     ("plugin.phase_audio", "audio start"),
     ("status.rescan", "rescanned: {n} destination(s)"),
+    ("help.open_logs", "Open Logs Folder"),
+    ("help.export_diag", "Export Diagnostics Bundle"),
+    ("status.logs_dir", "logs: {p}"),
+    ("status.logs_open_failed", "could not open logs folder"),
+    ("status.bundle_written", "diagnostics bundle: {p}"),
+    ("status.bundle_failed", "bundle export failed: {e}"),
 ];
 
 static JA: &[(&str, &str)] = &[
@@ -326,6 +332,12 @@ static JA: &[(&str, &str)] = &[
     ("tip.zout", "ズームアウト (Ctrl+-)"),
     ("tip.dest", "選択トラックの出力先"),
     ("tip.gui", "プラグインGUI"),
+    ("help.open_logs", "ログフォルダーを開く"),
+    ("help.export_diag", "診断バンドルをエクスポート"),
+    ("status.logs_dir", "ログ: {p}"),
+    ("status.logs_open_failed", "ログフォルダーを開けませんでした"),
+    ("status.bundle_written", "診断バンドル: {p}"),
+    ("status.bundle_failed", "バンドル出力に失敗: {e}"),
 ];
 
 fn detect_lang() -> &'static str {
