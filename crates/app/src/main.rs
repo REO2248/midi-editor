@@ -82,6 +82,8 @@ enum Sub {
     LenSet,
     VelSet,
     Oct,
+    /// Edit → legato gap/overlap presets
+    LegatoGap,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -928,6 +930,27 @@ impl EditorView {
             self.apply_tx(label, ops);
             self.status = label.to_string().into();
         }
+    }
+
+    /// Split notes spanning the playhead: the selection when there is one,
+    /// else every note on the selected track that straddles the line.
+    fn split_at_playhead(&mut self, cx: &mut Context<Self>) {
+        let at = self.doc(|d| d.tempo_map.us_to_tick(self.play_us));
+        let ops = {
+            let mut sh = lock_shared(&self.shared);
+            if self.selection.is_empty() {
+                sh.doc.split_ops(self.sel_track, 0, u64::MAX, at)
+            } else {
+                sh.doc.split_ids_ops(&self.selection, at)
+            }
+        };
+        if ops.is_empty() {
+            self.status = t("status.split_none").into();
+        } else {
+            self.apply_tx("split", ops);
+            self.status = "split".into();
+        }
+        cx.notify();
     }
 
     /// Set the tick-0 tempo to current bpm + delta (via the shared op layer).

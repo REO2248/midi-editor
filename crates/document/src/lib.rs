@@ -1123,19 +1123,21 @@ impl Document {
         ops
     }
 
-    /// Extend each note's end to the start of the next note ON THE SAME KEY
-    /// (per-pitch legato — chord voicings stay intact).
-    pub fn legato_ops(&mut self, track: usize, from: u64, to: u64) -> Vec<Op> {
+    /// Extend each note's end to `next.start - gap` ticks before the next
+    /// note ON THE SAME KEY AND CHANNEL (per-pitch legato — chord voicings
+    /// stay intact). `gap > 0` leaves space, `gap < 0` overlaps into the
+    /// next note. Notes already reaching the next start are left alone.
+    pub fn legato_ops(&mut self, track: usize, from: u64, to: u64, gap: i64) -> Vec<Op> {
         let mut notes: Vec<Note> = self
             .notes()
             .into_iter()
             .filter(|n| n.track == track && n.start_tick >= from && n.start_tick < to)
             .collect();
-        notes.sort_by_key(|n| (n.key, n.start_tick));
+        notes.sort_by_key(|n| (n.key, n.channel, n.start_tick));
         let mut ops = Vec::new();
         for w in notes.windows(2) {
             let (cur, nxt) = (&w[0], &w[1]);
-            if cur.key != nxt.key {
+            if cur.key != nxt.key || cur.channel != nxt.channel {
                 continue;
             }
             let Some(off_id) = cur.off_id else { continue };
@@ -1143,16 +1145,199 @@ impl Document {
             if nxt.start_tick <= cur_end {
                 continue;
             }
+            let new_end = (nxt.start_tick as i64 - gap).max(cur.start_tick as i64 + 1) as u64;
             if let Some((ti, ei)) = self.by_id.get(&off_id).copied() {
                 let before = self.tracks[ti].events[ei].clone();
                 let mut after = before.clone();
-                after.tick = nxt.start_tick;
+                after.tick = new_end;
                 ops.push(Op::UpdateEvent {
                     track: ti,
                     before,
                     after,
                 });
             }
+        }
+        ops
+    }
+
+    /// Split the notes whose `on_id` is in `on_ids` at `at_tick`: the
+    /// original keeps its NoteOn and ends at `at`, a fresh NoteOn+NoteOff
+    /// pair carries the tail. Only notes strictly spanning `at` split —
+    /// boundaries and dangling NoteOns are left alone.
+    pub fn split_ids_ops(
+        &mut self,
+        on_ids: &std::collections::BTreeSet<EventId>,
+        at: u64,
+    ) -> Vec<Op> {
+        let mut ops = Vec::new();
+        for n in self.notes() {
+            if !on_ids.contains(&n.on_id) {
+                continue;
+            }
+            let Some(off_id) = n.off_id else { continue };
+            let end = n.end_tick.unwrap_or(n.start_tick);
+            if n.start_tick >= at || end <= at {
+                continue;
+            }
+            let Some(&(ti, ei)) = self.by_id.get(&n.on_id) else {
+                continue;
+            };
+            let Some(&(oti, oei)) = self.by_id.get(&off_id) else {
+                continue;
+            };
+            let on_before = self.tracks[ti].events[ei].clone();
+            let off_before = self.tracks[oti].events[oei].clone();
+            let mut off_after = off_before.clone();
+            off_after.tick = at;
+            ops.push(Op::UpdateEvent {
+                track: oti,
+                before: off_before.clone(),
+                after: off_after,
+            });
+            let mut new_on = on_before;
+            new_on.id = self.alloc_event_id();
+            new_on.tick = at;
+            // note pairing is a per-(channel,key) LIFO stack: the new on at
+            // `at` must sort AFTER the shortened off, or the off would close
+            // the new on and make a zero-length note
+            new_on.seq = off_before.seq.saturating_add(1);
+            let mut new_off = off_before;
+            new_off.id = self.alloc_event_id();
+            new_off.tick = end;
+            ops.push(Op::InsertEvents {
+                track: n.track,
+                events: vec![new_on, new_off],
+            });
+        }
+        ops
+    }
+
+    /// Split every note in `track` starting inside `[from,to)` that spans
+    /// `at` — the MCP/range form of [`Self::split_ids_ops`].
+    pub fn split_ops(&mut self, track: usize, from: u64, to: u64, at: u64) -> Vec<Op> {
+        let ids: std::collections::BTreeSet<EventId> = self
+            .notes()
+            .into_iter()
+            .filter(|n| n.track == track && n.start_tick >= from && n.start_tick < to)
+            .map(|n| n.on_id)
+            .collect();
+        self.split_ids_ops(&ids, at)
+    }
+
+    /// Join runs of same-(key, channel) notes that overlap or touch into one
+    /// note. Explicit policy: the earliest NoteOn of each run survives with
+    /// its event id; the surviving NoteOff is the run's longest end moved
+    /// onto the earliest possible off event; every other event of the run is
+    /// removed. Notes are matched by start inside `[from,to)` — the merge
+    /// itself is by intervals, so notes never straddle into chains they
+    /// only touch at the range boundary.
+    pub fn join_ops(&mut self, track: usize, from: u64, to: u64) -> Vec<Op> {
+        let mut notes: Vec<Note> = self
+            .notes()
+            .into_iter()
+            .filter(|n| n.track == track && n.start_tick >= from && n.start_tick < to)
+            .collect();
+        notes.sort_by_key(|n| (n.key, n.channel, n.start_tick));
+        let mut ops = Vec::new();
+        let mut i = 0;
+        while i < notes.len() {
+            let head = notes[i].clone();
+            let mut end = head.end_tick.unwrap_or(head.start_tick);
+            let mut j = i + 1;
+            while j < notes.len()
+                && notes[j].key == head.key
+                && notes[j].channel == head.channel
+                && notes[j].start_tick <= end
+            {
+                end = end.max(notes[j].end_tick.unwrap_or(notes[j].start_tick));
+                j += 1;
+            }
+            if j > i + 1 {
+                // the head's off survives when present, else the last off in
+                // the run — a run of dangling NoteOns cannot join
+                let keep_off = head
+                    .off_id
+                    .or_else(|| notes[i + 1..j].iter().rev().find_map(|n| n.off_id));
+                if let Some(off_id) = keep_off {
+                    if let Some(&(ti, ei)) = self.by_id.get(&off_id) {
+                        let before = self.tracks[ti].events[ei].clone();
+                        if before.tick != end {
+                            let mut after = before.clone();
+                            after.tick = end;
+                            ops.push(Op::UpdateEvent {
+                                track: ti,
+                                before,
+                                after,
+                            });
+                        }
+                    }
+                }
+                let mut removed = Vec::new();
+                for n in &notes[i..j] {
+                    for id in [Some(n.on_id), n.off_id].into_iter().flatten() {
+                        if id == head.on_id || Some(id) == keep_off {
+                            continue;
+                        }
+                        if let Some(&(ti, ei)) = self.by_id.get(&id) {
+                            removed.push((ei, self.tracks[ti].events[ei].clone()));
+                        }
+                    }
+                }
+                if !removed.is_empty() {
+                    ops.push(Op::RemoveEvents {
+                        track: head.track,
+                        removed,
+                    });
+                }
+            }
+            i = j;
+        }
+        ops
+    }
+
+    /// Shorten any note whose end reaches past the next same-(key, channel)
+    /// note's start so the two no longer overlap. Only the offending
+    /// NoteOff's tick changes — every event keeps its id.
+    pub fn fix_overlaps_ops(&mut self, track: usize, from: u64, to: u64) -> Vec<Op> {
+        let mut notes: Vec<Note> = self
+            .notes()
+            .into_iter()
+            .filter(|n| n.track == track && n.start_tick >= from && n.start_tick < to)
+            .collect();
+        notes.sort_by_key(|n| (n.key, n.channel, n.start_tick));
+        let mut ops = Vec::new();
+        for w in notes.windows(2) {
+            let (cur, nxt) = (&w[0], &w[1]);
+            if cur.key != nxt.key || cur.channel != nxt.channel {
+                continue;
+            }
+            let Some(off_id) = cur.off_id else { continue };
+            let cur_end = cur.end_tick.unwrap_or(cur.start_tick);
+            if cur_end <= nxt.start_tick {
+                continue;
+            }
+            let new_end = nxt.start_tick.max(cur.start_tick + 1);
+            let Some(&(ti, ei)) = self.by_id.get(&off_id) else {
+                continue;
+            };
+            let before = self.tracks[ti].events[ei].clone();
+            let mut after = before.clone();
+            after.tick = new_end;
+            // pairing is a per-(channel,key) LIFO stack: the moved off must
+            // sort BEFORE the next on at the same tick or it closes the
+            // wrong note (a zero-length one) instead of `cur`
+            if new_end == nxt.start_tick {
+                if let Some(&(nti, nei)) = self.by_id.get(&nxt.on_id) {
+                    after.seq = self.tracks[nti].events[nei]
+                        .seq
+                        .saturating_sub(1);
+                }
+            }
+            ops.push(Op::UpdateEvent {
+                track: ti,
+                before,
+                after,
+            });
         }
         ops
     }
