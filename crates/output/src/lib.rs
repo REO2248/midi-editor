@@ -210,6 +210,145 @@ pub enum PluginError {
     Audio(String),
 }
 
+/// User-chosen audio configuration for hosted-plugin streams: output device,
+/// sample rate, buffer size. `None` fields mean "system default". Persisted
+/// globally; a device that has disappeared falls back to the default.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct AudioSelection {
+    /// output device display name (cpal `DeviceDescription::name`)
+    pub device: Option<String>,
+    pub sample_rate: Option<f64>,
+    pub buffer_size: Option<u32>,
+}
+
+/// Output device display names, for the settings panel.
+pub fn output_devices() -> Vec<String> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    cpal::default_host()
+        .output_devices()
+        .map(|ds| {
+            ds.filter_map(|d| d.description().ok().map(|x| x.name().to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Live per-instance stream state, written by `RoutedBackend` and read by
+/// the app. `device` is what the stream actually opened on (after any
+/// fallback); `error` records the last stream error (e.g. device unplugged).
+#[derive(Debug, Default)]
+pub struct StreamState {
+    pub device: Option<String>,
+    pub error: Option<String>,
+}
+
+/// `Arc<Mutex<StreamState>>` shared between one backend and its `PluginSlot`.
+pub type SharedStreamState = std::sync::Arc<std::sync::Mutex<StreamState>>;
+
+/// Snapshot of one stream's active configuration, for diagnostics.
+#[derive(Debug, Clone)]
+pub struct AudioDiag {
+    /// device the stream actually opened on (post-fallback resolution)
+    pub device: Option<String>,
+    pub sample_rate: f64,
+    pub block_size: u32,
+    /// last stream error, if any
+    pub stream_error: Option<String>,
+}
+
+/// `AudioBackend` wrapper applying an `AudioSelection`: resolves the chosen
+/// output device by name — falling back to the host default when it has
+/// disappeared so a reopened stream still comes up — passes stream creation
+/// through to cpal, and publishes the resolved device plus stream errors
+/// into `SharedStreamState` so device loss is visible and recoverable.
+pub struct RoutedBackend {
+    inner: vst3_host::backends::cpal_backend::CpalBackend,
+    selected: Option<String>,
+    state: SharedStreamState,
+}
+
+impl RoutedBackend {
+    pub fn new(sel: &AudioSelection, state: SharedStreamState) -> Result<Self, PluginError> {
+        Ok(Self {
+            inner: vst3_host::backends::cpal_backend::CpalBackend::new()
+                .map_err(|e| PluginError::Audio(e.to_string()))?,
+            selected: sel.device.clone(),
+            state,
+        })
+    }
+}
+
+impl vst3_host::AudioBackend for RoutedBackend {
+    type Stream = vst3_host::backends::cpal_backend::CpalStream;
+    type Device = cpal::Device;
+    type Error = vst3_host::Error;
+
+    fn enumerate_output_devices(&self) -> Result<Vec<Self::Device>, Self::Error> {
+        self.inner.enumerate_output_devices()
+    }
+
+    fn enumerate_input_devices(&self) -> Result<Vec<Self::Device>, Self::Error> {
+        self.inner.enumerate_input_devices()
+    }
+
+    /// The selected device while it's present, else the host default; the
+    /// resolved name is published either way.
+    fn default_output_device(&self) -> Option<Self::Device> {
+        use cpal::traits::DeviceTrait;
+        fn name_of(d: &cpal::Device) -> Option<String> {
+            d.description().ok().map(|x| x.name().to_string())
+        }
+        let chosen = self.selected.as_deref().and_then(|want| {
+            self.inner
+                .enumerate_output_devices()
+                .ok()?
+                .into_iter()
+                .find(|d| name_of(d).as_deref() == Some(want))
+        });
+        let device = chosen.or_else(|| self.inner.default_output_device());
+        if let Ok(mut st) = self.state.lock() {
+            st.device = device.as_ref().and_then(name_of);
+        }
+        device
+    }
+
+    fn default_input_device(&self) -> Option<Self::Device> {
+        self.inner.default_input_device()
+    }
+
+    fn create_output_stream(
+        &self,
+        device: &Self::Device,
+        config: vst3_host::AudioConfig,
+        data_callback: Box<dyn FnMut(&mut [f32]) + Send>,
+        mut error_callback: Box<dyn FnMut(Self::Error) + Send>,
+    ) -> Result<Self::Stream, Self::Error> {
+        let state = self.state.clone();
+        self.inner.create_output_stream(
+            device,
+            config,
+            data_callback,
+            Box::new(move |e| {
+                if let Ok(mut st) = state.lock() {
+                    st.error = Some(e.to_string());
+                }
+                error_callback(e);
+            }),
+        )
+    }
+
+    fn create_input_stream(
+        &self,
+        device: &Self::Device,
+        config: vst3_host::AudioConfig,
+        data_callback: Box<dyn FnMut(&[f32]) + Send>,
+        error_callback: Box<dyn FnMut(Self::Error) + Send>,
+    ) -> Result<Self::Stream, Self::Error> {
+        self.inner
+            .create_input_stream(device, config, data_callback, error_callback)
+    }
+}
+
 /// Live view of one hosted plugin's reported processing latency
 /// (`IAudioProcessor::getLatencySamples`), in samples.
 ///
@@ -282,19 +421,38 @@ pub struct PluginOutput {
     us_to_samples: f64,
     /// reported processing latency; shared with every cloned sink
     latency: LatencyComp,
+    /// resolved device + stream errors, shared with the backend
+    stream_state: SharedStreamState,
+    /// (sample rate, block size) the stream was opened with
+    audio_config: (f64, u32),
 }
 
 impl PluginOutput {
     /// Load `path` (a .vst3 bundle), start its audio stream on the default
     /// output device via cpal, and return a playable destination.
     pub fn open(path: &std::path::Path) -> Result<Self, PluginError> {
+        Self::open_with(path, &AudioSelection::default())
+    }
+
+    /// `open` with an explicit audio configuration: `sel.device` picks the
+    /// output device by name (the host default when it's missing or
+    /// unplugged), `sel.sample_rate`/`sel.buffer_size` become the stream and
+    /// plugin processing setup. Block size is clamped to what the device
+    /// advertises by the cpal backend.
+    pub fn open_with(path: &std::path::Path, sel: &AudioSelection) -> Result<Self, PluginError> {
         let mut host = new_host()?;
         let plugin = host
             .load_plugin(path)
             .map_err(|e| PluginError::Load(e.to_string()))?;
-        let config = vst3_host::AudioConfig::default();
-        let backend = vst3_host::backends::CpalBackend::new()
-            .map_err(|e| PluginError::Audio(e.to_string()))?;
+        let mut config = vst3_host::AudioConfig::default();
+        if let Some(sr) = sel.sample_rate {
+            config.sample_rate = sr;
+        }
+        if let Some(bs) = sel.buffer_size {
+            config.block_size = bs as usize;
+        }
+        let stream_state = SharedStreamState::default();
+        let backend = RoutedBackend::new(sel, stream_state.clone())?;
         let handle = vst3_host::play_with_backend(&backend, plugin, config)
             .map_err(|e| PluginError::Audio(e.to_string()))?;
         let sink = handle.midi_sink();
@@ -307,6 +465,8 @@ impl PluginOutput {
             sink,
             us_to_samples: config.sample_rate / 1_000_000.0,
             latency,
+            stream_state,
+            audio_config: (config.sample_rate, config.block_size as u32),
         })
     }
 
@@ -335,6 +495,17 @@ impl PluginOutput {
     /// clone is seen by all of them on their next scheduled event.
     pub fn latency(&self) -> LatencyComp {
         self.latency.clone()
+    }
+
+    /// Live stream state shared with the backend (resolved device, last
+    /// stream error).
+    pub fn stream_state(&self) -> SharedStreamState {
+        self.stream_state.clone()
+    }
+
+    /// (sample rate, block size) the stream was opened with.
+    pub fn audio_config(&self) -> (f64, u32) {
+        self.audio_config
     }
 
     /// Handle to the live plugin instance (e.g. to open its GUI editor).
@@ -384,9 +555,32 @@ pub struct PluginSlot {
     /// live latency tracker shared with `sink` — the compensation math reads
     /// it per event, so `refresh_latency` retimes playback in place
     pub latency: LatencyComp,
+    /// (sample rate, block size) the stream was opened with
+    pub audio: (f64, u32),
+    /// live stream state shared with the backend — resolved device name and
+    /// last stream error, for diagnostics and device-loss recovery
+    pub stream: SharedStreamState,
 }
 
 impl PluginSlot {
+    /// Snapshot of the stream's active configuration for diagnostics.
+    pub fn audio_diag(&self) -> AudioDiag {
+        let st = self.stream.lock().ok();
+        AudioDiag {
+            device: st.as_ref().and_then(|s| s.device.clone()),
+            sample_rate: self.audio.0,
+            block_size: self.audio.1,
+            stream_error: st.and_then(|s| s.error.clone()),
+        }
+    }
+
+    /// The last stream error (e.g. device unplugged), cleared on read.
+    pub fn take_stream_error(&self) -> Option<String> {
+        self.stream
+            .lock()
+            .ok()
+            .and_then(|mut s| s.error.take())
+    }
     /// Re-read `getLatencySamples` into the shared tracker. Call it when the
     /// plugin reports a latency change (`kLatencyChanged`) — the sink picks
     /// the new value up on its next event, no stream or instance rebuild.
@@ -404,8 +598,11 @@ impl PluginSlot {
 
 /// Work requests for the plugin host worker thread.
 pub enum PluginReq {
-    /// load+start audio for dest index `usize`; result arrives on the event channel
-    Open(usize, std::path::PathBuf),
+    /// load+start audio for dest index `usize` with the given audio
+    /// configuration; result arrives on the event channel. A same-dest
+    /// reopen preserves plugin state — it is a reconfigure (device/rate/
+    /// buffer change) or a device-loss recovery, not a plugin swap.
+    Open(usize, std::path::PathBuf, AudioSelection),
     /// unload the instance for a dest index (dest re-pointed/rescan)
     Drop(usize),
     /// drop every instance (rescan rebuilt the catalog)
@@ -435,14 +632,32 @@ pub fn spawn_plugin_host() -> (
             std::collections::HashMap::new();
         while let Ok(req) = req_rx.recv() {
             match req {
-                PluginReq::Open(d, path) => match PluginOutput::open(&path) {
-                    Ok(p) => {
-                        let slot = PluginSlot {
-                            sink: p.event_sink(),
-                            plugin: p.plugin_handle(),
-                            path,
-                            latency: p.latency(),
-                        };
+                PluginReq::Open(d, path, sel) => {
+                    // reopening a live destination keeps the plugin's state
+                    // (program, params) — the new instance continues where
+                    // the old stream left off
+                    let prior_state = owned.get(&d).and_then(|p| {
+                        p.plugin_handle()
+                            .lock()
+                            .map(|g| g.save_state().ok())
+                            .unwrap_or_else(|poisoned| poisoned.into_inner().save_state().ok())
+                    });
+                    match PluginOutput::open_with(&path, &sel) {
+                        Ok(p) => {
+                            if let Some(state) = prior_state {
+                                let _ = p
+                                    .plugin_handle()
+                                    .lock()
+                                    .map(|mut g| g.load_state(&state));
+                            }
+                            let slot = PluginSlot {
+                                sink: p.event_sink(),
+                                plugin: p.plugin_handle(),
+                                path,
+                                latency: p.latency(),
+                                audio: p.audio_config(),
+                                stream: p.stream_state(),
+                            };
                         owned.insert(d, p);
                         let _ = evt_tx.send(PluginEvent {
                             dest: d,
@@ -457,7 +672,8 @@ pub fn spawn_plugin_host() -> (
                             result: Err(e),
                         });
                     }
-                },
+                    }
+                }
                 PluginReq::Drop(d) => {
                     owned.remove(&d);
                 }
@@ -827,5 +1043,18 @@ mod tests {
         // and a later re-read updates scheduling again without a rebuild
         c.set_samples(0);
         assert_eq!(cloned.offset(100_000), 4410);
+    }
+
+    /// `StreamState::error` is the device-loss signal the app polls for; the
+    /// read clears it so one stream error reopens the slot exactly once.
+    #[test]
+    fn stream_state_error_reads_once() {
+        let shared = SharedStreamState::default();
+        shared.lock().unwrap().error = Some("device lost".into());
+        // mirror PluginSlot::take_stream_error on a bare state — the slot
+        // itself needs a live plugin, so the drain logic is tested here
+        let take = |s: &SharedStreamState| s.lock().ok().and_then(|mut g| g.error.take());
+        assert_eq!(take(&shared).as_deref(), Some("device lost"));
+        assert!(take(&shared).is_none());
     }
 }

@@ -323,6 +323,16 @@ struct EditorView {
     scan_probe_used: Option<bool>,
     host_diag: output::HostDiag,
     show_output_status: bool,
+    /// explicit audio configuration for hosted plugins (device/rate/buffer);
+    /// persisted in GlobalPrefs — applied to every `PluginReq::Open`
+    audio_sel: output::AudioSelection,
+    /// dest -> last stream-loss auto-reopen, throttled so a dead device
+    /// doesn't hot-loop reopens
+    audio_retry: HashMap<usize, std::time::Instant>,
+    /// cached output-device names for the audio settings panel (refreshed
+    /// every few seconds so hot-plug shows up)
+    audio_devices: Vec<String>,
+    audio_devices_at: std::time::Instant,
     /// Standalone window hosting the open plugin editor (in-process
     /// instance — isolated plugins cannot host a GUI on Windows).
     plugin_window: Option<vst3_host::PluginWindow>,
@@ -513,6 +523,14 @@ impl EditorView {
             scan_probe_used: None,
             host_diag: output::host_diag(),
             show_output_status: false,
+            audio_sel: output::AudioSelection {
+                device: g.audio_device.clone(),
+                sample_rate: g.sample_rate,
+                buffer_size: g.buffer_size,
+            },
+            audio_retry: HashMap::new(),
+            audio_devices: output::output_devices(),
+            audio_devices_at: std::time::Instant::now(),
             plugin_window: None,
             editor_plugin: None,
             restart_logged: HashMap::new(),
@@ -1747,7 +1765,9 @@ impl EditorView {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
         self.status = tf("plugin.loading", &[("name", name.as_str())]).into();
-        let _ = self.plugin_req.send(output::PluginReq::Open(d, path));
+        let _ = self
+            .plugin_req
+            .send(output::PluginReq::Open(d, path, self.audio_sel.clone()));
     }
 
     /// Warm instances for every VST3 destination a track or the default
@@ -1764,9 +1784,27 @@ impl EditorView {
         }
     }
 
+    /// Apply + persist a new audio configuration for hosted plugins. Every
+    /// live instance is reopened onto it (state is preserved across the
+    /// reopen, so a rate/buffer/device change doesn't lose the program);
+    /// loading/failed slots pick it up on their next open attempt.
+    fn apply_audio_selection(&mut self, sel: output::AudioSelection) {
+        self.audio_sel = sel;
+        self.save_global();
+        for d in self.plugin_slots.keys().copied().collect::<Vec<_>>() {
+            self.ensure_plugin(d, true);
+        }
+    }
+
     fn poll_plugin_events(&mut self) -> bool {
         let mut changed = false;
         let now = std::time::Instant::now();
+        // hot-plug: re-enumerate output devices every few seconds so the
+        // audio settings panel tracks additions/removals while it's open
+        if now.duration_since(self.audio_devices_at) >= std::time::Duration::from_secs(3) {
+            self.audio_devices = output::output_devices();
+            self.audio_devices_at = now;
+        }
         let timed_out: Vec<usize> = self.plugin_state.iter().filter_map(|(&d, s)| {
             matches!(s, PluginState::Loading { since, .. } if now.duration_since(*since) >= std::time::Duration::from_secs(20)).then_some(d)
         }).collect();
@@ -1838,9 +1876,16 @@ impl EditorView {
         // try_lock keeps a busy audio block from stalling a UI frame — the
         // next frame picks the flags up.
         let mut drained: Vec<(usize, vst3_host::RestartFlags)> = Vec::new();
+        // dest indexes whose stream errored mid-flight (device unplugged) —
+        // reopened below, throttled so a device that never comes up doesn't
+        // hot-loop stream builds
+        let mut lost: Vec<(usize, String)> = Vec::new();
         for (d, slot) in &self.plugin_slots {
             if !matches!(self.plugin_state.get(d), Some(PluginState::Ready { .. })) {
                 continue;
+            }
+            if let Some(err) = slot.take_stream_error() {
+                lost.push((*d, err));
             }
             if let Some(flags) = slot
                 .plugin
@@ -1858,6 +1903,23 @@ impl EditorView {
             changed |= self.apply_restart_flags(d, flags, &mut reloads);
         }
         for d in reloads {
+            self.ensure_plugin(d, true);
+            changed = true;
+        }
+        // device loss: reopen — the backend falls back to the current
+        // default when the selected device is gone, so this recovers onto
+        // whatever output still exists instead of staying dead
+        for (d, err) in lost {
+            let cooled = self
+                .audio_retry
+                .get(&d)
+                .map(|t| t.elapsed() >= std::time::Duration::from_secs(5))
+                .unwrap_or(true);
+            if !cooled {
+                continue;
+            }
+            self.audio_retry.insert(d, std::time::Instant::now());
+            self.status = tf("audio.device_lost", &[("e", err.as_str())]).into();
             self.ensure_plugin(d, true);
             changed = true;
         }
@@ -2621,6 +2683,15 @@ struct GlobalPrefs {
     count_in: bool,
     /// MIDI input port name to record from; empty = first available port
     midi_in: String,
+    /// VST3 audio output device display name; None = system default
+    #[serde(default)]
+    audio_device: Option<String>,
+    /// preferred sample rate for hosted-plugin streams; None = 44100
+    #[serde(default)]
+    sample_rate: Option<f64>,
+    /// preferred buffer size in samples; None = 512
+    #[serde(default)]
+    buffer_size: Option<u32>,
 }
 
 impl GlobalPrefs {
@@ -2790,6 +2861,9 @@ impl EditorView {
             recent: self.recent.iter().map(|r| r.to_string()).collect(),
             count_in: self.count_in,
             midi_in: self.midi_in.to_string(),
+            audio_device: self.audio_sel.device.clone(),
+            sample_rate: self.audio_sel.sample_rate,
+            buffer_size: self.audio_sel.buffer_size,
         }
         .save();
     }
@@ -3048,5 +3122,38 @@ mod tests {
     #[test]
     fn fresh_documents_share_revision_zero() {
         assert_eq!(empty_doc().revision(), empty_doc().revision());
+    }
+
+    /// GlobalPrefs written before audio settings existed has no audio keys;
+    /// it must still parse (serde defaults) instead of resetting recents.
+    #[test]
+    fn legacy_prefs_json_without_audio_fields_parses() {
+        let g: super::GlobalPrefs = serde_json::from_str(
+            r#"{"recent":["a.mid"],"count_in":true,"midi_in":"port"}"#,
+        )
+        .unwrap();
+        assert_eq!(g.recent, ["a.mid"]);
+        assert!(g.audio_device.is_none() && g.sample_rate.is_none() && g.buffer_size.is_none());
+    }
+
+    /// An `AudioSelection` deserializes from a minimal/legacy prefs JSON —
+    /// missing fields must come out as `None` (system defaults) rather than
+    /// a parse error, so old prefs files keep loading.
+    #[test]
+    fn audio_selection_missing_fields_are_system_default() {
+        let sel: output::AudioSelection = serde_json::from_str("{}").unwrap();
+        assert!(sel.device.is_none() && sel.sample_rate.is_none() && sel.buffer_size.is_none());
+        let rt: output::AudioSelection = serde_json::from_str(
+            &serde_json::to_string(&output::AudioSelection {
+                device: Some("Speakers".into()),
+                sample_rate: Some(48000.0),
+                buffer_size: Some(1024),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rt.device.as_deref(), Some("Speakers"));
+        assert_eq!(rt.sample_rate, Some(48000.0));
+        assert_eq!(rt.buffer_size, Some(1024));
     }
 }
