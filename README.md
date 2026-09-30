@@ -77,6 +77,19 @@ SMF itself is never touched by editor state.
 The app embeds a Streamable-HTTP MCP server at `http://127.0.0.1:7878/mcp`
 while it is running. Set `MIDI_MCP_TOKEN` to require `Authorization: Bearer`.
 
+**Loopback security model.** The endpoint binds to loopback only, so remote
+machines cannot reach it; the residual risks are local. A hostile web page in
+the user's browser could otherwise issue cross-origin requests to the endpoint
+(CSRF / DNS rebinding), so requests are rejected before tool dispatch when a
+present `Host` header is not `localhost`/`127.0.0.1`/`[::1]` or a present
+`Origin` header is not `http(s)://<loopback>:<any port>` — enforced both by an
+explicit guard middleware and rmcp's own allowlists. Non-browser MCP clients
+send no `Origin` and are unaffected; browser tooling served from localhost
+(e.g. MCP Inspector) still works. When `MIDI_MCP_TOKEN` is unset the endpoint
+is unauthenticated: any local process may call mutating tools. The effective
+mode is printed on stderr at startup and reported by the `diagnostics` tool
+under `security`.
+
 For stdio-only clients (Claude Desktop etc.) use the bridge:
 
 ```
