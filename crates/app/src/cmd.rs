@@ -301,6 +301,42 @@ pub static COMMANDS: &[Command] = &[
         |v, _w, cx| v.delete_selected(cx)
     ),
     cmd!(
+        "edit.marker_ins",
+        "edit.marker_ins",
+        &["m"],
+        None,
+        |v, w, cx| {
+            let tick = v.doc(|d| d.tempo_map.us_to_tick(v.play_us));
+            v.open_meta_edit(0, tick, 0x06, 0, w, cx);
+        }
+    ),
+    cmd!(
+        "edit.meta_edit",
+        "edit.meta_edit",
+        &["e"],
+        Some(|v: &EditorView| v.meta_sel.is_some()),
+        |v, w, cx| {
+            if let Some((tr, id)) = v.meta_sel {
+                let m = v.doc(|d| {
+                    d.tracks.get(tr).and_then(|t| {
+                        t.events
+                            .iter()
+                            .find(|e| e.id == id)
+                            .and_then(|e| match &e.kind {
+                                smf_core::EventKind::Meta { meta_type, .. } => {
+                                    Some((e.tick, *meta_type))
+                                }
+                                _ => None,
+                            })
+                    })
+                });
+                if let Some((tick, mt)) = m {
+                    v.open_meta_edit(tr, tick, mt, id, w, cx);
+                }
+            }
+        }
+    ),
+    cmd!(
         "edit.transpose_up",
         "edit.transpose_up",
         &[],
@@ -484,14 +520,14 @@ pub static COMMANDS: &[Command] = &[
     cmd!(
         "view.marker_prev",
         "view.marker_prev",
-        &[","],
+        &[",", "["],
         None,
         |v, _w, cx| v.marker_step(-1, cx)
     ),
     cmd!(
         "view.marker_next",
         "view.marker_next",
-        &["."],
+        &[".", "]"],
         None,
         |v, _w, cx| v.marker_step(1, cx)
     ),

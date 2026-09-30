@@ -564,6 +564,26 @@
     },
     {
       "deprecated": null,
+      "description": "Delete one meta event by id. Args: track, id. Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "remove_meta",
+      "version": 1
+    },
+    {
+      "deprecated": null,
       "description": "Remove a track entirely. Args: track. Optional base_revision.",
       "input_schema": {
         "properties": {
@@ -724,6 +744,29 @@
     },
     {
       "deprecated": null,
+      "description": "Set the song key signature (FF59). Args: sf (-7..7, negative = flats), mi (0 major / 1 minor), tick? (0). Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "mi": {
+            "type": "integer"
+          },
+          "sf": {
+            "type": "integer"
+          },
+          "tick": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "set_key_signature",
+      "version": 1
+    },
+    {
+      "deprecated": null,
       "description": "Set every note starting in range to exactly `ticks` long. Args: track?, from?, to?, ticks (required). Optional base_revision.",
       "input_schema": {
         "properties": {
@@ -746,6 +789,38 @@
         "type": "object"
       },
       "name": "set_length",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Create/update a text meta (0x01-0x0F: text, copyright, track/instrument name, lyric, marker, cue). Args: track? (0), tick, meta_type (1-15), text, id? (event id to overwrite), enc? (utf8|sjis|latin1, default utf8). Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "enc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "meta_type": {
+            "type": "integer"
+          },
+          "text": {
+            "type": "string"
+          },
+          "tick": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "set_meta",
       "version": 1
     },
     {

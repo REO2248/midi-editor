@@ -83,6 +83,10 @@ impl Render for EditorView {
             self.menu_sel = None;
             self.sub_sel = None;
         }
+        // menu actions arrive without a Window — the dialog opens here
+        if let Some((tr, tick, mt, id)) = self.meta_pending.take() {
+            self.open_meta_edit(tr, tick, mt, id, window, cx);
+        }
         // keep both scroll axes inside the content (resizes, zooms, edits all
         // self-heal here) and edge-scroll while a drag is parked at a border;
         // `panning` keeps animation frames flowing only while it actually moves
@@ -1729,7 +1733,8 @@ impl Render for EditorView {
                             cx.notify();
                         })),
                 )
-                // marker/lyric strip — meta 0x06/0x05 shown at their tick
+                // marker/lyric strip — meta 0x06/0x05 shown at their tick;
+                // click selects + seeks (then `e` edits, `Del` removes)
                 .child(
                     div()
                         .h(px(14.0))
@@ -1737,19 +1742,36 @@ impl Render for EditorView {
                         .relative()
                         .overflow_hidden()
                         .bg(rgb(0x17171d))
-                        .children(markers.iter().filter_map(|(tk, txt)| {
-                            let x = *tk as f32 * zoom - scroll_x;
-                            (x > -80.0).then(|| {
-                                div()
-                                    .absolute()
-                                    .left(px(x))
-                                    .top(px(0.0))
-                                    .text_size(px(9.0))
-                                    .text_color(rgb(0x9fd0ff))
-                                    .whitespace_nowrap()
-                                    .child(txt.clone())
-                            })
-                        })),
+                        .children(markers.iter().enumerate().filter_map(
+                            |(i, (tk, id, ti, txt))| {
+                                let (tk, id, ti) = (*tk, *id, *ti);
+                                let x = tk as f32 * zoom - scroll_x;
+                                let sel = self.meta_sel == Some((ti, id));
+                                (x > -80.0).then(|| {
+                                    div()
+                                        .id(("mark", i))
+                                        .absolute()
+                                        .left(px(x))
+                                        .top(px(0.0))
+                                        .text_size(px(9.0))
+                                        .text_color(if sel { rgb(0xffffff) } else { rgb(0x9fd0ff) })
+                                        .whitespace_nowrap()
+                                        .cursor_pointer()
+                                        .child(txt.clone())
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(
+                                                move |this, ev: &MouseDownEvent, _w, cx| {
+                                                    cx.stop_propagation();
+                                                    this.meta_sel = Some((ti, id));
+                                                    this.seek_to_tick(tk, false, cx);
+                                                    this.mouse_pos = Some(ev.position);
+                                                },
+                                            ),
+                                        )
+                                })
+                            },
+                        )),
                 )
                 .child({
                     // a11y snapshot inputs for the piano-roll synthetic
@@ -2292,6 +2314,7 @@ impl Render for EditorView {
                     self.mi_cmd("edit.paste", None, cx),
                     self.mi_cmd("edit.duplicate", None, cx),
                     self.mi_cmd("edit.delete", None, cx),
+                    Self::mi_sub("e.meta", t("edit.meta"), Sub::Meta, cx),
                     Self::msep(),
                     Self::mi_sub("e.tool", t("edit.tool"), Sub::Tool, cx),
                     Self::mi_sub("e.snap", t("edit.snap"), Sub::Snap, cx),
@@ -2649,6 +2672,32 @@ impl Render for EditorView {
                             |v, _e, cx| v.remove_lane(cx),
                         ));
                         rows
+                    }
+                    Sub::Meta => {
+                        // insert at the playhead, conductor track — editing
+                        // existing metas happens via strip/event-list clicks
+                        const METAS: [u8; 7] = [0x06, 0x05, 0x07, 0x01, 0x02, 0x04, 0x59];
+                        METAS
+                            .iter()
+                            .enumerate()
+                            .map(|(i, mt)| {
+                                let mt = *mt;
+                                Self::mi_leaf(
+                                    ("meta", i),
+                                    t(EditorView::meta_type_label(mt)),
+                                    "",
+                                    None,
+                                    cx,
+                                    move |v, _e, cx| {
+                                        let tick = v.doc(|d| d.tempo_map.us_to_tick(v.play_us));
+                                        // no Window in menu callbacks —
+                                        // render opens + focuses next frame
+                                        v.meta_pending = Some((0, tick, mt, 0));
+                                        cx.notify();
+                                    },
+                                )
+                            })
+                            .collect()
                     }
                     Sub::Tool => {
                         let opts = [
@@ -3163,6 +3212,9 @@ impl Render for EditorView {
                 (t("help.g_minimap"), "Click minimap"),
                 (t("help.g_zoom"), "Ctrl+wheel"),
                 (t("help.g_drop"), "Drag .mid file"),
+                (t("help.g_marker_click"), "Click marker"),
+                (t("help.g_marker_nav"), "[ / ]"),
+                (t("help.g_meta_edit"), "M / E"),
             ]
             .into_iter()
             .map(|(desc, gesture)| row(gesture.to_string(), desc.into()))
@@ -3237,6 +3289,67 @@ impl Render for EditorView {
                     MouseButton::Left,
                     cx.listener(|v, _e, _w, cx| {
                         v.help_open = false;
+                        cx.notify();
+                    }),
+                )
+                .child(panel)
+        });
+
+        // meta edit dialog — title = type label, hint shows write encoding
+        let meta_layer = self.meta_edit.map(|me| {
+            let enc = self
+                .enc_override
+                .map(|e| e.label())
+                .unwrap_or("utf8")
+                .to_string();
+            let hint = if me.meta_type == 0x59 {
+                "e.g. -3 minor · eb major · f#m".to_string()
+            } else {
+                tf("meta.hint", &[("enc", &enc)])
+            };
+            let panel = div()
+                .id("meta-panel")
+                .flex()
+                .flex_col()
+                .w(px(420.0))
+                .py_2()
+                .px_3()
+                .gap_1()
+                .bg(rgb(0x20202c))
+                .border_1()
+                .border_color(rgb(0x3c3c4a))
+                .rounded_lg()
+                .shadow_lg()
+                .text_size(px(12.0))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_v, _e, _w, cx| cx.stop_propagation()),
+                )
+                .child(
+                    div()
+                        .text_size(px(14.0))
+                        .text_color(rgb(0x9fd0ff))
+                        .pb_2()
+                        .child(t(EditorView::meta_type_label(me.meta_type))),
+                )
+                .child(Input::new(&self.meta_input).w_full())
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(rgb(0x8a8a9a))
+                        .child(hint),
+                );
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgba(0x00000066))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|v, _e, _w, cx| {
+                        v.meta_edit = None;
                         cx.notify();
                     }),
                 )
@@ -3842,6 +3955,20 @@ impl Render for EditorView {
             }))
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
                 let k = ev.keystroke.key.as_str();
+                // meta dialog swallows keys (typing must not trigger editor
+                // keys); Enter applies, Esc cancels
+                if this.meta_edit.is_some() {
+                    match (ev.keystroke.modifiers.control, k) {
+                        (false, "escape") => {
+                            this.meta_edit = None;
+                            let f = this.focus.clone();
+                            w.focus(&f, cx);
+                            cx.notify();
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
                 let ctrl = ev.keystroke.modifiers.control;
                 let shift = ev.keystroke.modifiers.shift;
                 // the rename input owns its keys: Enter commits, Escape and
@@ -3911,6 +4038,7 @@ impl Render for EditorView {
                     this.show_output_status = false;
                     this.selection.clear();
                     this.sel_events.clear();
+                    this.meta_sel = None;
                     cx.notify();
                     return;
                 }
@@ -3949,6 +4077,7 @@ impl Render for EditorView {
             .child(status_bar)
             .children(menu_layer)
             .children(help_layer)
+            .children(meta_layer)
             .children(output_status)
             .children(palette_layer)
             // drag a .mid file anywhere to open it
