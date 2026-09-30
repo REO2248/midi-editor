@@ -88,9 +88,16 @@ impl Shared {
 
     /// Index into `dests` for `dest`, appending a fresh entry when absent.
     /// Missing MIDI ports keep their identity — `open_named` fails at play
-    /// time, which surfaces a readable error instead of a wrong port.
+    /// time, which surfaces a readable error instead of a wrong port. Dedup
+    /// is by routing identity (`same_identity`), not struct equality, so a
+    /// plugin arriving with different metadata (moved path, fresh vendor
+    /// string) doesn't fork the catalog into duplicate entries.
     pub fn ensure_dest(&mut self, label: &str, dest: Destination) -> usize {
-        if let Some(i) = self.dests.iter().position(|(_, d)| *d == dest) {
+        if let Some(i) = self
+            .dests
+            .iter()
+            .position(|(_, d)| d.same_identity(&dest))
+        {
             return i;
         }
         self.dests.push((label.to_string(), dest));
@@ -1118,12 +1125,19 @@ fn dispatch(
                 } else if let Some(p) = d["vst3"].as_str() {
                     Destination::Plugin {
                         plugin_path: p.to_string(),
+                        component_id: None,
+                        vendor: None,
+                        plugin_name: None,
                     }
                 } else {
                     return err_json(
                         "destination must be \"default\", {\"midi_port\": name} or {\"vst3\": path}",
                     );
                 };
+                // adopt catalog metadata (component id, vendor, name) when the
+                // path is a known scan result so stored routing is durable
+                let catalog: Vec<Destination> = sh.dests.iter().map(|(_, d)| d.clone()).collect();
+                let (dest, _) = midi_io::resolve_plugin_dest(&dest, &catalog);
                 let label = dest_label(&dest);
                 let idx = sh.ensure_dest(&label, dest);
                 sh.track_dest.insert(track, idx);
@@ -1475,7 +1489,7 @@ fn apply_ops(sh: &mut Shared, label: &str, ops: Vec<Op>) -> CallToolResponse {
 fn dest_label(d: &Destination) -> String {
     match d {
         Destination::MidiPort { port_name } => port_name.clone(),
-        Destination::Plugin { plugin_path } => {
+        Destination::Plugin { plugin_path, .. } => {
             format!("{} [VST3]", plugin_path)
         }
     }
@@ -1486,7 +1500,7 @@ fn dest_json(d: &Destination) -> serde_json::Value {
         Destination::MidiPort { port_name } => {
             serde_json::json!({"kind": "midi_port", "port_name": port_name})
         }
-        Destination::Plugin { plugin_path } => {
+        Destination::Plugin { plugin_path, .. } => {
             serde_json::json!({"kind": "vst3", "plugin_path": plugin_path})
         }
     }
@@ -1619,6 +1633,61 @@ mod tests {
 
     fn note_count(shared: &SharedDoc) -> usize {
         shared.lock().unwrap().doc.notes().len()
+    }
+
+    /// Destination dedup is by routing identity: a plugin identity arriving
+    /// with different metadata (moved path, fresh vendor/name) or via MCP
+    /// (path only, no component id) must reuse the same catalog slot rather
+    /// than forking it.
+    #[test]
+    fn ensure_dest_dedups_by_routing_identity() {
+        let mut sh = Shared::new(Document::from_file(smf_core::File {
+            format: 1,
+            division: smf_core::Division::Metrical(480),
+            tracks: vec![],
+            warnings: vec![],
+        }));
+        let catalog_dest = Destination::Plugin {
+            plugin_path: r"C:\VST3\Surge.vst3".into(),
+            component_id: Some("UID".into()),
+            vendor: Some("V".into()),
+            plugin_name: Some("Surge".into()),
+        };
+        let i = sh.ensure_dest("Surge", catalog_dest);
+        // MCP-style: same bundle, no metadata at all → same slot
+        let j = sh.ensure_dest(
+            "Surge",
+            Destination::Plugin {
+                plugin_path: r"C:\VST3\Surge.vst3".into(),
+                component_id: None,
+                vendor: None,
+                plugin_name: None,
+            },
+        );
+        assert_eq!(i, j);
+        // moved bundle, same component ID → same slot
+        let k = sh.ensure_dest(
+            "Surge",
+            Destination::Plugin {
+                plugin_path: r"D:\Moved\Surge.vst3".into(),
+                component_id: Some("UID".into()),
+                vendor: None,
+                plugin_name: None,
+            },
+        );
+        assert_eq!(i, k);
+        assert_eq!(sh.dests.len(), 1);
+        // a different plugin does get its own slot
+        let l = sh.ensure_dest(
+            "Dexed",
+            Destination::Plugin {
+                plugin_path: r"C:\VST3\Dexed.vst3".into(),
+                component_id: Some("UID2".into()),
+                vendor: None,
+                plugin_name: None,
+            },
+        );
+        assert_eq!(l, 1);
     }
 
     #[test]

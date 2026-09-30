@@ -2520,7 +2520,7 @@ impl Render for EditorView {
             rows.push(Self::msep().into_any_element());
             rows.push(Self::mhead(t("output.cat_vst3")).into_any_element());
             for (i, (name, dest)) in dests.iter().enumerate() {
-                let output::Destination::Plugin { plugin_path } = dest else {
+                let output::Destination::Plugin { plugin_path, .. } = dest else {
                     continue;
                 };
                 let vendor = self
@@ -2858,7 +2858,7 @@ impl EditorView {
             .iter()
             .enumerate()
             .filter_map(|(i, (name, d))| {
-                let output::Destination::Plugin { plugin_path } = d else {
+                let output::Destination::Plugin { plugin_path, .. } = d else {
                     return None;
                 };
                 let vendor = self

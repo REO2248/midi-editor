@@ -12,8 +12,137 @@ use thiserror::Error;
 pub enum Destination {
     /// midir output port, resolved by name at open time
     MidiPort { port_name: String },
-    /// hosted VST3 plugin instance, by bundle path
-    Plugin { plugin_path: String },
+    /// hosted VST3 plugin instance. `plugin_path` is where the bundle lives
+    /// NOW; the durable identity is `component_id` (the VST3 class UID), so
+    /// routing survives the bundle moving or being reinstalled elsewhere.
+    /// The extra fields are absent in sidecars written before identity
+    /// persistence — serde defaults migrate them on read.
+    Plugin {
+        plugin_path: String,
+        /// VST3 class/component ID (TUID hex string) when a probe saw it
+        #[serde(default)]
+        component_id: Option<String>,
+        /// plugin vendor, for display + disambiguation
+        #[serde(default)]
+        vendor: Option<String>,
+        /// human name, for display + disambiguation
+        #[serde(default)]
+        plugin_name: Option<String>,
+    },
+}
+
+impl Destination {
+    /// Same endpoint for routing purposes — not byte equality. Ports match
+    /// by name. Plugins match when the path agrees (covers in-place bundle
+    /// upgrades that may change the reported class id) OR when both sides
+    /// carry a component ID and those agree (covers the bundle moving).
+    pub fn same_identity(&self, other: &Destination) -> bool {
+        match (self, other) {
+            (
+                Destination::MidiPort { port_name: a },
+                Destination::MidiPort { port_name: b },
+            ) => a == b,
+            (
+                Destination::Plugin {
+                    plugin_path: pa,
+                    component_id: ca,
+                    ..
+                },
+                Destination::Plugin {
+                    plugin_path: pb,
+                    component_id: cb,
+                    ..
+                },
+            ) => pa == pb || matches!((ca, cb), (Some(a), Some(b)) if a == b),
+            _ => false,
+        }
+    }
+}
+
+/// Where `stored` ended up after `resolve_plugin_dest` matched it against
+/// the live plugin catalog.
+pub enum Resolved {
+    /// exact path still in the catalog (the preferred hint won)
+    SamePath,
+    /// path gone; remapped onto the same component ID found elsewhere —
+    /// carries the catalog path it resolved to
+    Moved(std::path::PathBuf),
+    /// several installs expose the component ID; one was picked
+    /// deterministically (longest common path prefix, then lowest path)
+    Ambiguous(std::path::PathBuf),
+    /// nothing matched — the stored identity is kept as-is so the
+    /// destination stays named and revives when the plugin returns
+    Missing,
+}
+
+/// Match a stored plugin destination against the scanned catalog, preferring
+/// the recorded path and falling back to the class/component ID when the
+/// bundle moved. Non-plugin destinations pass through unchanged.
+pub fn resolve_plugin_dest(
+    stored: &Destination,
+    catalog: &[Destination],
+) -> (Destination, Resolved) {
+    let Destination::Plugin {
+        plugin_path,
+        component_id,
+        ..
+    } = stored
+    else {
+        return (stored.clone(), Resolved::SamePath);
+    };
+    fn path_of(d: &Destination) -> &str {
+        match d {
+            Destination::Plugin { plugin_path, .. } => plugin_path,
+            _ => "",
+        }
+    }
+    // 1. preferred hint: exact path match — adopt the catalog's fresh metadata
+    if let Some(exact) = catalog.iter().find(|d| {
+        matches!(d, Destination::Plugin { plugin_path: p, .. } if p == plugin_path)
+    }) {
+        return (exact.clone(), Resolved::SamePath);
+    }
+    // 2. component-ID match: the bundle moved or was reinstalled
+    if let Some(cid) = component_id {
+        let mut matches: Vec<&Destination> = catalog
+            .iter()
+            .filter(|d| {
+                matches!(d, Destination::Plugin { component_id: c, .. } if c.as_deref() == Some(cid.as_str()))
+            })
+            .collect();
+        match matches.len() {
+            0 => {}
+            1 => {
+                let found = matches.pop().expect("one match");
+                return (
+                    found.clone(),
+                    Resolved::Moved(std::path::PathBuf::from(path_of(found))),
+                );
+            }
+            _ => {
+                matches.sort_by(|a, b| {
+                    // deterministic pick: longest shared path prefix with the
+                    // stored location wins, then the lowest path for stability
+                    let common = |p: &str| {
+                        std::path::Path::new(p)
+                            .components()
+                            .zip(std::path::Path::new(plugin_path).components())
+                            .take_while(|(x, y)| x == y)
+                            .count()
+                    };
+                    let ra = (common(path_of(a)), path_of(a));
+                    let rb = (common(path_of(b)), path_of(b));
+                    rb.0.cmp(&ra.0).then(ra.1.cmp(rb.1))
+                });
+                let found = matches[0];
+                return (
+                    found.clone(),
+                    Resolved::Ambiguous(std::path::PathBuf::from(path_of(found))),
+                );
+            }
+        }
+    }
+    (stored.clone(), Resolved::Missing)
 }
 
 #[derive(Debug, Error)]
@@ -385,6 +514,97 @@ impl Drop for Playback {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    fn plugin(path: &str, cid: Option<&str>) -> Destination {
+        Destination::Plugin {
+            plugin_path: path.into(),
+            component_id: cid.map(str::to_string),
+            vendor: None,
+            plugin_name: None,
+        }
+    }
+
+    /// Routing identity must survive metadata churn: same path always means
+    /// same destination (in-place upgrade), and equal component IDs mean the
+    /// same plugin even when the bundle moved.
+    #[test]
+    fn destination_identity_is_path_or_component_id() {
+        let a_old = plugin(r"C:\VST3\A.vst3", Some("UID_A"));
+        let a_moved = plugin(r"D:\Moved\A.vst3", Some("UID_A"));
+        let a_upgraded = plugin(r"C:\VST3\A.vst3", Some("UID_A2"));
+        let b = plugin(r"C:\VST3\B.vst3", Some("UID_B"));
+        let a_path_only = plugin(r"C:\VST3\A.vst3", None);
+
+        assert!(a_old.same_identity(&a_moved));
+        assert!(a_old.same_identity(&a_upgraded)); // same install dir
+        assert!(a_path_only.same_identity(&a_old)); // legacy sidecar
+        assert!(!a_old.same_identity(&b));
+        assert!(!a_moved.same_identity(&b));
+        assert!(!a_moved.same_identity(&a_path_only)); // no shared key
+    }
+
+    /// Resolution order: exact path first (preferred hint), then a single
+    /// component-ID match (moved), a deterministic pick among several, and
+    /// the stored identity untouched when nothing matches.
+    #[test]
+    fn resolve_prefers_path_then_component_id() {
+        let catalog = vec![
+            plugin(r"C:\VST3\Surge.vst3", Some("UID_SURGE")),
+            plugin(r"D:\Instruments\Dexed.vst3", Some("UID_DEX")),
+        ];
+
+        // exact path → catalog entry adopted, path hint honored
+        let stored = plugin(r"C:\VST3\Surge.vst3", None);
+        let (got, outcome) = resolve_plugin_dest(&stored, &catalog);
+        assert!(matches!(outcome, Resolved::SamePath));
+        assert!(matches!(got, Destination::Plugin { component_id: Some(c), .. } if c == "UID_SURGE"));
+
+        // moved bundle → resolved by component ID
+        let stored = plugin(r"C:\VST3\Dexed.vst3", Some("UID_DEX"));
+        let (got, outcome) = resolve_plugin_dest(&stored, &catalog);
+        assert!(matches!(outcome, Resolved::Moved(_)));
+        assert!(matches!(&got, Destination::Plugin { plugin_path, .. } if plugin_path == r"D:\Instruments\Dexed.vst3"));
+
+        // nothing matches → identity preserved, flagged missing
+        let stored = plugin(r"C:\VST3\Gone.vst3", Some("UID_GONE"));
+        let (got, outcome) = resolve_plugin_dest(&stored, &catalog);
+        assert!(matches!(outcome, Resolved::Missing));
+        assert_eq!(got, stored);
+    }
+
+    /// Two installs exposing the same component ID pick the one closest to
+    /// the recorded path — deterministically, regardless of catalog order.
+    #[test]
+    fn resolve_multiple_matches_is_deterministic() {
+        let near = plugin(r"C:\VST3\Vendor\Dup.vst3", Some("UID_DUP"));
+        let far = plugin(r"E:\Other\Dup.vst3", Some("UID_DUP"));
+        let stored = plugin(r"C:\VST3\Dup.vst3", Some("UID_DUP"));
+        for catalog in [
+            vec![near.clone(), far.clone()],
+            vec![far.clone(), near.clone()],
+        ] {
+            let (got, outcome) = resolve_plugin_dest(&stored, &catalog);
+            assert!(matches!(outcome, Resolved::Ambiguous(_)));
+            assert!(matches!(&got, Destination::Plugin { plugin_path, .. } if plugin_path == r"C:\VST3\Vendor\Dup.vst3"));
+        }
+    }
+
+    /// Sidecars written before identity persistence (path-only Plugin
+    /// destination) still deserialize.
+    #[test]
+    fn legacy_path_only_destination_deserializes() {
+        let json = r#"{"Plugin":{"plugin_path":"C:\\VST3\\Old.vst3"}}"#;
+        let d: Destination = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            d,
+            Destination::Plugin {
+                plugin_path: _,
+                component_id: None,
+                vendor: None,
+                plugin_name: None
+            }
+        ));
+    }
 
     struct RecordingSink(Arc<Mutex<Vec<Vec<u8>>>>);
 

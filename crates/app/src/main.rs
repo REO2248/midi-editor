@@ -406,6 +406,9 @@ fn build_dest_catalog(plugins: &[output::PluginInfo]) -> Vec<(String, midi_io::D
             p.name.clone(),
             midi_io::Destination::Plugin {
                 plugin_path: p.path.to_string_lossy().into_owned(),
+                component_id: p.uid.clone(),
+                vendor: (!p.vendor.is_empty()).then(|| p.vendor.clone()),
+                plugin_name: Some(p.name.clone()),
             },
         ));
     }
@@ -1698,7 +1701,7 @@ impl EditorView {
         let path = {
             let sh = lock_shared(&self.shared);
             match sh.dests.get(d).map(|(_, dest)| dest) {
-                Some(output::Destination::Plugin { plugin_path }) => PathBuf::from(plugin_path),
+                Some(output::Destination::Plugin { plugin_path, .. }) => PathBuf::from(plugin_path),
                 _ => return,
             }
         };
@@ -2199,11 +2202,16 @@ impl EditorView {
             .collect();
         sh.dests = fresh;
         sh.default_dest = old_default
-            .and_then(|d| sh.dests.iter().position(|(_, dd)| *dd == d))
+            .and_then(|d| sh.dests.iter().position(|(_, dd)| dd.same_identity(&d)))
             .unwrap_or(0);
         sh.track_dest = old_tracks
             .into_iter()
-            .filter_map(|(t, d)| sh.dests.iter().position(|(_, dd)| *dd == d).map(|i| (t, i)))
+            .filter_map(|(t, d)| {
+                sh.dests
+                    .iter()
+                    .position(|(_, dd)| dd.same_identity(&d))
+                    .map(|i| (t, i))
+            })
             .collect();
         let n = sh.dests.len();
         drop(sh);
@@ -2236,7 +2244,7 @@ impl EditorView {
             let sh = lock_shared(&self.shared);
             let d = sh.dest_of(self.sel_track);
             let p = sh.dests.get(d).and_then(|(_, dd)| match dd {
-                output::Destination::Plugin { plugin_path } => Some(PathBuf::from(plugin_path)),
+                output::Destination::Plugin { plugin_path, .. } => Some(PathBuf::from(plugin_path)),
                 _ => None,
             });
             (d, p)
@@ -2564,7 +2572,7 @@ fn prefs_path(doc_path: &std::path::Path) -> PathBuf {
 fn dest_label(d: &output::Destination) -> String {
     match d {
         output::Destination::MidiPort { port_name } => port_name.clone(),
-        output::Destination::Plugin { plugin_path } => {
+        output::Destination::Plugin { plugin_path, .. } => {
             let stem = PathBuf::from(plugin_path)
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
@@ -2578,8 +2586,29 @@ impl EditorView {
     /// Find or re-create the dest matching a stored identity; returns its index
     /// into `shared.dests`. Unavailable ports/plugins keep their identity —
     /// the assignment stays visible and plays again once the device is back.
+    /// Plugin destinations resolve through the class/component ID first: a
+    /// bundle that moved keeps its routing (and its recorded path is updated
+    /// on the next save).
     fn resolve_dest(&mut self, d: &output::Destination) -> usize {
-        lock_shared(&self.shared).ensure_dest(&dest_label(d), d.clone())
+        let mut sh = lock_shared(&self.shared);
+        let catalog: Vec<output::Destination> =
+            sh.dests.iter().map(|(_, d)| d.clone()).collect();
+        let (resolved, outcome) = midi_io::resolve_plugin_dest(d, &catalog);
+        let stem = |p: &std::path::PathBuf| {
+            p.file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        };
+        match outcome {
+            midi_io::Resolved::Moved(p) => {
+                self.status = tf("output.plugin_moved", &[("name", stem(&p).as_str())]).into();
+            }
+            midi_io::Resolved::Ambiguous(p) => {
+                self.status = tf("output.plugin_ambiguous", &[("name", stem(&p).as_str())]).into();
+            }
+            _ => {}
+        }
+        sh.ensure_dest(&dest_label(&resolved), resolved)
     }
 
     fn apply_prefs(&mut self, doc_path: &std::path::Path) {

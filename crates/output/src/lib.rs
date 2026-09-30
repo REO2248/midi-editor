@@ -13,6 +13,10 @@ pub struct PluginInfo {
     pub name: String,
     pub path: std::path::PathBuf,
     pub vendor: String,
+    /// VST3 class/component ID (TUID hex) — the durable plugin identity
+    /// across bundle moves. `None` when only the filename fallback ran
+    /// (no probe) since the path alone is all that scan knows.
+    pub uid: Option<String>,
 }
 
 pub fn sidecar_binary(stem: &str) -> Option<std::path::PathBuf> {
@@ -115,6 +119,7 @@ pub fn discover_plugins() -> ScanReport {
                     name: p.info.name.clone(),
                     path: p.info.path.clone(),
                     vendor: p.info.vendor.clone(),
+                    uid: (!p.info.uid.is_empty()).then(|| p.info.uid.clone()),
                 })
                 .collect();
             found.sort_by(|a, b| a.name.cmp(&b.name));
@@ -171,6 +176,7 @@ pub fn discover_plugin_paths() -> Vec<PluginInfo> {
                             .unwrap_or_else(|| "unknown".into()),
                         path: p,
                         vendor: String::new(),
+                        uid: None,
                     });
                 }
             }
