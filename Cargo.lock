@@ -4308,6 +4308,7 @@ dependencies = [
  "mcp-server",
  "midi-io",
  "output",
+ "persist",
  "serde",
  "serde_json",
  "smf-core",
@@ -5327,6 +5328,8 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 name = "persist"
 version = "0.0.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "windows-sys 0.61.2",
 ]

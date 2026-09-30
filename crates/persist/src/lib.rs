@@ -4,6 +4,7 @@
 //! through, so durability and revision semantics cannot diverge.
 
 mod atomic;
+pub mod json;
 
 pub use atomic::{write_atomic, write_atomic_opts, AtomicOptions, PersistError, Phase};
 
