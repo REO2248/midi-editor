@@ -12,6 +12,7 @@ commands.workspace = true
 midi-io.workspace = true
 output.workspace = true
 mcp-server.workspace = true
+persist.workspace = true
 vst3-host.workspace = true
 serde.workspace = true
 serde_json.workspace = true

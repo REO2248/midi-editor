@@ -58,7 +58,7 @@ pub struct PersistError {
 }
 
 impl PersistError {
-    fn new(phase: Phase, path: &Path, source: std::io::Error) -> Self {
+    pub(crate) fn new(phase: Phase, path: &Path, source: std::io::Error) -> Self {
         Self {
             phase,
             recoverable: None,
@@ -297,11 +297,12 @@ fn replace(path: &Path, tmp: &Path, backup: Option<&Path>) -> std::io::Result<()
 #[cfg(windows)]
 fn is_transient(e: &std::io::Error) -> bool {
     // 2 = target vanished between the exists() check and the call;
-    // 5/32/33 = sharing/lock violations; 1176-1178 = ReplaceFileW's
-    // UNABLE_TO_MOVE family on a target being concurrently replaced
+    // 5/32/33 = sharing/lock violations; 1175-1178 = ReplaceFileW's
+    // UNABLE_TO_MOVE/UNABLE_TO_REMOVE family on a target being
+    // concurrently replaced
     matches!(
         e.raw_os_error(),
-        Some(2 | 5 | 32 | 33 | 1176 | 1177 | 1178)
+        Some(2 | 5 | 32 | 33 | 1175 | 1176 | 1177 | 1178)
     )
 }
 
@@ -378,14 +379,15 @@ fn sync_dir(_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+// fault injection is one process-global flag — every test in this crate
+// (atomic + json) takes the guard so no test can consume another's armed phase
+#[cfg(test)]
+pub(crate) static TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::ErrorKind;
-
-    // fault injection is one process-global flag — every test takes the
-    // guard so no test can consume another's armed phase
-    static TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn testdir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join("midi-editor-persist-tests").join(name);
@@ -405,7 +407,7 @@ mod tests {
 
     #[test]
     fn unique_temps_no_collision_under_concurrency() {
-        let _g = TEST_GUARD.lock().unwrap();
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let dir = testdir("unique_temps_no_collision_under_concurrency");
         let p = dir.join("song.mid");
         std::fs::write(&p, b"original").unwrap();
@@ -427,7 +429,7 @@ mod tests {
 
     #[test]
     fn write_failure_leaves_target_intact() {
-        let _g = TEST_GUARD.lock().unwrap();
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let dir = testdir("write_failure_leaves_target_intact");
         let p = dir.join("song.mid");
         std::fs::write(&p, b"old").unwrap();
@@ -441,7 +443,7 @@ mod tests {
 
     #[test]
     fn sync_failure_leaves_target_intact() {
-        let _g = TEST_GUARD.lock().unwrap();
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let dir = testdir("sync_failure_leaves_target_intact");
         let p = dir.join("song.mid");
         std::fs::write(&p, b"old").unwrap();
@@ -454,7 +456,7 @@ mod tests {
 
     #[test]
     fn replace_failure_keeps_recoverable_temp() {
-        let _g = TEST_GUARD.lock().unwrap();
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let dir = testdir("replace_failure_keeps_recoverable_temp");
         let p = dir.join("song.mid");
         std::fs::write(&p, b"old").unwrap();
@@ -471,7 +473,7 @@ mod tests {
 
     #[test]
     fn dirsync_failure_reports_phase_after_replace() {
-        let _g = TEST_GUARD.lock().unwrap();
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let dir = testdir("dirsync_failure_reports_phase_after_replace");
         let p = dir.join("song.mid");
         std::fs::write(&p, b"old").unwrap();
@@ -486,7 +488,7 @@ mod tests {
 
     #[test]
     fn backup_holds_previous_contents() {
-        let _g = TEST_GUARD.lock().unwrap();
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let dir = testdir("backup_holds_previous_contents");
         let p = dir.join("song.mid");
         let bak = dir.join("song.mid.bak");
@@ -505,7 +507,7 @@ mod tests {
 
     #[test]
     fn write_into_missing_target_creates_it() {
-        let _g = TEST_GUARD.lock().unwrap();
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let dir = testdir("write_into_missing_target_creates_it");
         let p = dir.join("fresh.mid");
         write_atomic(&p, b"data").unwrap();
@@ -514,7 +516,7 @@ mod tests {
 
     #[test]
     fn temp_create_failure_is_typed() {
-        let _g = TEST_GUARD.lock().unwrap();
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let dir = testdir("temp_create_failure_is_typed");
         let p = dir.join("song.mid");
         set_fail_phase(Some(Phase::TempCreate));

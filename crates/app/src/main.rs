@@ -532,7 +532,10 @@ impl EditorView {
         v.sel_track = v.pick_default_track();
         v.refresh_derived();
         if let Some(p) = &path {
-            v.apply_prefs(p);
+            let diags = v.apply_prefs(p);
+            if !diags.is_empty() {
+                v.status = tf("status.prefs_warn", &[("e", &diags.join("; "))]).into();
+            }
             v.push_recent(p);
         }
         v.rescan_plugins();
@@ -1623,7 +1626,7 @@ impl EditorView {
                 // content — a saved per-file sidecar (applied next) overrides
                 self.refresh_derived();
                 self.reset_view_to_content();
-                self.apply_prefs(&path);
+                let pref_diags = self.apply_prefs(&path);
                 self.push_recent(&path);
                 let mut status = if load_warnings.is_empty() {
                     t("status.loaded").to_string()
@@ -1636,6 +1639,12 @@ impl EditorView {
                         ],
                     )
                 };
+                if !pref_diags.is_empty() {
+                    status = format!(
+                        "{status} — {}",
+                        tf("status.prefs_warn", &[("e", &pref_diags.join("; "))])
+                    );
+                }
                 if rec_discarded {
                     status = format!("{status} — {}", t("status.rec_discarded"));
                 }
@@ -2456,12 +2465,46 @@ impl EditorView {
 
 /// App-wide preferences: recent files + record count-in + recording source.
 /// Stored at %APPDATA%/midi-editor/prefs.json (unlike the per-song sidecar).
-#[derive(serde::Serialize, serde::Deserialize, Default)]
+/// Versioned + atomically persisted via `persist::json` — a torn write can
+/// no longer silently reset recent files.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct GlobalPrefs {
+    /// schema version — absent in v0 files
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
     recent: Vec<String>,
+    #[serde(default)]
     count_in: bool,
     /// MIDI input port name to record from; empty = first available port
+    #[serde(default)]
     midi_in: String,
+}
+
+impl Default for GlobalPrefs {
+    fn default() -> Self {
+        Self {
+            version: <Self as persist::json::Versioned>::VERSION,
+            recent: Vec::new(),
+            count_in: false,
+            midi_in: String::new(),
+        }
+    }
+}
+
+impl persist::json::Versioned for GlobalPrefs {
+    const VERSION: u32 = 1;
+
+    fn migrate(doc: &mut serde_json::Value) {
+        // v0 → v1: identical shape, the version stamp is the only change
+        doc["version"] = 1.into();
+    }
+
+    fn sanitize(&mut self) {
+        self.recent.retain(|p| !p.is_empty());
+        self.recent.dedup();
+        self.recent.truncate(10); // same cap as push_recent
+    }
 }
 
 impl GlobalPrefs {
@@ -2473,18 +2516,17 @@ impl GlobalPrefs {
     }
 
     fn load() -> Self {
-        std::fs::read_to_string(Self::path().join("prefs.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        let l = persist::json::load_json::<GlobalPrefs>(&Self::path().join("prefs.json"));
+        for d in &l.diagnostics {
+            tracing::warn!("prefs: {d}");
+        }
+        l.value.unwrap_or_default()
     }
 
     fn save(&self) {
         let dir = Self::path();
         let _ = std::fs::create_dir_all(&dir);
-        if let Ok(s) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(dir.join("prefs.json"), s);
-        }
+        let _ = persist::json::save_json(&dir.join("prefs.json"), self);
     }
 }
 
@@ -2492,13 +2534,21 @@ impl GlobalPrefs {
 /// assignments (by stable destination identity, not runtime index), mute/solo,
 /// metronome/loop, view transform. Written next to the document as
 /// `song.mid.editor.json`.
-#[derive(serde::Serialize, serde::Deserialize, Default)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Prefs {
+    /// schema version — absent in v0 files
+    #[serde(default)]
+    version: u32,
     default_dest: Option<output::Destination>,
+    #[serde(default)]
     track_dest: HashMap<usize, output::Destination>,
+    #[serde(default)]
     muted: Vec<usize>,
+    #[serde(default)]
     soloed: Vec<usize>,
+    #[serde(default)]
     metronome: bool,
+    #[serde(default)]
     loop_enabled: bool,
     /// None in old sidecars = keep the default (off)
     chase_sysex: Option<bool>,
@@ -2511,6 +2561,72 @@ struct Prefs {
     show_events: Option<bool>,
     tool: Option<String>,
     snap: Option<usize>,
+}
+
+impl Default for Prefs {
+    fn default() -> Self {
+        Self {
+            version: <Self as persist::json::Versioned>::VERSION,
+            default_dest: None,
+            track_dest: HashMap::new(),
+            muted: Vec::new(),
+            soloed: Vec::new(),
+            metronome: false,
+            loop_enabled: false,
+            chase_sysex: None,
+            zoom: None,
+            scroll_x: None,
+            scroll_y: None,
+            sel_track: None,
+            enc: None,
+            lane: None,
+            show_events: None,
+            tool: None,
+            snap: None,
+        }
+    }
+}
+
+impl persist::json::Versioned for Prefs {
+    const VERSION: u32 = 1;
+
+    fn migrate(doc: &mut serde_json::Value) {
+        // v0 → v1: identical shape, the version stamp is the only change
+        doc["version"] = 1.into();
+    }
+
+    /// clamp doc-independent fields at load time; track-index bounds that
+    /// depend on the document are still checked where they're applied
+    fn sanitize(&mut self) {
+        // a NaN/non-positive zoom makes every roll coordinate NaN —
+        // nothing paints; drop it to the default instead
+        self.zoom = self
+            .zoom
+            .and_then(|z| (z.is_finite() && z > 0.0).then(|| z.clamp(ZOOM_MIN, ZOOM_MAX)));
+        self.scroll_x = self.scroll_x.and_then(|x| x.is_finite().then(|| x.max(0.0)));
+        self.scroll_y = self.scroll_y.and_then(|y| y.is_finite().then(|| y.max(0.0)));
+        self.snap = self.snap.map(|i| i.min(SNAPS.len() - 1));
+        self.enc = self
+            .enc
+            .take()
+            .filter(|e| matches!(e.as_str(), "utf8" | "sjis" | "latin1"));
+        self.tool = self
+            .tool
+            .take()
+            .filter(|t| matches!(t.as_str(), "select" | "draw" | "erase"));
+        self.lane = self.lane.take().filter(|l| {
+            l == "vel"
+                || l == "pb"
+                || l.strip_prefix("cc")
+                    .and_then(|n| n.parse::<u8>().ok())
+                    .is_some_and(|c| c <= 127)
+        });
+        // unbounded track indexes are noise, not data — keep only plausible
+        // indices (document bounds are still enforced at apply time)
+        self.muted.retain(|t| *t < 1024);
+        self.soloed.retain(|t| *t < 1024);
+        self.track_dest.retain(|t, _| *t < 1024);
+    }
 }
 
 fn prefs_path(doc_path: &std::path::Path) -> PathBuf {
@@ -2539,12 +2655,13 @@ impl EditorView {
         lock_shared(&self.shared).ensure_dest(&dest_label(d), d.clone())
     }
 
-    fn apply_prefs(&mut self, doc_path: &std::path::Path) {
-        let Ok(text) = std::fs::read_to_string(prefs_path(doc_path)) else {
-            return;
-        };
-        let Ok(p) = serde_json::from_str::<Prefs>(&text) else {
-            return;
+    /// Apply the per-song sidecar. A corrupt or quarantined sidecar can
+    /// never break the open — the returned diagnostics are surfaced on the
+    /// status line instead of being silently discarded.
+    fn apply_prefs(&mut self, doc_path: &std::path::Path) -> Vec<String> {
+        let l = persist::json::load_json::<Prefs>(&prefs_path(doc_path));
+        let Some(p) = l.value else {
+            return l.diagnostics;
         };
         if let Some(d) = &p.default_dest {
             let i = self.resolve_dest(d);
@@ -2611,10 +2728,11 @@ impl EditorView {
             _ => Tool::Select,
         };
         if let Some(i) = p.snap {
-            self.snap_idx = i.min(SNAPS.len() - 1);
+            self.snap_idx = i;
         }
         // start warming any VST3 destinations the prefs just restored
         self.refresh_plugins();
+        l.diagnostics
     }
 
     /// MRU update + persist to the app-wide prefs file.
@@ -2631,6 +2749,7 @@ impl EditorView {
             recent: self.recent.iter().map(|r| r.to_string()).collect(),
             count_in: self.count_in,
             midi_in: self.midi_in.to_string(),
+            ..Default::default()
         }
         .save();
     }
@@ -2641,6 +2760,7 @@ impl EditorView {
             return;
         };
         let prefs = Prefs {
+            version: <Prefs as persist::json::Versioned>::VERSION,
             default_dest: sh.dests.get(sh.default_dest).map(|(_, d)| d.clone()),
             track_dest: sh
                 .track_dest
@@ -2680,9 +2800,9 @@ impl EditorView {
             ),
             snap: Some(self.snap_idx),
         };
-        if let Ok(text) = serde_json::to_string_pretty(&prefs) {
-            let _ = std::fs::write(prefs_path(&path), text);
-        }
+        // atomic temp+replace with a bounded .bak of the previous valid
+        // version — a crash mid-write can no longer reset the sidecar
+        let _ = persist::json::save_json(&prefs_path(&path), &prefs);
     }
 }
 
@@ -2843,7 +2963,7 @@ fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
 
 #[cfg(test)]
 mod tests {
-    use crate::empty_doc;
+    use crate::{empty_doc, GlobalPrefs, Prefs};
 
     /// Every freshly parsed document reports revision 0, so the derived-view
     /// caches must not key on the revision alone: before `doc_epoch` existed,
@@ -2853,5 +2973,131 @@ mod tests {
     #[test]
     fn fresh_documents_share_revision_zero() {
         assert_eq!(empty_doc().revision(), empty_doc().revision());
+    }
+
+    fn testdir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join("midi-editor-prefs-tests")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// v0 sidecars (every existing `.editor.json`) carry no version field —
+    /// migration stamps v1 and the same fields load.
+    #[test]
+    fn sidecar_v0_migrates_to_v1() {
+        let dir = testdir("sidecar_v0_migrates_to_v1");
+        let p = dir.join("song.mid.editor.json");
+        std::fs::write(
+            &p,
+            br#"{"metronome":true,"loop_enabled":true,"zoom":0.05,"snap":3,"muted":[2]}"#,
+        )
+        .unwrap();
+        let l = persist::json::load_json::<Prefs>(&p);
+        let prefs = l.value.expect("v0 sidecar loads");
+        assert_eq!(prefs.version, 1);
+        assert!(prefs.metronome && prefs.loop_enabled);
+        assert_eq!(prefs.snap, Some(3));
+        assert_eq!(prefs.muted, vec![2]);
+    }
+
+    /// corrupt sidecar → quarantined, open proceeds, .bak recovers prior state
+    #[test]
+    fn sidecar_corruption_recovers_backup() {
+        let dir = testdir("sidecar_corruption_recovers_backup");
+        let p = dir.join("song.mid.editor.json");
+        persist::json::save_json(
+            &p,
+            &Prefs {
+                metronome: true,
+                zoom: Some(0.1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        persist::json::save_json(
+            &p,
+            &Prefs {
+                loop_enabled: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        std::fs::write(&p, b"{\"version\":1,\"zoom\":").unwrap();
+        let l = persist::json::load_json::<Prefs>(&p);
+        assert!(l.recovered_from_backup);
+        let prefs = l.value.expect("backup recovers last valid");
+        assert!(prefs.metronome, "previous valid version, not the torn one");
+        assert!(!p.exists(), "corrupt primary quarantined");
+    }
+
+    /// unknown future fields and a newer version still load known data —
+    /// the file is left alone for the newer build that wrote it
+    #[test]
+    fn sidecar_newer_version_keeps_known_fields() {
+        let dir = testdir("sidecar_newer_version_keeps_known_fields");
+        let p = dir.join("song.mid.editor.json");
+        std::fs::write(
+            &p,
+            br#"{"version":7,"metronome":true,"future_thing":[1,2,3],"zoom":0.2}"#,
+        )
+        .unwrap();
+        let l = persist::json::load_json::<Prefs>(&p);
+        let prefs = l.value.expect("newer sidecar loads");
+        assert!(prefs.metronome);
+        assert!(p.exists());
+        assert!(!l.diagnostics.is_empty());
+    }
+
+    /// out-of-range numerics are clamped at load, before apply_prefs
+    #[test]
+    fn sidecar_bad_numerics_are_clamped() {
+        let dir = testdir("sidecar_bad_numerics_are_clamped");
+        let p = dir.join("song.mid.editor.json");
+        std::fs::write(
+            &p,
+            br#"{"version":1,"zoom":-4.0,"scroll_x":-9.5,"snap":999,"enc":"koi8","tool":"laser","lane":"cc999"}"#,
+        )
+        .unwrap();
+        let l = persist::json::load_json::<Prefs>(&p);
+        let prefs = l.value.unwrap();
+        assert_eq!(prefs.zoom, None, "non-positive zoom dropped, not clamped");
+        assert_eq!(prefs.scroll_x, Some(0.0));
+        assert_eq!(prefs.snap, Some(crate::SNAPS.len() - 1));
+        assert_eq!(prefs.enc, None);
+        assert_eq!(prefs.tool, None);
+        assert_eq!(prefs.lane, None);
+    }
+
+    /// destinations that no longer exist still deserialize — they keep
+    /// their identity and resolve again when the device comes back
+    #[test]
+    fn sidecar_missing_destinations_still_parse() {
+        let dir = testdir("sidecar_missing_destinations_still_parse");
+        let p = dir.join("song.mid.editor.json");
+        std::fs::write(
+            &p,
+            br#"{"version":1,"default_dest":{"MidiPort":{"port_name":"gone-port"}},"track_dest":{"3":{"Plugin":{"plugin_path":"C:\\VST3\\absent.vst3"}}}}"#,
+        )
+        .unwrap();
+        let l = persist::json::load_json::<Prefs>(&p);
+        let prefs = l.value.expect("missing destinations parse fine");
+        assert!(prefs.default_dest.is_some());
+        assert!(prefs.track_dest.contains_key(&3));
+    }
+
+    #[test]
+    fn global_prefs_v0_loads_and_newer_survives() {
+        let dir = testdir("global_prefs_v0_loads_and_newer_survives");
+        let p = dir.join("prefs.json");
+        std::fs::write(&p, br#"{"recent":["a.mid"],"count_in":true,"midi_in":"p1"}"#).unwrap();
+        let l = persist::json::load_json::<GlobalPrefs>(&p);
+        let g = l.value.expect("v0 globals load");
+        assert_eq!(g.version, 1);
+        assert_eq!(g.recent, vec!["a.mid"]);
+        assert!(g.count_in);
+        assert_eq!(g.midi_in, "p1");
     }
 }
