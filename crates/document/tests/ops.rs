@@ -510,23 +510,19 @@ fn humanize_is_deterministic_and_bounded() {
         chan(1440, 0x90, 64, 90),
         chan(1920, 0x80, 64, 0),
     ]]);
-    let ops_a = d.humanize_ops(0, 0, u64::MAX, 10, 8);
-    let ops_b = d.humanize_ops(0, 0, u64::MAX, 10, 8);
-    let ticks_a: Vec<u64> = ops_a
-        .iter()
-        .map(|o| match o {
-            Op::UpdateEvent { after, .. } => after.tick,
-            _ => 0,
-        })
-        .collect();
-    let ticks_b: Vec<u64> = ops_b
-        .iter()
-        .map(|o| match o {
-            Op::UpdateEvent { after, .. } => after.tick,
-            _ => 0,
-        })
-        .collect();
-    assert_eq!(ticks_a, ticks_b);
+    let ops_a = d.humanize_ops(0, 0, u64::MAX, 10, 8, 42);
+    let ops_b = d.humanize_ops(0, 0, u64::MAX, 10, 8, 42);
+    let ops_c = d.humanize_ops(0, 0, u64::MAX, 10, 8, 7);
+    let ticks_of = |ops: &[Op]| -> Vec<u64> {
+        ops.iter()
+            .map(|o| match o {
+                Op::UpdateEvent { after, .. } => after.tick,
+                _ => 0,
+            })
+            .collect()
+    };
+    assert_eq!(ticks_of(&ops_a), ticks_of(&ops_b)); // same seed -> identical
+    assert_ne!(ticks_of(&ops_a), ticks_of(&ops_c)); // different seed differs
     apply(&mut d, ops_a);
     for n in notes_on(&d, 0) {
         assert!(
@@ -1404,4 +1400,41 @@ fn legato_stays_within_channel() {
     assert_eq!(ch0_first.end_tick, Some(500));
     let ch1 = ns.iter().find(|n| n.channel == 1).unwrap();
     assert_eq!(ch1.end_tick, Some(960)); // no ch1 successor — untouched
+}
+
+#[test]
+fn swing_delays_only_odd_grid_notes_and_keeps_duration() {
+    // grid 240 (8th at ppq 480): notes at 0 (even), 240 (odd), 480 (even), 720 (odd)
+    let mut d = doc(vec![vec![
+        chan(0, 0x90, 60, 100),
+        chan(200, 0x80, 60, 0),
+        chan(240, 0x90, 62, 90),
+        chan(440, 0x80, 62, 0),
+        chan(480, 0x90, 64, 80),
+        chan(680, 0x80, 64, 0),
+        chan(720, 0x90, 65, 70),
+        chan(920, 0x80, 65, 0),
+    ]]);
+    // 50% swing -> odd-line notes shift +120
+    let ops = d.swing_ops(0, 0, u64::MAX, 240, 50);
+    apply(&mut d, ops);
+    let ns = notes_on(&d, 0);
+    let at = |key: u8| ns.iter().find(|n| n.key == key).unwrap();
+    assert_eq!(at(60).start_tick, 0);
+    assert_eq!(at(62).start_tick, 360);
+    assert_eq!(at(64).start_tick, 480);
+    assert_eq!(at(65).start_tick, 840);
+    assert_eq!(at(62).end_tick.unwrap() - at(62).start_tick, 200); // duration held
+}
+
+#[test]
+fn swing_amount_zero_is_noop_and_hundred_clamps() {
+    let mk = || doc(vec![vec![chan(240, 0x90, 62, 90), chan(440, 0x80, 62, 0)]]);
+    let mut d = mk();
+    assert!(d.swing_ops(0, 0, u64::MAX, 240, 0).is_empty());
+    // amount > 100 clamps to 100 -> shift == grid-1, still < one cell
+    let mut d = mk();
+    let ops = d.swing_ops(0, 0, u64::MAX, 240, 200);
+    apply(&mut d, ops);
+    assert_eq!(notes_on(&d, 0)[0].start_tick, 240 + 239);
 }

@@ -129,6 +129,8 @@ enum Sub {
     Scale,
     /// Edit → legato gap/overlap presets
     LegatoGap,
+    /// Edit → swing amount presets
+    Swing,
 }
 
 #[derive(Clone, Copy, PartialEq)]

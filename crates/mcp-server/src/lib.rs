@@ -1734,6 +1734,25 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "ticks": {"type": "integer"}, "base_revision": {"type": "integer"},
             })),
         ),
+        spec(
+            "swing",
+            "Swing: shift notes landing on odd `grid` cells later by `amount`% of a cell. Args: track?, from?, to?, grid (ticks, required), amount 0-100, dry_run? (preview summary without applying). Optional base_revision.",
+            object_schema(serde_json::json!({
+                "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
+                "grid": {"type": "integer"}, "amount": {"type": "integer"},
+                "dry_run": {"type": "boolean"}, "base_revision": {"type": "integer"},
+            })),
+        ),
+        spec(
+            "humanize",
+            "Deterministic seeded jitter on note starts and velocities. Args: track?, from?, to?, timing (max |tick|), vel (max |dv|), seed (integer; same seed+settings = identical output, recorded in the tx label), dry_run?. Optional base_revision.",
+            object_schema(serde_json::json!({
+                "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
+                "timing": {"type": "integer"}, "vel": {"type": "integer"},
+                "seed": {"type": "integer"},
+                "dry_run": {"type": "boolean"}, "base_revision": {"type": "integer"},
+            })),
+        ),
     ]
 }
 
@@ -2741,6 +2760,55 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
             }
             apply_ops(&mut sh, "set length", ops)
         }
+        "swing" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let (from, to) = region(args);
+            let Some(grid) = args["grid"].as_u64() else {
+                return err_json("swing requires 'grid' (ticks)");
+            };
+            let amount = args["amount"].as_u64().unwrap_or(50) as u32;
+            let tracks = match sel_tracks(&sh, args) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
+            let mut ops = Vec::new();
+            for t in tracks {
+                ops.extend(sh.doc.swing_ops(t, from, to, grid, amount));
+            }
+            dry_or_apply(
+                &mut sh,
+                &format!("swing {amount}% grid={grid}"),
+                ops,
+                args["dry_run"].as_bool().unwrap_or(false),
+            )
+        }
+        "humanize" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let (from, to) = region(args);
+            let timing = args["timing"].as_i64().unwrap_or(12);
+            let vel = args["vel"].as_i64().unwrap_or(8) as i32;
+            let seed = args["seed"].as_u64().unwrap_or(0);
+            let tracks = match sel_tracks(&sh, args) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
+            let mut ops = Vec::new();
+            for t in tracks {
+                ops.extend(sh.doc.humanize_ops(t, from, to, timing, vel, seed));
+            }
+            // seed rides in the label so the history/undo entry is
+            // self-describing and reproducible
+            dry_or_apply(
+                &mut sh,
+                &format!("humanize seed={seed} timing={timing} vel={vel}"),
+                ops,
+                args["dry_run"].as_bool().unwrap_or(false),
+            )
+        }
         _ => err_json(format!("unknown tool '{name}'")),
     }
 }
@@ -2797,6 +2865,18 @@ fn sel_tracks(sh: &Shared, args: &serde_json::Value) -> Result<Vec<usize>, CallT
             sh.view().tracks.len()
         ))),
     }
+}
+
+/// `dry_run` reports what would change without touching the document.
+fn dry_or_apply(sh: &mut Shared, label: &str, ops: Vec<Op>, dry_run: bool) -> CallToolResponse {
+    if dry_run {
+        return ok_json(serde_json::json!({
+            "dry_run": true,
+            "label": label,
+            "ops": ops.len(),
+        }));
+    }
+    apply_ops(sh, label, ops)
 }
 
 fn apply_ops(sh: &mut Shared, label: &str, ops: Vec<Op>) -> CallToolResponse {

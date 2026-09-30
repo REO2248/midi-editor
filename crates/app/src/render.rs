@@ -2358,7 +2358,9 @@ impl Render for EditorView {
                     Self::msep("ms6").into_any_element(),
                     Self::mi("e.human", t("edit.humanize"), "", None, cx, |v, _e, _cx| {
                         v.apply_region_op("humanize", |d, t, f, to| {
-                            d.humanize_ops(t, f, to, 12, 8)
+                            // revision as seed: identical ops replay the same
+                            // take; a different doc state reseeds the jitter
+                            d.humanize_ops(t, f, to, 12, 8, d.revision())
                         });
                     })
                     .into_any_element(),
@@ -2366,6 +2368,7 @@ impl Render for EditorView {
                         v.split_at_playhead(cx);
                     })
                     .into_any_element(),
+                    Self::mi_sub("e.swing", t("edit.swing"), Sub::Swing, cx).into_any_element(),
                     Self::mi("e.join", t("edit.join"), "", None, cx, |v, _e, _cx| {
                         v.apply_region_op("join", |d, t, f, to| d.join_ops(t, f, to));
                     })
@@ -3252,6 +3255,28 @@ impl Render for EditorView {
                                 Self::mi_leaf(("leg", i), label, "", None, cx, move |v, _e, _cx| {
                                     v.apply_region_op("legato", move |d, t, f, to| {
                                         d.legato_ops(t, f, to, gap)
+                                    });
+                                })
+                                .into_any_element()
+                            })
+                            .collect()
+                    }
+                    Sub::Swing => {
+                        // swing grid = 16th note; amount = % of one cell the
+                        // off-beat shifts later
+                        let grid = self.ppq() / 4;
+                        let opts: [(&str, u32); 4] = [
+                            ("swing 50%", 50),
+                            ("swing 66%", 66),
+                            ("swing 75%", 75),
+                            ("swing 100%", 100),
+                        ];
+                        opts.into_iter()
+                            .enumerate()
+                            .map(|(i, (label, amount))| {
+                                Self::mi_leaf(("swg", i), label, "", None, cx, move |v, _e, _cx| {
+                                    v.apply_region_op("swing", move |d, t, f, to| {
+                                        d.swing_ops(t, f, to, grid, amount)
                                     });
                                 })
                                 .into_any_element()
