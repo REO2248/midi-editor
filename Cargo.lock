@@ -5328,6 +5328,7 @@ name = "persist"
 version = "0.0.0"
 dependencies = [
  "thiserror 2.0.21",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
