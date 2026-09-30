@@ -71,6 +71,8 @@ static EN: &[(&str, &str)] = &[
     ("view.zoom_out", "Zoom Out"),
     ("view.zoom_reset", "Zoom Reset"),
     ("view.lane", "Lane"),
+    ("view.lane.add", "Add lane"),
+    ("view.lane.remove", "Remove lane"),
     ("view.encoding", "Text Encoding"),
     ("enc.auto", "Auto"),
     // Track
@@ -229,6 +231,8 @@ static JA: &[(&str, &str)] = &[
     ("view.zoom_out", "ズームアウト"),
     ("view.zoom_reset", "ズームリセット"),
     ("view.lane", "レーン"),
+    ("view.lane.add", "レーン追加"),
+    ("view.lane.remove", "レーン削除"),
     ("view.encoding", "文字エンコーディング"),
     ("enc.auto", "自動"),
     ("track.rename", "名前を変更…"),

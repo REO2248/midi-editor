@@ -48,6 +48,8 @@ enum DragMode {
     Velocity,
     /// lane drag editing a CC/PB event (`on_id` = event id; `dkey` = value)
     LaneEvent,
+    /// drag on a lane's header strip resizes that lane's body height
+    LaneResize,
     /// alt-drag: copy the selection instead of moving it
     Duplicate,
     /// erase tool: every note touched joins `erase_ids`, deleted on commit
@@ -90,8 +92,8 @@ enum DestPick {
     Default,
 }
 
-/// What the bottom lane edits for the selected track.
-#[derive(Clone, Copy, PartialEq)]
+/// What a bottom lane edits for the selected track.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum LaneMode {
     Velocity,
     /// Control Change lane, controller number in the field
@@ -117,6 +119,63 @@ impl LaneMode {
             LaneMode::CC(n) => format!("CC{n}"),
             LaneMode::PitchBend => "PB".to_string(),
         }
+    }
+}
+
+/// Modes offered by the View > Lane menu and the add-lane picker.
+const LANE_MODES: [LaneMode; 7] = [
+    LaneMode::Velocity,
+    LaneMode::CC(1),
+    LaneMode::CC(7),
+    LaneMode::CC(10),
+    LaneMode::CC(11),
+    LaneMode::CC(64),
+    LaneMode::PitchBend,
+];
+
+/// One stacked lane in the bottom strip: the stream it edits, its body
+/// height in px, and whether it is collapsed to just its header.
+#[derive(Clone, Copy, PartialEq)]
+struct LaneCfg {
+    mode: LaneMode,
+    h: f32,
+    collapsed: bool,
+}
+
+impl Default for LaneCfg {
+    fn default() -> Self {
+        LaneCfg {
+            mode: LaneMode::Velocity,
+            h: LANE_H,
+            collapsed: false,
+        }
+    }
+}
+
+const LANE_H: f32 = 56.0;
+/// header strip shown above every lane (and the only thing shown when
+/// the lane is collapsed); it doubles as the drag-to-resize handle
+const LANE_HDR: f32 = 16.0;
+const LANE_H_MIN: f32 = 24.0;
+const LANE_H_MAX: f32 = 220.0;
+const LANES_MAX: usize = 8;
+
+fn lane_mode_str(m: LaneMode) -> String {
+    match m {
+        LaneMode::Velocity => "vel".into(),
+        LaneMode::CC(c) => format!("cc{c}"),
+        LaneMode::PitchBend => "pb".into(),
+    }
+}
+
+fn lane_mode_parse(s: &str) -> LaneMode {
+    match s {
+        "pb" => LaneMode::PitchBend,
+        s if s.starts_with("cc") => s[2..]
+            .parse()
+            .map(LaneMode::CC)
+            .unwrap_or(LaneMode::Velocity),
+        _ => LaneMode::Velocity,
     }
 }
 
@@ -173,6 +232,8 @@ struct Drag {
     a_key: i32,
     b_tick: i64,
     b_key: i32,
+    /// index into `lanes` — only meaningful for lane drags
+    lane: usize,
 }
 
 /// Document-derived data the chrome (menu bar, marker strip, minimap,
@@ -276,12 +337,10 @@ struct EditorView {
     doc_ui: Arc<DocUi>,
     doc_ui_key: (u64, u64),
     doc_ui_enc: Option<smf_core::TextEncoding>,
-    /// lane (velocity/CC/PB) points cache — keys on epoch + revision +
-    /// track + mode
-    lane_cache: Arc<Vec<(EventId, u64, i32)>>,
-    lane_key: (u64, u64),
-    lane_track: usize,
-    lane_mode_cached: LaneMode,
+    /// per-mode lane (velocity/CC/PB) point caches — each entry keys on
+    /// epoch + revision + track, so several stacked lanes sharing a mode
+    /// still reuse one scan
+    lane_caches: HashMap<LaneMode, ((u64, u64), usize, Arc<Vec<(EventId, u64, i32)>>)>,
     /// last window-space cursor position, kept while a roll/lane drag is
     /// active so edge auto-scroll can keep the drag deltas current
     mouse_pos: Option<Point<Pixels>>,
@@ -301,8 +360,8 @@ struct EditorView {
     roll_bounds: Rc<Cell<Bounds<Pixels>>>,
     /// seek-ruler strip bounds
     ruler_bounds: Rc<Cell<Bounds<Pixels>>>,
-    /// velocity lane bounds — same trick for the lane's hit-testing
-    lane_bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// per-lane canvas bounds — same trick for each lane's hit-testing
+    lane_bounds: Vec<Rc<Cell<Bounds<Pixels>>>>,
     mini_bounds: Rc<Cell<Bounds<Pixels>>>,
     scroll_x: f32,
     scroll_y: f32,
@@ -337,8 +396,10 @@ struct EditorView {
     /// restart at `loop_start_us` when playback reaches the end
     /// (`loop_enabled` itself lives in `shared` so MCP can toggle it)
     loop_start_us: u64,
-    /// what the bottom lane edits
-    lane_mode: LaneMode,
+    /// stacked bottom lanes (never empty)
+    lanes: Vec<LaneCfg>,
+    /// lane that lane gestures and the View > Lane menu act on
+    lane_focus: usize,
     /// live MIDI input capture while `rec` is armed
     rec: Option<Rec>,
     /// open menubar dropdown + the x-coordinate it was opened at
@@ -464,10 +525,7 @@ impl EditorView {
             doc_ui: Arc::new(DocUi::default()),
             doc_ui_key: (u64::MAX, u64::MAX),
             doc_ui_enc: None,
-            lane_cache: Arc::new(vec![]),
-            lane_key: (u64::MAX, u64::MAX),
-            lane_track: 0,
-            lane_mode_cached: LaneMode::Velocity,
+            lane_caches: HashMap::new(),
             mouse_pos: None,
             sel_track: 0,
             selection: BTreeSet::new(),
@@ -484,10 +542,7 @@ impl EditorView {
                 point(px(0.0), px(0.0)),
                 size(px(0.0), px(0.0)),
             ))),
-            lane_bounds: Rc::new(Cell::new(Bounds::new(
-                point(px(0.0), px(0.0)),
-                size(px(0.0), px(0.0)),
-            ))),
+            lane_bounds: Vec::new(),
             mini_bounds: Rc::new(Cell::new(Bounds::new(
                 point(px(0.0), px(0.0)),
                 size(px(0.0), px(0.0)),
@@ -515,7 +570,8 @@ impl EditorView {
             playback: None,
             play_us: 0,
             loop_start_us: 0,
-            lane_mode: LaneMode::Velocity,
+            lanes: vec![LaneCfg::default()],
+            lane_focus: 0,
             rec: None,
             open_menu: None,
             help_open: false,
@@ -645,8 +701,50 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Mode of the focused lane — drives the View > Lane checkmarks and
+    /// the status-bar chip.
+    fn lane_mode(&self) -> LaneMode {
+        self.lanes
+            .get(self.lane_focus)
+            .map(|c| c.mode)
+            .unwrap_or(LaneMode::Velocity)
+    }
+
     fn set_lane(&mut self, m: LaneMode, cx: &mut Context<Self>) {
-        self.lane_mode = m;
+        if let Some(c) = self.lanes.get_mut(self.lane_focus) {
+            c.mode = m;
+        }
+        self.persist();
+        cx.notify();
+    }
+
+    /// Stack a new lane below the existing ones, preferring a mode not
+    /// already shown.
+    fn add_lane(&mut self, cx: &mut Context<Self>) {
+        if self.lanes.len() >= LANES_MAX {
+            return;
+        }
+        let mode = LANE_MODES
+            .iter()
+            .find(|m| !self.lanes.iter().any(|c| c.mode == **m))
+            .copied()
+            .unwrap_or(LaneMode::Velocity);
+        self.lanes.push(LaneCfg {
+            mode,
+            ..LaneCfg::default()
+        });
+        self.lane_focus = self.lanes.len() - 1;
+        self.persist();
+        cx.notify();
+    }
+
+    fn remove_lane(&mut self, cx: &mut Context<Self>) {
+        if self.lanes.len() <= 1 {
+            return;
+        }
+        self.lanes
+            .remove(self.lane_focus.min(self.lanes.len() - 1));
+        self.lane_focus = self.lane_focus.min(self.lanes.len() - 1);
         self.persist();
         cx.notify();
     }
@@ -777,14 +875,18 @@ impl EditorView {
     /// Control events of the selected track for the bottom lane, cached on
     /// (epoch, revision, track, lane mode) — render must not rescan the
     /// track while animating the playhead.
-    fn lane_events_cached(&mut self) -> Arc<Vec<(EventId, u64, i32)>> {
+    /// Points for one lane mode on the selected track — cached per mode
+    /// on (epoch, revision, track) so stacked lanes stay allocation-free
+    /// at playhead-frame rate.
+    fn lane_events_cached(&mut self, mode: LaneMode) -> Arc<Vec<(EventId, u64, i32)>> {
         let key = (self.doc_epoch, self.doc(|d| d.revision()));
-        if self.lane_key != key
-            || self.lane_track != self.sel_track
-            || self.lane_mode_cached != self.lane_mode
-        {
+        let stale = self
+            .lane_caches
+            .get(&mode)
+            .map(|(k, tr, _)| *k != key || *tr != self.sel_track)
+            .unwrap_or(true);
+        if stale {
             let tr = self.sel_track;
-            let mode = self.lane_mode;
             let mut v = Vec::new();
             self.doc(|d| {
                 if let Some(t) = d.tracks.get(tr) {
@@ -804,12 +906,9 @@ impl EditorView {
                 }
             });
             v.sort_by_key(|e| e.1);
-            self.lane_cache = Arc::new(v);
-            self.lane_key = key;
-            self.lane_track = tr;
-            self.lane_mode_cached = mode;
+            self.lane_caches.insert(mode, (key, tr, Arc::new(v)));
         }
-        self.lane_cache.clone()
+        self.lane_caches[&mode].2.clone()
     }
 
     /// Tick position of the song end (scroll extent, minimap scale).
@@ -1369,6 +1468,13 @@ impl EditorView {
                 return;
             }
             DragMode::Move | DragMode::Duplicate => {}
+            DragMode::LaneResize => {
+                // the height already tracked the cursor in update_drag —
+                // committing only persists the new layout
+                self.persist();
+                cx.notify();
+                return;
+            }
             DragMode::LaneEvent => {
                 // CC/PB lane: update an existing event's value, or insert a
                 // new one when the drag started on empty lane space
@@ -1380,9 +1486,14 @@ impl EditorView {
                     cx.notify();
                     return;
                 };
+                let mode = self
+                    .lanes
+                    .get(d.lane)
+                    .map(|c| c.mode)
+                    .unwrap_or(LaneMode::Velocity);
                 if d.on_id == 0 {
                     let ch = track_events.out_channel & 0x0F;
-                    let (status, data) = match self.lane_mode {
+                    let (status, data) = match mode {
                         LaneMode::CC(cc) => (0xB0 | ch, [cc, d.dkey.clamp(0, 127) as u8]),
                         LaneMode::PitchBend => {
                             let v = d.dkey.clamp(0, 16383) as u16;
@@ -1410,7 +1521,7 @@ impl EditorView {
                         if e.id == d.on_id {
                             let mut after = e.clone();
                             if let EventKind::Channel { data, .. } = &mut after.kind {
-                                match self.lane_mode {
+                                match mode {
                                     LaneMode::CC(_) => data[1] = d.dkey.clamp(0, 127) as u8,
                                     LaneMode::PitchBend => {
                                         let v = d.dkey.clamp(0, 16383) as u16;
@@ -2320,16 +2431,34 @@ impl EditorView {
         };
         match mode {
             DragMode::Velocity | DragMode::LaneEvent => {
-                let b = self.lane_bounds.get();
+                let li = self.drag.as_ref().map(|d| d.lane).unwrap_or(0);
+                let Some(cell) = self.lane_bounds.get(li) else {
+                    return;
+                };
+                let b = cell.get();
                 let y = f32::from(pos.y) - f32::from(b.origin.y);
                 let h = f32::from(b.size.height).max(1.0);
-                let vrange = match self.lane_mode {
-                    LaneMode::PitchBend => 16383.0,
+                let vrange = match self.lanes.get(li).map(|c| c.mode) {
+                    Some(LaneMode::PitchBend) => 16383.0,
                     _ => 127.0,
                 };
                 let val = ((1.0 - y / h) * vrange) as i32;
                 if let Some(d) = self.drag.as_mut() {
                     d.dkey = val;
+                }
+            }
+            DragMode::LaneResize => {
+                // `orig_start` carries the grab-time height in centipx;
+                // `a_tick` the pointer y it was grabbed at
+                let grabbed = self
+                    .drag
+                    .as_ref()
+                    .map(|d| (d.lane, d.orig_start, d.a_tick));
+                if let Some((li, h0, y0)) = grabbed {
+                    let dy = f32::from(pos.y) - y0 as f32;
+                    if let Some(c) = self.lanes.get_mut(li) {
+                        c.h = (h0 as f32 / 100.0 + dy).clamp(LANE_H_MIN, LANE_H_MAX);
+                    }
                 }
             }
             _ => {
@@ -2398,7 +2527,10 @@ impl EditorView {
         }
         // vertical panning only makes sense for roll-space drags — lane
         // drags map the y axis to a value, not to pitch
-        if !matches!(mode, DragMode::Velocity | DragMode::LaneEvent) {
+        if !matches!(
+            mode,
+            DragMode::Velocity | DragMode::LaneEvent | DragMode::LaneResize
+        ) {
             if y < by + EDGE && y > by - SLOP {
                 dy = -SPEED;
             }
@@ -2550,10 +2682,25 @@ struct Prefs {
     scroll_y: Option<f32>,
     sel_track: Option<usize>,
     enc: Option<String>,
+    /// legacy single-lane sidecar key — read as a fallback when `lanes`
+    /// is absent; new saves always write `lanes`
     lane: Option<String>,
+    /// stacked bottom lanes, top to bottom. Absent in old sidecars =
+    /// the default single velocity lane
+    lanes: Option<Vec<LanePref>>,
     show_events: Option<bool>,
     tool: Option<String>,
     snap: Option<usize>,
+}
+
+/// Per-lane layout as stored in the sidecar (`mode` uses the same
+/// "vel"/"cc<n>"/"pb" codec as the legacy `lane` key).
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct LanePref {
+    mode: String,
+    h: f32,
+    #[serde(default)]
+    collapsed: bool,
 }
 
 fn prefs_path(doc_path: &std::path::Path) -> PathBuf {
@@ -2637,14 +2784,36 @@ impl EditorView {
             "sjis" => smf_core::TextEncoding::ShiftJis,
             _ => smf_core::TextEncoding::Latin1,
         });
-        self.lane_mode = match p.lane.as_deref() {
-            Some("pb") => LaneMode::PitchBend,
-            Some(s) if s.starts_with("cc") => s[2..]
-                .parse()
-                .map(LaneMode::CC)
-                .unwrap_or(LaneMode::Velocity),
-            _ => LaneMode::Velocity,
+        // stacked lanes restore verbatim; a hand-edited sidecar drops
+        // non-finite heights instead of producing NaN-sized panels
+        self.lanes = match p.lanes {
+            Some(ls) => {
+                let v: Vec<LaneCfg> = ls
+                    .iter()
+                    .filter(|lp| lp.h.is_finite())
+                    .take(LANES_MAX)
+                    .map(|lp| LaneCfg {
+                        mode: lane_mode_parse(&lp.mode),
+                        h: lp.h.clamp(LANE_H_MIN, LANE_H_MAX),
+                        collapsed: lp.collapsed,
+                    })
+                    .collect();
+                if v.is_empty() {
+                    vec![LaneCfg::default()]
+                } else {
+                    v
+                }
+            }
+            None => vec![LaneCfg {
+                mode: p
+                    .lane
+                    .as_deref()
+                    .map(lane_mode_parse)
+                    .unwrap_or(LaneMode::Velocity),
+                ..LaneCfg::default()
+            }],
         };
+        self.lane_focus = self.lanes.len() - 1;
         if let Some(v) = p.show_events {
             self.show_events = v;
         }
@@ -2707,11 +2876,20 @@ impl EditorView {
                 }
                 .to_string()
             }),
-            lane: Some(match self.lane_mode {
-                LaneMode::Velocity => "vel".into(),
-                LaneMode::CC(c) => format!("cc{c}"),
-                LaneMode::PitchBend => "pb".into(),
-            }),
+            lane: self
+                .lanes
+                .first()
+                .map(|c| lane_mode_str(c.mode)),
+            lanes: Some(
+                self.lanes
+                    .iter()
+                    .map(|c| LanePref {
+                        mode: lane_mode_str(c.mode),
+                        h: c.h,
+                        collapsed: c.collapsed,
+                    })
+                    .collect(),
+            ),
             show_events: Some(self.show_events),
             tool: Some(
                 match self.tool {
@@ -2896,5 +3074,30 @@ mod tests {
     #[test]
     fn fresh_documents_share_revision_zero() {
         assert_eq!(empty_doc().revision(), empty_doc().revision());
+    }
+
+    /// The stacked-lane sidecar round-trips, and a legacy single-lane
+    /// `lane` key still parses on old files.
+    #[test]
+    fn lane_layout_prefs_round_trip() {
+        let p: crate::Prefs = serde_json::from_str(
+            r#"{"track_dest":{},"muted":[],"soloed":[],"metronome":false,"loop_enabled":false,"lanes":[{"mode":"cc11","h":80.0,"collapsed":true},{"mode":"pb","h":40.0,"collapsed":false}]}"#,
+        )
+        .unwrap();
+        let ls = p.lanes.unwrap();
+        assert_eq!(ls.len(), 2);
+        assert_eq!(ls[0].mode, "cc11");
+        assert!(ls[0].collapsed);
+        assert!(!ls[1].collapsed);
+        let back: crate::Prefs = serde_json::from_str(
+            r#"{"track_dest":{},"muted":[],"soloed":[],"metronome":false,"loop_enabled":false,"lane":"pb"}"#,
+        )
+        .unwrap();
+        assert!(back.lanes.is_none());
+        assert!(matches!(
+            crate::lane_mode_parse(back.lane.as_deref().unwrap()),
+            crate::LaneMode::PitchBend
+        ));
+        assert_eq!(crate::lane_mode_str(crate::LaneMode::CC(11)), "cc11");
     }
 }
