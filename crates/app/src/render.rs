@@ -276,6 +276,8 @@ impl Render for EditorView {
             (TopMenu::Help, "menu.help", 50.0),
         ];
         let mut menu_bar = div()
+            .id("menu-bar")
+            .test_support()
             .flex()
             .items_center()
             .h(px(28.0))
@@ -299,6 +301,7 @@ impl Render for EditorView {
             menu_bar = menu_bar.child(
                 div()
                     .id(key)
+                    .test_support()
                     .w(px(w))
                     .h(px(22.0))
                     .flex()
@@ -336,6 +339,8 @@ impl Render for EditorView {
 
         // --- transport / tool bar: icon groups, DAW style -------------------------
         let transport_bar = div()
+            .id("transport")
+            .test_support()
             .flex()
             .items_center()
             .gap(px(2.0))
@@ -484,6 +489,7 @@ impl Render for EditorView {
             .child(
                 div()
                     .id("bpm")
+                    .test_support()
                     .px_2()
                     .h(px(24.0))
                     .flex()
@@ -549,6 +555,7 @@ impl Render for EditorView {
             .child(
                 div()
                     .id("snap")
+                    .test_support()
                     .h(px(26.0))
                     .pl_1()
                     .pr_2()
@@ -680,6 +687,8 @@ impl Render for EditorView {
             }));
         // --- event list: right-docked panel -------------------------------------
         let events_panel = div()
+            .id("events-panel")
+            .test_support()
             .w(px(340.0))
             .h_full()
             .flex()
@@ -702,6 +711,7 @@ impl Render for EditorView {
                     .children((n_diags > 0).then(|| {
                         div()
                             .id("fix-diags")
+                            .test_support()
                             .ml_2()
                             .px_1()
                             .text_size(px(10.0))
@@ -744,6 +754,8 @@ impl Render for EditorView {
 
         // --- track column: select / mute / solo -------------------------------
         let track_col = div()
+            .id("track-col")
+            .test_support()
             .w(px(150.0))
             .h_full()
             .flex()
@@ -767,6 +779,7 @@ impl Render for EditorView {
                 // scrollable when a file has more tracks than fit the panel
                 div()
                     .id("track-list")
+                    .test_support()
                     .flex_1()
                     .min_h(px(0.0))
                     .overflow_y_scroll()
@@ -777,6 +790,7 @@ impl Render for EditorView {
                         let color = TRACK_COLORS[i % TRACK_COLORS.len()];
                         div()
                             .id(("track", i))
+                            .test_support()
                             .flex()
                             .flex_row()
                             .items_center()
@@ -806,6 +820,7 @@ impl Render for EditorView {
                             .child(
                                 div()
                                     .id(("mute", i))
+                                    .test_support()
                                     .px_1()
                                     .text_size(px(9.0))
                                     .text_color(rgb(if muted { 0xffb454 } else { 0x707080 }))
@@ -825,6 +840,7 @@ impl Render for EditorView {
                             .child(
                                 div()
                                     .id(("solo", i))
+                                    .test_support()
                                     .px_1()
                                     .text_size(px(9.0))
                                     .text_color(rgb(if soloed { 0xffd24f } else { 0x707080 }))
@@ -844,6 +860,7 @@ impl Render for EditorView {
                             .child(
                                 div()
                                     .id(("ch", i))
+                                    .test_support()
                                     .px_1()
                                     .text_size(px(9.0))
                                     .text_color(rgb(0x7070a0))
@@ -1098,6 +1115,8 @@ impl Render for EditorView {
 
         let body = body.child(track_col).child(
             div()
+                .id("timeline")
+                .test_support()
                 .flex_1()
                 .h_full()
                 .flex()
@@ -1124,6 +1143,8 @@ impl Render for EditorView {
                 }))
                 .child(
                     div()
+                        .id("minimap-strip")
+                        .test_support()
                         .h(px(20.0))
                         .w_full()
                         .bg(rgb(0x111118))
@@ -1150,6 +1171,8 @@ impl Render for EditorView {
                 )
                 .child(
                     div()
+                        .id("ruler-strip")
+                        .test_support()
                         .h(px(26.0))
                         .w_full()
                         .bg(rgb(0x17171d))
@@ -1208,6 +1231,8 @@ impl Render for EditorView {
                 )
                 .child(
                     div()
+                        .id("roll")
+                        .test_support()
                         .flex_1()
                         .relative()
                         .overflow_hidden()
@@ -1336,6 +1361,8 @@ impl Render for EditorView {
                 )
                 .child(
                     div()
+                        .id("lane-strip")
+                        .test_support()
                         .h(px(56.0))
                         .w_full()
                         .bg(rgb(0x14141a))
@@ -1348,6 +1375,7 @@ impl Render for EditorView {
                             // CC11 -> CC64 -> PB -> Vel
                             div()
                                 .id("lane-mode")
+                                .test_support()
                                 .absolute()
                                 .top(px(2.0))
                                 .right(px(4.0))
@@ -1513,6 +1541,7 @@ impl Render for EditorView {
             Some(
                 div()
                     .id("plugin-chip")
+                    .test_support()
                     .px_1()
                     .rounded_sm()
                     .cursor_pointer()
@@ -1531,6 +1560,8 @@ impl Render for EditorView {
             None
         };
         let status_bar = div()
+            .id("status-bar")
+            .test_support()
             .flex()
             .items_center()
             .gap_2()
@@ -2013,6 +2044,7 @@ impl Render for EditorView {
             let popup_h = (items.len() as f32 * 24.0 + 16.0).min(popup_max_h);
             let popup = div()
                 .id("menu-popup")
+                .test_support()
                 .absolute()
                 .top(px(0.0))
                 .left(px(mx))
@@ -2330,6 +2362,7 @@ impl Render for EditorView {
                 let top = (y - 30.0).clamp(0.0, (vh - h - 8.0).max(0.0));
                 div()
                     .id("sub-popup")
+                    .test_support()
                     .absolute()
                     .top(px(top))
                     .left(px(x2))
@@ -2353,6 +2386,7 @@ impl Render for EditorView {
             });
             div()
                 .id("menu-overlay")
+                .test_support()
                 .absolute()
                 .top(px(28.0))
                 .left(px(0.0))
@@ -2400,6 +2434,7 @@ impl Render for EditorView {
             ];
             let panel = div()
                 .id("help-panel")
+                .test_support()
                 .flex()
                 .flex_col()
                 .w(px(420.0))
@@ -2552,6 +2587,7 @@ impl Render for EditorView {
                 };
                 let mut row = div()
                     .id(("output-status", i))
+                    .test_support()
                     .flex()
                     .flex_col()
                     .gap_1()
@@ -2585,6 +2621,7 @@ impl Render for EditorView {
             let panel_content_h = 24.0 + rows.len() as f32 * 26.0 + 32.0 + 32.0;
             let panel = div()
                 .id("output-status-panel")
+                .test_support()
                 .w(px(520.0))
                 .flex()
                 .flex_col()
@@ -2655,6 +2692,8 @@ impl Render for EditorView {
         });
 
         div()
+            .id("editor-root")
+            .test_support()
             .flex()
             .flex_col()
             .relative()
@@ -2991,9 +3030,10 @@ impl EditorView {
         clears_sub: bool,
         cx: &mut Context<Self>,
         f: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
-    ) -> Stateful<Div> {
+    ) -> gpui_kit::base::ObservedElement<Stateful<Div>> {
         div()
             .id(id)
+            .test_support()
             .flex()
             .items_center()
             .h(px(24.0))
@@ -3045,7 +3085,7 @@ impl EditorView {
         check: Option<bool>,
         cx: &mut Context<Self>,
         f: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
-    ) -> Stateful<Div> {
+    ) -> gpui_kit::base::ObservedElement<Stateful<Div>> {
         Self::mi_inner(id, label, shortcut, None, check, true, cx, f)
     }
 
@@ -3057,7 +3097,7 @@ impl EditorView {
         check: Option<bool>,
         cx: &mut Context<Self>,
         f: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
-    ) -> Stateful<Div> {
+    ) -> gpui_kit::base::ObservedElement<Stateful<Div>> {
         Self::mi_inner(id, label, shortcut, None, check, false, cx, f)
     }
 
@@ -3067,9 +3107,10 @@ impl EditorView {
         label: &'static str,
         sub: Sub,
         cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
+    ) -> gpui_kit::base::ObservedElement<Stateful<Div>> {
         div()
             .id(id)
+            .test_support()
             .flex()
             .items_center()
             .h(px(24.0))
@@ -3150,9 +3191,10 @@ impl EditorView {
         on: bool,
         cx: &mut Context<Self>,
         f: impl Fn(&mut Self, &ClickEvent, &mut Context<Self>) + 'static,
-    ) -> Stateful<Div> {
+    ) -> gpui_kit::base::ObservedElement<Stateful<Div>> {
         div()
             .id(id)
+            .test_support()
             .w(px(26.0))
             .h(px(26.0))
             .flex()
@@ -3181,9 +3223,10 @@ impl EditorView {
         accent: u32,
         cx: &mut Context<Self>,
         f: impl Fn(&mut Self, &ClickEvent, &mut Context<Self>) + 'static,
-    ) -> Stateful<Div> {
+    ) -> gpui_kit::base::ObservedElement<Stateful<Div>> {
         div()
             .id(id)
+            .test_support()
             .w(px(26.0))
             .h(px(26.0))
             .flex()

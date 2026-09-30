@@ -7,6 +7,8 @@ mod geometry;
 mod i18n;
 mod icons;
 mod render;
+#[cfg(test)]
+mod ui_tests;
 use geometry::{
     clamp_move_delta, clamp_span, content_view, reanchor, roll_hit, ZOOM_MAX, ZOOM_MIN,
 };
@@ -91,7 +93,7 @@ enum DestPick {
 }
 
 /// What the bottom lane edits for the selected track.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum LaneMode {
     Velocity,
     /// Control Change lane, controller number in the field
@@ -452,8 +454,42 @@ impl EditorView {
         let initial_plugins = output::discover_plugin_paths();
         sh.dests = build_dest_catalog(&initial_plugins);
         let g = GlobalPrefs::load();
-        let shared = Arc::new(Mutex::new(sh));
         let (plugin_req, plugin_evt) = output::spawn_plugin_host();
+        let mut v = Self::build(
+            sh,
+            status,
+            initial_plugins,
+            plugin_req,
+            plugin_evt,
+            output::host_diag(),
+            &g,
+            input,
+            cx,
+        );
+        if let Some(p) = &path {
+            v.apply_prefs(p);
+            v.push_recent(p);
+        }
+        v.rescan_plugins();
+        v
+    }
+
+    /// Shared initializer: assembles the view around an already-loaded
+    /// document + plugin-host channel pair, then derives the view caches.
+    /// Side effects (plugin host thread, prefs I/O, scans) stay in `new`.
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        sh: Shared,
+        status: SharedString,
+        initial_plugins: Vec<output::PluginInfo>,
+        plugin_req: std::sync::mpsc::Sender<output::PluginReq>,
+        plugin_evt: std::sync::mpsc::Receiver<output::PluginEvent>,
+        host_diag: output::HostDiag,
+        g: &GlobalPrefs,
+        input: Entity<InputState>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let shared = Arc::new(Mutex::new(sh));
         let mut v = Self {
             shared,
             doc_epoch: 0,
@@ -507,7 +543,7 @@ impl EditorView {
             scan_rx: None,
             scan_note: None,
             scan_probe_used: None,
-            host_diag: output::host_diag(),
+            host_diag,
             show_output_status: false,
             plugin_window: None,
             editor_plugin: None,
@@ -530,12 +566,51 @@ impl EditorView {
         };
         v.sel_track = v.pick_default_track();
         v.refresh_derived();
-        if let Some(p) = &path {
-            v.apply_prefs(p);
-            v.push_recent(p);
-        }
-        v.rescan_plugins();
         v
+    }
+
+    /// Test-only constructor: skips the plugin host thread, plugin scan,
+    /// audio probe, and user prefs so tests stay inert and deterministic.
+    /// The shared doc has no path, so `persist()` is a no-op.
+    #[cfg(test)]
+    fn new_for_test(doc: Document, input: Entity<InputState>, cx: &mut Context<Self>) -> Self {
+        let mut sh = Shared::new(doc);
+        sh.path = None;
+        sh.saved_revision = sh.doc.revision();
+        sh.dests = vec![
+            (
+                "Test MIDI Out".into(),
+                midi_io::Destination::MidiPort {
+                    port_name: "Test MIDI Out".into(),
+                },
+            ),
+            (
+                "Test Synth".into(),
+                midi_io::Destination::Plugin {
+                    plugin_path: "C:/Fixtures/TestSynth.vst3".into(),
+                },
+            ),
+        ];
+        // no host worker: requests sent to plugin_req go nowhere and no
+        // plugin events ever arrive, which is exactly the inert state
+        // the plugin-unavailable golden wants
+        let (plugin_req, _req_rx) = std::sync::mpsc::channel::<output::PluginReq>();
+        let (_evt_tx, plugin_evt) = std::sync::mpsc::channel::<output::PluginEvent>();
+        Self::build(
+            sh,
+            "test document".into(),
+            Vec::new(),
+            plugin_req,
+            plugin_evt,
+            output::HostDiag {
+                helper: None,
+                probe: None,
+                audio_device: Err("test audio".into()),
+            },
+            &GlobalPrefs::default(),
+            input,
+            cx,
+        )
     }
 
     fn doc<R>(&self, f: impl FnOnce(&Document) -> R) -> R {
@@ -2474,9 +2549,10 @@ impl EditorView {
         label: impl Into<SharedString>,
         cx: &mut Context<Self>,
         on: impl Fn(&mut Self, &ClickEvent, &mut Context<Self>) + 'static,
-    ) -> Stateful<Div> {
+    ) -> gpui_kit::base::ObservedElement<Stateful<Div>> {
         div()
             .id(id)
+            .test_support()
             .px_2()
             .py_1()
             .rounded_sm()
