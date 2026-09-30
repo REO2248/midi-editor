@@ -118,10 +118,7 @@ fn inject(phase: Phase) -> std::io::Result<()> {
         // survive checks at earlier stages
         if FAIL_PHASE.load(Ordering::SeqCst) == want {
             FAIL_PHASE.store(0, Ordering::SeqCst);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "fault-injected",
-            ));
+            return Err(std::io::Error::other("fault-injected"));
         }
     }
     let _ = phase;
@@ -198,7 +195,7 @@ fn unique_temp(dir: &Path, stem: &str) -> PathBuf {
         .unwrap_or(0);
     dir.join(format!(
         "{}-{}-{}-{}",
-        crate::temp_prefix(&stem),
+        crate::temp_prefix(stem),
         std::process::id(),
         ctr,
         nanos
@@ -434,7 +431,7 @@ mod tests {
         let payloads: Vec<Vec<u8>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         let final_bytes = std::fs::read(&p).unwrap();
         // the winner is a complete payload — never a torn mix of two
-        assert!(payloads.iter().any(|pl| *pl == final_bytes));
+        assert!(payloads.contains(&final_bytes));
         assert!(
             leftover_temps(&dir).is_empty(),
             "no temp litter after success"

@@ -7,7 +7,7 @@
 //!   - intentional breaking change → bump the tool's `version` (and
 //!     `MCP_SURFACE_VERSION` when the contract is incompatible), mark the
 //!     old name `deprecated` first when removing/renaming, then regenerate:
-//!         MCP_UPDATE_SCHEMA_SNAPSHOT=1 cargo test -p mcp-server --test schema_snapshot
+//!     MCP_UPDATE_SCHEMA_SNAPSHOT=1 cargo test -p mcp-server --test schema_snapshot
 //!   - additive change (new tool / optional arg / response field) → just
 //!     regenerate the snapshot the same way.
 

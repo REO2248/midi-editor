@@ -243,8 +243,8 @@ pub fn build_ops(doc: &mut Document, spec: &OpSpec) -> Vec<Op> {
     if n == 0 {
         // no tracks to address — only track-free ops still produce work
         return match *spec {
-            OpSpec::SetTempo { tick, bpm } => doc.set_tempo_ops(tick, bpm),
-            OpSpec::SetTimeSig { tick, num, den } => doc.set_time_sig_ops(tick, num, den),
+            OpSpec::SetTempo { tick, bpm } => doc.set_tempo_ops(0, tick, bpm),
+            OpSpec::SetTimeSig { tick, num, den } => doc.set_time_sig_ops(0, tick, num, den),
             OpSpec::AddTrack { ref name } => doc.add_track_ops(name.as_deref()),
             _ => vec![],
         };
@@ -275,8 +275,15 @@ pub fn build_ops(doc: &mut Document, spec: &OpSpec) -> Vec<Op> {
             to,
             timing,
             vel,
-        } => doc.humanize_ops(track % n, from, to, timing, vel),
-        OpSpec::Legato { track, from, to } => doc.legato_ops(track % n, from, to),
+        } => doc.humanize_ops(
+            track % n,
+            from,
+            to,
+            timing,
+            vel,
+            timing as u64 ^ ((vel as u64) << 32),
+        ),
+        OpSpec::Legato { track, from, to } => doc.legato_ops(track % n, from, to, 0),
         OpSpec::SetLength {
             track,
             from,
@@ -316,8 +323,8 @@ pub fn build_ops(doc: &mut Document, spec: &OpSpec) -> Vec<Op> {
             channel,
             value,
         } => doc.set_pitch_bend_ops(track % n, tick, channel, value),
-        OpSpec::SetTempo { tick, bpm } => doc.set_tempo_ops(tick, bpm),
-        OpSpec::SetTimeSig { tick, num, den } => doc.set_time_sig_ops(tick, num, den),
+        OpSpec::SetTempo { tick, bpm } => doc.set_tempo_ops(0, tick, bpm),
+        OpSpec::SetTimeSig { tick, num, den } => doc.set_time_sig_ops(0, tick, num, den),
         OpSpec::SetTrackChannel { track, channel } => doc.set_track_channel_ops(track % n, channel),
         OpSpec::DuplicateRange { track, from, to } => doc.duplicate_range_ops(track % n, from, to),
         OpSpec::DeleteRange { track, from, to } => doc.delete_range_ops(track % n, from, to),
@@ -924,7 +931,7 @@ fn transforms_respect_range_boundaries() {
 
     // legato [480,1440): the key-62 pair (480→960) is the only adjacent
     // same-key pair — its off moves to the next start.
-    let ops = doc.legato_ops(0, 480, 1440);
+    let ops = doc.legato_ops(0, 480, 1440, 0);
     assert_eq!(ops.len(), 1);
     let Op::UpdateEvent { before, after, .. } = &ops[0] else {
         panic!()

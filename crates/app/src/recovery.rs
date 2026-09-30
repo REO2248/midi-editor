@@ -162,7 +162,7 @@ pub(crate) fn list_snapshots(dir: &Path) -> Vec<PathBuf> {
                 .collect()
         })
         .unwrap_or_default();
-    snaps.sort_by(|a, b| b.0.cmp(&a.0));
+    snaps.sort_by_key(|s| std::cmp::Reverse(s.0));
     snaps.into_iter().map(|(_, p)| p).collect()
 }
 

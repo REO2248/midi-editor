@@ -263,7 +263,10 @@ static EN: &[(&str, &str)] = &[
     ("output.audio", "Audio device"),
     ("output.scan", "Plugin scan"),
     ("output.missing", "missing"),
-    ("output.helper_hint", "Place vst3-host-helper.exe and vst3-host-probe.exe next to midi-editor.exe"),
+    (
+        "output.helper_hint",
+        "Place vst3-host-helper.exe and vst3-host-probe.exe next to midi-editor.exe",
+    ),
     ("output.probe_used", "probe: isolated"),
     ("output.probe_unused", "probe: unavailable (filename scan)"),
     ("output.scan_summary", "{n} plugins ({c} cached), {mode}, timeout {timeout}s"),
@@ -276,7 +279,10 @@ static EN: &[(&str, &str)] = &[
     ("plugin.loading", "loading {name}…"),
     ("plugin.ready", "{name} ready"),
     ("plugin.failed", "{name} failed to load"),
-    ("plugin.waiting", "waiting for {name}… playback starts when ready"),
+    (
+        "plugin.waiting",
+        "waiting for {name}… playback starts when ready",
+    ),
     ("plugin.timeout", "timed out after 20 s"),
     ("plugin.gui_failed", "plugin editor failed"),
     ("plugin.state_ready", "ready"),

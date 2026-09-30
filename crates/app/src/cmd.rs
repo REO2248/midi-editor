@@ -17,7 +17,7 @@ pub struct Command {
     pub id: &'static str,
     /// i18n key — resolved per render so labels follow the UI language
     pub label_key: &'static str,
-    /// default bindings, "ctrl+shift+z" style; keys[0] shows in menus
+    /// default bindings, "ctrl+shift+z" style; keys\[0\] shows in menus
     pub keys: &'static [&'static str],
     /// palette/menu enable predicate; None = always enabled
     pub enabled: Option<fn(&EditorView) -> bool>,
@@ -160,7 +160,7 @@ impl KeyMap {
     }
 
     /// Another command already bound to `desc` (excluding `except_id`).
-    pub fn conflicts<'a>(&'a self, desc: &str, except_id: &str) -> Option<&'static Command> {
+    pub fn conflicts(&self, desc: &str, except_id: &str) -> Option<&'static Command> {
         COMMANDS
             .iter()
             .find(|c| c.id != except_id && self.bindings(c.id).iter().any(|b| b == desc))

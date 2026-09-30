@@ -417,7 +417,7 @@ fn long_sysex_messages_send_verbatim_in_one_send() {
     // a >1KiB SysEx: no splitting or reordering at the scheduler — port-level
     // serialization of long messages is the sink's business
     let mut msg = vec![0xF0, 0x7E, 0x7F, 0x09, 0x01];
-    msg.extend(std::iter::repeat(0x5Au8).take(1024));
+    msg.extend(std::iter::repeat_n(0x5Au8, 1024));
     msg.push(0xF7);
     let len = msg.len();
     let r = run(

@@ -587,6 +587,11 @@ struct MetaEdit {
     id: EventId,
 }
 
+type LaneCache =
+    HashMap<(LaneMode, Option<u8>), ((u64, u64), usize, Arc<Vec<(EventId, u64, i32, i32)>>)>;
+
+type EvRowOut = (Vec<EvRow>, Vec<Option<(usize, usize, EventId)>>);
+
 struct EditorView {
     shared: SharedDoc,
     /// Bumped every time the whole document is swapped in (open / new file).
@@ -635,8 +640,7 @@ struct EditorView {
     /// per-(mode, poly key) lane point caches — each entry keys on
     /// epoch + revision + track, so stacked lanes sharing a stream
     /// still reuse one scan. Tuple inside: (id, tick, value, key|-1)
-    lane_caches:
-        HashMap<(LaneMode, Option<u8>), ((u64, u64), usize, Arc<Vec<(EventId, u64, i32, i32)>>)>,
+    lane_caches: LaneCache,
     /// lane marquee selection — event ids of non-note lane points
     lane_sel: BTreeSet<EventId>,
     /// last window-space cursor position, kept while a roll/lane drag is
@@ -2298,11 +2302,11 @@ impl EditorView {
                 cx.notify();
             }
             ("enter", _) => self.palette_activate(w, cx),
-            ("delete", false) | ("backspace", false) | ("r", true) => {
+            ("delete", false) | ("backspace", false) | ("r", true)
                 // Keys mode: reset the selected command to its defaults.
                 // (Del is also consumed by the filter input when focused, so
                 // Ctrl+R is the reliable path — both are offered.)
-                if mode == PaletteMode::Keys {
+                if mode == PaletteMode::Keys => {
                     let rows = self.palette_rows(cx);
                     if let Some(c) = rows.get(self.palette.as_ref().unwrap().sel).copied() {
                         self.keys.reset(c.id);
@@ -2311,7 +2315,6 @@ impl EditorView {
                         cx.notify();
                     }
                 }
-            }
             _ => {}
         }
         cx.stop_propagation();
@@ -2609,10 +2612,7 @@ impl EditorView {
         tags
     }
 
-    fn build_event_rows(
-        &self,
-        doc: &Document,
-    ) -> (Vec<EvRow>, Vec<Option<(usize, usize, EventId)>>) {
+    fn build_event_rows(&self, doc: &Document) -> EvRowOut {
         let td = doc.time_display();
         let seq = doc.is_sequential();
         let hint = self.enc_override.or(doc.text_encoding_hint());
@@ -2765,10 +2765,8 @@ impl EditorView {
         if shift {
             let anchor = self.ev_anchor.unwrap_or(row).min(self.event_refs.len() - 1);
             let (lo, hi) = (anchor.min(row), anchor.max(row));
-            for r in &self.event_refs[lo..=hi] {
-                if let Some((_, _, id)) = r {
-                    self.sel_events.insert(*id);
-                }
+            for (_, _, id) in self.event_refs[lo..=hi].iter().flatten() {
+                self.sel_events.insert(*id);
             }
         } else if ctrl {
             if !self.sel_events.remove(&id) {
@@ -3281,7 +3279,7 @@ impl EditorView {
     }
 
     /// Adjust the event-list selection's primary value by `delta`
-    /// (velocity/CC/pressure → data[1]; program/channel pressure → data[0];
+    /// (velocity/CC/pressure → data\[1\]; program/channel pressure → data\[0\];
     /// pitch bend → 14-bit). Exact per-event editing from the keyboard.
     fn nudge_sel_events(&mut self, delta: i32, cx: &mut Context<Self>) {
         if self.sel_events.is_empty() {
@@ -4617,7 +4615,7 @@ impl EditorView {
     /// in `prompt_save_conflict`; any unexpected index is Cancel.
     fn resolve_save_conflict(
         &mut self,
-        p: &PathBuf,
+        p: &Path,
         ev: watch::FileEvent,
         idx: usize,
         cx: &mut Context<Self>,
@@ -4627,7 +4625,7 @@ impl EditorView {
             watch::FileEvent::Modified => match idx {
                 // Reload = the only path that resets undo/history — and it
                 // only happens through this explicit choice
-                0 => self.open(p.clone(), cx),
+                0 => self.open(p.to_path_buf(), cx),
                 1 => self.save_as(cx),
                 2 => self.write_file(p, cx),
                 _ => {
@@ -4735,7 +4733,7 @@ impl EditorView {
     /// [Reload, Keep]; dirty-modified = [Keep, Reload].
     fn resolve_ext_change(
         &mut self,
-        p: &PathBuf,
+        p: &Path,
         ev: watch::FileEvent,
         dirty: bool,
         idx: usize,
@@ -4750,7 +4748,7 @@ impl EditorView {
             watch::FileEvent::Modified => {
                 let reload = if dirty { idx == 1 } else { idx == 0 };
                 if reload {
-                    self.open(p.clone(), cx);
+                    self.open(p.to_path_buf(), cx);
                 }
             }
             _ => {}
@@ -5356,13 +5354,9 @@ impl EditorView {
         // patch dumps) must land before notes struck at the same instant.
         // assemble_events' stable sort keeps sysex < channel < click at
         // equal µs.
-        let mut events: Vec<(u64, usize, Vec<u8>)> = route_events(
-            self.doc(|d| d.timeline_sysex()),
-            &audible,
-            &dest_of,
-            &sink_of,
-        );
-        events.extend(route_events(tagged, &audible, &dest_of, &sink_of));
+        let mut events: Vec<(u64, usize, Vec<u8>)> =
+            route_events(self.doc(|d| d.timeline_sysex()), audible, dest_of, &sink_of);
+        events.extend(route_events(tagged, audible, dest_of, &sink_of));
         if metronome {
             // prefer a plain MIDI port for clicks; fall back to any sink
             let click_sink = dests
@@ -5410,16 +5404,16 @@ impl EditorView {
         events.sort_by_key(|e| e.0);
         let chase = route_events(
             self.doc(|d| d.chase_events(start_us)),
-            &audible,
-            &dest_of,
+            audible,
+            dest_of,
             &sink_of,
         );
         // opt-in SysEx chase
         let chase_sx = if chase_sysex {
             route_events(
                 self.doc(|d| d.chase_sysex(start_us)),
-                &audible,
-                &dest_of,
+                audible,
+                dest_of,
                 &sink_of,
             )
         } else {
@@ -6644,7 +6638,7 @@ fn parse_num(text: &str, lo: i64, hi: i64, name: &str) -> Result<i64, String> {
 /// is rejected before a transaction exists.
 fn parse_hex(text: &str) -> Result<Vec<u8>, String> {
     let cleaned: String = text.chars().filter(|c| c.is_ascii_hexdigit()).collect();
-    if cleaned.len() % 2 != 0 {
+    if !cleaned.len().is_multiple_of(2) {
         return Err(format!("hex data needs whole bytes: {text}"));
     }
     (0..cleaned.len())
@@ -7176,7 +7170,7 @@ impl persist::json::Versioned for Prefs {
 }
 
 /// Per-lane layout as stored in the sidecar (`mode` uses the same
-/// "vel"/"cc<n>"/"pb" codec as the legacy `lane` key).
+/// "vel"/"`cc<n>`"/"pb" codec as the legacy `lane` key).
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct LanePref {
     mode: String,
@@ -7421,7 +7415,6 @@ impl EditorView {
             hc: self.hc_pref,
             theme: Some(self.theme_mode.name().to_string()),
             keymap: self.keys.overrides.clone(),
-            ..Default::default()
         }
         .save();
     }
@@ -7977,7 +7970,7 @@ fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
                     // catalog, vanished ones stay visible but marked offline,
                     // and an armed recording's input reconnects on return
                     tick += 1;
-                    let ports_changed = tick % 13 == 0 && v.reconcile_ports();
+                    let ports_changed = tick.is_multiple_of(13) && v.reconcile_ports();
                     // MCP transport requests -> real playback actions
                     for r in reqs {
                         match r {
@@ -8773,7 +8766,7 @@ mod tests {
     fn track_audible_solo_wins_over_mute() {
         let muted = set(&[1, 2]);
         let soloed = set(&[2]);
-        assert!(track_audible(0, &muted, &soloed) == false);
+        assert!(!track_audible(0, &muted, &soloed));
         assert!(!track_audible(1, &muted, &soloed));
         assert!(track_audible(2, &muted, &soloed));
     }

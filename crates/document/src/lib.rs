@@ -503,10 +503,10 @@ impl Document {
                 }
                 let ks = (e.tick, data[0] as i8, data[1] != 0);
                 if e.tick <= at_tick {
-                    if best.map_or(true, |(t, ..)| e.tick >= t) {
+                    if best.is_none_or(|(t, ..)| e.tick >= t) {
                         best = Some(ks);
                     }
-                } else if earliest.map_or(true, |(t, ..)| e.tick < t) {
+                } else if earliest.is_none_or(|(t, ..)| e.tick < t) {
                     earliest = Some(ks);
                 }
             }
@@ -604,14 +604,12 @@ impl Document {
                             open = Some((us, b));
                         }
                     }
-                    EventKind::Escape(p) => {
-                        if open.is_some() {
-                            let completes = p.last() == Some(&0xF7);
-                            open.as_mut().unwrap().1.extend_from_slice(p);
-                            if completes {
-                                let (us, b) = open.take().unwrap();
-                                out.push((us, ti, b, true));
-                            }
+                    EventKind::Escape(p) if open.is_some() => {
+                        let completes = p.last() == Some(&0xF7);
+                        open.as_mut().unwrap().1.extend_from_slice(p);
+                        if completes {
+                            let (us, b) = open.take().unwrap();
+                            out.push((us, ti, b, true));
                         }
                     }
                     _ => {}
@@ -715,7 +713,7 @@ impl Document {
                             st.pedal_down = false;
                             st.sustained.clear();
                         }
-                        123 | 124..=127 => {
+                        123..=127 => {
                             // all-notes-off semantics; hold pedal still catches
                             if st.pedal_down {
                                 for (key, stack) in st.pending.iter_mut().enumerate() {
@@ -1726,7 +1724,6 @@ impl Document {
         }
         ops
     }
-
     /// Set every note in [from,to) to exactly `ticks` long.
     pub fn set_length_ops(&mut self, track: usize, from: u64, to: u64, ticks: u64) -> Vec<Op> {
         let mut ops = Vec::new();
@@ -2101,8 +2098,8 @@ impl Document {
         for (ti, t) in self.tracks.iter().enumerate() {
             let mut bank = [(0u8, 0u8); 16];
             for e in &t.events {
-                match e.kind {
-                    EventKind::Channel { status, data, len } => match status & 0xF0 {
+                if let EventKind::Channel { status, data, len } = e.kind {
+                    match status & 0xF0 {
                         0xB0 if len == 2 && data[0] == 0 => {
                             bank[(status & 0x0F) as usize].0 = data[1];
                         }
@@ -2122,8 +2119,7 @@ impl Document {
                             });
                         }
                         _ => {}
-                    },
-                    _ => {}
+                    }
                 }
             }
         }
@@ -2140,6 +2136,7 @@ impl Document {
     /// Canonical RPN/NRPN write: selector MSB, selector LSB, data entry MSB,
     /// optional data entry LSB — inserted at `tick` with consecutive seqs.
     /// `param_msb`/`param_lsb` 0x7F/0x7F writes the null selector reset.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_rpn_ops(
         &mut self,
         track: usize,
@@ -3018,7 +3015,7 @@ mod tests {
             })
             .collect();
         assert_eq!(ks.len(), 1);
-        assert!(matches!(&ks[0].kind, EventKind::Meta { data, .. } if data.as_ref() == &[2u8, 0]));
+        assert!(matches!(&ks[0].kind, EventKind::Meta { data, .. } if data.as_ref() == [2u8, 0]));
     }
 
     #[test]

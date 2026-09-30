@@ -15,9 +15,9 @@ pub enum ModeHint {
     Gm1,
     /// GM2 System On: 7E 7F 09 03
     Gm2,
-    /// Roland GS Reset: 41 <dev> 42 12 40 00 7F 00 <chk>
+    /// Roland GS Reset: 41 {dev} 42 12 40 00 7F 00 {chk}
     Gs,
-    /// Yamaha XG System On: 43 <dev> 4C 00 00 7E 00
+    /// Yamaha XG System On: 43 {dev} 4C 00 00 7E 00
     Xg,
 }
 

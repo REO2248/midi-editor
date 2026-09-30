@@ -1136,6 +1136,9 @@ impl Drop for Playback {
 
 #[cfg(test)]
 mod tests {
+    type TimingLog = Arc<Mutex<Vec<(Vec<u8>, u64)>>>;
+    type SendLog = Arc<Mutex<Vec<(u64, Vec<u8>)>>>;
+
     use super::*;
     use std::sync::atomic::Ordering::Relaxed;
     use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -1302,7 +1305,7 @@ mod tests {
 
     /// Sink that also records `rem_us` — the value a VST3 sink converts to a
     /// sample offset, so its schedule-vs-deadline relationship is testable.
-    struct TimingSink(Arc<Mutex<Vec<(Vec<u8>, u64)>>>, u64);
+    struct TimingSink(TimingLog, u64);
 
     impl EventSink for TimingSink {
         fn lead_us(&self) -> u64 {
@@ -1315,7 +1318,7 @@ mod tests {
         fn notes_off(&mut self) {} // stop() cleanup isn't scheduled traffic
     }
 
-    fn wait_for(log: &Arc<Mutex<Vec<(Vec<u8>, u64)>>>, n: usize) -> Vec<(Vec<u8>, u64)> {
+    fn wait_for(log: &TimingLog, n: usize) -> Vec<(Vec<u8>, u64)> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let snap = log.lock().unwrap().clone();
@@ -1596,7 +1599,7 @@ mod tests {
         struct GatedSink {
             cfg: SysexConfig,
             stats: Arc<SysexStats>,
-            log: Arc<Mutex<Vec<(u64, Vec<u8>)>>>,
+            log: SendLog,
         }
         impl EventSink for GatedSink {
             fn send_at(&mut self, bytes: &[u8], _rem_us: u64) {

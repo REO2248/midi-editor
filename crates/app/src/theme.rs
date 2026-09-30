@@ -473,8 +473,10 @@ mod tests {
     /// Every foreground/background pairing the UI relies on for reading:
     /// body text, dimmed labels, accents, LCD digits, and state colors on
     /// each surface they sit on, grouped by how critical legibility is.
+    /// (foreground field, background field) getter pair for one surface.
+    type FgBg = (fn(&Theme) -> u32, fn(&Theme) -> u32);
     /// Primary content text — must clear WCAG AA 4.5:1 in every theme.
-    const TEXT_PAIRS: &[(fn(&Theme) -> u32, fn(&Theme) -> u32)] = &[
+    const TEXT_PAIRS: &[FgBg] = &[
         (|t: &Theme| t.text, |t: &Theme| t.bg_panel),
         (|t: &Theme| t.text, |t: &Theme| t.bg_row),
         (|t: &Theme| t.text, |t: &Theme| t.bg_row_sel),
@@ -505,7 +507,7 @@ mod tests {
 
     /// Secondary/muted labels — 3:1 floor in the legacy dark palette
     /// (WCAG large-text level; AA for them is tracked by the HC theme).
-    const SECONDARY_PAIRS: &[(fn(&Theme) -> u32, fn(&Theme) -> u32)] = &[
+    const SECONDARY_PAIRS: &[FgBg] = &[
         (|t: &Theme| t.text_muted, |t: &Theme| t.bg_panel),
         (|t: &Theme| t.text_muted, |t: &Theme| t.bg_bar),
         (|t: &Theme| t.text_muted, |t: &Theme| t.bg_row),
@@ -516,13 +518,13 @@ mod tests {
 
     /// Off-state glyphs: exempt from contrast minimums in dark mode
     /// (disabled/secondary affordances) but fully legible in HC.
-    const DISABLED_PAIRS: &[(fn(&Theme) -> u32, fn(&Theme) -> u32)] = &[
+    const DISABLED_PAIRS: &[FgBg] = &[
         (|t: &Theme| t.state_off, |t: &Theme| t.bg_panel),
         (|t: &Theme| t.state_off, |t: &Theme| t.bg_off),
     ];
 
     /// Meaningful 1px+ cues — 3:1 in every theme (WCAG non-text).
-    const CUE_PAIRS: &[(fn(&Theme) -> u32, fn(&Theme) -> u32)] = &[
+    const CUE_PAIRS: &[FgBg] = &[
         (|t: &Theme| t.accent, |t: &Theme| t.bg_canvas),
         (|t: &Theme| t.ok, |t: &Theme| t.bg_canvas),
         (|t: &Theme| t.sel, |t: &Theme| t.bg_canvas),
@@ -533,7 +535,7 @@ mod tests {
 
     /// Decorative hairlines: deliberately subtle in the dark palette,
     /// but must become real separators in HC.
-    const HAIRLINE_PAIRS: &[(fn(&Theme) -> u32, fn(&Theme) -> u32)] = &[
+    const HAIRLINE_PAIRS: &[FgBg] = &[
         (|t: &Theme| t.border, |t: &Theme| t.bg_panel),
         (|t: &Theme| t.border, |t: &Theme| t.bg_canvas),
         (|t: &Theme| t.border_strong, |t: &Theme| t.bg_tooltip),
@@ -541,7 +543,7 @@ mod tests {
         (|t: &Theme| t.accent_edge, |t: &Theme| t.bg_panel),
     ];
 
-    fn check(t: &Theme, pairs: &[(fn(&Theme) -> u32, fn(&Theme) -> u32)], floor: f64, name: &str) {
+    fn check(t: &Theme, pairs: &[FgBg], floor: f64, name: &str) {
         for (i, (fg, bg)) in pairs.iter().enumerate() {
             let r = contrast(fg(t), bg(t));
             assert!(r >= floor, "{name} pair {i} only {r:.2}:1");

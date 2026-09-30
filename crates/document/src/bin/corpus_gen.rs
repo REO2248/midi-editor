@@ -415,7 +415,7 @@ fn huge_sysex() -> Vec<u8> {
     meta(0, 0x03, b"bulk", &mut t);
     // 64KB sample/patch dump
     let mut payload = vec![0x41u8, 0x10];
-    payload.extend(std::iter::repeat(0x5Au8).take(64 * 1024));
+    payload.extend(std::iter::repeat_n(0x5Au8, 64 * 1024));
     payload.push(0xF7);
     sysex(0, &payload, &mut t);
     three_notes(0, &mut t);

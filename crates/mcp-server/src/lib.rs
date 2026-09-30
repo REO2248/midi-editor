@@ -26,7 +26,7 @@
 //!   to `127.0.0.1`. Defence: requests carrying an `Origin` header must name a
 //!   loopback origin (`http(s)://localhost|127.0.0.1|[::1]:<any port>`), and a
 //!   present `Host` header must be a loopback host — enforced by
-//!   [`loopback_guard`] *and* rmcp's own allowlists (defence in depth).
+//!   `loopback_guard` *and* rmcp's own allowlists (defence in depth).
 //!   Non-browser MCP clients send no `Origin` and are unaffected.
 //! - **Unauthenticated local access**: when `MIDI_MCP_TOKEN` is unset, any
 //!   local process can call mutating tools. This is accepted for convenience
@@ -192,7 +192,7 @@ pub struct Shared {
     /// bounded committed-transaction log (oldest evicted past TX_HISTORY_CAP)
     pub history: std::collections::VecDeque<TxRecord>,
     /// last agent-originated committed transaction — the GUI watches this to
-    /// show "MCP: <label>" in the status bar
+    /// show "MCP: name" in the status bar
     pub last_mcp_tx: Option<TxRecord>,
     /// file-write scope for `save` — stamped by the transport entry point;
     /// defaults to the stricter HTTP policy
@@ -421,6 +421,9 @@ impl Shared {
 
     /// Open a named transaction. One at a time — a second begin is an error
     /// naming the open checkpoint (a caller cannot silently hijack it).
+    // the Err arm is the wire-level JSON-RPC error payload — it is the
+    // value being returned, not overhead, so boxing it buys nothing
+    #[allow(clippy::result_large_err)]
     pub fn begin_batch(&mut self, label: String) -> Result<u64, CallToolResponse> {
         if let Some(b) = &self.batch {
             return Err(err_json(
@@ -480,6 +483,9 @@ impl Shared {
     /// merged ops against a clone of the committed document and keeps the
     /// batch open. A document changed since begin yields a stale-revision
     /// conflict; the batch stays open so the caller can inspect and decide.
+    // the Err arm is the wire-level JSON-RPC error payload — it is the
+    // value being returned, not overhead, so boxing it buys nothing
+    #[allow(clippy::result_large_err)]
     pub fn commit_batch(&mut self, dry_run: bool) -> Result<serde_json::Value, CallToolResponse> {
         let Some(b) = self.batch.take() else {
             return Err(err_json("no open transaction"));
@@ -831,7 +837,7 @@ fn authorize_write(
         }
     }
     if scope == FsScope::Stdio {
-        if let Ok(cwd) = std::env::current_dir().and_then(|d| std::fs::canonicalize(d)) {
+        if let Ok(cwd) = std::env::current_dir().and_then(std::fs::canonicalize) {
             roots.push(cwd);
         }
     }
@@ -927,6 +933,9 @@ fn parse_cursor(s: &str, key_len: usize) -> Result<Vec<u64>, serde_json::Value> 
 }
 
 /// `args["cursor"]` → resume key, or an error response (bad shape / stale).
+// the Err arm is the wire-level JSON-RPC error payload — it is the
+// value being returned, not overhead, so boxing it buys nothing
+#[allow(clippy::result_large_err)]
 fn cursor_arg(
     sh: &Shared,
     args: &serde_json::Value,
@@ -1976,8 +1985,8 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
                 .as_u64()
                 .unwrap_or(500)
                 .min(MAX_QUERY_LIMIT as u64) as usize;
-            let fields = field_projection(&args);
-            let after = match cursor_arg(&sh, &args, 4) {
+            let fields = field_projection(args);
+            let after = match cursor_arg(&sh, args, 4) {
                 Ok(a) => a,
                 Err(r) => return r,
             };
@@ -2017,8 +2026,8 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
                 .unwrap_or(500)
                 .min(MAX_QUERY_LIMIT as u64) as usize;
             let offset = args["offset"].as_u64().unwrap_or(0) as usize;
-            let fields = field_projection(&args);
-            let after = match cursor_arg(&sh, &args, 4) {
+            let fields = field_projection(args);
+            let after = match cursor_arg(&sh, args, 4) {
                 Ok(a) => a,
                 Err(r) => return r,
             };
@@ -2319,8 +2328,8 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
                 .as_u64()
                 .unwrap_or(500)
                 .min(MAX_QUERY_LIMIT as u64) as usize;
-            let fields = field_projection(&args);
-            let after = match cursor_arg(&sh, &args, 4) {
+            let fields = field_projection(args);
+            let after = match cursor_arg(&sh, args, 4) {
                 Ok(a) => a,
                 Err(r) => return r,
             };
@@ -2366,8 +2375,7 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
                         serde_json::Value::Null
                     };
                     project_fields(
-                        serde_json::json!({
-                            "track": ti, "id": e.id, "tick": e.tick,
+                        serde_json::json!({                            "track": ti, "id": e.id, "tick": e.tick,
                             "type": format!("0x{meta_type:02x}"),
                             "text": text,
                             "data_hex": bytes_hex(data),
@@ -2389,8 +2397,8 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
                 .as_u64()
                 .unwrap_or(500)
                 .min(MAX_QUERY_LIMIT as u64) as usize;
-            let fields = field_projection(&args);
-            let after = match cursor_arg(&sh, &args, 3) {
+            let fields = field_projection(args);
+            let after = match cursor_arg(&sh, args, 3) {
                 Ok(a) => a,
                 Err(r) => return r,
             };
@@ -2464,7 +2472,7 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
                                 })
                             }
                             0xA0 if (kind.is_none() || kind == Some("poly"))
-                                && key.map_or(true, |k| k == data[0]) =>
+                                && key.is_none_or(|k| k == data[0]) =>
                             {
                                 serde_json::json!({
                                     "track": ti, "id": e.id, "tick": e.tick,
@@ -3561,6 +3569,7 @@ pub fn read_stored_token() -> Option<String> {
 ///   1. `MIDI_MCP_TOKEN` (non-empty)     → fixed bearer token
 ///   2. `MIDI_MCP_ALLOW_INSECURE` truthy → explicit unauthenticated opt-out
 ///   3. otherwise                        → auto-provisioned token file
+///
 /// Errors instead of silently serving unauthenticated when provisioning
 /// fails — failing open would hand mutating tools to any local process.
 pub fn resolve_http_auth() -> anyhow::Result<HttpAuth> {
@@ -3689,7 +3698,7 @@ async fn bounded_request(
 }
 
 /// Build the `/mcp` router with the full HTTP security posture: the explicit
-/// [`loopback_guard`] (outermost layer), bounded concurrency/time, Bearer
+/// `loopback_guard` (outermost layer), bounded concurrency/time, Bearer
 /// auth middleware (with per-IP failure throttling), body-size cap and rmcp's
 /// own Host/Origin allowlists configured explicitly rather than left at
 /// library defaults. Split out of [`serve_http`] so tests can mount it on an

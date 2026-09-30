@@ -452,7 +452,7 @@ fn track_lenient(
                 EventKind::Escape(payload)
             };
             p = end;
-        } else if st >= 0x80 && st < 0xF0 {
+        } else if (0x80..0xF0).contains(&st) {
             running = Some(st);
             p += 1;
             let want = if matches!(st >> 4, 0xC | 0xD) { 1 } else { 2 };

@@ -235,15 +235,17 @@ impl ScanCache {
 
 /// Partition the discovered candidates into "answer from cache" vs "must
 /// probe". Pure (no process spawning) so the decision logic is unit-testable.
+type ScanBuckets = (
+    Vec<PluginInfo>,
+    Vec<(std::path::PathBuf, String)>,
+    Vec<(std::path::PathBuf, BundleStamp)>,
+);
+
 fn plan_scan(
     cache: &ScanCache,
     candidates: &[std::path::PathBuf],
     force: &std::collections::HashSet<String>,
-) -> (
-    Vec<PluginInfo>,
-    Vec<(std::path::PathBuf, String)>,
-    Vec<(std::path::PathBuf, BundleStamp)>,
-) {
+) -> ScanBuckets {
     let mut cached = Vec::new();
     let mut quarantined = Vec::new();
     let mut probe = Vec::new();
@@ -1622,10 +1624,10 @@ mod tests {
         assert_eq!(s1.files, 1);
         assert_eq!(s1.size, 3);
         // a payload change bumps size; a new file bumps the file count
-        std::fs::write(b.join("Contents/x86_64-win/A.vst3"), &[1, 2, 3, 4]).unwrap();
+        std::fs::write(b.join("Contents/x86_64-win/A.vst3"), [1, 2, 3, 4]).unwrap();
         let s2 = bundle_stamp(&b);
         assert_ne!(s1, s2, "size change must invalidate");
-        std::fs::write(b.join("Contents/x86_64-win/extra.bin"), &[9]).unwrap();
+        std::fs::write(b.join("Contents/x86_64-win/extra.bin"), [9]).unwrap();
         let s3 = bundle_stamp(&b);
         assert_eq!(s3.files, 2);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1635,7 +1637,7 @@ mod tests {
     fn stamp_handles_file_bundles_and_missing_paths() {
         let dir = tmpdir("stampf");
         let f = dir.join("Solo.vst3");
-        std::fs::write(&f, &[1, 2, 3, 4, 5]).unwrap();
+        std::fs::write(&f, [1, 2, 3, 4, 5]).unwrap();
         let s = bundle_stamp(&f);
         assert_eq!((s.files, s.size), (1, 5));
         assert_eq!(bundle_stamp(&dir.join("gone.vst3")), BundleStamp::default());
@@ -1708,7 +1710,7 @@ mod tests {
         assert_eq!(probe[0].0, new_b, "only uncached paths are probed");
 
         // same quarantined bundle, changed on disk -> re-probed
-        std::fs::write(bad_b.join("Contents/x86_64-win/Bad.vst3"), &[2, 2, 2, 2]).unwrap();
+        std::fs::write(bad_b.join("Contents/x86_64-win/Bad.vst3"), [2, 2, 2, 2]).unwrap();
         let (_, q2, p2) = plan_scan(&cache, &candidates, &std::collections::HashSet::new());
         assert!(q2.is_empty());
         assert_eq!(p2.len(), 2, "updated quarantined bundle re-probes");

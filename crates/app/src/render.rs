@@ -225,7 +225,7 @@ impl Render for EditorView {
                 for r in r0..r1 {
                     let key = kbd_keys[r as usize];
                     let black = matches!(key % 12, 1 | 3 | 6 | 8 | 10);
-                    let cur = scrub_key == Some(key as u8);
+                    let cur = scrub_key == Some(key);
                     let y = bounds.origin.y + px(r as f32 * note_h - scroll_y);
                     window.paint_quad(fill(
                         Bounds::new(
@@ -241,7 +241,7 @@ impl Render for EditorView {
                         }),
                     ));
                     // C guide line across the strip, like the roll's rows
-                    if key % 12 == 0 {
+                    if key.is_multiple_of(12) {
                         window.paint_quad(fill(
                             Bounds::new(
                                 point(bounds.origin.x, y + px(note_h - 1.0)),
@@ -294,7 +294,11 @@ impl Render for EditorView {
                     }
                     window.paint_quad(fill(
                         Bounds::new(point(bounds.origin.x, y), size(w, px(1.0))),
-                        rgb(if key % 12 == 0 { 0x2e2e3a } else { 0x232329 }),
+                        rgb(if key.is_multiple_of(12) {
+                            0x2e2e3a
+                        } else {
+                            0x232329
+                        }),
                     ));
                 }
                 // beat/bar lines — quarter/bar for metrical, frame/second
@@ -1845,7 +1849,7 @@ impl Render for EditorView {
                                 .child(kbd.size_full())
                                 .children((0..strip_keys.len() as i32).filter_map(|r| {
                                     let k = strip_keys[r as usize];
-                                    if k % 12 != 0 {
+                                    if !k.is_multiple_of(12) {
                                         return None;
                                     }
                                     let y = r as f32 * note_h - scroll_y + (note_h - 8.0) / 2.0;
@@ -4060,14 +4064,11 @@ impl Render for EditorView {
                 // meta dialog swallows keys (typing must not trigger editor
                 // keys); Enter applies, Esc cancels
                 if this.meta_edit.is_some() {
-                    match (ev.keystroke.modifiers.control, k) {
-                        (false, "escape") => {
-                            this.meta_edit = None;
-                            let f = this.focus.clone();
-                            w.focus(&f, cx);
-                            cx.notify();
-                        }
-                        _ => {}
+                    if let (false, "escape") = (ev.keystroke.modifiers.control, k) {
+                        this.meta_edit = None;
+                        let f = this.focus.clone();
+                        w.focus(&f, cx);
+                        cx.notify();
                     }
                     return;
                 }
@@ -4206,6 +4207,7 @@ impl EditorView {
         MenuRow::Head(label.into())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dest_rows(
         &self,
         kind: DestPick,
