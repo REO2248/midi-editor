@@ -15,6 +15,7 @@ use geometry::{
 };
 use i18n::{t, tf};
 
+use commands::UndoStack;
 use document::{Document, Event as DocEvent, EventId, Note, Op};
 use gpui_kit::component::input::InputState;
 use gpui_kit::component::Root;

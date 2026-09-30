@@ -132,7 +132,8 @@ pub(crate) fn write_snapshot(
     };
     std::fs::create_dir_all(dir)?;
     let path = dir.join(format!("autosave-{}.snap", meta.timestamp));
-    mcp_server::write_atomic(&path, &encode(&meta, &payload))?;
+    mcp_server::write_atomic(&path, &encode(&meta, &payload))
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     Ok(path)
 }
 
