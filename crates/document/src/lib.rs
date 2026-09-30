@@ -414,6 +414,45 @@ impl Document {
         ops
     }
 
+    /// Bank+program state a (track, channel) reached by `tick`, as wire
+    /// bytes in emit order (CC0, CC32, PC). Audition strikes prefix their
+    /// note-on with these so the preview sounds on the patch the track
+    /// would actually be playing at that point.
+    pub fn channel_setup(&self, track: usize, channel: u8, tick: u64) -> Vec<Vec<u8>> {
+        let (mut msb, mut lsb, mut prog) = (None, None, None);
+        if let Some(t) = self.tracks.get(track) {
+            for e in &t.events {
+                if e.tick >= tick {
+                    break;
+                }
+                let EventKind::Channel { status, data, .. } = &e.kind else {
+                    continue;
+                };
+                if status & 0x0F != channel & 0x0F {
+                    continue;
+                }
+                match (status & 0xF0, data[0]) {
+                    (0xB0, 0) => msb = Some(data[1]),
+                    (0xB0, 32) => lsb = Some(data[1]),
+                    (0xC0, p) => prog = Some(p),
+                    _ => {}
+                }
+            }
+        }
+        let ch = channel & 0x0F;
+        let mut out = Vec::new();
+        if let Some(v) = msb {
+            out.push(vec![0xB0 | ch, 0, v]);
+        }
+        if let Some(v) = lsb {
+            out.push(vec![0xB0 | ch, 32, v]);
+        }
+        if let Some(p) = prog {
+            out.push(vec![0xC0 | ch, p]);
+        }
+        out
+    }
+
     /// `(absolute µs, source track index, raw channel message)` sorted by time.
     /// The track tag lets playback fan events out to per-track destinations.
     pub fn timeline_tagged(&self) -> Vec<(u64, usize, Vec<u8>)> {
