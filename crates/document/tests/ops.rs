@@ -1122,3 +1122,33 @@ fn overlapping_ons_are_preserved_not_normalized() {
     assert_eq!(notes_on(&d2, 0).len(), 2);
     assert!(d2.diagnose().iter().any(|d| d.code == "overlapping-noteon"));
 }
+
+#[test]
+fn channel_setup_collects_bank_and_program_before_tick() {
+    let mut d = doc(vec![vec![
+        chan(10, 0xB0, 0, 1),  // bank MSB = 1
+        chan(20, 0xB0, 32, 5), // bank LSB = 5
+        chan(30, 0xC0, 42, 0), // program 42
+        chan(40, 0xB0, 0, 3),  // MSB overwritten -> 3
+        chan(60, 0xB1, 0, 99), // different channel: must not leak in
+        chan(60, 0xC1, 7, 0),
+        chan(500, 0xC0, 99, 0), // after the query tick: ignored
+    ]]);
+    // MSB+LSB+PC in emit order
+    assert_eq!(
+        d.channel_setup(0, 0, 100),
+        vec![vec![0xB0, 0, 3], vec![0xB0, 32, 5], vec![0xC0, 42]]
+    );
+    // before the PC/second-bank events only the first bank pair survives
+    assert_eq!(
+        d.channel_setup(0, 0, 25),
+        vec![vec![0xB0, 0, 1], vec![0xB0, 32, 5]]
+    );
+    // channel with no setup state -> nothing prefixed
+    assert!(d.channel_setup(0, 5, 100).is_empty());
+    // before every event -> nothing
+    assert!(d.channel_setup(0, 0, 5).is_empty());
+    // missing track -> nothing
+    assert!(d.channel_setup(9, 0, 100).is_empty());
+    let _ = &mut d;
+}

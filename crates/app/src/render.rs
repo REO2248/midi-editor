@@ -43,6 +43,13 @@ impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // the plugin editor lives in the helper subprocess's own window —
         // no native event queue to pump here
+        // focus-loss guarantee: deactivate = release preview notes (the
+        // worker's deadline cap is the backstop for a kill without repaint)
+        let active = window.is_window_active();
+        if self.win_active && !active {
+            self.audition_off();
+        }
+        self.win_active = active;
         self.refresh_derived();
         // keep both scroll axes inside the content (resizes, zooms, edits all
         // self-heal here) and edge-scroll while a drag is parked at a border;
@@ -139,6 +146,51 @@ impl Render for EditorView {
         let playing = self.playback.is_some();
         let play_x_tick = playhead_tick;
         let active_track = self.sel_track;
+
+        // piano-key strip: clickable/scrubbable keyboard that auditions the
+        // pitch through the selected track's routing (issue #39)
+        let kbd_bounds_cell = self.kbd_bounds.clone();
+        let scrub_key = self.scrub_key;
+        let kbd = canvas(
+            move |bounds, _window, _cx| {
+                kbd_bounds_cell.set(bounds);
+            },
+            move |bounds, _state, window, _cx| {
+                let w = bounds.size.width;
+                let k0 = (scroll_y / NOTE_H).max(0.0) as i32;
+                let k1 =
+                    ((scroll_y + f32::from(bounds.size.height)) / NOTE_H + 1.0).min(128.0) as i32;
+                for k in k0..k1 {
+                    let key = 127 - k;
+                    let black = matches!(key % 12, 1 | 3 | 6 | 8 | 10);
+                    let cur = scrub_key == Some(key as u8);
+                    let y = bounds.origin.y + px(k as f32 * NOTE_H - scroll_y);
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(bounds.origin.x, y),
+                            size(w, px((NOTE_H - 1.0).max(1.0))),
+                        ),
+                        rgb(if cur {
+                            ACCENT
+                        } else if black {
+                            0x101016
+                        } else {
+                            0x2a2a34
+                        }),
+                    ));
+                    // C guide line across the strip, like the roll's rows
+                    if key % 12 == 0 {
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                point(bounds.origin.x, y + px(NOTE_H - 1.0)),
+                                size(w, px(1.0)),
+                            ),
+                            rgb(0x3a3a48),
+                        ));
+                    }
+                }
+            },
+        );
 
         let roll = canvas(
             move |bounds, _window, _cx| {
@@ -1282,9 +1334,106 @@ impl Render for EditorView {
                 .child(
                     div()
                         .flex_1()
+                        .flex_row()
                         .relative()
                         .overflow_hidden()
-                        .child(roll.size_full())
+                        // piano-key strip — click or scrub to audition the
+                        // pitch through the selected track's routing
+                        .child(
+                            div()
+                                .w(px(48.0))
+                                .h_full()
+                                .relative()
+                                .overflow_hidden()
+                                .bg(rgb(0x17171d))
+                                .border_r_1()
+                                .border_color(rgb(BORDER_C))
+                                .cursor_pointer()
+                                .child(kbd.size_full())
+                                .children((0..128i32).filter_map(|k| {
+                                    if k % 12 != 0 {
+                                        return None;
+                                    }
+                                    let y = (127 - k) as f32 * NOTE_H - scroll_y
+                                        + (NOTE_H - 8.0) / 2.0;
+                                    (y > -12.0).then(|| {
+                                        div()
+                                            .absolute()
+                                            .right(px(2.0))
+                                            .top(px(y))
+                                            .text_size(px(7.0))
+                                            .text_color(rgb(0x8080a0))
+                                            .child(format!("C{}", k / 12 - 1))
+                                    })
+                                }))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, ev: &MouseDownEvent, w, cx| {
+                                        cx.stop_propagation();
+                                        w.focus(&this.focus, cx);
+                                        this.mouse_pos = Some(ev.position);
+                                        if let Some(k) = this.kbd_key(ev.position) {
+                                            let ch = this.sel_track_ch();
+                                            let tr = this.sel_track;
+                                            let vel = this.aud_vel;
+                                            let at = this
+                                                .doc(|d| d.tempo_map.us_to_tick(this.play_us));
+                                            this.scrub_key = Some(k);
+                                            this.audition_strike(tr, ch, k, vel, at);
+                                            cx.notify();
+                                        }
+                                    }),
+                                )
+                                .on_mouse_move(cx.listener(
+                                    |this, ev: &MouseMoveEvent, _w, cx| {
+                                        if this.scrub_key.is_none() {
+                                            return;
+                                        }
+                                        cx.stop_propagation();
+                                        if ev.pressed_button != Some(MouseButton::Left) {
+                                            this.audition_off();
+                                            cx.notify();
+                                            return;
+                                        }
+                                        if let Some(k) = this.kbd_key(ev.position) {
+                                            if this.scrub_key != Some(k) {
+                                                this.scrub_key = Some(k);
+                                                let ch = this.sel_track_ch();
+                                                let tr = this.sel_track;
+                                                let vel = this.aud_vel;
+                                                let at = this.doc(|d| {
+                                                    d.tempo_map.us_to_tick(this.play_us)
+                                                });
+                                                this.audition_strike(tr, ch, k, vel, at);
+                                            }
+                                            cx.notify();
+                                        }
+                                    },
+                                ))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _ev: &MouseUpEvent, _w, _cx| {
+                                        if this.scrub_key.is_some() {
+                                            this.audition_off();
+                                        }
+                                    }),
+                                )
+                                .on_mouse_up_out(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _ev: &MouseUpEvent, _w, _cx| {
+                                        if this.scrub_key.is_some() {
+                                            this.audition_off();
+                                        }
+                                    }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .relative()
+                                .overflow_hidden()
+                                .child(roll.size_full()),
+                        )
                         .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, ev: &MouseDownEvent, w, cx| {
@@ -1314,12 +1463,15 @@ impl Render for EditorView {
                                 a_key: 0,
                                 b_tick: 0,
                                 b_key: 0,
+                                aud_vel: 0,
+                                aud_ch: 0,
                             });
                             cx.notify();
                             return;
                         }
                         if let Some(n) = this.edge_at(ev.position) {
                             this.sel_track = n.track;
+                            this.audition_strike(n.track, n.channel, n.key, n.vel, n.start_tick);
                             this.drag = Some(Drag {
                                 mode: DragMode::Resize,
                                 on_id: n.on_id,
@@ -1334,6 +1486,8 @@ impl Render for EditorView {
                                 a_key: 0,
                                 b_tick: 0,
                                 b_key: 0,
+                                aud_vel: n.vel,
+                                aud_ch: n.channel,
                             });
                         } else if let Some(n) = this.note_at(ev.position) {
                             if shift {
@@ -1344,6 +1498,7 @@ impl Render for EditorView {
                                 this.selection = BTreeSet::from([n.on_id]);
                             }
                             this.sel_track = n.track;
+                            this.audition_strike(n.track, n.channel, n.key, n.vel, n.start_tick);
                             this.drag = Some(Drag {
                                 mode: if ev.modifiers.alt {
                                     DragMode::Duplicate
@@ -1362,6 +1517,8 @@ impl Render for EditorView {
                                 a_key: 0,
                                 b_tick: 0,
                                 b_key: 0,
+                                aud_vel: n.vel,
+                                aud_ch: n.channel,
                             });
                         } else {
                             let (tick, key) = this.hit(ev.position);
@@ -1369,13 +1526,26 @@ impl Render for EditorView {
                                 if !shift {
                                     this.selection.clear();
                                 }
+                                // draw tool auditions the pitch under the
+                                // anchor; scrub changes preview on update_drag
+                                let aud_ch = this.sel_track_ch();
+                                let aud_vel = this.aud_vel;
+                                if this.tool == Tool::Draw {
+                                    this.audition_strike(
+                                        this.sel_track,
+                                        aud_ch,
+                                        key as u8,
+                                        aud_vel,
+                                        tick.max(0) as u64,
+                                    );
+                                }
                                 // becomes a marquee on drag; a click without
                                 // drag inserts a note at the anchor
                                 this.drag = Some(Drag {
                                     mode: DragMode::Marquee,
                                     on_id: 0,
                                     off_id: None,
-                                    track: 0,
+                                    track: this.sel_track,
                                     orig_start: 0,
                                     orig_end: None,
                                     orig_key: 0,
@@ -1385,6 +1555,8 @@ impl Render for EditorView {
                                     a_key: key,
                                     b_tick: tick,
                                     b_key: key,
+                                    aud_vel,
+                                    aud_ch,
                                 });
                             }
                         }
@@ -1482,6 +1654,8 @@ impl Render for EditorView {
                                                 a_key: 0,
                                                 b_tick: 0,
                                                 b_key: 0,
+                                                aud_vel: 0,
+                                                aud_ch: 0,
                                             });
                                         }
                                     }
@@ -1536,6 +1710,8 @@ impl Render for EditorView {
                                             a_key: 0,
                                             b_tick: 0,
                                             b_key: 0,
+                                            aud_vel: 0,
+                                            aud_ch: 0,
                                         });
                                     }
                                 }
@@ -2119,6 +2295,27 @@ impl Render for EditorView {
                         },
                     )
                     .into_any_element(),
+                    Self::msep().into_any_element(),
+                    Self::mi(
+                        "tr.aud",
+                        t("transport.audition"),
+                        "",
+                        Some(self.aud_enabled),
+                        cx,
+                        |v, _e, _cx| {
+                            v.aud_enabled = !v.aud_enabled;
+                            // disabling mid-ring must silence immediately
+                            if !v.aud_enabled {
+                                v.audition_off();
+                            }
+                            v.save_global();
+                        },
+                    )
+                    .into_any_element(),
+                    Self::mi_sub("tr.audv", t("transport.aud_vel"), Sub::AudVel, cx)
+                        .into_any_element(),
+                    Self::mi_sub("tr.audd", t("transport.aud_dur"), Sub::AudDur, cx)
+                        .into_any_element(),
                 ],
                 TopMenu::Help => vec![
                     Self::mi(
@@ -2208,6 +2405,7 @@ impl Render for EditorView {
                                         let mut sh = crate::lock_shared(&v.shared);
                                         sh.doc.set_track_channel_ops(tr, ch)
                                     };
+                                    v.audition_off();
                                     v.apply_tx("set track channel", ops);
                                 },
                             )
@@ -2530,6 +2728,42 @@ impl Render for EditorView {
                             })
                             .collect()
                     }
+                    Sub::AudVel => [64u8, 80, 100, 112, 127]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, vel)| {
+                            Self::mi_leaf(
+                                ("audv", i),
+                                format!("{vel}"),
+                                "",
+                                Some(self.aud_vel == vel),
+                                cx,
+                                move |v, _e, _cx| {
+                                    v.aud_vel = vel;
+                                    v.save_global();
+                                },
+                            )
+                            .into_any_element()
+                        })
+                        .collect(),
+                    Sub::AudDur => [150u64, 300, 500, 1000]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, ms)| {
+                            Self::mi_leaf(
+                                ("audd", i),
+                                format!("{ms} ms"),
+                                "",
+                                Some(self.aud_ms == ms),
+                                cx,
+                                move |v, _e, _cx| {
+                                    v.aud_ms = ms;
+                                    v.save_global();
+                                },
+                            )
+                            .into_any_element()
+                        })
+                        .collect(),
                     Sub::Enc => {
                         let opts: [(Option<smf_core::TextEncoding>, &str); 4] = [
                             (None, "auto"),
@@ -3213,6 +3447,8 @@ impl EditorView {
                         crate::lock_shared(&v.shared)
                             .track_dest
                             .remove(&v.sel_track);
+                        // a preview routed to the old destination must stop
+                        v.audition_off();
                         v.persist();
                     },
                 )
@@ -3274,6 +3510,7 @@ impl EditorView {
                                 sh.default_dest = i;
                             }
                             drop(sh);
+                            v.audition_off();
                             v.persist();
                         },
                     )
@@ -3386,6 +3623,7 @@ impl EditorView {
                             sh.default_dest = i;
                         }
                         drop(sh);
+                        v.audition_off();
                         v.persist();
                         v.ensure_plugin(i, true);
                         let _ = path2;

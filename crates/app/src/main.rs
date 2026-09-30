@@ -3,6 +3,7 @@
 //! basic editing (draw / drag / delete) all going through
 //! `Document::apply(Transaction)` so undo is shared with MCP edits.
 
+mod audition;
 mod diagnostics;
 mod geometry;
 mod guard;
@@ -13,6 +14,8 @@ mod recovery;
 mod render;
 mod shutdown;
 mod watch;
+
+use audition::Audition;
 use geometry::{
     clamp_move_delta, clamp_span, content_view, reanchor, roll_hit, ZOOM_MAX, ZOOM_MIN,
 };
@@ -28,7 +31,7 @@ use midi_io::{EventSink, Playback, PortSink};
 use smf_core::Division;
 use smf_core::EventKind;
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -103,6 +106,8 @@ enum Sub {
     VelSet,
     RelSet,
     Oct,
+    AudVel,
+    AudDur,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -198,6 +203,10 @@ struct Drag {
     a_key: i32,
     b_tick: i64,
     b_key: i32,
+    /// Audition routing captured at drag start (0 where unused): the
+    /// velocity and channel preview strikes for this drag use.
+    aud_vel: u8,
+    aud_ch: u8,
 }
 
 /// Document-derived data the chrome (menu bar, marker strip, minimap,
@@ -336,6 +345,8 @@ struct EditorView {
     clipboard: Vec<ClipNote>,
     /// canvas bounds as painted last frame — for hit-testing
     roll_bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// piano-key strip bounds (the clickable keyboard left of the roll)
+    kbd_bounds: Rc<Cell<Bounds<Pixels>>>,
     /// seek-ruler strip bounds
     ruler_bounds: Rc<Cell<Bounds<Pixels>>>,
     /// velocity lane bounds — same trick for the lane's hit-testing
@@ -424,6 +435,26 @@ struct EditorView {
     open_menu: Option<(TopMenu, f32)>,
     /// open cascading submenu + the y of its parent item
     open_sub: Option<(Sub, f32)>,
+    /// note audition/scrub preview worker (issue #39) — owns preview sinks
+    /// on its own thread and enforces every strike's note-off itself, so a
+    /// UI stall can never strand a sounding note
+    audition: Audition,
+    /// Transport ▸ Audition Notes (global prefs)
+    aud_enabled: bool,
+    /// preview velocity for piano-key/draw strikes (note clicks use the
+    /// note's own velocity)
+    aud_vel: u8,
+    /// max preview sustain in ms — release ends the note earlier
+    aud_ms: u64,
+    /// destination indexes whose sink the worker already holds
+    aud_ships: HashSet<usize>,
+    /// ports that failed to open — one status line, not a retry per click
+    aud_failed: HashSet<usize>,
+    /// piano-key strip scrub: the row currently held (also marks drag)
+    scrub_key: Option<u8>,
+    /// last-seen window activation — a transition to inactive releases any
+    /// preview note (focus-loss guarantee)
+    win_active: bool,
     /// right-docked event list panel visibility
     show_events: bool,
     /// F1 keyboard-shortcuts overlay
@@ -733,6 +764,10 @@ impl EditorView {
                 point(px(0.0), px(0.0)),
                 size(px(0.0), px(0.0)),
             ))),
+            kbd_bounds: Rc::new(Cell::new(Bounds::new(
+                point(px(0.0), px(0.0)),
+                size(px(0.0), px(0.0)),
+            ))),
             ruler_bounds: Rc::new(Cell::new(Bounds::new(
                 point(px(0.0), px(0.0)),
                 size(px(0.0), px(0.0)),
@@ -799,6 +834,14 @@ impl EditorView {
             in_latency_ms: g.in_latency_ms,
             open_sub: None,
             show_events: true,
+            audition: Audition::spawn(),
+            aud_enabled: g.audition.unwrap_or(true),
+            aud_vel: g.aud_vel.unwrap_or(100).clamp(1, 127),
+            aud_ms: g.aud_ms.unwrap_or(400),
+            aud_ships: HashSet::new(),
+            aud_failed: HashSet::new(),
+            scrub_key: None,
+            win_active: true,
             focus: cx.focus_handle(),
             input,
             status,
@@ -1692,6 +1735,9 @@ impl EditorView {
     }
 
     fn commit_drag(&mut self, cx: &mut Context<Self>) {
+        // every release ends any sounding preview (draw scrub, pitch drag,
+        // key strip) — the worker's own deadline is the backstop
+        self.audition_off();
         let Some(d) = self.drag.take() else { return };
         match d.mode {
             DragMode::Erase => {
@@ -2526,6 +2572,10 @@ impl EditorView {
             self.restart_logged.remove(&d);
             self.plugin_slots.remove(&d);
             let _ = self.plugin_req.send(output::PluginReq::Drop(d));
+            // an audition sink bound to that slot is stale too
+            if self.aud_ships.remove(&d) {
+                self.audition.drop_sink(d);
+            }
         }
         self.plugin_state.insert(
             d,
@@ -2594,6 +2644,9 @@ impl EditorView {
                     },
                 );
                 let _ = self.plugin_req.send(output::PluginReq::Drop(d));
+                if self.aud_ships.remove(&d) {
+                    self.audition.drop_sink(d);
+                }
                 changed = true;
             }
         }
@@ -2781,6 +2834,7 @@ impl EditorView {
     }
 
     fn start_playback(&mut self) {
+        self.audition_off();
         // snapshot routing state so no lock is held while opening sinks
         let (
             dests,
@@ -2984,6 +3038,7 @@ impl EditorView {
     }
 
     fn stop_playback(&mut self) {
+        self.audition_off();
         self.play_pending = false;
         if let Some(mut p) = self.playback.take() {
             self.play_us = p.position_us();
@@ -3293,6 +3348,10 @@ impl EditorView {
         self.plugin_slots.clear();
         self.restart_logged.clear();
         self.plugin_state.clear();
+        // audition sinks key on the same indexes — rebuild on next strike
+        self.aud_ships.clear();
+        self.aud_failed.clear();
+        self.audition.clear_sinks();
         let _ = self.plugin_req.send(output::PluginReq::Clear);
         self.refresh_plugins();
         let ns = n.to_string();
@@ -3553,6 +3612,9 @@ impl EditorView {
                     .then(|| self.note_at(pos).or_else(|| self.edge_at(pos)))
                     .flatten()
                     .map(|n| n.on_id);
+                // preview strike to send after the drag borrow is released —
+                // (track, ch, key, vel, at_tick) when a pitch drag moves
+                let mut strike = None;
                 if let Some(d) = self.drag.as_mut() {
                     match d.mode {
                         DragMode::Move | DragMode::Duplicate => {
@@ -3562,6 +3624,15 @@ impl EditorView {
                                 key - d.orig_key as i32,
                                 d.orig_key,
                             );
+                            if dk != d.dkey {
+                                strike = Some((
+                                    d.track,
+                                    d.aud_ch,
+                                    (d.orig_key as i32 + dk).clamp(0, 127) as u8,
+                                    d.aud_vel,
+                                    (d.orig_start as i64 + dt).max(0) as u64,
+                                ));
+                            }
                             d.dtick = dt;
                             d.dkey = dk;
                         }
@@ -3569,11 +3640,23 @@ impl EditorView {
                             d.dtick = tick - d.orig_end.unwrap_or(d.orig_start) as i64;
                         }
                         DragMode::Marquee => {
+                            if self.tool == Tool::Draw && key != d.b_key {
+                                strike = Some((
+                                    d.track,
+                                    d.aud_ch,
+                                    key.clamp(0, 127) as u8,
+                                    d.aud_vel,
+                                    tick.max(0) as u64,
+                                ));
+                            }
                             d.b_tick = tick;
                             d.b_key = key;
                         }
                         _ => {}
                     }
+                }
+                if let Some((tr, ch, k, v, at)) = strike {
+                    self.audition_strike(tr, ch, k, v, at);
                 }
                 if let Some(id) = erase_id {
                     self.erase_ids.insert(id);
@@ -3672,6 +3755,101 @@ impl EditorView {
             .cloned()
     }
 
+    // --- note audition (issue #39) -------------------------------------------
+
+    /// Channel the selected track's previews route through.
+    fn sel_track_ch(&self) -> u8 {
+        self.doc(|d| {
+            d.tracks
+                .get(self.sel_track)
+                .map(|t| t.out_channel & 0x0F)
+                .unwrap_or(0)
+        })
+    }
+
+    /// Piano-key under a window-space position on the key strip.
+    fn kbd_key(&self, pos: Point<Pixels>) -> Option<u8> {
+        let b = self.kbd_bounds.get();
+        let y = f32::from(pos.y) - f32::from(b.origin.y);
+        let row = ((y + self.scroll_y) / NOTE_H) as i32;
+        let key = 127 - row;
+        (0..=127).contains(&key).then_some(key as u8)
+    }
+
+    /// Make sure the audition worker holds a sink for destination `d`.
+    /// Ports are opened once then owned by the worker; plugins reuse the
+    /// already-warm slot (a still-loading plugin simply skips this strike —
+    /// the next click works once the slot is ready).
+    fn audition_sink(&mut self, d: usize) -> bool {
+        if self.aud_ships.contains(&d) {
+            return true;
+        }
+        let dest = lock_shared(&self.shared)
+            .dests
+            .get(d)
+            .map(|(_, dd)| dd.clone());
+        match dest {
+            Some(output::Destination::MidiPort { port_name, ord }) => {
+                match midi_io::Output::open_ord(&port_name, ord) {
+                    Ok(out) => {
+                        self.audition.set_sink(d, Box::new(PortSink::new(out)));
+                        self.aud_ships.insert(d);
+                        true
+                    }
+                    Err(e) => {
+                        if self.aud_failed.insert(d) {
+                            self.status = tf("status.aud_failed", &[("e", &e.to_string())]).into();
+                        }
+                        false
+                    }
+                }
+            }
+            Some(output::Destination::Plugin { .. }) => {
+                self.ensure_plugin(d, false);
+                if self.plugin_slots.contains_key(&d)
+                    && matches!(self.plugin_state.get(&d), Some(PluginState::Ready { .. }))
+                {
+                    let sink = self
+                        .plugin_slots
+                        .get(&d)
+                        .expect("slot just loaded")
+                        .sink
+                        .clone();
+                    self.audition.set_sink(d, Box::new(sink));
+                    self.aud_ships.insert(d);
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Preview one pitch through `track`'s destination + `ch`'s bank/program
+    /// state at `at_tick`. The worker schedules the note-off itself.
+    fn audition_strike(&mut self, track: usize, ch: u8, key: u8, vel: u8, at_tick: u64) {
+        if !self.aud_enabled {
+            return;
+        }
+        let (d, setup) = {
+            let sh = lock_shared(&self.shared);
+            (sh.dest_of(track), sh.doc.channel_setup(track, ch, at_tick))
+        };
+        if !self.audition_sink(d) {
+            return;
+        }
+        self.audition.setup(d, ch, setup);
+        self.audition.strike(d, ch, key, vel, self.aud_ms);
+    }
+
+    /// Release every preview note — mouse-up, focus loss, doc swap,
+    /// destination change, quit.
+    fn audition_off(&mut self) {
+        self.scrub_key = None;
+        self.audition.all_off();
+    }
+
     #[allow(dead_code)]
     fn button(
         label: &'static str,
@@ -3746,6 +3924,15 @@ struct GlobalPrefs {
     /// Per-plugin probe bound in seconds (default
     /// `output::DEFAULT_SCAN_TIMEOUT`); quarantined entries respect it too.
     probe_timeout_secs: Option<u64>,
+    /// note audition preview on/off (None in older files = on)
+    #[serde(default)]
+    audition: Option<bool>,
+    /// preview velocity for piano-key/draw strikes (None = 100)
+    #[serde(default)]
+    aud_vel: Option<u8>,
+    /// max preview sustain in ms (None = 400)
+    #[serde(default)]
+    aud_ms: Option<u64>,
 }
 
 impl Default for GlobalPrefs {
@@ -3760,6 +3947,9 @@ impl Default for GlobalPrefs {
             sample_rate: None,
             buffer_size: None,
             probe_timeout_secs: None,
+            audition: None,
+            aud_vel: None,
+            aud_ms: None,
         }
     }
 }
@@ -4089,6 +4279,9 @@ impl EditorView {
             sample_rate: self.audio_sel.sample_rate,
             buffer_size: self.audio_sel.buffer_size,
             probe_timeout_secs: Some(self.probe_timeout_secs),
+            audition: Some(self.aud_enabled),
+            aud_vel: Some(self.aud_vel),
+            aud_ms: Some(self.aud_ms),
             ..Default::default()
         }
         .save();
@@ -4148,6 +4341,13 @@ impl EditorView {
         // persist is the routine durability point: capture any slot whose
         // state was marked dirty and write the companion file now
         self.flush_plugin_states(true);
+    }
+}
+
+impl Drop for EditorView {
+    fn drop(&mut self) {
+        // last line of defense: no preview note outlives the view
+        self.audition.all_off();
     }
 }
 
@@ -4557,6 +4757,9 @@ fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
                         // also warms any newly-assigned VST3 destination
                         v.persist();
                         v.refresh_plugins();
+                        // a preview ringing on a route MCP just changed
+                        // must not keep sounding into the wrong place
+                        v.audition_off();
                     }
                     // watch the backing .mid for external modification /
                     // deletion (only the MIDI file — the sidecar doesn't count)
