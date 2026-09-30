@@ -9,6 +9,28 @@
 //!
 //! Every mutation goes through `Document::apply(Transaction)` on the shared
 //! doc — the exact same path GUI edits take — so undo is unified.
+//!
+//! ## Threat model: loopback HTTP transport
+//!
+//! The embedded endpoint binds to loopback only, so remote machines cannot
+//! reach it. The residual risks are *local*: a hostile web page in the user's
+//! browser (CSRF / DNS rebinding), and other processes running as the same
+//! user.
+//!
+//! - **DNS rebinding / CSRF**: a browser page can issue cross-origin requests
+//!   to `127.0.0.1`. Defence: requests carrying an `Origin` header must name a
+//!   loopback origin (`http(s)://localhost|127.0.0.1|[::1]:<any port>`), and a
+//!   present `Host` header must be a loopback host — enforced by
+//!   [`loopback_guard`] *and* rmcp's own allowlists (defence in depth).
+//!   Non-browser MCP clients send no `Origin` and are unaffected.
+//! - **Unauthenticated local access**: when `MIDI_MCP_TOKEN` is unset, any
+//!   local process can call mutating tools. This is accepted for convenience
+//!   in the desktop app; setting `MIDI_MCP_TOKEN` enables Bearer auth. The
+//!   effective mode is reported in the `diagnostics` tool output and on
+//!   stderr at startup.
+//! - **Web content never gains filesystem access** beyond what the MCP tools
+//!   themselves expose; the guard only rejects browser-origin *requests*, it
+//!   is not a substitute for authentication.
 
 use bytes::Bytes;
 use commands::UndoStack;
@@ -31,6 +53,53 @@ pub enum TransportReq {
     Play,
     Stop,
     Seek { tick: u64 },
+}
+
+/// The effective MCP security posture, reported by the `diagnostics` tool and
+/// renderable by the GUI. Lives in `Shared` (not on the service) so the stdio
+/// frontend, the in-app HTTP server, and the UI all see the same facts.
+/// Never carries credential material — only the mode names.
+#[derive(Debug, Clone)]
+pub struct SecurityReport {
+    /// e.g. "streamable-http 127.0.0.1:7878" or "stdio"
+    pub transport: String,
+    /// "bearer" when a token is required, "none" when unauthenticated
+    pub auth: String,
+    /// which Host header values are accepted
+    pub host_policy: String,
+    /// which Origin header values are accepted
+    pub origin_policy: String,
+}
+
+impl SecurityReport {
+    /// stdio transports inherit the trust of the spawning process — no HTTP
+    /// attack surface exists, so Host/Origin checks do not apply.
+    pub fn stdio() -> Self {
+        Self {
+            transport: "stdio".into(),
+            auth: "process-local (no HTTP)".into(),
+            host_policy: "n/a".into(),
+            origin_policy: "n/a".into(),
+        }
+    }
+
+    pub fn http(bind: &str, authenticated: bool) -> Self {
+        Self {
+            transport: format!("streamable-http {bind}"),
+            auth: if authenticated { "bearer" } else { "none" }.into(),
+            host_policy: "loopback only (localhost/127.0.0.1/[::1])".into(),
+            origin_policy: "absent or loopback only".into(),
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "transport": self.transport,
+            "auth": self.auth,
+            "host_policy": self.host_policy,
+            "origin_policy": self.origin_policy,
+        })
+    }
 }
 
 /// Shared editor state. The GUI owns one `Arc`; MCP handlers hold clones and
@@ -62,6 +131,9 @@ pub struct Shared {
     pub chase_sysex: bool,
     /// drained by the GUI watcher
     pub transport_req: Vec<TransportReq>,
+    /// effective security posture of the MCP transport serving this doc
+    /// (stdio by default; the HTTP server overwrites it at startup)
+    pub mcp_security: SecurityReport,
 }
 
 pub type SharedDoc = Arc<Mutex<Shared>>;
@@ -83,6 +155,7 @@ impl Shared {
             loop_enabled: false,
             chase_sysex: false,
             transport_req: Vec::new(),
+            mcp_security: SecurityReport::stdio(),
         }
     }
 
@@ -834,6 +907,7 @@ fn dispatch(
             let diags = sh.doc.diagnose();
             ok_json(serde_json::json!({
                 "count": diags.len(),
+                "security": sh.mcp_security.to_json(),
                 "diagnostics": diags.iter().map(|d| serde_json::json!({
                     "code": d.code,
                     "track": d.track,
@@ -1518,29 +1592,136 @@ pub async fn serve_stdio(doc: SharedDoc) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Serve Streamable-HTTP on `addr` (e.g. "127.0.0.1:7878") at path `/mcp`.
-/// When `token` is Some, requests must carry `Authorization: Bearer <token>`.
-/// Host/Origin validation stays at rmcp's loopback defaults.
-pub async fn serve_http(
-    doc: SharedDoc,
-    addr: &str,
-    token: Option<String>,
-) -> anyhow::Result<()> {
+/// Loopback hostnames accepted in `Host`/`Origin` authority checks.
+const LOOPBACK_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1"];
+
+/// `Origin` values the endpoint accepts: any port on a loopback host, either
+/// HTTP scheme. rmcp matches `(scheme, host, port)` tuples where an absent
+/// allowlist port is a wildcard, so these six entries cover local browser
+/// tooling (e.g. MCP Inspector) while rejecting every remote origin.
+const LOOPBACK_ORIGINS: &[&str] = &[
+    "http://localhost",
+    "https://localhost",
+    "http://127.0.0.1",
+    "https://127.0.0.1",
+    "http://[::1]",
+    "https://[::1]",
+];
+
+fn is_loopback_host(host: &str) -> bool {
+    LOOPBACK_HOSTS.contains(&host.to_ascii_lowercase().as_str())
+}
+
+/// Host part of a `host[:port]` / `[v6][:port]` authority, lowercased.
+/// Anything surprising — userinfo, whitespace, unbalanced brackets, a stray
+/// colon, a non-numeric port — is malformed, not loopback.
+fn authority_host(authority: &str) -> Option<String> {
+    if authority.is_empty()
+        || authority.contains('@')
+        || authority.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (v6, tail) = rest.split_once(']')?;
+        match tail.strip_prefix(':') {
+            None if tail.is_empty() => {}
+            Some(port) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {}
+            _ => return None,
+        }
+        return Some(v6.to_ascii_lowercase());
+    }
+    match authority.split(':').collect::<Vec<_>>().as_slice() {
+        [host] if !host.is_empty() => Some(host.to_ascii_lowercase()),
+        [host, port]
+            if !host.is_empty()
+                && !port.is_empty()
+                && port.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            Some(host.to_ascii_lowercase())
+        }
+        _ => None,
+    }
+}
+
+/// An `Origin` header value is acceptable iff it is `http(s)://<loopback>`
+/// with any port. `Origin: null`, remote hosts, userinfo tricks, and
+/// malformed values all fail — non-browser clients simply omit the header.
+fn origin_is_loopback(origin: &str) -> bool {
+    let origin = origin.trim();
+    let rest = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"));
+    let Some(rest) = rest else { return false };
+    let authority = rest.split('/').next().unwrap_or("");
+    authority_host(authority).is_some_and(|h| is_loopback_host(&h))
+}
+
+fn forbidden(reason: &'static str) -> axum::response::Response {
+    axum::response::Response::builder()
+        .status(axum::http::StatusCode::FORBIDDEN)
+        .body(axum::body::Body::from(reason))
+        .expect("static response")
+}
+
+/// Explicit browser-origin / DNS-rebinding guard for the loopback endpoint —
+/// the primary check described by the MCP transport guidance for local HTTP
+/// servers. A present `Host` must name a loopback host; a present `Origin`
+/// must name a loopback origin. Non-browser MCP clients send neither and are
+/// unaffected; browser `fetch`/`XHR` from a rebinded or remote page always
+/// carries a hostile `Origin` and is rejected before tool dispatch.
+async fn loopback_guard(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if let Some(host) = req.headers().get(axum::http::header::HOST) {
+        let ok = host
+            .to_str()
+            .ok()
+            .and_then(authority_host)
+            .is_some_and(|h| is_loopback_host(&h));
+        if !ok {
+            tracing::warn!(host = ?host, "mcp http: rejected non-loopback Host");
+            return forbidden("forbidden host");
+        }
+    }
+    if let Some(origin) = req.headers().get(axum::http::header::ORIGIN) {
+        if !origin.to_str().ok().is_some_and(origin_is_loopback) {
+            tracing::warn!(origin = ?origin, "mcp http: rejected non-loopback Origin");
+            return forbidden("forbidden origin");
+        }
+    }
+    next.run(req).await
+}
+
+/// Build the `/mcp` router with the full HTTP security posture: the explicit
+/// [`loopback_guard`] (outermost layer), optional Bearer auth, and rmcp's own
+/// Host/Origin allowlists configured explicitly rather than left at library
+/// defaults. Split out of [`serve_http`] so tests can mount it on an
+/// ephemeral port.
+pub fn mcp_http_router(doc: SharedDoc, addr: &str, token: Option<String>) -> axum::Router {
     use axum::middleware::Next;
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService,
     };
 
+    doc.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .mcp_security = SecurityReport::http(addr, token.is_some());
+
     let factory = {
         let doc = doc.clone();
         move || -> Result<MidiService, std::io::Error> { Ok(MidiService::new(doc.clone())) }
     };
-    let service = StreamableHttpService::new(
-        factory,
-        Arc::new(LocalSessionManager::default()),
-        StreamableHttpServerConfig::default(),
-    );
+    // Explicit allowlists: the library default disables Origin validation,
+    // which is exactly the DNS-rebinding gap this guards. Loopback Hosts and
+    // loopback Origins only.
+    let config = StreamableHttpServerConfig::default()
+        .with_allowed_hosts(LOOPBACK_HOSTS.iter().copied())
+        .with_allowed_origins(LOOPBACK_ORIGINS.iter().copied());
+    let service =
+        StreamableHttpService::new(factory, Arc::new(LocalSessionManager::default()), config);
 
     let mut app = axum::Router::new().route_service("/mcp", service);
     if let Some(tok) = token {
@@ -1566,6 +1747,19 @@ pub async fn serve_http(
             },
         ));
     }
+    // guard is applied last so it is the outermost layer: hostile Host/Origin
+    // requests are rejected before auth and before tool dispatch.
+    app.layer(axum::middleware::from_fn(loopback_guard))
+}
+
+/// Serve Streamable-HTTP on `addr` (e.g. "127.0.0.1:7878") at path `/mcp`.
+/// When `token` is Some, requests must carry `Authorization: Bearer <token>`.
+pub async fn serve_http(
+    doc: SharedDoc,
+    addr: &str,
+    token: Option<String>,
+) -> anyhow::Result<()> {
+    let app = mcp_http_router(doc, addr, token);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!("mcp http listening on {addr}");
     axum::serve(listener, app).await?;
@@ -1737,6 +1931,193 @@ mod tests {
             ]}]}),
         );
         assert!(err);
+    }
+
+    #[test]
+    fn authority_parsing_accepts_only_wellformed() {
+        assert_eq!(authority_host("127.0.0.1:7878").as_deref(), Some("127.0.0.1"));
+        assert_eq!(authority_host("LOCALHOST").as_deref(), Some("localhost"));
+        assert_eq!(authority_host("[::1]:7878").as_deref(), Some("::1"));
+        assert_eq!(authority_host("[::1]").as_deref(), Some("::1"));
+        // malformed / hostile spellings
+        for bad in [
+            "", "127.0.0.1:", ":7878", "a:b:c", "127.0.0.1:8x", "[::1", "::1]",
+            "user@127.0.0.1", "evil.com@127.0.0.1", "127.0.0.1 @evil.com",
+        ] {
+            assert!(authority_host(bad).is_none(), "{bad:?} must be malformed");
+        }
+        // parses fine but is not loopback
+        assert!(!is_loopback_host(&authority_host("127.0.0.1.evil.com").unwrap()));
+        assert!(!is_loopback_host(&authority_host("localhost.").unwrap()));
+        assert!(!is_loopback_host(&authority_host("127.1").unwrap()));
+    }
+
+    #[test]
+    fn origin_check_accepts_only_loopback() {
+        for good in [
+            "http://localhost",
+            "https://localhost:6274",
+            "http://127.0.0.1:7878",
+            "http://[::1]:3000",
+            "https://[::1]",
+        ] {
+            assert!(origin_is_loopback(good), "{good:?} must pass");
+        }
+        for bad in [
+            "null",
+            "",
+            "https://evil.com",
+            "http://127.0.0.1.evil.com",
+            "http://evil.com@127.0.0.1",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "http://127.0.0.1@evil.com",
+            "localhost",       // missing scheme
+            "ftp://localhost", // wrong scheme
+        ] {
+            assert!(!origin_is_loopback(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    /// Start the real router on an ephemeral port; returns the bound address.
+    async fn start_http() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().unwrap().to_string();
+        let app = mcp_http_router(shared(), &addr, None);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        addr
+    }
+
+    /// Raw HTTP/1.1 POST (no client library needed); returns the status code.
+    /// `host` overrides the Host header; `headers` may carry any others.
+    async fn http_post(
+        addr: &str,
+        host: Option<&str>,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let host = host.unwrap_or(addr);
+        let mut req = format!(
+            "POST /mcp HTTP/1.1\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        );
+        if !host.is_empty() {
+            req += &format!("Host: {host}\r\n");
+        }
+        for (k, v) in headers {
+            req += &format!("{k}: {v}\r\n");
+        }
+        req += "\r\n";
+        req += body;
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), s.read_to_end(&mut buf))
+            .await
+            .expect("response timed out");
+        let text = String::from_utf8_lossy(&buf);
+        text.split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or_else(|| panic!("no status line in {text:?}"))
+    }
+
+    /// A well-formed initialize request — the request every MCP client starts
+    /// with. Proves legitimate local clients still get through the guard.
+    const INIT: &str = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","#,
+        r#""params":{"protocolVersion":"2025-03-26","capabilities":{},"#,
+        r#""clientInfo":{"name":"t","version":"0"}}}"#,
+    );
+    const MCP_HEADERS: &[(&str, &str)] = &[
+        ("Content-Type", "application/json"),
+        ("Accept", "application/json, text/event-stream"),
+    ];
+
+    #[tokio::test]
+    async fn legitimate_client_initialize_passes() {
+        let addr = start_http().await;
+        let status = http_post(&addr, None, MCP_HEADERS, INIT).await;
+        assert_eq!(status, 200);
+    }
+
+    #[tokio::test]
+    async fn hostile_origins_are_rejected() {
+        let addr = start_http().await;
+        for origin in [
+            "https://evil.com",
+            "null",
+            "http://127.0.0.1.attacker.tld",
+            "http://user@127.0.0.1:7878",
+        ] {
+            let headers: Vec<_> = MCP_HEADERS
+                .iter()
+                .cloned()
+                .chain([("Origin", origin)])
+                .collect();
+            let status = http_post(&addr, None, &headers, INIT).await;
+            assert_eq!(status, 403, "Origin {origin:?} must be rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn hostile_hosts_are_rejected() {
+        let addr = start_http().await;
+        for host in ["evil.com", "127.0.0.1.evil.com", "localhost.evil.com", "user@127.0.0.1"] {
+            let status = http_post(&addr, Some(host), MCP_HEADERS, INIT).await;
+            assert_eq!(status, 403, "Host {host:?} must be rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn loopback_ipv4_ipv6_and_loopback_origin_pass() {
+        let addr = start_http().await;
+        // Host variants the guard must accept (the socket is IPv4 but the
+        // Host header is validated by value, not by interface)
+        for host in ["localhost:7878", "127.0.0.1:7878", "[::1]:7878", "localhost"] {
+            let status = http_post(&addr, Some(host), MCP_HEADERS, INIT).await;
+            assert_eq!(status, 200, "Host {host:?} must pass");
+        }
+        // local browser tooling origins pass too
+        for origin in ["http://localhost:6274", "https://127.0.0.1:3000", "http://[::1]:9"] {
+            let headers: Vec<_> = MCP_HEADERS
+                .iter()
+                .cloned()
+                .chain([("Origin", origin)])
+                .collect();
+            let status = http_post(&addr, None, &headers, INIT).await;
+            assert_eq!(status, 200, "Origin {origin:?} must pass");
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostics_reports_http_security_mode() {
+        let addr = start_http().await;
+        let sh = shared();
+        // mounting the router is what stamps the security report
+        let _app = mcp_http_router(sh.clone(), &addr, Some("t0k3n".into()));
+        let (err, v) = call(&sh, "diagnostics", json!({}));
+        assert!(!err);
+        assert_eq!(v["security"]["auth"], "bearer");
+        assert!(v["security"]["transport"]
+            .as_str()
+            .unwrap()
+            .contains("streamable-http"));
+        // and the report never leaks credential material
+        assert!(!v.to_string().contains("t0k3n"));
+    }
+
+    #[test]
+    fn diagnostics_reports_stdio_mode_by_default() {
+        let sh = shared();
+        let (err, v) = call(&sh, "diagnostics", json!({}));
+        assert!(!err);
+        assert_eq!(v["security"]["transport"], "stdio");
     }
 
     #[test]
