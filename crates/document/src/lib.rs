@@ -46,7 +46,7 @@ pub struct Diagnostic {
     pub detail: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Document {
     pub format: u16,
     pub division: Division,
@@ -1628,7 +1628,7 @@ impl Document {
         }]
     }
 }
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct TempoMap {
     /// (tick, us_per_quarter, cumulative_us)
     points: Vec<(u64, u32, u64)>,
