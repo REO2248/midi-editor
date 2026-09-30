@@ -309,6 +309,9 @@ struct EditorView {
     lane_sel: BTreeSet<EventId>,
     /// event-list row selection — a single event id
     sel_event: Option<EventId>,
+    /// first visible row of the events list (manual virtualization; the
+    /// pre-0.3.6 uniform_list does not dispatch input to item children)
+    ev_first: usize,
     /// last window-space cursor position, kept while a roll/lane drag is
     /// active so edge auto-scroll can keep the drag deltas current
     mouse_pos: Option<Point<Pixels>>,
@@ -500,6 +503,7 @@ impl EditorView {
             lane_key_cached: None,
             lane_sel: BTreeSet::new(),
             sel_event: None,
+            ev_first: 0,
             mouse_pos: None,
             sel_track: 0,
             selection: BTreeSet::new(),
@@ -1560,6 +1564,8 @@ impl EditorView {
             DragMode::LaneEvent => {
                 // CC/PB/AT lane: update an existing event's value, or insert a
                 // new one when the drag started on empty lane space
+                // snap before locking: snap_down -> doc() re-acquires `sh`
+                let ins_tick = self.snap_down(d.a_tick).max(0) as u64;
                 let mut sh = lock_shared(&self.shared);
                 let mut ops = Vec::new();
                 // the track may be gone (MCP remove/undo during the drag)
@@ -1603,7 +1609,7 @@ impl EditorView {
                         track: d.track,
                         events: vec![DocEvent {
                             id,
-                            tick: self.snap_down(d.a_tick).max(0) as u64,
+                            tick: ins_tick,
                             seq: 0,
                             raw_body: None,
                             kind: EventKind::Channel {

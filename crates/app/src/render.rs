@@ -725,47 +725,65 @@ impl Render for EditorView {
                             }))
                     })),
             )
-            .child({
-                let events = self.events.clone();
-                let sel_event = self.sel_event;
-                let view_weak = cx.weak_entity();
-                uniform_list("events", events.len(), move |range, _w, _app| {
-                    range
-                        .map(|i| {
-                            let (id, text) = events[i].clone();
-                            let sel = id != 0 && sel_event == Some(id);
-                            let weak = view_weak.clone();
-                            div()
-                                .id(("ev", i))
-                                .h(px(18.0))
-                                .px_2()
-                                .text_size(px(11.0))
-                                .font_family("Cascadia Mono")
-                                .bg(if sel { rgb(0x2b3d4f) } else { rgb(0x000000) })
-                                .text_color(rgb(0xb8b8c8))
-                                .cursor_pointer()
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    move |_e, _w, app| {
-                                        // click selects the event for
-                                        // delete / value nudge (-/=)
-                                        let _ = weak.update_in(app, |v, _w, cx| {
-                                            v.sel_event = if id == 0 || v.sel_event == Some(id) {
-                                                None
-                                            } else {
-                                                Some(id)
-                                            };
-                                            cx.notify();
-                                        });
-                                    },
-                                )
-                                .child(text)
-                        })
-                        .collect()
-                })
-                .h_full()
-                .flex_1()
-            });
+            .child(
+                div()
+                    .id("ev-list")
+                    .flex_1()
+                    .h_full()
+                    .overflow_hidden()
+                    .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _w, cx| {
+                        let d = ev.delta.pixel_delta(px(18.0));
+                        let max = this.events.len().saturating_sub(1) as i64;
+                        this.ev_first = (this.ev_first as i64
+                            + (d.y.to_f64() / 18.0).round() as i64)
+                            .clamp(0, max) as usize;
+                        cx.notify();
+                    }))
+                    .children({
+                        let events = self.events.clone();
+                        let sel_event = self.sel_event;
+                        let view_weak = cx.weak_entity();
+                        let start = self.ev_first.min(events.len());
+                        // fixed 18px rows: a 120-row window covers any panel
+                        // height; uniform_list children can't receive input in
+                        // this gpui version, so virtualize manually
+                        events[start..(start + 120).min(events.len())]
+                            .iter()
+                            .enumerate()
+                            .map(|(ri, (id, text))| {
+                                let (id, text) = (*id, text.clone());
+                                let sel = id != 0 && sel_event == Some(id);
+                                let weak = view_weak.clone();
+                                div()
+                                    .id(("ev", start + ri))
+                                    .h(px(18.0))
+                                    .px_2()
+                                    .text_size(px(11.0))
+                                    .font_family("Cascadia Mono")
+                                    .bg(if sel { rgb(0x2b3d4f) } else { rgb(0x000000) })
+                                    .text_color(rgb(0xb8b8c8))
+                                    .cursor_pointer()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        move |_e, _w, app| {
+                                            // click selects the event for
+                                            // delete / value nudge (-/=)
+                                            let _ = weak.update_in(app, |v, _w, cx| {
+                                                v.sel_event = if id == 0 || v.sel_event == Some(id)
+                                                {
+                                                    None
+                                                } else {
+                                                    Some(id)
+                                                };
+                                                cx.notify();
+                                            });
+                                        },
+                                    )
+                                    .child(text)
+                            })
+                            .collect::<Vec<_>>()
+                    }),
+            );
 
         let body = div().flex().flex_1().min_h(px(0.0));
 
