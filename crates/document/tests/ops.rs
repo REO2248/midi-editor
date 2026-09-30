@@ -287,6 +287,58 @@ fn delete_range_removes_whole_notes() {
     assert!(d.tracks[0].events.is_empty());
 }
 
+/// Replace-mode recording erases only the channels the take carries:
+/// channel-0 events in range go, channel-1 events survive, meta untouched,
+/// notes delete whole (off beyond range removed with the on).
+#[test]
+fn delete_range_channel_ops_filters_channels() {
+    let mut d = doc(vec![vec![
+        chan(0, 0x90, 60, 100),   // ch0 note, on+off
+        chan(500, 0x80, 60, 0),
+        chan(100, 0x91, 62, 100), // ch1 note — survives
+        chan(600, 0x81, 62, 0),
+        chan(200, 0xB0, 7, 90),   // ch0 CC — deleted
+        smf_core::Event {
+            tick: 300,
+            seq: 0,
+            raw_body: None,
+            kind: EventKind::Meta {
+                meta_type: 0x03,
+                data: b"name".to_vec().into(),
+            },
+        },
+    ]]);
+    let chans: std::collections::BTreeSet<u8> = [0].into_iter().collect();
+    let ops = d.delete_range_channel_ops(0, 0, 1000, &chans);
+    apply(&mut d, ops);
+    let notes = notes_on(&d, 0);
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].channel, 1, "ch1 note must survive");
+    assert_eq!(notes[0].key, 62);
+    // meta untouched; only ch0 events removed
+    assert_eq!(d.tracks[0].events.len(), 3);
+    assert!(d.tracks[0]
+        .events
+        .iter()
+        .all(|e| !matches!(e.kind, EventKind::Channel { status, .. } if status & 0x0F == 0)));
+}
+
+/// The unfiltered variant still clears every channel (regression).
+#[test]
+fn delete_range_ops_covers_all_channels() {
+    let mut d = doc(vec![vec![
+        chan(100, 0x90, 60, 100),
+        chan(300, 0x95, 62, 100),
+        chan(400, 0x85, 62, 0),
+    ]]);
+    let ops = d.delete_range_ops(0, 0, 1000);
+    apply(&mut d, ops);
+    assert!(d.tracks[0]
+        .events
+        .iter()
+        .all(|e| !matches!(e.kind, EventKind::Channel { .. })));
+}
+
 #[test]
 fn track_ops_roundtrip_and_revert() {
     let mut d = doc(vec![vec![chan(0, 0x90, 60, 100)]]);

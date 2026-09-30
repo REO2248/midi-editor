@@ -1978,6 +1978,104 @@ impl Render for EditorView {
                         },
                     )
                     .into_any_element(),
+                    Self::mi(
+                        "tr.mode",
+                        tf(
+                            "transport.rec_mode",
+                            &[(
+                                "mode",
+                                t(match self.rec_mode {
+                                    RecMode::Overdub => "transport.rec_overdub",
+                                    RecMode::Replace => "transport.rec_replace",
+                                }),
+                            )],
+                        ),
+                        "",
+                        None,
+                        cx,
+                        |v, _e, _cx| {
+                            v.rec_mode = match v.rec_mode {
+                                RecMode::Overdub => RecMode::Replace,
+                                RecMode::Replace => RecMode::Overdub,
+                            };
+                            v.persist();
+                        },
+                    )
+                    .into_any_element(),
+                    Self::mi(
+                        "tr.pin",
+                        tf(
+                            "transport.punch_in",
+                            &[("t", playhead_tick.to_string().as_str())],
+                        ),
+                        "",
+                        Some(self.punch_in.is_some()),
+                        cx,
+                        |v, _e, _cx| {
+                            v.punch_in = Some(v.playhead_tick());
+                            v.persist();
+                        },
+                    )
+                    .into_any_element(),
+                    Self::mi(
+                        "tr.pout",
+                        tf(
+                            "transport.punch_out",
+                            &[("t", playhead_tick.to_string().as_str())],
+                        ),
+                        "",
+                        Some(self.punch_out.is_some()),
+                        cx,
+                        |v, _e, _cx| {
+                            v.punch_out = Some(v.playhead_tick());
+                            v.persist();
+                        },
+                    )
+                    .into_any_element(),
+                    Self::mi(
+                        "tr.pclr",
+                        match self.punch_range() {
+                            Some((a, b)) => tf(
+                                "transport.punch_clear",
+                                &[("a", a.to_string().as_str()), ("b", b.to_string().as_str())],
+                            ),
+                            None => tf(
+                                "transport.punch_clear",
+                                &[("a", "-"), ("b", "-")],
+                            ),
+                        },
+                        "",
+                        None,
+                        cx,
+                        |v, _e, _cx| {
+                            v.punch_in = None;
+                            v.punch_out = None;
+                            v.persist();
+                        },
+                    )
+                    .into_any_element(),
+                    Self::mi(
+                        "tr.rtake",
+                        t("transport.discard_take"),
+                        "",
+                        Some(self.rec.is_some()),
+                        cx,
+                        |v, _e, _cx| {
+                            v.discard_record();
+                        },
+                    )
+                    .into_any_element(),
+                    Self::mi(
+                        "tr.qtake",
+                        t("transport.quant_take"),
+                        "",
+                        Some(self.last_take.is_some()),
+                        cx,
+                        |v, _e, _cx| {
+                            v.quantize_last_take();
+                        },
+                    )
+                    .into_any_element(),
                 ],
                 TopMenu::Help => vec![
                     Self::mi(
