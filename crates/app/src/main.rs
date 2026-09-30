@@ -380,6 +380,10 @@ struct EditorView {
     /// first visible row of the events list (manual virtualization; the
     /// pre-0.3.6 uniform_list does not dispatch input to item children)
     ev_first: usize,
+    /// set when the meta dialog closes from a path that lacks a Window
+    /// (Enter in the input subscription) — render refocuses the editor so
+    /// editor keys (Del, arrows) keep working after commit
+    meta_refocus: bool,
     /// one-bar count-in before MIDI recording starts (global pref)
     count_in: bool,
     /// recently opened files (global pref, newest first)
@@ -614,6 +618,7 @@ impl EditorView {
             meta_sel: None,
             meta_pending: None,
             ev_first: 0,
+            meta_refocus: false,
             count_in: g.count_in,
             recent: g.recent.iter().map(|p| p.as_str().into()).collect(),
             midi_in: g.midi_in.clone().into(),
@@ -1273,6 +1278,7 @@ impl EditorView {
         } else {
             self.apply_tx("meta", ops);
         }
+        self.meta_refocus = true;
         cx.notify();
     }
 

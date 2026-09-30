@@ -36,6 +36,12 @@ impl Render for EditorView {
         if let Some((tr, tick, mt, id)) = self.meta_pending.take() {
             self.open_meta_edit(tr, tick, mt, id, window, cx);
         }
+        // a closed meta dialog must hand keyboard focus back to the editor
+        // (Enter has no Window in the input subscription, so it's deferred)
+        if self.meta_refocus {
+            self.meta_refocus = false;
+            window.focus(&self.focus.clone(), cx);
+        }
         // keep both scroll axes inside the content (resizes, zooms, edits all
         // self-heal here) and edge-scroll while a drag is parked at a border;
         // `panning` keeps animation frames flowing only while it actually moves
@@ -734,7 +740,7 @@ impl Render for EditorView {
                         let d = ev.delta.pixel_delta(px(18.0));
                         let max = this.events.len().saturating_sub(1) as i64;
                         this.ev_first = (this.ev_first as i64
-                            + (d.y.to_f64() / 18.0).round() as i64)
+                            - (d.y.to_f64() / 18.0).round() as i64)
                             .clamp(0, max) as usize;
                         cx.notify();
                     }))
@@ -1421,6 +1427,14 @@ impl Render for EditorView {
                                 .text_size(px(9.0))
                                 .text_color(rgb(0x9fd0ff))
                                 .child(lane_mode.label())
+                                // swallow the mouse_down so it can't start
+                                // a lane insert-drag under the chip
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|_v, _e, _w, cx| {
+                                        cx.stop_propagation()
+                                    }),
+                                )
                                 .on_click(cx.listener(|v, _e: &ClickEvent, _w, cx| {
                                     cx.stop_propagation();
                                     v.lane_mode = v.lane_mode.cycle();
@@ -2601,8 +2615,9 @@ impl Render for EditorView {
                 .bg(rgba(0x00000066))
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|v, _e, _w, cx| {
+                    cx.listener(|v, _e, w, cx| {
                         v.meta_edit = None;
+                        w.focus(&v.focus.clone(), cx);
                         cx.notify();
                     }),
                 )
@@ -2843,6 +2858,7 @@ impl Render for EditorView {
                     match (ev.keystroke.modifiers.control, k) {
                         (false, "escape") => {
                             this.meta_edit = None;
+                            w.focus(&this.focus.clone(), cx);
                             cx.notify();
                         }
                         _ => {}
