@@ -834,6 +834,18 @@ fn tempo(tick: u64, mpq: u32) -> smf_core::Event {
     }
 }
 
+fn meta(tick: u64, meta_type: u8, data: Vec<u8>) -> smf_core::Event {
+    smf_core::Event {
+        tick,
+        seq: 0,
+        raw_body: None,
+        kind: EventKind::Meta {
+            meta_type,
+            data: data.into(),
+        },
+    }
+}
+
 #[test]
 fn smpte_time_and_positions_round_trip() {
     // 25fps * 40tpf = 1000 ticks/s — the classic PAL fixture
@@ -1151,4 +1163,28 @@ fn channel_setup_collects_bank_and_program_before_tick() {
     // missing track -> nothing
     assert!(d.channel_setup(9, 0, 100).is_empty());
     let _ = &mut d;
+}
+
+#[test]
+fn key_signature_picks_latest_before_tick_else_earliest() {
+    // C major at 0, then G major (1 sharp) at 960 — a mid-song modulation
+    let d = doc(vec![vec![
+        meta(0, 0x59, vec![0, 0]),
+        meta(960, 0x59, vec![1, 0]),
+    ]]);
+    assert_eq!(d.key_signature(0), Some((0, false)));
+    assert_eq!(d.key_signature(959), Some((0, false)));
+    assert_eq!(d.key_signature(960), Some((1, false)));
+    // minor flag reads through (mi=1)
+    let d = doc(vec![vec![meta(0, 0x59, vec![0, 1])]]);
+    assert_eq!(d.key_signature(0), Some((0, true)));
+    // signature only in the future: the earliest is the best hint
+    let d = doc(vec![vec![meta(1920, 0x59, vec![254, 0])]]);
+    assert_eq!(d.key_signature(0), Some((-2, false)));
+    // malformed data and no signatures both give None
+    let d = doc(vec![vec![
+        meta(0, 0x59, vec![0]),
+        meta(0, 0x58, vec![4, 2, 24, 8]),
+    ]]);
+    assert_eq!(d.key_signature(0), None);
 }

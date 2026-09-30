@@ -123,6 +123,10 @@ enum Sub {
     AudVel,
     AudDur,
     Theme,
+    /// View → row height (vertical zoom preset)
+    RowH,
+    /// View → scale highlight root
+    Scale,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -185,6 +189,112 @@ enum Tool {
     Draw,
     /// click or sweep over notes deletes them (one undo step per stroke)
     Erase,
+}
+
+/// Vertical zoom bounds for the piano-key row height (px).
+const NOTE_H_MIN: f32 = 4.0;
+const NOTE_H_MAX: f32 = 40.0;
+
+/// GM drum-kit names for keys 35..=81 — the drum view labels folded rows
+/// with these instead of pitch names.
+const GM_DRUMS: [&str; 47] = [
+    "Acoustic Bass Drum",
+    "Bass Drum 1",
+    "Side Stick",
+    "Acoustic Snare",
+    "Hand Clap",
+    "Electric Snare",
+    "Low Floor Tom",
+    "Closed Hi-Hat",
+    "High Floor Tom",
+    "Pedal Hi-Hat",
+    "Low Tom",
+    "Open Hi-Hat",
+    "Low-Mid Tom",
+    "Hi-Mid Tom",
+    "Crash Cymbal 1",
+    "High Tom",
+    "Ride Cymbal 1",
+    "Chinese Cymbal",
+    "Ride Bell",
+    "Tambourine",
+    "Splash Cymbal",
+    "Cowbell",
+    "Crash Cymbal 2",
+    "Vibraslap",
+    "Ride Cymbal 2",
+    "Hi Bongo",
+    "Low Bongo",
+    "Mute Hi Conga",
+    "Open Hi Conga",
+    "Low Conga",
+    "High Timbale",
+    "Low Timbale",
+    "High Agogo",
+    "Low Agogo",
+    "Cabasa",
+    "Maracas",
+    "Short Whistle",
+    "Long Whistle",
+    "Short Guiro",
+    "Long Guiro",
+    "Claves",
+    "Hi Wood Block",
+    "Low Wood Block",
+    "Mute Cuica",
+    "Open Cuica",
+    "Mute Triangle",
+    "Open Triangle",
+];
+
+/// GM drum name for a key, if it has one (35..=81).
+fn drum_name(key: u8) -> Option<&'static str> {
+    (35..=81)
+        .contains(&key)
+        .then(|| GM_DRUMS[key as usize - 35])
+}
+
+/// Identity row map: all 128 keys, highest first (row 0 = key 127).
+fn all_keys() -> Vec<u8> {
+    (0u8..128).rev().collect()
+}
+
+/// Row map for a folded view: only the pitches `notes` actually uses,
+/// highest first. `drum` restricts to channel 9 (0-indexed) on the selected
+/// track — the percussion view. Empty input falls back to the identity map
+/// so the roll is never blank.
+fn used_keys(notes: &[Note], drum: bool, sel_track: usize) -> Vec<u8> {
+    let mut mask = [false; 128];
+    for n in notes {
+        if drum && !(n.track == sel_track && n.channel == 9) {
+            continue;
+        }
+        mask[n.key as usize] = true;
+    }
+    let v: Vec<u8> = (0..128u8).rev().filter(|k| mask[*k as usize]).collect();
+    if v.is_empty() {
+        all_keys()
+    } else {
+        v
+    }
+}
+
+/// Pitch-class membership of a diatonic scale (major or natural minor).
+fn scale_pcs_of(root: u8, minor: bool) -> [bool; 12] {
+    const MAJ: [u8; 7] = [0, 2, 4, 5, 7, 9, 11];
+    const MIN: [u8; 7] = [0, 2, 3, 5, 7, 8, 10];
+    let mut out = [false; 12];
+    for &iv in if minor { &MIN } else { &MAJ } {
+        out[((root + iv) % 12) as usize] = true;
+    }
+    out
+}
+
+/// Tonic pitch class of a 0x59 key signature: sf counts fifths from C
+/// (negative = flats), mi selects the relative minor a minor third up.
+fn keysig_root(sf: i8, minor: bool) -> u8 {
+    let maj = (7 * sf as i32).rem_euclid(12);
+    (if minor { maj + 9 } else { maj } % 12) as u8
 }
 
 /// Snap grid divisors of a whole note; 0 = snap off.
@@ -370,6 +480,27 @@ struct EditorView {
     scroll_x: f32,
     scroll_y: f32,
     zoom: f32,
+    /// piano-key row height — the vertical zoom factor (sidecar pref)
+    note_h: f32,
+    /// fold view: only pitches used by the document get a row
+    fold: bool,
+    /// drum view: fold to channel-9 pitches of the selected track with GM
+    /// drum names (implies fold semantics for percussion editing)
+    drum: bool,
+    /// scale highlight: -2 = follow the key signature, -1 = off,
+    /// 0..=11 = manual root (with `scale_minor` picking the mode)
+    scale_sel: i8,
+    scale_minor: bool,
+    /// visible row→key map (identity = all 128); rebuilt by refresh_derived
+    vis_keys: Vec<u8>,
+    /// reverse of `vis_keys`: key→row, -1 when folded out
+    row_of: [i32; 128],
+    /// pitch classes painted as scale-member rows (None = highlight off)
+    scale_pcs: Option<[bool; 12]>,
+    /// cache key for the view-derived fields above
+    view_key: (u64, u64, bool, bool, usize, i8, bool),
+    /// key signature hint parsed from meta 0x59 at the playhead
+    keysig: Option<(i8, bool)>,
     /// Plugin instances kept warm on the host worker thread, keyed by dest
     /// index. They persist across play/stop/loop so parameter state survives
     /// and Play doesn't pay a load stall — only an explicit destination
@@ -813,6 +944,22 @@ impl EditorView {
             scroll_x: 0.0,
             scroll_y: (127.0 - 84.0) * NOTE_H, // show ~C3..C7
             zoom: 0.08,
+            note_h: NOTE_H,
+            fold: false,
+            drum: false,
+            scale_sel: -2,
+            scale_minor: false,
+            vis_keys: all_keys(),
+            row_of: {
+                let mut r = [-1i32; 128];
+                for (i, k) in all_keys().iter().enumerate() {
+                    r[*k as usize] = i as i32;
+                }
+                r
+            },
+            scale_pcs: None,
+            view_key: (u64::MAX, u64::MAX, false, false, 0, i8::MAX, false),
+            keysig: None,
             plugin_slots: HashMap::new(),
             plugin_state: HashMap::new(),
             plugin_req,
@@ -1069,7 +1216,7 @@ impl EditorView {
         if w <= 0.0 || h <= 0.0 {
             return;
         }
-        self.scroll_y = clamp_span(self.scroll_y, 128.0 * NOTE_H, h);
+        self.scroll_y = clamp_span(self.scroll_y, self.vis_keys.len() as f32 * self.note_h, h);
         self.scroll_x = clamp_span(self.scroll_x, self.doc_end_ticks() as f32 * self.zoom, w);
     }
 
@@ -1087,7 +1234,12 @@ impl EditorView {
             keys.sort_unstable();
             Some(keys[keys.len() / 2] as i32)
         };
-        let (x, y) = content_view(first, mid, self.zoom);
+        // center on the median pitch's *row* (the row map may be folded)
+        let mid_row = mid.and_then(|k| {
+            let r = self.row_of[k as usize];
+            (r >= 0).then_some(r)
+        });
+        let (x, y) = content_view(first, mid_row, self.zoom, self.note_h);
         self.scroll_x = x;
         self.scroll_y = y;
     }
@@ -1166,6 +1318,61 @@ impl EditorView {
 
     fn set_snap(&mut self, idx: usize, cx: &mut Context<Self>) {
         self.snap_idx = idx;
+        self.persist();
+        cx.notify();
+    }
+
+    /// Vertical zoom to an absolute row height, keeping the row at
+    /// `anchor_off` pixels from the viewport's top edge fixed (the cursor's
+    /// pitch stays under the cursor).
+    fn vzoom_set(&mut self, h: f32, anchor_off: f32, cx: &mut Context<Self>) {
+        let anchor_row = (anchor_off.max(0.0) + self.scroll_y) / self.note_h;
+        self.note_h = h.clamp(NOTE_H_MIN, NOTE_H_MAX);
+        self.scroll_y = (anchor_row * self.note_h - anchor_off.max(0.0)).max(0.0);
+        self.clamp_scroll();
+        self.persist();
+        cx.notify();
+    }
+
+    /// Menu-driven vertical zoom — anchors on the selected note's pitch when
+    /// there is one, else the viewport center.
+    fn vzoom_by(&mut self, f: f32, cx: &mut Context<Self>) {
+        let anchor = self
+            .selection
+            .iter()
+            .next()
+            .and_then(|id| self.notes.iter().find(|n| n.on_id == *id))
+            .and_then(|n| {
+                let r = self.row_of[n.key as usize];
+                (r >= 0).then_some(r as f32 * self.note_h - self.scroll_y)
+            })
+            .unwrap_or_else(|| f32::from(self.roll_bounds.get().size.height) / 2.0);
+        self.vzoom_set(self.note_h * f, anchor, cx);
+    }
+
+    /// Fold/drum/scale toggles rebuild the row map on the next refresh; the
+    /// selection may hold keys that fold out, which paint/hit-test already
+    /// skip via `row_of`.
+    fn set_fold(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.fold = on;
+        self.refresh_derived();
+        self.clamp_scroll();
+        self.persist();
+        cx.notify();
+    }
+
+    fn set_drum(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.drum = on;
+        self.refresh_derived();
+        self.clamp_scroll();
+        self.persist();
+        cx.notify();
+    }
+
+    fn set_scale(&mut self, sel: i8, minor: bool, cx: &mut Context<Self>) {
+        self.scale_sel = sel;
+        self.scale_minor = minor;
+        self.refresh_derived();
         self.persist();
         cx.notify();
     }
@@ -1255,6 +1462,42 @@ impl EditorView {
             ));
             self.doc_ui_key = vkey;
             self.doc_ui_enc = self.enc_override;
+        }
+        // view-derived state: the visible row map (fold/drum), the key
+        // signature at the playhead, and the scale-highlight pitch classes.
+        // Keyed on the doc revision + the view toggles — all view-only, never
+        // written back into the document.
+        let vkey = (
+            self.doc_epoch,
+            sh.doc.revision(),
+            self.fold,
+            self.drum,
+            self.sel_track,
+            self.scale_sel,
+            self.scale_minor,
+        );
+        if self.view_key != vkey {
+            self.vis_keys = if self.drum {
+                used_keys(&self.notes, true, self.sel_track)
+            } else if self.fold {
+                used_keys(&self.notes, false, self.sel_track)
+            } else {
+                all_keys()
+            };
+            self.row_of = [-1; 128];
+            for (r, &k) in self.vis_keys.iter().enumerate() {
+                self.row_of[k as usize] = r as i32;
+            }
+            let at = sh.doc.tempo_map.us_to_tick(self.play_us);
+            self.keysig = sh.doc.key_signature(at);
+            self.scale_pcs = match self.scale_sel {
+                -1 => None,
+                -2 => self
+                    .keysig
+                    .map(|(sf, m)| scale_pcs_of(keysig_root(sf, m), m)),
+                r => Some(scale_pcs_of(r as u8, self.scale_minor)),
+            };
+            self.view_key = vkey;
         }
     }
 
@@ -1849,11 +2092,23 @@ impl EditorView {
                     }
                     return;
                 }
-                // rect select: notes intersecting the rubber-band box.
+                // rect select: notes intersecting the rubber-band box — the
+                // box corners are keys from hit(); compare in row space so a
+                // folded view selects exactly the visible rows it covers.
                 // Same sequence gate as note_at/edge_at: a marquee must
                 // never select another sequence's ghosts for deletion.
                 let (t0, t1) = (d.a_tick.min(d.b_tick), d.a_tick.max(d.b_tick));
-                let (k0, k1) = (d.a_key.min(d.b_key), d.a_key.max(d.b_key));
+                let row_sel = |key: i32| -> i32 {
+                    if (0..=127).contains(&key) {
+                        self.row_of[key as usize]
+                    } else {
+                        -1
+                    }
+                };
+                let (r0, r1) = (
+                    row_sel(d.a_key).min(row_sel(d.b_key)),
+                    row_sel(d.a_key).max(row_sel(d.b_key)),
+                );
                 let seq = self.is_seq();
                 self.selection = self
                     .notes
@@ -1862,8 +2117,8 @@ impl EditorView {
                         (!seq || n.track == self.sel_track) && {
                             let st = n.start_tick as i64;
                             let en = n.end_tick.unwrap_or(n.start_tick) as i64;
-                            let key = n.key as i32;
-                            st <= t1 && en >= t0 && key >= k0 && key <= k1
+                            let row = self.row_of[n.key as usize];
+                            st <= t1 && en >= t0 && row >= r0 && row <= r1
                         }
                     })
                     .map(|n| n.on_id)
@@ -3659,7 +3914,15 @@ impl EditorView {
         let b = self.roll_bounds.get();
         let x = f32::from(pos.x) - f32::from(b.origin.x);
         let y = f32::from(pos.y) - f32::from(b.origin.y);
-        roll_hit(x, y, self.scroll_x, self.scroll_y, self.zoom)
+        roll_hit(
+            x,
+            y,
+            self.scroll_x,
+            self.scroll_y,
+            self.zoom,
+            self.note_h,
+            &self.vis_keys,
+        )
     }
 
     /// Center the timeline view on the minimap position under window-x
@@ -3862,13 +4125,16 @@ impl EditorView {
         })
     }
 
-    /// Piano-key under a window-space position on the key strip.
+    /// Piano-key under a window-space position on the key strip — row
+    /// position maps through `vis_keys` so folded/drum views audition the
+    /// visible row under the cursor.
     fn kbd_key(&self, pos: Point<Pixels>) -> Option<u8> {
         let b = self.kbd_bounds.get();
         let y = f32::from(pos.y) - f32::from(b.origin.y);
-        let row = ((y + self.scroll_y) / NOTE_H) as i32;
-        let key = 127 - row;
-        (0..=127).contains(&key).then_some(key as u8)
+        let row = ((y + self.scroll_y) / self.note_h) as i32;
+        (row >= 0)
+            .then(|| self.vis_keys.get(row as usize).copied())
+            .flatten()
     }
 
     /// Make sure the audition worker holds a sink for destination `d`.
@@ -4147,6 +4413,12 @@ struct Prefs {
     show_events: Option<bool>,
     tool: Option<String>,
     snap: Option<usize>,
+    /// vertical zoom (row height px) and fold/drum/scale view toggles
+    note_h: Option<f32>,
+    fold: Option<bool>,
+    drum: Option<bool>,
+    scale: Option<i8>,
+    scale_minor: Option<bool>,
 }
 
 impl Default for Prefs {
@@ -4170,6 +4442,11 @@ impl Default for Prefs {
             show_events: None,
             tool: None,
             snap: None,
+            note_h: None,
+            fold: None,
+            drum: None,
+            scale: None,
+            scale_minor: None,
         }
     }
 }
@@ -4362,6 +4639,23 @@ impl EditorView {
             plugin_state::PluginStateStore::load(&plugin_state::state_path(doc_path));
         self.state_file_dirty = false;
         self.state_restored.clear();
+        if let Some(h) = p.note_h {
+            if h.is_finite() && h > 0.0 {
+                self.note_h = h.clamp(NOTE_H_MIN, NOTE_H_MAX);
+            }
+        }
+        if let Some(f) = p.fold {
+            self.fold = f;
+        }
+        if let Some(d) = p.drum {
+            self.drum = d;
+        }
+        if let Some(s) = p.scale {
+            self.scale_sel = s.clamp(-2, 11);
+        }
+        if let Some(m) = p.scale_minor {
+            self.scale_minor = m;
+        }
         // start warming any VST3 destinations the prefs just restored
         self.refresh_plugins();
         let plugin_dests: Vec<usize> = {
@@ -4428,6 +4722,11 @@ impl EditorView {
             scroll_x: Some(self.scroll_x),
             scroll_y: Some(self.scroll_y),
             sel_track: Some(self.sel_track),
+            note_h: Some(self.note_h),
+            fold: Some(self.fold),
+            drum: Some(self.drum),
+            scale: Some(self.scale_sel),
+            scale_minor: Some(self.scale_minor),
             enc: self.enc_override.map(|e| {
                 match e {
                     smf_core::TextEncoding::Utf8 => "utf8",

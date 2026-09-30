@@ -10,13 +10,27 @@ pub(crate) const ZOOM_MAX: f32 = 1.0;
 
 /// (tick, key) under a canvas-local (x, y). Tick truncates (a pixel inside
 /// tick n is tick n) and floors at 0; the key is the painted row band — every
-/// pixel of a row resolves to that key, never the one below it. Key may fall
-/// outside 0..=127 (callers decide: marquee anchors reject it, drags clamp
-/// via [`clamp_move_delta`]).
-pub(crate) fn roll_hit(x: f32, y: f32, scroll_x: f32, scroll_y: f32, zoom: f32) -> (i64, i32) {
+/// pixel of a row resolves to that key, never the one below it. `keys` is the
+/// visible row→key map (identity = all 128 descending; a fold/drum view
+/// shrinks it): pixels outside the map hit key -1, which callers' `0..=127`
+/// checks already reject.
+pub(crate) fn roll_hit(
+    x: f32,
+    y: f32,
+    scroll_x: f32,
+    scroll_y: f32,
+    zoom: f32,
+    note_h: f32,
+    keys: &[u8],
+) -> (i64, i32) {
     let tick = ((x + scroll_x) / zoom) as i64;
-    let row = ((y + scroll_y) / NOTE_H).floor() as i32;
-    (tick.max(0), 127 - row)
+    let row = ((y + scroll_y) / note_h).floor() as i32;
+    let key = if row < 0 {
+        -1
+    } else {
+        keys.get(row as usize).copied().map(i32::from).unwrap_or(-1)
+    };
+    (tick.max(0), key)
 }
 
 /// Clamp one scroll axis into `[0, content - view]`. Content shorter than the
@@ -62,13 +76,18 @@ pub(crate) fn clamp_move_delta(dtick: i64, orig_start: u64, dkey: i32, orig_key:
 }
 
 /// Scroll offsets that land freshly opened content in frame: the first note
-/// gets a small left margin, the median pitch sits 16 rows below the top
-/// edge (centered in a typical roll). `mid_key: None` = no notes — keep the
-/// familiar C3-ish default view.
-pub(crate) fn content_view(first_tick: u64, mid_key: Option<i32>, zoom: f32) -> (f32, f32) {
+/// gets a small left margin, the median pitch's *row* sits 16 rows below the
+/// top edge (centered in a typical roll). `mid_row: None` = no notes — keep
+/// the familiar C3-ish default view (identity row map).
+pub(crate) fn content_view(
+    first_tick: u64,
+    mid_row: Option<i32>,
+    zoom: f32,
+    note_h: f32,
+) -> (f32, f32) {
     let scroll_x = (first_tick as f32 * zoom - 200.0).max(0.0);
-    let scroll_y = match mid_key {
-        Some(k) => (127 - k - 16).max(0) as f32 * NOTE_H,
+    let scroll_y = match mid_row {
+        Some(r) => (r - 16).max(0) as f32 * note_h,
         None => (127.0 - 84.0) * NOTE_H,
     };
     (scroll_x, scroll_y)
@@ -78,23 +97,56 @@ pub(crate) fn content_view(first_tick: u64, mid_key: Option<i32>, zoom: f32) -> 
 mod tests {
     use super::*;
 
+    /// identity row map: row 0 = key 127, row 127 = key 0
+    fn all_keys() -> Vec<u8> {
+        (0u8..128).rev().collect()
+    }
+
     #[test]
     fn hit_maps_rows_by_band_not_rounding() {
         // row k spans [(127-k)*H, (127-k+1)*H) in scrolled space; every
         // pixel of the band is key k — the old .round() made the bottom half
         // of each row select the key below it
+        let keys = all_keys();
         let y = |key: i32, off: f32| (127 - key) as f32 * NOTE_H + off - 500.0;
-        assert_eq!(roll_hit(0.0, y(60, 0.0), 0.0, 500.0, 0.1).1, 60);
-        assert_eq!(roll_hit(0.0, y(60, NOTE_H - 0.01), 0.0, 500.0, 0.1).1, 60);
-        assert_eq!(roll_hit(0.0, y(60, -0.01), 0.0, 500.0, 0.1).1, 61); // row above
-        assert_eq!(roll_hit(0.0, y(60, NOTE_H), 0.0, 500.0, 0.1).1, 59); // row below
+        assert_eq!(
+            roll_hit(0.0, y(60, 0.0), 0.0, 500.0, 0.1, NOTE_H, &keys).1,
+            60
+        );
+        assert_eq!(
+            roll_hit(0.0, y(60, NOTE_H - 0.01), 0.0, 500.0, 0.1, NOTE_H, &keys).1,
+            60
+        );
+        assert_eq!(
+            roll_hit(0.0, y(60, -0.01), 0.0, 500.0, 0.1, NOTE_H, &keys).1,
+            61
+        ); // row above
+        assert_eq!(
+            roll_hit(0.0, y(60, NOTE_H), 0.0, 500.0, 0.1, NOTE_H, &keys).1,
+            59
+        ); // row below
+    }
+
+    #[test]
+    fn hit_uses_row_map_and_row_height() {
+        // folded view: three used pitches — row 0 = highest
+        let keys = vec![67u8, 64, 60];
+        assert_eq!(roll_hit(0.0, 0.0, 0.0, 0.0, 0.1, 20.0, &keys).1, 67);
+        assert_eq!(roll_hit(0.0, 21.0, 0.0, 0.0, 0.1, 20.0, &keys).1, 64);
+        assert_eq!(roll_hit(0.0, 59.9, 0.0, 0.0, 0.1, 20.0, &keys).1, 60);
+        // beyond the last visible row and above row 0 both reject
+        assert_eq!(roll_hit(0.0, 60.0, 0.0, 0.0, 0.1, 20.0, &keys).1, -1);
+        assert_eq!(roll_hit(0.0, -1.0, 0.0, 0.0, 0.1, 20.0, &keys).1, -1);
+        // a taller row height stretches the same band over more pixels
+        assert_eq!(roll_hit(0.0, 79.9, 0.0, 0.0, 0.1, 40.0, &keys).1, 64);
     }
 
     #[test]
     fn hit_tick_floors_and_clamps_to_zero() {
-        assert_eq!(roll_hit(0.0, 0.0, 0.0, 0.0, 0.5).0, 0);
-        assert_eq!(roll_hit(9.9, 0.0, 0.0, 0.0, 0.5).0, 19); // 19.8 ticks
-        assert_eq!(roll_hit(-50.0, 0.0, 0.0, 0.0, 0.5).0, 0);
+        let keys = all_keys();
+        assert_eq!(roll_hit(0.0, 0.0, 0.0, 0.0, 0.5, NOTE_H, &keys).0, 0);
+        assert_eq!(roll_hit(9.9, 0.0, 0.0, 0.0, 0.5, NOTE_H, &keys).0, 19); // 19.8 ticks
+        assert_eq!(roll_hit(-50.0, 0.0, 0.0, 0.0, 0.5, NOTE_H, &keys).0, 0);
     }
 
     #[test]
@@ -148,19 +200,22 @@ mod tests {
 
     #[test]
     fn content_view_lands_on_the_music() {
-        // notes from tick 10000, median key 60: first note near the left
-        // edge with margin, key 60 sixteen rows from the top
-        let (x, y) = content_view(10000, Some(60), 0.08);
+        // notes from tick 10000, median pitch on row 67: first note near the
+        // left edge with margin, the row sixteen rows from the top
+        let (x, y) = content_view(10000, Some(67), 0.08, NOTE_H);
         assert_eq!(x, 10000.0 * 0.08 - 200.0);
-        assert_eq!(y, (127 - 60 - 16) as f32 * NOTE_H);
+        assert_eq!(y, (67 - 16) as f32 * NOTE_H);
         // high content never yields a negative offset
-        let (x, _) = content_view(480, Some(60), 0.08);
+        let (x, _) = content_view(480, Some(67), 0.08, NOTE_H);
         assert_eq!(x, 0.0);
         // content above the centering row pins at the top
-        let (_, y) = content_view(0, Some(120), 0.08);
+        let (_, y) = content_view(0, Some(7), 0.08, NOTE_H);
         assert_eq!(y, 0.0);
+        // row height scales the anchor's offset (vertical zoom)
+        let (_, y2) = content_view(0, Some(67), 0.08, NOTE_H * 2.0);
+        assert_eq!(y2, (67 - 16) as f32 * NOTE_H * 2.0);
         // no notes: the default C3-ish view
-        let (x, y) = content_view(0, None, 0.08);
+        let (x, y) = content_view(0, None, 0.08, NOTE_H);
         assert_eq!((x, y), (0.0, (127.0 - 84.0) * NOTE_H));
     }
 }
