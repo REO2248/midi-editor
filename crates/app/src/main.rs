@@ -554,9 +554,6 @@ struct EditorView {
     lane_key_cached: Option<u8>,
     /// lane marquee selection — event ids of non-note lane points
     lane_sel: BTreeSet<EventId>,
-    /// first visible row of the events list (manual virtualization; the
-    /// pre-0.3.6 uniform_list does not dispatch input to item children)
-    ev_first: usize,
     /// last window-space cursor position, kept while a roll/lane drag is
     /// active so edge auto-scroll can keep the drag deltas current
     mouse_pos: Option<Point<Pixels>>,
@@ -973,6 +970,7 @@ fn empty_doc() -> Document {
 /// `EditorView::transport_points` on a bare `Document` — free so tests can
 /// drive it without a view. Tempo map + every `0x58` meter meta as `(µs,
 /// TransportCmd)`, sorted by µs.
+#[cfg(test)]
 fn transport_points_of(d: &Document) -> Vec<(u64, output::TransportCmd)> {
     transport_points_for(d, None)
 }
@@ -1107,7 +1105,6 @@ impl EditorView {
             lane_mode_cached: LaneMode::Velocity,
             lane_key_cached: None,
             lane_sel: BTreeSet::new(),
-            ev_first: 0,
             mouse_pos: None,
             sel_track: 0,
             selection: BTreeSet::new(),
