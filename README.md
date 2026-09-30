@@ -101,6 +101,15 @@ send no `Origin` and are unaffected; browser tooling served from localhost
 (e.g. MCP Inspector) still works. The effective mode is printed on stderr at
 startup and reported by the `diagnostics` tool under `security`.
 
+Transport and tool limits keep one request from exhausting the process:
+request bodies are capped at 4 MiB, at most 16 requests may be in flight
+(excess → `429`), and each request has 60 s to produce a response
+(exceeded → `504`) — rejections carry a JSON-RPC-shaped error body. Per
+call, `apply_patch` accepts ≤ 1000 ops (each ≤ 10 000 inserted events),
+read tools paginate via `limit`/`offset` (≤ 10 000 rows), `diagnostics`
+caps at 500 rows with a `total` field, and hex payloads decode to at most
+1 MiB.
+
 For stdio-only clients (Claude Desktop etc.) use the bridge, which
 discovers the provisioned token file automatically:
 
