@@ -89,6 +89,15 @@ appear in the Plugin Host Status panel where a click re-probes just that
 bundle. The per-plugin probe bound defaults to 10 s and can be overridden via
 `probe_timeout_secs` in `prefs.json`.
 
+VST3 destinations persist by *component identity*, not just path: alongside
+the bundle path the sidecar records the plugin's class/component ID (plus
+vendor/name), so a bundle that moved or was reinstalled resolves onto the
+same plugin instead of losing its routing. The recorded path stays the
+preferred hint; when several installs expose the same component ID the
+closest one is picked deterministically and a note appears in the status
+line. Sidecars written by older versions (path only) migrate automatically
+on first resolve.
+
 ## MCP server
 
 The app embeds a Streamable-HTTP MCP server at `http://127.0.0.1:7878/mcp`

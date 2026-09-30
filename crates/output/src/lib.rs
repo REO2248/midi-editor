@@ -13,10 +13,10 @@ pub struct PluginInfo {
     pub name: String,
     pub path: std::path::PathBuf,
     pub vendor: String,
-    /// Stable class/component uid (32-hex) when a real probe ran; empty for
-    /// filename-only scan results. This is the durable identity for state
-    /// persistence — paths move, uids don't.
-    pub uid: String,
+    /// VST3 class/component ID (TUID hex) — the durable plugin identity
+    /// across bundle moves. `None` when only the filename fallback ran
+    /// (no probe) since the path alone is all that scan knows.
+    pub uid: Option<String>,
     /// Plugin version string, when the probe reported one.
     pub version: String,
 }
@@ -259,7 +259,7 @@ fn plan_scan(
                             name: e.name.clone(),
                             path: p.clone(),
                             vendor: e.vendor.clone(),
-                            uid: e.uid.clone(),
+                            uid: (!e.uid.is_empty()).then(|| e.uid.clone()),
                             version: e.version.clone(),
                         });
                     } else {
@@ -343,7 +343,7 @@ pub fn discover_plugins_cached(
                         name: info.info.name.clone(),
                         path: path.clone(),
                         vendor: info.info.vendor.clone(),
-                        uid: info.info.uid.clone(),
+                        uid: (!info.info.uid.is_empty()).then(|| info.info.uid.clone()),
                         version: info.info.version.clone(),
                     });
                     cache.entries.insert(
@@ -395,7 +395,7 @@ pub fn discover_plugins_cached(
                     .unwrap_or_else(|| "unknown".into()),
                 path: path.clone(),
                 vendor: String::new(),
-                uid: String::new(),
+                uid: None,
                 version: String::new(),
             });
         }
@@ -454,7 +454,7 @@ pub fn discover_plugin_paths() -> Vec<PluginInfo> {
                             .unwrap_or_else(|| "unknown".into()),
                         path: p,
                         vendor: String::new(),
-                        uid: String::new(),
+                        uid: None,
                         version: String::new(),
                     });
                 }
@@ -861,10 +861,7 @@ impl PluginSlot {
 
     /// The last stream error (e.g. device unplugged), cleared on read.
     pub fn take_stream_error(&self) -> Option<String> {
-        self.stream
-            .lock()
-            .ok()
-            .and_then(|mut s| s.error.take())
+        self.stream.lock().ok().and_then(|mut s| s.error.take())
     }
     /// Re-read `getLatencySamples` into the shared tracker. Call it when the
     /// plugin reports a latency change (`kLatencyChanged`) — the sink picks
@@ -933,10 +930,7 @@ pub fn spawn_plugin_host() -> (
                     match PluginOutput::open_with(&path, &sel) {
                         Ok(p) => {
                             if let Some(state) = prior_state {
-                                let _ = p
-                                    .plugin_handle()
-                                    .lock()
-                                    .map(|mut g| g.load_state(&state));
+                                let _ = p.plugin_handle().lock().map(|mut g| g.load_state(&state));
                             }
                             let slot = PluginSlot {
                                 sink: p.event_sink(),
@@ -946,20 +940,20 @@ pub fn spawn_plugin_host() -> (
                                 audio: p.audio_config(),
                                 stream: p.stream_state(),
                             };
-                        owned.insert(d, p);
-                        let _ = evt_tx.send(PluginEvent {
-                            dest: d,
-                            path: slot.path.clone(),
-                            result: Ok(slot),
-                        });
-                    }
-                    Err(e) => {
-                        let _ = evt_tx.send(PluginEvent {
-                            dest: d,
-                            path,
-                            result: Err(e),
-                        });
-                    }
+                            owned.insert(d, p);
+                            let _ = evt_tx.send(PluginEvent {
+                                dest: d,
+                                path: slot.path.clone(),
+                                result: Ok(slot),
+                            });
+                        }
+                        Err(e) => {
+                            let _ = evt_tx.send(PluginEvent {
+                                dest: d,
+                                path,
+                                result: Err(e),
+                            });
+                        }
                     }
                 }
                 PluginReq::Drop(d) => {
@@ -1131,9 +1125,9 @@ pub fn encode_transport(cmd: &TransportCmd) -> Vec<u8> {
 /// SysEx traffic for a transport update.
 pub fn decode_transport(bytes: &[u8]) -> Option<TransportCmd> {
     match bytes {
-        [TRANSPORT_TAG, 1, rest @ ..] if rest.len() == 8 => {
-            Some(TransportCmd::Tempo(f64::from_be_bytes(rest.try_into().ok()?)))
-        }
+        [TRANSPORT_TAG, 1, rest @ ..] if rest.len() == 8 => Some(TransportCmd::Tempo(
+            f64::from_be_bytes(rest.try_into().ok()?),
+        )),
         [TRANSPORT_TAG, 2, rest @ ..] if rest.len() == 8 => {
             let (n, d) = rest.split_at(4);
             Some(TransportCmd::TimeSig(
@@ -1150,10 +1144,7 @@ pub fn decode_transport(bytes: &[u8]) -> Option<TransportCmd> {
 /// re-asserts the position's tempo and meter so the plugin hears the state
 /// it would have reached playing through, not whatever was last scheduled.
 /// `points` must be sorted by µs (the playback schedule already is).
-pub fn chase_transport(
-    points: &[(u64, TransportCmd)],
-    pos_us: u64,
-) -> Vec<(u64, TransportCmd)> {
+pub fn chase_transport(points: &[(u64, TransportCmd)], pos_us: u64) -> Vec<(u64, TransportCmd)> {
     let mut tempo = None;
     let mut sig = None;
     for (us, c) in points {
@@ -1432,10 +1423,7 @@ mod tests {
         use RestartAction::*;
         for n in RestartNote::ALL {
             let a = restart_action(n);
-            assert!(matches!(
-                a,
-                RefreshLatency | RequeryIo | Reload | LogOnly
-            ));
+            assert!(matches!(a, RefreshLatency | RequeryIo | Reload | LogOnly));
         }
         assert_eq!(restart_action(RestartNote::Latency), RefreshLatency);
         assert_eq!(restart_action(RestartNote::Io), RequeryIo);
@@ -1503,7 +1491,10 @@ mod tests {
         // channel traffic, a stray F7 payload, short and unknown kinds
         assert_eq!(decode_transport(&[0x90, 60, 100]), None);
         assert_eq!(decode_transport(&[0xF7, 1, 0, 0]), None);
-        assert_eq!(decode_transport(&[TRANSPORT_TAG, 9, 0, 0, 0, 0, 0, 0, 0, 0]), None);
+        assert_eq!(
+            decode_transport(&[TRANSPORT_TAG, 9, 0, 0, 0, 0, 0, 0, 0, 0]),
+            None
+        );
     }
 
     /// The recording "processor" behind `TransportSink`: every update the
@@ -1677,7 +1668,9 @@ mod tests {
         assert!(!e.ok && e.reason == "crashed: x" && e.last_attempt_ms == 7);
         std::fs::write(&file, b"not json").unwrap();
         assert!(ScanCache::load(&file).entries.is_empty());
-        assert!(ScanCache::load(&dir.join("missing.json")).entries.is_empty());
+        assert!(ScanCache::load(&dir.join("missing.json"))
+            .entries
+            .is_empty());
         // wrong version is discarded
         std::fs::write(&file, r#"{"version":99,"entries":{}}"#).unwrap();
         assert!(ScanCache::load(&file).entries.is_empty());
@@ -1692,10 +1685,9 @@ mod tests {
         let new_b = fake_bundle(&dir, "New", &[3]);
 
         let mut cache = ScanCache::default();
-        cache.entries.insert(
-            canon(&ok_b),
-            entry(bundle_stamp(&ok_b), true, ""),
-        );
+        cache
+            .entries
+            .insert(canon(&ok_b), entry(bundle_stamp(&ok_b), true, ""));
         cache.entries.insert(
             canon(&bad_b),
             entry(bundle_stamp(&bad_b), false, "crashed: abort()"),
@@ -1717,14 +1709,12 @@ mod tests {
 
         // same quarantined bundle, changed on disk -> re-probed
         std::fs::write(bad_b.join("Contents/x86_64-win/Bad.vst3"), &[2, 2, 2, 2]).unwrap();
-        let (_, q2, p2) =
-            plan_scan(&cache, &candidates, &std::collections::HashSet::new());
+        let (_, q2, p2) = plan_scan(&cache, &candidates, &std::collections::HashSet::new());
         assert!(q2.is_empty());
         assert_eq!(p2.len(), 2, "updated quarantined bundle re-probes");
 
         // force set bypasses the cache even for a matching stamp
-        let force: std::collections::HashSet<String> =
-            [canon(&ok_b)].into_iter().collect();
+        let force: std::collections::HashSet<String> = [canon(&ok_b)].into_iter().collect();
         let (c3, _, p3) = plan_scan(&cache, &candidates, &force);
         assert!(c3.is_empty());
         assert_eq!(p3.len(), 3);
@@ -1806,7 +1796,7 @@ mod tests {
     /// Shutdown closes the event channel — all without needing a real plugin.
     #[test]
     fn host_worker_request_ordering_and_exit() {
-        let (tx, rx) = spawn_plugin_host();
+        let (tx, rx, _worker) = spawn_plugin_host();
         let bogus = std::path::PathBuf::from(r"C:\no\such\bundle.vst3");
         tx.send(PluginReq::Open(7, bogus.clone(), AudioSelection::default()))
             .unwrap();
@@ -1828,8 +1818,6 @@ mod tests {
         assert_eq!(second.dest, 2);
         assert!(second.result.is_err());
         // after Shutdown the worker exits and the event channel closes
-        assert!(rx
-            .recv_timeout(std::time::Duration::from_secs(30))
-            .is_err());
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(30)).is_err());
     }
 }

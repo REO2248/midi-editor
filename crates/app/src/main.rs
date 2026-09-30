@@ -581,6 +581,9 @@ fn build_dest_catalog(plugins: &[output::PluginInfo]) -> Vec<(String, midi_io::D
             p.name.clone(),
             midi_io::Destination::Plugin {
                 plugin_path: p.path.to_string_lossy().into_owned(),
+                component_id: p.uid.clone(),
+                vendor: (!p.vendor.is_empty()).then(|| p.vendor.clone()),
+                plugin_name: Some(p.name.clone()),
             },
         ));
     }
@@ -613,10 +616,7 @@ fn transport_points_of(d: &Document) -> Vec<(u64, output::TransportCmd)> {
 
 /// `tr` selects the sequence in format-2 documents (each sequence has its
 /// own tempo map and meta events); `None` uses the document-level maps.
-fn transport_points_for(
-    d: &Document,
-    tr: Option<usize>,
-) -> Vec<(u64, output::TransportCmd)> {
+fn transport_points_for(d: &Document, tr: Option<usize>) -> Vec<(u64, output::TransportCmd)> {
     let owned;
     let (tm, tracks): (&document::TempoMap, &[document::Track]) = match tr {
         Some(t) => {
@@ -646,10 +646,7 @@ fn transport_points_for(
                 if data.len() >= 2 {
                     sig_pts.push((
                         tm.tick_to_us(e.tick),
-                        output::TransportCmd::TimeSig(
-                            i32::from(data[0]),
-                            1i32 << (data[1] & 0x1f),
-                        ),
+                        output::TransportCmd::TimeSig(i32::from(data[0]), 1i32 << (data[1] & 0x1f)),
                     ));
                 }
             }
@@ -2509,7 +2506,7 @@ impl EditorView {
         let path = {
             let sh = lock_shared(&self.shared);
             match sh.dests.get(d).map(|(_, dest)| dest) {
-                Some(output::Destination::Plugin { plugin_path }) => PathBuf::from(plugin_path),
+                Some(output::Destination::Plugin { plugin_path, .. }) => PathBuf::from(plugin_path),
                 _ => return,
             }
         };
@@ -2745,11 +2742,7 @@ impl EditorView {
         let name = self
             .plugin_slots
             .get(&d)
-            .and_then(|s| {
-                s.path
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-            })
+            .and_then(|s| s.path.file_stem().map(|s| s.to_string_lossy().into_owned()))
             .unwrap_or_default();
         for note in output::restart_notes(flags) {
             match output::restart_action(note) {
@@ -2766,12 +2759,7 @@ impl EditorView {
                     let ch = self
                         .plugin_slots
                         .get(&d)
-                        .and_then(|s| {
-                            s.plugin
-                                .try_lock()
-                                .ok()
-                                .map(|p| p.output_channel_count())
-                        });
+                        .and_then(|s| s.plugin.try_lock().ok().map(|p| p.output_channel_count()));
                     tracing::info!("{name} (dest {d}): kIoChanged -> {ch:?} output channel(s)");
                 }
                 output::RestartAction::Reload => {
@@ -2780,12 +2768,7 @@ impl EditorView {
                     changed = true;
                 }
                 output::RestartAction::LogOnly => {
-                    if self
-                        .restart_logged
-                        .entry(d)
-                        .or_default()
-                        .first_seen(note)
-                    {
+                    if self.restart_logged.entry(d).or_default().first_seen(note) {
                         tracing::info!(
                             "{name} (dest {d}): {} noted — no host state to rebuild",
                             note.name()
@@ -3277,19 +3260,20 @@ impl EditorView {
             .collect();
         sh.dests = fresh;
         sh.default_dest = old_default
-            .and_then(|d| {
-                // an offline port keeps its identity: re-add it rather than
-                // dropping the assignment — it plays again once replugged
-                Some(match sh.dests.iter().position(|(_, dd)| *dd == d) {
+            .map(|d| {
+                // identity-aware lookup (path or component id), then re-add
+                // offline entries rather than dropping the assignment —
+                // they play again once replugged
+                match sh.dests.iter().position(|(_, dd)| dd.same_identity(&d)) {
                     Some(i) => i,
                     None => sh.ensure_dest(&dest_label(&d), d),
-                })
+                }
             })
             .unwrap_or(0);
         sh.track_dest = old_tracks
             .into_iter()
             .map(|(t, d)| {
-                let i = match sh.dests.iter().position(|(_, dd)| *dd == d) {
+                let i = match sh.dests.iter().position(|(_, dd)| dd.same_identity(&d)) {
                     Some(i) => i,
                     None => sh.ensure_dest(&dest_label(&d), d),
                 };
@@ -3331,7 +3315,7 @@ impl EditorView {
             let sh = lock_shared(&self.shared);
             let d = sh.dest_of(self.sel_track);
             let p = sh.dests.get(d).and_then(|(_, dd)| match dd {
-                output::Destination::Plugin { plugin_path } => Some(PathBuf::from(plugin_path)),
+                output::Destination::Plugin { plugin_path, .. } => Some(PathBuf::from(plugin_path)),
                 _ => None,
             });
             (d, p)
@@ -3449,7 +3433,10 @@ impl EditorView {
         if !force && self.last_state_write.elapsed() < std::time::Duration::from_secs(1) {
             return;
         }
-        match self.plugin_states.save(&plugin_state::state_path(&doc_path)) {
+        match self
+            .plugin_states
+            .save(&plugin_state::state_path(&doc_path))
+        {
             Ok(_) => {
                 self.state_file_dirty = false;
                 self.last_state_write = std::time::Instant::now();
@@ -3941,7 +3928,7 @@ fn dest_label(d: &output::Destination) -> String {
                 format!("{port_name} #{}", ord + 1)
             }
         }
-        output::Destination::Plugin { plugin_path } => {
+        output::Destination::Plugin { plugin_path, .. } => {
             let stem = PathBuf::from(plugin_path)
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
@@ -3955,8 +3942,28 @@ impl EditorView {
     /// Find or re-create the dest matching a stored identity; returns its index
     /// into `shared.dests`. Unavailable ports/plugins keep their identity —
     /// the assignment stays visible and plays again once the device is back.
+    /// Plugin destinations resolve through the class/component ID first: a
+    /// bundle that moved keeps its routing (and its recorded path is updated
+    /// on the next save).
     fn resolve_dest(&mut self, d: &output::Destination) -> usize {
-        lock_shared(&self.shared).ensure_dest(&dest_label(d), d.clone())
+        let mut sh = lock_shared(&self.shared);
+        let catalog: Vec<output::Destination> = sh.dests.iter().map(|(_, d)| d.clone()).collect();
+        let (resolved, outcome) = midi_io::resolve_plugin_dest(d, &catalog);
+        let stem = |p: &std::path::PathBuf| {
+            p.file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        };
+        match outcome {
+            midi_io::Resolved::Moved(p) => {
+                self.status = tf("output.plugin_moved", &[("name", stem(&p).as_str())]).into();
+            }
+            midi_io::Resolved::Ambiguous(p) => {
+                self.status = tf("output.plugin_ambiguous", &[("name", stem(&p).as_str())]).into();
+            }
+            _ => {}
+        }
+        sh.ensure_dest(&dest_label(&resolved), resolved)
     }
 
     /// Apply the per-song sidecar. A corrupt or quarantined sidecar can
@@ -4054,9 +4061,7 @@ impl EditorView {
         let plugin_dests: Vec<usize> = {
             let sh = lock_shared(&self.shared);
             (0..sh.dests.len())
-                .filter(|i| {
-                    matches!(sh.dests[*i].1, output::Destination::Plugin { .. })
-                })
+                .filter(|i| matches!(sh.dests[*i].1, output::Destination::Plugin { .. }))
                 .collect()
         };
         for d in plugin_dests {
@@ -4804,10 +4809,9 @@ mod tests {
     /// it must still parse (serde defaults) instead of resetting recents.
     #[test]
     fn legacy_prefs_json_without_audio_fields_parses() {
-        let g: super::GlobalPrefs = serde_json::from_str(
-            r#"{"recent":["a.mid"],"count_in":true,"midi_in":"port"}"#,
-        )
-        .unwrap();
+        let g: super::GlobalPrefs =
+            serde_json::from_str(r#"{"recent":["a.mid"],"count_in":true,"midi_in":"port"}"#)
+                .unwrap();
         assert_eq!(g.recent, ["a.mid"]);
         assert!(g.audio_device.is_none() && g.sample_rate.is_none() && g.buffer_size.is_none());
     }
@@ -4848,11 +4852,11 @@ mod tests {
             })
             .unwrap();
         }
-        let ops = d.set_time_sig_ops(0, 3, 4);
+        let ops = d.set_time_sig_ops(0, 0, 3, 4);
         apply(&mut d, ops);
-        let ops = d.set_tempo_ops(960, 60.0); // 960 ticks @480ppq = 2 quarters in
+        let ops = d.set_tempo_ops(0, 960, 60.0); // 960 ticks @480ppq = 2 quarters in
         apply(&mut d, ops);
-        let ops = d.set_time_sig_ops(1920, 6, 8);
+        let ops = d.set_time_sig_ops(0, 1920, 6, 8);
         apply(&mut d, ops);
         let pts = super::transport_points_of(&d);
         assert!(pts.windows(2).all(|w| w[0].0 <= w[1].0), "{pts:?}");

@@ -170,7 +170,6 @@ impl PluginStateStore {
         self.records.insert(key, record);
         true
     }
-
 }
 
 /// Current unix time in milliseconds (state capture stamp).
@@ -319,7 +318,10 @@ mod tests {
         let loaded = PluginStateStore::load(&file);
         assert_eq!(loaded.records.len(), 2);
         assert_eq!(
-            loaded.lookup("AABBCCDD", Path::new("ignored")).unwrap().state,
+            loaded
+                .lookup("AABBCCDD", Path::new("ignored"))
+                .unwrap()
+                .state,
             vec![1, 2, 3]
         );
         assert_eq!(
@@ -349,7 +351,10 @@ mod tests {
             ("badmagic", b"NOTOURS\x01\x00\x00\x00".to_vec()),
             ("badversion", b"MEDPLGST\x63\x00\x00\x00".to_vec()),
             // valid header, record count lies about the remainder
-            ("truncated", b"MEDPLGST\x01\x00\x00\x00\x05\x00\x00\x00".to_vec()),
+            (
+                "truncated",
+                b"MEDPLGST\x01\x00\x00\x00\x05\x00\x00\x00".to_vec(),
+            ),
         ] {
             let file = dir.join(name);
             std::fs::write(&file, bytes).unwrap();

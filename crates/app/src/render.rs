@@ -2719,7 +2719,12 @@ impl Render for EditorView {
                 };
                 tf(
                     "output.scan_summary",
-                    &[("n", n.as_str()), ("c", c.as_str()), ("mode", mode), ("timeout", to.as_str())],
+                    &[
+                        ("n", n.as_str()),
+                        ("c", c.as_str()),
+                        ("mode", mode),
+                        ("timeout", to.as_str()),
+                    ],
                 )
             };
             let mut rows: Vec<AnyElement> = vec![
@@ -2744,9 +2749,8 @@ impl Render for EditorView {
             // falls back to the system default there.
             rows.push(Self::msep().into_any_element());
             rows.push(Self::mhead(t("output.cat_audio")).into_any_element());
-            let mut dev_picks: Vec<(usize, String, Option<String>)> = vec![
-                (0, t("audio.sys_default").to_string(), None),
-            ];
+            let mut dev_picks: Vec<(usize, String, Option<String>)> =
+                vec![(0, t("audio.sys_default").to_string(), None)];
             dev_picks.extend(
                 self.audio_devices
                     .iter()
@@ -2847,7 +2851,7 @@ impl Render for EditorView {
             rows.push(Self::msep().into_any_element());
             rows.push(Self::mhead(t("output.cat_vst3")).into_any_element());
             for (i, (name, dest)) in dests.iter().enumerate() {
-                let output::Destination::Plugin { plugin_path } = dest else {
+                let output::Destination::Plugin { plugin_path, .. } = dest else {
                     continue;
                 };
                 let vendor = self
@@ -3282,7 +3286,7 @@ impl EditorView {
             .iter()
             .enumerate()
             .filter_map(|(i, (name, d))| {
-                let output::Destination::Plugin { plugin_path } = d else {
+                let output::Destination::Plugin { plugin_path, .. } = d else {
                     return None;
                 };
                 let vendor = self
