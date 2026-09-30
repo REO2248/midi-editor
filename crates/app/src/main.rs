@@ -7,6 +7,7 @@ mod geometry;
 mod i18n;
 mod icons;
 mod render;
+mod shutdown;
 use geometry::{
     clamp_move_delta, clamp_span, content_view, reanchor, roll_hit, ZOOM_MAX, ZOOM_MIN,
 };
@@ -358,6 +359,10 @@ struct EditorView {
     focus: FocusHandle,
     input: Entity<InputState>,
     status: SharedString,
+    /// teardown coordinator — owns every worker handle (see `shutdown.rs`)
+    shutdown: shutdown::Shutdown,
+    /// keeps the on_app_quit subscription registered for the view's life
+    _quit_sub: Option<Subscription>,
 }
 
 enum PluginState {
@@ -453,7 +458,7 @@ impl EditorView {
         sh.dests = build_dest_catalog(&initial_plugins);
         let g = GlobalPrefs::load();
         let shared = Arc::new(Mutex::new(sh));
-        let (plugin_req, plugin_evt) = output::spawn_plugin_host();
+        let (plugin_req, plugin_evt, host_thread) = output::spawn_plugin_host();
         let mut v = Self {
             shared,
             doc_epoch: 0,
@@ -527,7 +532,16 @@ impl EditorView {
             focus: cx.focus_handle(),
             input,
             status,
+            shutdown: shutdown::Shutdown::default(),
+            _quit_sub: None,
         };
+        v.shutdown.track_host(host_thread);
+        // app-quit path (menu Quit / task kill minus window close) —
+        // on_window_should_close alone doesn't cover it
+        v._quit_sub = Some(cx.on_app_quit(|v, _| {
+            v.perform_shutdown();
+            async {}
+        }));
         v.sel_track = v.pick_default_track();
         v.refresh_derived();
         if let Some(p) = &path {
@@ -2149,9 +2163,19 @@ impl EditorView {
         self.status = t("status.scanning").into();
         let (tx, rx) = std::sync::mpsc::channel();
         self.scan_rx = Some(rx);
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             let _ = tx.send(output::discover_plugins());
         });
+        self.shutdown.track_scan(handle);
+    }
+
+    /// Ordered, bounded teardown of everything the app owns. Runs from
+    /// `on_window_should_close` and `on_app_quit`; the Shutdown latch
+    /// makes the second call a no-op.
+    fn perform_shutdown(&mut self) {
+        let mut sd = std::mem::take(&mut self.shutdown);
+        sd.run(self);
+        self.shutdown = sd;
     }
 
     fn apply_catalog(&mut self, report: output::ScanReport) {
@@ -2748,11 +2772,23 @@ fn main() {
                 let input =
                     cx.new(|cx| InputState::new(window, cx).placeholder(t("field.track_name")));
                 let view = cx.new(|cx| {
-                    let v = EditorView::new(path.clone(), input, cx);
-                    spawn_mcp(v.shared.clone());
+                    let mut v = EditorView::new(path.clone(), input, cx);
+                    let (mcp_stop, mcp_thread) = spawn_mcp(v.shared.clone());
+                    v.shutdown.track_mcp(mcp_stop, mcp_thread);
                     spawn_doc_watch(cx, v.shared.clone());
                     window.focus(&v.focus.clone(), cx);
                     v
+                });
+                // closing the window runs the teardown once before the
+                // app exits (idempotent with the on_app_quit hook)
+                let view_weak = view.downgrade();
+                window.on_window_should_close(cx, move |_, cx| {
+                    view_weak
+                        .update(cx, |v, _| {
+                            v.perform_shutdown();
+                            true
+                        })
+                        .unwrap_or(true)
                 });
                 cx.new(|cx| Root::new(view, window, cx))
             })
@@ -2765,8 +2801,11 @@ fn main() {
 /// In-app MCP server: Streamable-HTTP on 127.0.0.1:7878/mcp on its own
 /// tokio runtime thread. Bearer token = MIDI_MCP_TOKEN env (unset = open on
 /// loopback only). `mcp-bridge` is the stdio frontend for stdio-only clients.
-fn spawn_mcp(shared: SharedDoc) {
-    std::thread::spawn(move || {
+fn spawn_mcp(
+    shared: SharedDoc,
+) -> (tokio::sync::oneshot::Sender<()>, std::thread::JoinHandle<()>) {
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let handle = std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2779,11 +2818,14 @@ fn spawn_mcp(shared: SharedDoc) {
         };
         rt.block_on(async move {
             let token = std::env::var("MIDI_MCP_TOKEN").ok();
-            if let Err(e) = mcp_server::serve_http(shared, "127.0.0.1:7878", token).await {
+            if let Err(e) =
+                mcp_server::serve_http(shared, "127.0.0.1:7878", token, stop_rx).await
+            {
                 eprintln!("mcp http: {e}");
             }
         });
     });
+    (stop_tx, handle)
 }
 
 /// Poll the shared doc's notify counter so MCP-driven edits repaint the UI

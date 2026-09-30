@@ -1521,10 +1521,13 @@ pub async fn serve_stdio(doc: SharedDoc) -> anyhow::Result<()> {
 /// Serve Streamable-HTTP on `addr` (e.g. "127.0.0.1:7878") at path `/mcp`.
 /// When `token` is Some, requests must carry `Authorization: Bearer <token>`.
 /// Host/Origin validation stays at rmcp's loopback defaults.
+/// `shutdown`: resolve to stop accepting connections and drain in-flight
+/// requests (axum graceful shutdown — open connections finish their work).
 pub async fn serve_http(
     doc: SharedDoc,
     addr: &str,
     token: Option<String>,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
     use axum::middleware::Next;
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -1568,7 +1571,11 @@ pub async fn serve_http(
     }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!("mcp http listening on {addr}");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = shutdown.await;
+        })
+        .await?;
     Ok(())
 }
 
