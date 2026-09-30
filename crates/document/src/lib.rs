@@ -2510,6 +2510,19 @@ impl Document {
     /// Delete every channel event in [from,to) plus the matching NoteOff of
     /// any note that starts inside the range (notes delete whole).
     pub fn delete_range_ops(&mut self, track: usize, from: u64, to: u64) -> Vec<Op> {
+        self.delete_range_channel_ops(track, from, to, &(0u8..16).collect())
+    }
+
+    /// `delete_range_ops` limited to channel events on `channels`
+    /// (status low nibble) — replace-mode recording erases only the
+    /// channels the take actually carries, never the whole range.
+    pub fn delete_range_channel_ops(
+        &mut self,
+        track: usize,
+        from: u64,
+        to: u64,
+        channels: &std::collections::BTreeSet<u8>,
+    ) -> Vec<Op> {
         let t = match self.tracks.get(track) {
             Some(t) => t,
             None => return vec![],
@@ -2518,14 +2531,18 @@ impl Document {
             .events
             .iter()
             .filter(|e| e.tick >= from && e.tick < to)
-            .filter(|e| matches!(e.kind, EventKind::Channel { .. }))
+            .filter(|e| match e.kind {
+                EventKind::Channel { status, .. } => channels.contains(&(status & 0x0F)),
+                _ => false,
+            })
             .map(|e| e.id)
             .collect();
-        for n in self
-            .notes()
-            .into_iter()
-            .filter(|n| n.track == track && n.start_tick >= from && n.start_tick < to)
-        {
+        for n in self.notes().into_iter().filter(|n| {
+            n.track == track
+                && n.start_tick >= from
+                && n.start_tick < to
+                && channels.contains(&n.channel)
+        }) {
             ids.insert(n.on_id);
             if let Some(o) = n.off_id {
                 ids.insert(o);

@@ -830,6 +830,15 @@ struct EditorView {
     sys_dark: bool,
     /// keeps the OS appearance-change observer alive
     _appearance: Option<Subscription>,
+    /// overdub vs replace-in-range recording write mode (sidecar pref)
+    rec_mode: RecMode,
+    /// punch range in ticks — only events inside are committed;
+    /// replace mode erases exactly this window
+    punch_in: Option<u64>,
+    punch_out: Option<u64>,
+    /// (track, from_tick, to_tick) of the last committed take — target of
+    /// the separate, reversible "quantize take" transaction
+    last_take: Option<(usize, u64, u64)>,
     focus: FocusHandle,
     input: Entity<InputState>,
     status: SharedString,
@@ -990,6 +999,33 @@ fn plugin_plan(
 /// Captured (µs, raw channel bytes) pairs from the input callback.
 type RecBuf = std::sync::Arc<Mutex<Vec<(u64, Vec<u8>)>>>;
 
+/// What `finish_record` does with the events already on the armed track.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecMode {
+    /// Insert the take over existing content (default).
+    Overdub,
+    /// In the same transaction, delete the in-range channel events the take
+    /// re-records — only the range and channels the take actually carries,
+    /// then insert it.
+    Replace,
+}
+
+impl RecMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Overdub => "overdub",
+            Self::Replace => "replace",
+        }
+    }
+    fn from_label(s: &str) -> Option<Self> {
+        match s {
+            "overdub" => Some(Self::Overdub),
+            "replace" => Some(Self::Replace),
+            _ => None,
+        }
+    }
+}
+
 /// Armed recording: timestamps channel messages against the playhead's µs base.
 struct Rec {
     input: midi_io::Input,
@@ -1004,6 +1040,9 @@ struct Rec {
     /// jitter counters — how much callback-delivery delay the backend
     /// timestamps absorbed this take (surfaced as a debug diagnostic)
     diag: std::sync::Arc<midi_io::InputDiag>,
+    /// (loop_start, loop_end) snapshot when the take was armed while a loop
+    /// ran — events past the wrap map back into the span (per-pass replace)
+    loop_span_us: Option<(u64, u64)>,
 }
 
 /// Output destination catalog: real MIDI ports by name, then discovered
@@ -1364,6 +1403,10 @@ impl EditorView {
             theme: theme::Theme::dark(), // replaced by apply_theme below
             hc_pref: g.hc,
             _appearance: None,
+            rec_mode: RecMode::Overdub,
+            punch_in: None,
+            punch_out: None,
+            last_take: None,
             open_sub: None,
             show_events: true,
             audition: Audition::spawn(),
@@ -1467,6 +1510,9 @@ impl EditorView {
         self.state_file_dirty = false;
         self.pending_state_capture.clear();
         mcp_server::service::swap_document(&self.shared, empty_doc(), None);
+        self.last_take = None;
+        self.punch_in = None;
+        self.punch_out = None;
         self.doc_epoch += 1; // the fresh document reports revision 0 again
         self.selection.clear();
         self.drag = None;
@@ -4692,6 +4738,11 @@ impl EditorView {
                 // state file) is still the active one — `apply_prefs` loads
                 // the incoming song's table after the swap
                 self.flush_plugin_states(true);
+                self.last_take = None;
+                // sidecar-less file: a stale punch from the previous doc
+                // must not carry over (apply_prefs early-returns then)
+                self.punch_in = None;
+                self.punch_out = None;
                 // swap the document in place — the MCP server holds this same Arc
                 mcp_server::service::swap_document(&self.shared, d, Some(path.clone()));
                 // the new document also reports revision 0 — bump the epoch
@@ -5351,9 +5402,26 @@ impl EditorView {
                     base_us: self.play_us,
                     cin_us,
                     diag,
+                    loop_span_us: None,
                 });
                 if self.playback.is_none() {
                     self.start_playback();
+                }
+                // armed inside a loop: the transport wraps at the last
+                // scheduled event — snapshot the span so past-wrap input can
+                // be mapped back into it (per-pass take)
+                if lock_shared(&self.shared).loop_enabled {
+                    let end = self
+                        .doc(|d| d.timeline_tagged())
+                        .iter()
+                        .map(|e| e.0)
+                        .max()
+                        .unwrap_or(0);
+                    if end > self.loop_start_us {
+                        if let Some(r) = self.rec.as_mut() {
+                            r.loop_span_us = Some((self.loop_start_us, end));
+                        }
+                    }
                 }
                 self.status = tf(
                     "status.rec_armed",
@@ -5365,13 +5433,30 @@ impl EditorView {
         }
     }
 
+    /// Current playhead position in ticks — where a punch bound lands.
+    fn playhead_tick(&self) -> u64 {
+        self.doc(|d| d.tempo_map.us_to_tick(self.play_us))
+    }
+
+    /// Normalized punch window in ticks, when both bounds are set and in order.
+    fn punch_range(&self) -> Option<(u64, u64)> {
+        match (self.punch_in, self.punch_out) {
+            (Some(a), Some(b)) if a < b => Some((a, b)),
+            _ => None,
+        }
+    }
+
     /// Commit the captured take into the selected track (raw channel events;
-    /// the notes() view pairs on/off for display).
+    /// the notes() view pairs on/off for display). One transaction keeps the
+    /// take a single undoable unit with its raw, pre-quantized timing —
+    /// quantization is offered afterwards as a separate "quantize take" tx.
     fn finish_record(&mut self) {
         let Some(rec) = self.rec.take() else {
             return;
         };
         let msgs = std::mem::take(&mut *rec.buf.lock().unwrap_or_else(|e| e.into_inner()));
+        let punch = self.punch_range();
+        let mode = self.rec_mode;
         let mut sh = lock_shared(&self.shared);
         if sh.doc.tracks.is_empty() {
             let ops = sh.doc.add_track_ops(None);
@@ -5382,7 +5467,8 @@ impl EditorView {
             }
         }
         let track = self.sel_track.min(sh.doc.tracks.len().saturating_sub(1));
-        let mut events = Vec::new();
+        // (pass, channel, event) — pass is the loop lap the event landed on
+        let mut captured: Vec<(u64, u8, document::Event)> = Vec::new();
         for (us, b) in msgs {
             // channel voice messages only; realtime/sysex are not captured
             if b.is_empty() || b[0] < 0x80 || b[0] >= 0xF0 {
@@ -5398,24 +5484,59 @@ impl EditorView {
             if us < rec.cin_us {
                 continue;
             }
+            let doc_us = rec.base_us + (us - rec.cin_us);
+            // armed inside a loop: input that arrives on later passes wraps
+            // back into the span instead of spilling past the loop end
+            let (doc_us, pass) = match rec.loop_span_us {
+                Some((s, e)) if e > s && doc_us >= e => {
+                    (s + (doc_us - s) % (e - s), (doc_us - s) / (e - s))
+                }
+                Some((s, e)) if e > s => (doc_us, (doc_us - s) / (e - s)),
+                _ => (doc_us, 0),
+            };
             // the take lands in the selected track — for format 2 that
-            // sequence's own tempo map converts live-µs back to ticks
-            let tick = sh
-                .doc
-                .tempo_map_for(track)
-                .us_to_tick(rec.base_us + (us - rec.cin_us));
-            events.push(document::Event {
-                id: sh.doc.alloc_event_id(),
-                tick,
-                seq: u32::MAX / 2,
-                raw_body: None,
-                kind: EventKind::Channel {
-                    status: b[0],
-                    data: [b[1], b.get(2).copied().unwrap_or(0)],
-                    len,
+            // sequence's own tempo map converts live-us back to ticks
+            let tick = sh.doc.tempo_map_for(track).us_to_tick(doc_us);
+            if let Some((a, b)) = punch {
+                if tick < a || tick >= b {
+                    continue;
+                }
+            }
+            captured.push((
+                pass,
+                b[0] & 0x0F,
+                document::Event {
+                    id: sh.doc.alloc_event_id(),
+                    tick,
+                    seq: u32::MAX / 2,
+                    raw_body: None,
+                    kind: EventKind::Channel {
+                        status: b[0],
+                        data: [b[1], b.get(2).copied().unwrap_or(0)],
+                        len,
+                    },
                 },
-            });
+            ));
         }
+        // replace-in-loop: each channel keeps only its latest pass, so a
+        // multi-lap take commits one coherent layer per channel
+        let events: Vec<document::Event> = if mode == RecMode::Replace && rec.loop_span_us.is_some()
+        {
+            let mut last_pass: HashMap<u8, u64> = HashMap::new();
+            for (p, ch, _) in &captured {
+                last_pass
+                    .entry(*ch)
+                    .and_modify(|e| *e = (*e).max(*p))
+                    .or_insert(*p);
+            }
+            captured
+                .into_iter()
+                .filter(|(p, ch, _)| *p == last_pass[ch])
+                .map(|(_, _, e)| e)
+                .collect()
+        } else {
+            captured.into_iter().map(|(_, _, e)| e).collect()
+        };
         let n = events.len();
         // timing diagnostic: how much callback delivery delay the backend
         // timestamps absorbed — would have been recorded as timing error
@@ -5431,13 +5552,67 @@ impl EditorView {
                 gap / 1000
             );
         }
-        drop(sh);
         if n == 0 {
+            // an empty take must never erase: cancelled or out-of-punch
+            // recording leaves the document untouched
+            drop(sh);
             self.status = t("status.rec_no_events").into();
             return;
         }
-        self.apply_tx("record", vec![Op::InsertEvents { track, events }]);
+        let (from, to) = (
+            events.iter().map(|e| e.tick).min().unwrap_or(0),
+            events.iter().map(|e| e.tick).max().unwrap_or(0) + 1,
+        );
+        let mut ops = Vec::new();
+        if mode == RecMode::Replace {
+            let (df, dt) = punch.unwrap_or((from, to));
+            let channels: std::collections::BTreeSet<u8> = events
+                .iter()
+                .filter_map(|e| match e.kind {
+                    EventKind::Channel { status, .. } => Some(status & 0x0F),
+                    _ => None,
+                })
+                .collect();
+            ops.extend(sh.doc.delete_range_channel_ops(track, df, dt, &channels));
+        }
+        ops.push(Op::InsertEvents { track, events });
+        drop(sh);
+        self.last_take = Some((track, from, to));
+        self.apply_tx("record", ops);
         self.status = tf("status.rec_done", &[("n", &n.to_string())]).into();
+    }
+
+    /// Drop the armed take without committing — the document is untouched.
+    /// (Document replacement paths already warn; this is the explicit cancel.)
+    fn discard_record(&mut self) {
+        if self.rec.take().is_some() {
+            self.status = t("status.rec_discarded").into();
+        }
+    }
+
+    /// Post-record quantize as its own reversible transaction — the take
+    /// committed raw timing stays intact underneath in the undo stack.
+    fn quantize_last_take(&mut self) {
+        let Some((track, from, to)) = self.last_take else {
+            self.status = t("status.no_take").into();
+            return;
+        };
+        let grid = self.snap_ticks().max(self.ppq() as i64 / 4) as u64;
+        let ops = {
+            let mut sh = lock_shared(&self.shared);
+            if track >= sh.doc.tracks.len() {
+                drop(sh);
+                self.status = t("status.no_take").into();
+                return;
+            }
+            sh.doc.quantize_ops(track, from, to, grid, 100)
+        };
+        if ops.is_empty() {
+            self.status = t("status.no_take").into();
+            return;
+        }
+        self.apply_tx("quantize take", ops);
+        self.status = t("status.fixed").into();
     }
 
     fn rescan_plugins(&mut self, mode: ScanMode) {
@@ -6739,6 +6914,11 @@ struct Prefs {
     metronome: bool,
     #[serde(default)]
     loop_enabled: bool,
+    /// None in old sidecars = keep the default (overdub)
+    rec_mode: Option<String>,
+    /// punch bounds in ticks — None = not set
+    punch_in: Option<u64>,
+    punch_out: Option<u64>,
     /// None in old sidecars = keep the default (off)
     chase_sysex: Option<bool>,
     /// None in old sidecars = keep the default (`SysexPolicy::Serialize`)
@@ -6783,6 +6963,9 @@ impl Default for Prefs {
             loop_enabled: false,
             chase_sysex: None,
             sysex_policy: None,
+            rec_mode: None,
+            punch_in: None,
+            punch_out: None,
             zoom: None,
             scroll_x: None,
             scroll_y: None,
@@ -6955,6 +7138,12 @@ impl EditorView {
                 sh.sysex_policy = sp;
             }
         }
+        if let Some(m) = p.rec_mode.as_deref().and_then(RecMode::from_label) {
+            self.rec_mode = m;
+        }
+        self.punch_in = p.punch_in;
+        self.punch_out = p.punch_out;
+        self.last_take = None;
         // a hand-edited or corrupted sidecar must not blank the roll: a NaN
         // or non-positive zoom makes every coordinate NaN (nothing paints)
         if let Some(z) = p.zoom {
@@ -7117,6 +7306,9 @@ impl EditorView {
             loop_enabled: sh.loop_enabled,
             chase_sysex: Some(sh.chase_sysex),
             sysex_policy: Some(sh.sysex_policy.label().to_string()),
+            rec_mode: Some(self.rec_mode.label().to_string()),
+            punch_in: self.punch_in,
+            punch_out: self.punch_out,
             zoom: Some(self.zoom),
             scroll_x: Some(self.scroll_x),
             scroll_y: Some(self.scroll_y),
