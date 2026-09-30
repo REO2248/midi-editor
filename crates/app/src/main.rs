@@ -2499,8 +2499,12 @@ fn load_document(path: &std::path::Path) -> Result<(Document, Vec<String>), Stri
 
 /// App-wide preferences: recent files + record count-in + recording source.
 /// Stored at %APPDATA%/midi-editor/prefs.json (unlike the per-song sidecar).
+/// `schema_version` 0 = written before versioning existed; serde(default)
+/// keeps older/newer files loading instead of failing on missing fields.
 #[derive(serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
 struct GlobalPrefs {
+    schema_version: u32,
     recent: Vec<String>,
     count_in: bool,
     /// MIDI input port name to record from; empty = first available port
@@ -2534,9 +2538,12 @@ impl GlobalPrefs {
 /// Session state that cannot live inside the SMF: per-track output
 /// assignments (by stable destination identity, not runtime index), mute/solo,
 /// metronome/loop, view transform. Written next to the document as
-/// `song.mid.editor.json`.
+/// `song.mid.editor.json`. `schema_version` anchors future migrations
+/// (see docs/UPGRADING.md); 0 = written before versioning existed.
 #[derive(serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
 struct Prefs {
+    schema_version: u32,
     default_dest: Option<output::Destination>,
     track_dest: HashMap<usize, output::Destination>,
     muted: Vec<usize>,
@@ -2671,6 +2678,7 @@ impl EditorView {
 
     fn save_global(&self) {
         GlobalPrefs {
+            schema_version: 1,
             recent: self.recent.iter().map(|r| r.to_string()).collect(),
             count_in: self.count_in,
             midi_in: self.midi_in.to_string(),
@@ -2684,6 +2692,7 @@ impl EditorView {
             return;
         };
         let prefs = Prefs {
+            schema_version: 1,
             default_dest: sh.dests.get(sh.default_dest).map(|(_, d)| d.clone()),
             track_dest: sh
                 .track_dest
@@ -2730,6 +2739,20 @@ impl EditorView {
 }
 
 fn main() {
+    // exact build identity for bug reports — same string as Help>About and
+    // MCP serverInfo: "<semver>+<commit>[.dirty]"
+    if std::env::args_os()
+        .skip(1)
+        .any(|a| a == "--version" || a == "-V")
+    {
+        println!(
+            "midi-editor {} ({} {})",
+            env!("BUILD_IDENTITY"),
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
+        return;
+    }
     output::init_env();
     std::panic::set_hook(Box::new(|i| eprintln!("panic: {i}")));
     let path = std::env::args().nth(1).map(PathBuf::from);

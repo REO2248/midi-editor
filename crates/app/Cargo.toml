@@ -1,6 +1,7 @@
 [package]
 name = "midi-editor"
 edition.workspace = true
+version.workspace = true
 license.workspace = true
 description = "Pure-SMF MIDI editor — gpui app"
 

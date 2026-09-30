@@ -1995,7 +1995,7 @@ impl Render for EditorView {
                     Self::mi("h.about", t("help.about"), "", None, cx, |v, _e, _cx| {
                         v.status = concat!(
                             "midi-editor ",
-                            env!("CARGO_PKG_VERSION"),
+                            env!("BUILD_IDENTITY"),
                             " — pure-SMF editor"
                         )
                         .into();
