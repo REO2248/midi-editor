@@ -176,7 +176,6 @@ static EN: &[(&str, &str)] = &[
     ("plugin.phase_load", "plugin load"),
     ("plugin.phase_audio", "audio start"),
     ("status.rescan", "rescanned: {n} destination(s)"),
-<<<<<<< HEAD
     ("guard.unsaved", "You have unsaved changes."),
     (
         "guard.unsaved_rec",
@@ -397,7 +396,6 @@ static JA: &[(&str, &str)] = &[
     ("tip.zout", "ズームアウト (Ctrl+-)"),
     ("tip.dest", "選択トラックの出力先"),
     ("tip.gui", "プラグインGUI"),
-<<<<<<< HEAD
     ("guard.unsaved", "保存されていない変更があります。"),
     (
         "guard.unsaved_rec",
