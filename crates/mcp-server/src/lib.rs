@@ -169,6 +169,9 @@ pub struct Shared {
     /// opt-in: also chase the last complete SysEx message on play/loop wrap
     /// (a chased GM/GS/XG reset can wipe the channel-state chase)
     pub chase_sysex: bool,
+    /// the GUI drains `transport_req` and repaints on `gui_notify`; false in
+    /// standalone `mcp-bridge --file` mode (feature-detected via editor_info)
+    pub gui_attached: bool,
     /// drained by the GUI watcher
     pub transport_req: Vec<TransportReq>,
     /// effective security posture of the MCP transport serving this doc
@@ -199,6 +202,7 @@ impl Shared {
             metronome: false,
             loop_enabled: false,
             chase_sysex: false,
+            gui_attached: false,
             transport_req: Vec::new(),
             mcp_security: SecurityReport::stdio(),
         }
@@ -281,6 +285,26 @@ const MAX_CONCURRENT_REQUESTS: usize = 16;
 /// produced up front, so this bounds time-to-response, not stream lifetime.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Contract version of the whole MCP tool surface. Bump on ANY breaking
+/// change: renaming/removing a tool, renaming required arguments, or
+/// narrowing a response. Additive changes (new tool, new optional arg, new
+/// response field) don't require a bump — but the checked-in schema
+/// snapshot test still fails on every surface diff, so even additive
+/// changes are deliberate.
+pub const MCP_SURFACE_VERSION: u32 = 1;
+
+/// One tool's contract metadata as advertised by `editor_info` and covered
+/// by the schema snapshot test. `version` starts at 1 and is bumped when
+/// the tool's input schema or response shape changes incompatibly;
+/// `deprecated` is set when a tool is scheduled for removal (value = what
+/// to use instead) so agents can migrate before it disappears.
+pub struct ToolSpec {
+    pub name: &'static str,
+    pub version: u32,
+    pub deprecated: Option<&'static str>,
+    pub tool: Tool,
+}
+
 fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
     let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
     if !s.len().is_multiple_of(2) || s.len() / 2 > MAX_HEX_BYTES {
@@ -322,6 +346,63 @@ fn note_json(n: &document::Note) -> serde_json::Value {
     serde_json::json!({
         "track": n.track, "channel": n.channel, "key": n.key, "vel": n.vel,
         "start": n.start_tick, "end": n.end_tick, "on_id": n.on_id, "off_id": n.off_id,
+    })
+}
+
+/// The `editor_info` response — one call gives an agent everything it needs
+/// to feature-detect the running editor and its tool surface instead of
+/// probing behavior through trial-and-error mutations.
+fn editor_info_json(sh: &Shared) -> serde_json::Value {
+    let division = match sh.doc.division {
+        smf_core::Division::Metrical(ppq) => {
+            serde_json::json!({"kind": "metrical", "ppq": ppq})
+        }
+        smf_core::Division::Smpte {
+            fps,
+            ticks_per_frame,
+        } => serde_json::json!({"kind": "smpte", "fps": fps, "ticks_per_frame": ticks_per_frame}),
+    };
+    serde_json::json!({
+        "name": "midi-editor",
+        "version": env!("CARGO_PKG_VERSION"),
+        "commit": env!("MIDI_EDITOR_COMMIT"),
+        "mcp_surface_version": MCP_SURFACE_VERSION,
+        "transports": ["streamable-http", "stdio-bridge"],
+        "document": {
+            "format": sh.doc.format,
+            "division": division,
+            "tracks": sh.doc.tracks.len(),
+            "revision": sh.doc.revision(),
+        },
+        "features": {
+            "smf": {
+                "formats": [0, 1, 2],
+                "sysex": true,
+                "escape_events": true,
+                "byte_exact_roundtrip": true,
+                "text_encodings": ["auto", "utf-8", "shift-jis", "latin-1"],
+            },
+            "destinations": ["midi_port", "vst3"],
+            "editing": {
+                "undo": true,
+                "redo": true,
+                "dry_run": true,
+                "base_revision": true,
+                "atomic_transactions": true,
+            },
+            // these only work while the desktop app hosts the document
+            "transport": sh.gui_attached,
+            "midi_recording": sh.gui_attached,
+            "vst3_host": sh.gui_attached,
+        },
+        "tools": tool_specs()
+            .iter()
+            .map(|s| serde_json::json!({
+                "name": s.name,
+                "version": s.version,
+                "deprecated": s.deprecated,
+            }))
+            .collect::<Vec<_>>(),
     })
 }
 
@@ -619,10 +700,10 @@ impl ServerHandler for MidiService {
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        tool_defs()
+        tool_specs()
             .into_iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, t)| t)
+            .find(|s| s.name == name)
+            .map(|s| s.tool)
     }
 
     fn list_tools(
@@ -631,7 +712,7 @@ impl ServerHandler for MidiService {
         _ctx: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, McpError>> + '_ {
         std::future::ready(Ok(ListToolsResult::with_all_items(
-            tool_defs().into_iter().map(|(_, t)| t).collect(),
+            tool_specs().into_iter().map(|s| s.tool).collect(),
         )))
     }
 
@@ -648,329 +729,259 @@ impl ServerHandler for MidiService {
     }
 }
 
-fn tool_defs() -> Vec<(&'static str, Tool)> {
+/// The tool registry — single source for `list_tools`, dispatch, the
+/// `editor_info` feature report, and the schema snapshot test. Every tool
+/// starts at `version: 1`; bump on breaking schema changes and set
+/// `deprecated` (with a migration hint) before removing one.
+pub fn tool_specs() -> Vec<ToolSpec> {
+    let spec = |name: &'static str, description: &str, schema: serde_json::Value| ToolSpec {
+        name,
+        version: 1,
+        deprecated: None,
+        tool: tool(name, description, schema),
+    };
     vec![
-        (
+        spec(
+            "editor_info",
+            "Editor capabilities contract: semver, commit/build id, MCP surface version, supported SMF features, destination kinds, live-feature flags (transport/undo/dry_run/base_revision), and the per-tool version/deprecation table. Call first for feature detection.",
+            object_schema(serde_json::json!({})),
+        ),
+        spec(
             "document_summary",
-            tool(
-                "document_summary",
-                "JSON summary: format/division, per-track names+counts, note count, duration, revision, dirty flag",
-                object_schema(serde_json::json!({})),
-            ),
+            "JSON summary: format/division, per-track names+counts, note count, duration, revision, dirty flag",
+            object_schema(serde_json::json!({})),
         ),
-        (
+        spec(
             "list_notes",
-            tool(
-                "list_notes",
-                "Paired note view (NoteOn+NoteOff). Args: track?, from_tick?, to_tick?, limit?",
-                object_schema(serde_json::json!({
-                    "track": {"type": "integer"},
-                    "from_tick": {"type": "integer"},
-                    "to_tick": {"type": "integer"},
-                    "limit": {"type": "integer"},
-                })),
-            ),
+            "Paired note view (NoteOn+NoteOff). Args: track?, from_tick?, to_tick?, limit?",
+            object_schema(serde_json::json!({
+                "track": {"type": "integer"},
+                "from_tick": {"type": "integer"},
+                "to_tick": {"type": "integer"},
+                "limit": {"type": "integer"},
+            })),
         ),
-        (
+        spec(
             "query_events",
-            tool(
-                "query_events",
-                "Raw SMF events (id, tick, seq, kind, raw_hex). Args: track?, from_tick?, to_tick?, limit?, offset?",
-                object_schema(serde_json::json!({
-                    "track": {"type": "integer"},
-                    "from_tick": {"type": "integer"},
-                    "to_tick": {"type": "integer"},
-                    "limit": {"type": "integer"},
-                    "offset": {"type": "integer"},
-                })),
-            ),
+            "Raw SMF events (id, tick, seq, kind, raw_hex). Args: track?, from_tick?, to_tick?, limit?, offset?",
+            object_schema(serde_json::json!({
+                "track": {"type": "integer"},
+                "from_tick": {"type": "integer"},
+                "to_tick": {"type": "integer"},
+                "limit": {"type": "integer"},
+                "offset": {"type": "integer"},
+            })),
         ),
-        (
+        spec(
             "diagnostics",
-            tool(
-                "diagnostics",
-                "Import-quality findings over the raw event layer: dangling noteOn, zero-length notes, missing End-of-Track, tempo events outside the conductor track. Each has code/track/tick/event_id + detail.",
-                object_schema(serde_json::json!({})),
-            ),
+            "Import-quality findings over the raw event layer: dangling noteOn, zero-length notes, missing End-of-Track, tempo events outside the conductor track. Each has code/track/tick/event_id + detail.",
+            object_schema(serde_json::json!({})),
         ),
-        (
+        spec(
             "normalize",
-            tool(
-                "normalize",
-                "Resolve import-quality findings as one undo step. Args: codes? (array of diagnostic codes; omitted = fix all). Returns resolved/failed counts.",
-                object_schema(serde_json::json!({"codes": {"type": "array", "items": {"type": "string"}}})),
-            ),
+            "Resolve import-quality findings as one undo step. Args: codes? (array of diagnostic codes; omitted = fix all). Returns resolved/failed counts.",
+            object_schema(serde_json::json!({"codes": {"type": "array", "items": {"type": "string"}}})),
         ),
-        (
+        spec(
             "apply_patch",
-            tool(
-                "apply_patch",
-                "Atomic edit as one undo step. Optional base_revision: when given it must match document_summary.revision (optimistic concurrency) \
-                 (optimistic concurrency). dry_run:true returns the op breakdown without applying. ops: insert_note {track,key,vel,start,dur,channel} | \
-                 insert_events {track,events:[{tick,seq,kind:{channel|meta|sysex_hex}}]} | \
-                 remove_events {ids} | move_note {on_id,dtick,dkey,dur_dtick} | \
-                 set_tempo {tick,bpm}",
-                object_schema(serde_json::json!({
-                    "base_revision": {"type": "integer"},
-                    "label": {"type": "string"},
-                    "dry_run": {"type": "boolean"},
-                    "ops": {"type": "array", "items": {"type": "object"}},
-                })),
-            ),
+            "Atomic edit as one undo step. Optional base_revision: when given it must match document_summary.revision (optimistic concurrency). \
+             dry_run:true returns the op breakdown without applying. ops: insert_note {track,key,vel,start,dur,channel} | \
+             insert_events {track,events:[{tick,seq,kind:{channel|meta|sysex_hex}}]} | \
+             remove_events {ids} | move_note {on_id,dtick,dkey,dur_dtick} | \
+             set_tempo {tick,bpm}",
+            object_schema(serde_json::json!({
+                "base_revision": {"type": "integer"},
+                "label": {"type": "string"},
+                "dry_run": {"type": "boolean"},
+                "ops": {"type": "array", "items": {"type": "object"}},
+            })),
         ),
-        (
+        spec(
             "undo",
-            tool("undo", "Revert the last transaction (shared with GUI edits)", object_schema(serde_json::json!({}))),
+            "Revert the last transaction (shared with GUI edits)",
+            object_schema(serde_json::json!({})),
         ),
-        (
+        spec(
             "redo",
-            tool("redo", "Replay the last undone transaction", object_schema(serde_json::json!({}))),
+            "Replay the last undone transaction",
+            object_schema(serde_json::json!({})),
         ),
-        (
+        spec(
             "save",
-            tool(
-                "save",
-                "Serialize the document to SMF and write it. Args: path? (defaults to the document's open path)",
-                object_schema(serde_json::json!({"path": {"type": "string"}})),
-            ),
+            "Serialize the document to SMF and write it. Args: path? (defaults to the document's open path)",
+            object_schema(serde_json::json!({"path": {"type": "string"}})),
         ),
-        (
+        spec(
             "get_tempo_map",
-            tool(
-                "get_tempo_map",
-                "Tempo breakpoints: [{tick, us_per_quarter, bpm, cumulative_us}] + ppq. Read before editing tempo or converting ticks<->time.",
-                object_schema(serde_json::json!({})),
-            ),
+            "Tempo breakpoints: [{tick, us_per_quarter, bpm, cumulative_us}] + ppq. Read before editing tempo or converting ticks<->time.",
+            object_schema(serde_json::json!({})),
         ),
-        (
+        spec(
             "get_meta",
-            tool(
-                "get_meta",
-                "Meta events (names, markers, lyrics, text, tempo, time-sig) with text decoded (UTF-8/SJIS). Args: track?, meta_type? (hex int)",
-                object_schema(serde_json::json!({
-                    "track": {"type": "integer"},
-                    "meta_type": {"type": "integer"},
-                })),
-            ),
+            "Meta events (names, markers, lyrics, text, tempo, time-sig) with text decoded (UTF-8/SJIS). Args: track?, meta_type? (hex int)",
+            object_schema(serde_json::json!({
+                "track": {"type": "integer"},
+                "meta_type": {"type": "integer"},
+            })),
         ),
-        (
+        spec(
             "get_cc",
-            tool(
-                "get_cc",
-                "Latest controller value per (track, channel, cc) — the current CC state. Args: track?, channel?, cc?",
-                object_schema(serde_json::json!({
-                    "track": {"type": "integer"},
-                    "channel": {"type": "integer"},
-                    "cc": {"type": "integer"},
-                })),
-            ),
+            "Latest controller value per (track, channel, cc) — the current CC state. Args: track?, channel?, cc?",
+            object_schema(serde_json::json!({
+                "track": {"type": "integer"},
+                "channel": {"type": "integer"},
+                "cc": {"type": "integer"},
+            })),
         ),
-        (
+        spec(
             "list_midi_ports",
-            tool(
-                "list_midi_ports",
-                "Enumerate real MIDI outputs/inputs on this machine (WinMM): [{index, name}]. Use names in set_track_destination.",
-                object_schema(serde_json::json!({})),
-            ),
+            "Enumerate real MIDI outputs/inputs on this machine (WinMM): [{index, name}]. Use names in set_track_destination.",
+            object_schema(serde_json::json!({})),
         ),
-        (
+        spec(
             "list_destinations",
-            tool(
-                "list_destinations",
-                "Output routing: catalog [{index, label, kind, port_name|plugin_path}], default_dest, per-track overrides, mute/solo.",
-                object_schema(serde_json::json!({})),
-            ),
+            "Output routing: catalog [{index, label, kind, port_name|plugin_path}], default_dest, per-track overrides, mute/solo.",
+            object_schema(serde_json::json!({})),
         ),
-        (
+        spec(
             "set_track_destination",
-            tool(
-                "set_track_destination",
-                "Route a track to an output. Args: track, destination: {\"midi_port\":\"<name>\"} | {\"vst3\":\"<bundle path>\"} | \"default\" (inherit). Unknown destinations are remembered and fail at play time.",
-                object_schema(serde_json::json!({
-                    "track": {"type": "integer"},
-                    "destination": {},
-                })),
-            ),
+            "Route a track to an output. Args: track, destination: {\"midi_port\":\"<name>\"} | {\"vst3\":\"<bundle path>\"} | \"default\" (inherit). Unknown destinations are remembered and fail at play time.",
+            object_schema(serde_json::json!({
+                "track": {"type": "integer"},
+                "destination": {},
+            })),
         ),
-        (
+        spec(
             "transport",
-            tool(
-                "transport",
-                "Ask the GUI transport: {action: \"play\"|\"stop\"|\"seek\", tick?}. Only works while the app is running.",
-                object_schema(serde_json::json!({
-                    "action": {"type": "string"},
-                    "tick": {"type": "integer"},
-                })),
-            ),
+            "Ask the GUI transport: {action: \"play\"|\"stop\"|\"seek\", tick?}. Only works while the app is running.",
+            object_schema(serde_json::json!({
+                "action": {"type": "string"},
+                "tick": {"type": "integer"},
+            })),
         ),
-        (
+        spec(
             "quantize",
-            tool(
-                "quantize",
-                "Snap note onsets to a grid (duration preserved). Args: track? (all when omitted), from?, to?, grid? (ticks, default ppq/4), strength? (0-100, default 100). Optional base_revision.",
-                object_schema(serde_json::json!({
-                    "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
-                    "grid": {"type": "integer"}, "strength": {"type": "integer"},
-                    "base_revision": {"type": "integer"},
-                })),
-            ),
+            "Snap note onsets to a grid (duration preserved). Args: track? (all when omitted), from?, to?, grid? (ticks, default ppq/4), strength? (0-100, default 100). Optional base_revision.",
+            object_schema(serde_json::json!({
+                "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
+                "grid": {"type": "integer"}, "strength": {"type": "integer"},
+                "base_revision": {"type": "integer"},
+            })),
         ),
-        (
+        spec(
             "transpose",
-            tool(
-                "transpose",
-                "Shift note pitch. Args: track?, from?, to?, semitones (+/-). Notes leaving 0..127 are skipped. Optional base_revision.",
-                object_schema(serde_json::json!({
-                    "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
-                    "semitones": {"type": "integer"}, "base_revision": {"type": "integer"},
-                })),
-            ),
+            "Shift note pitch. Args: track?, from?, to?, semitones (+/-). Notes leaving 0..127 are skipped. Optional base_revision.",
+            object_schema(serde_json::json!({
+                "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
+                "semitones": {"type": "integer"}, "base_revision": {"type": "integer"},
+            })),
         ),
-        (
+        spec(
             "scale_velocity",
-            tool(
-                "scale_velocity",
-                "Multiply note velocities. Args: track?, from?, to?, factor (e.g. 1.2 = +20%). Optional base_revision.",
-                object_schema(serde_json::json!({
-                    "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
-                    "factor": {"type": "number"}, "base_revision": {"type": "integer"},
-                })),
-            ),
+            "Multiply note velocities. Args: track?, from?, to?, factor (e.g. 1.2 = +20%). Optional base_revision.",
+            object_schema(serde_json::json!({
+                "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
+                "factor": {"type": "number"}, "base_revision": {"type": "integer"},
+            })),
         ),
-        (
+        spec(
             "set_channel",
-            tool(
-                "set_channel",
-                "Retarget all channel events in range to one channel. Args: track, from?, to?, channel (1-16). Optional base_revision.",
-                object_schema(serde_json::json!({
-                    "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
-                    "channel": {"type": "integer"}, "base_revision": {"type": "integer"},
-                })),
-            ),
+            "Retarget all channel events in range to one channel. Args: track, from?, to?, channel (1-16). Optional base_revision.",
+            object_schema(serde_json::json!({
+                "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
+                "channel": {"type": "integer"}, "base_revision": {"type": "integer"},
+            })),
         ),
-        (
+        spec(
             "set_program",
-            tool(
-                "set_program",
-                "Program change (with optional bank CC0/CC32) on a track. Args: track, tick, program (0-127), channel? (default track channel), bank_msb?, bank_lsb?. Optional base_revision.",
-                object_schema(serde_json::json!({
-                    "track": {"type": "integer"}, "tick": {"type": "integer"},
-                    "program": {"type": "integer"}, "channel": {"type": "integer"},
-                    "bank_msb": {"type": "integer"}, "bank_lsb": {"type": "integer"},
-                    "base_revision": {"type": "integer"},
-                })),
-            ),
+            "Program change (with optional bank CC0/CC32) on a track. Args: track, tick, program (0-127), channel? (default track channel), bank_msb?, bank_lsb?. Optional base_revision.",
+            object_schema(serde_json::json!({
+                "track": {"type": "integer"}, "tick": {"type": "integer"},
+                "program": {"type": "integer"}, "channel": {"type": "integer"},
+                "bank_msb": {"type": "integer"}, "bank_lsb": {"type": "integer"},
+                "base_revision": {"type": "integer"},
+            })),
         ),
-        (
+        spec(
             "set_cc",
-            tool(
-                "set_cc",
-                "Insert controller events. Args: track, channel? (default track channel), points: [{tick, cc, value}] — or scalar {tick, cc, value}. Optional base_revision.",
-                object_schema(serde_json::json!({
-                    "track": {"type": "integer"}, "channel": {"type": "integer"},
-                    "tick": {"type": "integer"}, "cc": {"type": "integer"}, "value": {"type": "integer"},
-                    "points": {"type": "array", "items": {"type": "object"}},
-                    "base_revision": {"type": "integer"},
-                })),
-            ),
+            "Insert controller events. Args: track, channel? (default track channel), points: [{tick, cc, value}] — or scalar {tick, cc, value}. Optional base_revision.",
+            object_schema(serde_json::json!({
+                "track": {"type": "integer"}, "channel": {"type": "integer"},
+                "tick": {"type": "integer"}, "cc": {"type": "integer"}, "value": {"type": "integer"},
+                "points": {"type": "array", "items": {"type": "object"}},
+                "base_revision": {"type": "integer"},
+            })),
         ),
-        (
+        spec(
             "set_pitch_bend",
-            tool(
-                "set_pitch_bend",
-                "Insert a pitch-bend event. Args: track, tick, value (0..16383, 8192=center), channel?. Optional base_revision.",
-                object_schema(serde_json::json!({
-                    "track": {"type": "integer"}, "tick": {"type": "integer"},
-                    "value": {"type": "integer"}, "channel": {"type": "integer"},
-                    "base_revision": {"type": "integer"},
-                })),
-            ),
+            "Insert a pitch-bend event. Args: track, tick, value (0..16383, 8192=center), channel?. Optional base_revision.",
+            object_schema(serde_json::json!({
+                "track": {"type": "integer"}, "tick": {"type": "integer"},
+                "value": {"type": "integer"}, "channel": {"type": "integer"},
+                "base_revision": {"type": "integer"},
+            })),
         ),
-        (
+        spec(
             "set_tempo",
-            tool(
-                "set_tempo",
-                "Set/replace tempo at a tick (conductor track). Args: tick, bpm. Optional base_revision.",
-                object_schema(serde_json::json!({
-                    "tick": {"type": "integer"}, "bpm": {"type": "number"},
-                    "base_revision": {"type": "integer"},
-                })),
-            ),
+            "Set/replace tempo at a tick (conductor track). Args: tick, bpm. Optional base_revision.",
+            object_schema(serde_json::json!({
+                "tick": {"type": "integer"}, "bpm": {"type": "number"},
+                "base_revision": {"type": "integer"},
+            })),
         ),
-        (
+        spec(
             "set_time_signature",
-            tool(
-                "set_time_signature",
-                "Set/replace time signature at a tick. Args: tick, num (beats/bar), den (beat value 4=quarter,8=eighth). Optional base_revision.",
-                object_schema(serde_json::json!({
-                    "tick": {"type": "integer"}, "num": {"type": "integer"}, "den": {"type": "integer"},
-                    "base_revision": {"type": "integer"},
-                })),
-            ),
+            "Set/replace time signature at a tick. Args: tick, num (beats/bar), den (beat value 4=quarter,8=eighth). Optional base_revision.",
+            object_schema(serde_json::json!({
+                "tick": {"type": "integer"}, "num": {"type": "integer"}, "den": {"type": "integer"},
+                "base_revision": {"type": "integer"},
+            })),
         ),
-        (
+        spec(
             "set_track_channel",
-            tool(
-                "set_track_channel",
-                "Set the track's default channel (FF20 meta). Args: track, channel (1-16). Optional base_revision.",
-                object_schema(serde_json::json!({
-                    "track": {"type": "integer"}, "channel": {"type": "integer"},
-                    "base_revision": {"type": "integer"},
-                })),
-            ),
+            "Set the track's default channel (FF20 meta). Args: track, channel (1-16). Optional base_revision.",
+            object_schema(serde_json::json!({
+                "track": {"type": "integer"}, "channel": {"type": "integer"},
+                "base_revision": {"type": "integer"},
+            })),
         ),
-        (
+        spec(
             "set_track_name",
-            tool(
-                "set_track_name",
-                "Set track name (UTF-8 meta 0x03). Args: track, name. Optional base_revision.",
-                object_schema(serde_json::json!({
-                    "track": {"type": "integer"}, "name": {"type": "string"},
-                    "base_revision": {"type": "integer"},
-                })),
-            ),
+            "Set track name (UTF-8 meta 0x03). Args: track, name. Optional base_revision.",
+            object_schema(serde_json::json!({
+                "track": {"type": "integer"}, "name": {"type": "string"},
+                "base_revision": {"type": "integer"},
+            })),
         ),
-        (
+        spec(
             "add_track",
-            tool(
-                "add_track",
-                "Append a track (with optional name). Args: name?. Optional base_revision.",
-                object_schema(serde_json::json!({
-                    "name": {"type": "string"}, "base_revision": {"type": "integer"},
-                })),
-            ),
+            "Append a track (with optional name). Args: name?. Optional base_revision.",
+            object_schema(serde_json::json!({
+                "name": {"type": "string"}, "base_revision": {"type": "integer"},
+            })),
         ),
-        (
+        spec(
             "remove_track",
-            tool(
-                "remove_track",
-                "Remove a track entirely. Args: track. Optional base_revision.",
-                object_schema(serde_json::json!({
-                    "track": {"type": "integer"}, "base_revision": {"type": "integer"},
-                })),
-            ),
+            "Remove a track entirely. Args: track. Optional base_revision.",
+            object_schema(serde_json::json!({
+                "track": {"type": "integer"}, "base_revision": {"type": "integer"},
+            })),
         ),
-        (
+        spec(
             "delete_range",
-            tool(
-                "delete_range",
-                "Delete channel events in [from,to) (notes delete whole). Args: track, from, to. Optional base_revision.",
-                object_schema(serde_json::json!({
-                    "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
-                    "base_revision": {"type": "integer"},
-                })),
-            ),
+            "Delete channel events in [from,to) (notes delete whole). Args: track, from, to. Optional base_revision.",
+            object_schema(serde_json::json!({
+                "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
+                "base_revision": {"type": "integer"},
+            })),
         ),
-        (
+        spec(
             "duplicate_range",
-            tool(
-                "duplicate_range",
-                "Copy channel events in [from,to) to start at `to`. Args: track, from, to. Optional base_revision.",
-                object_schema(serde_json::json!({
-                    "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
-                    "base_revision": {"type": "integer"},
-                })),
-            ),
+            "Copy channel events in [from,to) to start at `to`. Args: track, from, to. Optional base_revision.",
+            object_schema(serde_json::json!({
+                "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
+                "base_revision": {"type": "integer"},
+            })),
         ),
     ]
 }
@@ -980,6 +991,7 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
     // must not take down every later request
     let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
     match name {
+        "editor_info" => ok_json(editor_info_json(&sh)),
         "document_summary" => ok_json(summary_json(&sh)),
         "diagnostics" => {
             let diags = sh.doc.diagnose();
@@ -2156,6 +2168,41 @@ mod tests {
 
     fn note_count(shared: &SharedDoc) -> usize {
         shared.lock().unwrap().doc.notes().len()
+    }
+
+    #[test]
+    fn editor_info_reports_contract() {
+        let sh = shared();
+        let (err, v) = call(&sh, "editor_info", json!({}));
+        assert!(!err);
+        assert_eq!(v["name"], "midi-editor");
+        assert!(v["version"].as_str().unwrap().contains('.'));
+        assert!(v["commit"].as_str().is_some());
+        assert_eq!(v["mcp_surface_version"], MCP_SURFACE_VERSION);
+        assert_eq!(v["document"]["revision"], 0);
+        assert_eq!(v["features"]["editing"]["base_revision"], true);
+        // standalone (test) mode: no GUI-hosted features
+        assert_eq!(v["features"]["transport"], false);
+        // every listed tool is dispatchable and carries contract metadata
+        let tools = v["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), tool_specs().len());
+        for t in tools {
+            assert!(t["version"].as_u64().unwrap() >= 1);
+            assert!(t["name"].as_str().is_some());
+        }
+        assert!(tools.iter().any(|t| t["name"] == "apply_patch"));
+    }
+
+    #[test]
+    fn every_spec_is_listed_and_dispatchable() {
+        // the registry is the single source of truth for the tool surface
+        let names: Vec<_> = tool_specs().iter().map(|s| s.name).collect();
+        assert_eq!(names.len(), {
+            let mut n = names.clone();
+            n.sort();
+            n.dedup();
+            n.len()
+        });
     }
 
     #[test]

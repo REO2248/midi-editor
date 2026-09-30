@@ -497,6 +497,7 @@ impl EditorView {
         };
         let mut sh = Shared::new(doc);
         sh.path = path.clone();
+        sh.gui_attached = true;
         let initial_plugins = output::discover_plugin_paths();
         sh.dests = build_dest_catalog(&initial_plugins);
         let g = GlobalPrefs::load();
