@@ -748,7 +748,6 @@ impl Render for EditorView {
                         let events = self.events.clone();
                         let ev_ids = self.ev_ids.clone();
                         let meta_sel = self.meta_sel;
-                        let view_weak = cx.weak_entity();
                         let start = self.ev_first.min(events.len());
                         // fixed 18px rows: a 120-row window covers any panel
                         // height; uniform_list children can't receive input in
@@ -769,15 +768,12 @@ impl Render for EditorView {
                                     .bg(if sel { rgb(0x2b3d4f) } else { rgb(0x000000) })
                                     .text_color(rgb(0xb8b8c8));
                                 if let Some((tr, id, tick, mt)) = meta {
-                                    let weak = view_weak.clone();
                                     row = row.cursor_pointer().on_mouse_down(
                                         MouseButton::Left,
-                                        move |_e, _w, app| {
-                                            let _ = weak.update_in(app, |v, w, cx| {
-                                                v.meta_sel = Some((tr, id));
-                                                v.open_meta_edit(tr, tick, mt, id, w, cx);
-                                            });
-                                        },
+                                        cx.listener(move |v, _e, w, cx| {
+                                            v.meta_sel = Some((tr, id));
+                                            v.open_meta_edit(tr, tick, mt, id, w, cx);
+                                        }),
                                     );
                                 }
                                 row.child(events[i].clone())
@@ -2947,7 +2943,7 @@ impl Render for EditorView {
                     (false, false, "1") => this.set_tool(Tool::Select, cx),
                     (false, false, "2") => this.set_tool(Tool::Draw, cx),
                     (false, false, "3") => this.set_tool(Tool::Erase, cx),
-                    (false, false, " ") => this.toggle_play(cx),
+                    (false, false, " ") | (false, false, "space") => this.toggle_play(cx),
                     _ => {}
                 }
             }))
