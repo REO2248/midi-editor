@@ -21,6 +21,11 @@ tracing.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
 
+[dev-dependencies]
+# turns `TestSupportExt::test_support()` on: elements opted in via
+# `.test_support()` expose role/label/state snapshots in test windows.
+gpui-kit = { workspace = true, features = ["test-support"] }
+
 [[bin]]
 name = "midi-editor"
 path = "src/main.rs"
