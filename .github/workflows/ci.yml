@@ -23,7 +23,8 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
       - name: Test
-        run: cargo test -p smf-core -p document -p commands -p mcp-server -p midi-io -p midi-editor --locked      - name: Build workspace (gpui app needs Windows)
+        run: cargo test -p smf-core -p document -p commands -p mcp-server -p midi-io -p midi-editor --locked
+      - name: Build workspace (gpui app needs Windows)
         run: cargo build --workspace --locked
 
   fuzz-smoke:
@@ -51,7 +52,8 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
-  coverage:    runs-on: windows-latest
+  coverage:
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -94,7 +96,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable      - name: Cache cargo
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
