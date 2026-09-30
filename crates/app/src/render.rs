@@ -2116,6 +2116,27 @@ impl Render for EditorView {
                                 .into_any_element(),
                             );
                         }
+                        // manual input-latency compensation, cycles presets
+                        rows.push(
+                            Self::mi_leaf(
+                                "in.lat",
+                                tf(
+                                    "output.in_latency",
+                                    &[("ms", self.in_latency_ms.to_string().as_str())],
+                                ),
+                                "",
+                                None,
+                                cx,
+                                |v, _e, _cx| {
+                                    const STEPS: [u64; 7] = [0, 1, 2, 5, 10, 20, 50];
+                                    let i =
+                                        STEPS.iter().position(|&s| s == v.in_latency_ms).unwrap_or(0);
+                                    v.in_latency_ms = STEPS[(i + 1) % STEPS.len()];
+                                    v.save_global();
+                                },
+                            )
+                            .into_any_element(),
+                        );
                         rows
                     }
                     Sub::Lane => {
