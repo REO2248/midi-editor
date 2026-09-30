@@ -187,6 +187,9 @@ pub struct Shared {
     /// last agent-originated committed transaction — the GUI watches this to
     /// show "MCP: <label>" in the status bar
     pub last_mcp_tx: Option<TxRecord>,
+    /// file-write scope for `save` — stamped by the transport entry point;
+    /// defaults to the stricter HTTP policy
+    pub fs_scope: FsScope,
 }
 
 /// A named edit checkpoint. While open, every edit tool stages its ops on
@@ -304,6 +307,7 @@ impl Shared {
             batch: None,
             history: std::collections::VecDeque::new(),
             last_mcp_tx: None,
+            fs_scope: FsScope::Http,
         }
     }
 
@@ -748,6 +752,95 @@ pub struct ToolSpec {
     pub version: u32,
     pub deprecated: Option<&'static str>,
     pub tool: Tool,
+}
+
+/// Which transport the document is being served over — the file-write
+/// policy differs because stdio inherits the spawning client's trust while
+/// HTTP may be reached by any local process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FsScope {
+    /// Embedded HTTP server: explicit `path` args must land under the
+    /// document's directory or `MIDI_MCP_ALLOWED_ROOTS`.
+    Http,
+    /// Standalone stdio (`mcp-bridge --file`): additionally allows the
+    /// working directory, plus `MIDI_MCP_STDIO_ALLOWED_ROOTS`.
+    Stdio,
+}
+
+/// `;`-separated directory list from an env var, canonicalized.
+/// Unresolvable entries are dropped rather than trusted.
+fn roots_from_env(var: &str) -> Vec<PathBuf> {
+    std::env::var(var)
+        .unwrap_or_default()
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| std::fs::canonicalize(s).ok())
+        .collect()
+}
+
+/// Canonicalize a write target: an existing file resolves fully (symlinks,
+/// junctions, `..` — everything); a new file resolves through its parent so
+/// a link inside the parent can't smuggle the write elsewhere.
+fn canonical_for_write(path: &std::path::Path) -> Result<PathBuf, String> {
+    if let Ok(c) = std::fs::canonicalize(path) {
+        return Ok(c);
+    }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| format!("{} has no directory component", path.display()))?;
+    let canon_dir = std::fs::canonicalize(parent)
+        .map_err(|e| format!("cannot resolve {}: {e}", parent.display()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("{} has no file name", path.display()))?;
+    Ok(canon_dir.join(name))
+}
+
+/// Resolve `path` against the save policy: canonicalize first, *then* check
+/// containment — the order matters, authorization on a non-canonical path is
+/// what traversal attacks exploit. Returns the canonical path to write.
+fn authorize_write(
+    doc_path: &Option<PathBuf>,
+    scope: FsScope,
+    extra_roots: &[PathBuf],
+    path: &std::path::Path,
+) -> Result<PathBuf, String> {
+    let canon = canonical_for_write(path)?;
+    let mut roots: Vec<PathBuf> = Vec::new();
+    // the current document's own directory is always writable
+    if let Some(dp) = doc_path {
+        if let Some(dir) = dp.parent() {
+            if let Ok(d) = std::fs::canonicalize(dir) {
+                roots.push(d);
+            }
+        }
+    }
+    if scope == FsScope::Stdio {
+        if let Ok(cwd) = std::env::current_dir().and_then(|d| std::fs::canonicalize(d)) {
+            roots.push(cwd);
+        }
+    }
+    roots.extend(extra_roots.iter().cloned());
+    if roots.iter().any(|r| canon.starts_with(r)) {
+        Ok(canon)
+    } else {
+        let env_var = match scope {
+            FsScope::Http => "MIDI_MCP_ALLOWED_ROOTS",
+            FsScope::Stdio => "MIDI_MCP_STDIO_ALLOWED_ROOTS",
+        };
+        Err(format!(
+            "{} is outside the MCP save scope; allowed roots: {}; \
+             add a directory with {env_var}",
+            canon.display(),
+            roots
+                .iter()
+                .map(|r| r.display().to_string())
+                .collect::<Vec<_>>()
+                .join("; "),
+        ))
+    }
 }
 
 fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
@@ -1299,7 +1392,9 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ),
         spec(
             "save",
-            "Serialize the document to SMF and write it. Args: path? (defaults to the document's open path)",
+            "Serialize the document to SMF and write it. Args: path? (defaults to the document's open path; \
+             an explicit path must be under the document's directory — or MIDI_MCP_ALLOWED_ROOTS / \
+             MIDI_MCP_STDIO_ALLOWED_ROOTS)",
             object_schema(serde_json::json!({"path": {"type": "string"}})),
         ),
         spec(
@@ -1811,8 +1906,23 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
             }))
         }
         "save" => {
-            let path = args["path"].as_str().map(PathBuf::from);
+            let explicit = args["path"].as_str().map(PathBuf::from);
             let expect_revision = args["base_revision"].as_u64();
+            // an explicit path is a file-write primitive — scope it; the
+            // document's own path is always allowed (backwards compatible)
+            let path: Option<PathBuf> = match explicit {
+                Some(p) => {
+                    let extra = match sh.fs_scope {
+                        FsScope::Http => roots_from_env("MIDI_MCP_ALLOWED_ROOTS"),
+                        FsScope::Stdio => roots_from_env("MIDI_MCP_STDIO_ALLOWED_ROOTS"),
+                    };
+                    match authorize_write(&sh.path, sh.fs_scope, &extra, &p) {
+                        Ok(c) => Some(c),
+                        Err(e) => return err_json(e),
+                    }
+                }
+                None => sh.path.clone(),
+            };
             drop(sh); // never hold the editor lock across disk I/O
             match service::save_document(
                 &shared,
@@ -2339,6 +2449,9 @@ fn dests_json(sh: &Shared) -> serde_json::Value {
 
 /// Serve over stdio (standalone `--file` mode or tests).
 pub async fn serve_stdio(doc: SharedDoc) -> anyhow::Result<()> {
+    // stdio clients inherit the spawning process's trust — the scope loosens
+    // to also cover the working directory and its own env roots
+    doc.lock().unwrap_or_else(|e| e.into_inner()).fs_scope = FsScope::Stdio;
     let service = MidiService::new(doc)
         .serve(rmcp::transport::stdio())
         .await?;
@@ -3214,6 +3327,7 @@ mod tests {
     }
 
     // ---------- issue #10: auth ----------
+    // ---------- issue #16: file-system scope ----------
 
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir()
@@ -3350,6 +3464,23 @@ mod tests {
             _ => panic!("default must auto-provision a token file"),
         }
         std::env::remove_var("LOCALAPPDATA");
+    }
+
+    /// shared() pointed at a real temp dir as its document path
+    fn shared_in(dir: &std::path::Path) -> SharedDoc {
+        let sh = shared();
+        sh.lock().unwrap().path = Some(dir.join("song.mid"));
+        sh
+    }
+
+    #[test]
+    fn save_inside_doc_dir_writes() {
+        let dir = tmpdir("inside");
+        let sh = shared_in(&dir);
+        let out = dir.join("out.mid");
+        let (err, v) = call(&sh, "save", json!({"path": out.to_string_lossy()}));
+        assert!(!err, "{v}");
+        assert!(out.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3690,12 +3821,111 @@ mod tests {
     }
 
     #[test]
+    fn save_with_no_arg_uses_doc_path() {
+        let dir = tmpdir("noarg");
+        let sh = shared_in(&dir);
+        // no path arg → document path, always allowed even outside roots
+        let (err, v) = call(&sh, "save", json!({}));
+        assert!(!err, "{v}");
+        assert!(dir.join("song.mid").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_traversal_cannot_escape_root() {
+        let dir = tmpdir("trav");
+        let allowed = dir.join("allowed");
+        std::fs::create_dir_all(&allowed).unwrap();
+        let sh = shared_in(&allowed);
+        // `../..` out of the document dir must be canonicalized then rejected
+        let evil = allowed.join("..").join("..").join("evil.mid");
+        let (err, _) = call(&sh, "save", json!({"path": evil.to_string_lossy()}));
+        assert!(err);
+        assert!(
+            !dir.parent().unwrap().join("evil.mid").exists(),
+            "escaped write happened"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn diagnostics_report_total_and_truncation() {
         let sh = shared();
         let (err, v) = call(&sh, "diagnostics", json!({}));
         assert!(!err);
         assert_eq!(v["total"], v["count"]);
         assert_eq!(v["truncated"], false);
+    }
+
+    #[test]
+    fn save_outside_all_roots_is_actionable_error() {
+        let allowed = tmpdir("scope-a");
+        let elsewhere = tmpdir("scope-b");
+        let sh = shared_in(&allowed);
+        let target = elsewhere.join("x.mid");
+        let (err, text) = call_text(&sh, "save", json!({"path": target.to_string_lossy()}));
+        assert!(err);
+        assert!(text.contains("outside the MCP save scope"), "{text}");
+        assert!(text.contains("MIDI_MCP_ALLOWED_ROOTS"), "{text}");
+        assert!(!target.exists());
+        let _ = (std::fs::remove_dir_all(&allowed), std::fs::remove_dir_all(&elsewhere));
+    }
+
+    #[test]
+    fn save_via_reparse_point_cannot_escape() {
+        // directory junction needs no privilege on Windows — other
+        // platforms can't forge one here, so the test is Windows-only
+        #[cfg(windows)]
+        {
+            let dir = tmpdir("junction");
+            let allowed = dir.join("allowed");
+            let outside = dir.join("outside");
+            std::fs::create_dir_all(&allowed).unwrap();
+            std::fs::create_dir_all(&outside).unwrap();
+            std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(allowed.join("link"))
+                .arg(&outside)
+                .status()
+                .expect("mklink");
+            assert!(allowed.join("link").exists());
+            let sh = shared_in(&allowed);
+            // looks inside the allowed root, resolves outside it
+            let via_link = allowed.join("link").join("evil.mid");
+            let (err, text) =
+                call_text(&sh, "save", json!({"path": via_link.to_string_lossy()}));
+            assert!(err, "junction must be resolved before the root check");
+            assert!(text.contains("outside the MCP save scope"), "{text}");
+            assert!(!outside.join("evil.mid").exists());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn stdio_scope_also_allows_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        // parent must exist for canonicalization — use the cwd itself
+        let target = cwd.join("stdio-write.mid");
+        // HTTP scope refuses (not under doc dir or extra roots)
+        let none: Option<PathBuf> = None;
+        assert!(authorize_write(&none, FsScope::Http, &[], &target).is_err());
+        // stdio trusts the spawning client: cwd is an implicit root
+        assert!(authorize_write(&none, FsScope::Stdio, &[], &target).is_ok());
+    }
+
+    #[test]
+    fn env_roots_extend_the_scope() {
+        let dir = tmpdir("envroots");
+        let target = dir.join("ok.mid");
+        std::env::set_var("MIDI_MCP_ALLOWED_ROOTS", &dir);
+        let roots = roots_from_env("MIDI_MCP_ALLOWED_ROOTS");
+        std::env::remove_var("MIDI_MCP_ALLOWED_ROOTS");
+        let none: Option<PathBuf> = None;
+        assert_eq!(
+            authorize_write(&none, FsScope::Http, &roots, &target).unwrap(),
+            std::fs::canonicalize(&dir).unwrap().join("ok.mid")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

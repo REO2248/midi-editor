@@ -142,6 +142,14 @@ decoded), `get_cc` (latest CC value per track/channel/cc), `diagnostics`
 (import-quality findings), `list_midi_ports`, `list_destinations`,
 `transaction_status`.
 
+**File-write scope**: `save` with no `path` always writes the open
+document. An explicit `path` is scoped — it is canonicalized (following
+symlinks/junctions and `..`) and must land under the document's
+directory. Extra roots are opt-in via `MIDI_MCP_ALLOWED_ROOTS`
+(`;`-separated dirs) for the HTTP server; standalone stdio mode
+(`mcp-bridge --file`) also allows its working directory and uses
+`MIDI_MCP_STDIO_ALLOWED_ROOTS` instead.
+
 **Edit tools** — one call = one undoable transaction, or wrap many calls in a
 named checkpoint (`begin_transaction` / `commit_transaction` /
 `rollback_transaction`): staged edits land on a private copy, commit folds
