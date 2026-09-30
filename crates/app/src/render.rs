@@ -1976,6 +1976,18 @@ impl Render for EditorView {
                         })
                         .into_any_element(),
                         Self::mi(
+                            "o.audio",
+                            t("output.audio_settings"),
+                            "",
+                            None,
+                            cx,
+                            |v, _e, cx| {
+                                v.show_output_status = true;
+                                cx.notify();
+                            },
+                        )
+                        .into_any_element(),
+                        Self::mi(
                             "o.status",
                             t("output.host_status"),
                             "",
@@ -2705,16 +2717,108 @@ impl Render for EditorView {
                     t("output.helper_hint").into(),
                 ),
                 div()
-                    .child(format!(
-                        "{}: {}",
-                        t("output.audio"),
-                        diag.audio_device.clone().unwrap_or_else(|e| e)
-                    ))
-                    .into_any_element(),
-                div()
                     .child(format!("{}: {}", t("output.scan"), scan))
                     .into_any_element(),
             ];
+            // Audio settings: the persisted selection (device/rate/buffer)
+            // every plugin stream is opened with; picking a value reopens
+            // live instances onto it. The resolved per-stream device shows
+            // on each plugin row below — a selected device that disappears
+            // falls back to the system default there.
+            rows.push(Self::msep().into_any_element());
+            rows.push(Self::mhead(t("output.cat_audio")).into_any_element());
+            let mut dev_picks: Vec<(usize, String, Option<String>)> = vec![
+                (0, t("audio.sys_default").to_string(), None),
+            ];
+            dev_picks.extend(
+                self.audio_devices
+                    .iter()
+                    .enumerate()
+                    .map(|(i, n)| (i + 1, n.clone(), Some(n.clone()))),
+            );
+            for (i, label, dev) in dev_picks {
+                let current = self.audio_sel.device == dev;
+                rows.push(
+                    div()
+                        .id(("audio-dev", i))
+                        .px_1()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(0x2a2a35)))
+                        .text_color(rgb(if current { 0x9fd0ff } else { 0xd8d8e0 }))
+                        .child(format!(
+                            "{}: {}{}",
+                            t("audio.device"),
+                            label,
+                            if current { "  ✓" } else { "" }
+                        ))
+                        .on_click(cx.listener(move |v, _e, _w, cx| {
+                            let mut sel = v.audio_sel.clone();
+                            sel.device = dev.clone();
+                            v.apply_audio_selection(sel);
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                );
+            }
+            // sample-rate / buffer-size option chips
+            let cur_sr = self.audio_sel.sample_rate.unwrap_or(44100.0) as u32;
+            let cur_bs = self.audio_sel.buffer_size.unwrap_or(512);
+            let mut sr_row = div()
+                .flex()
+                .gap_1()
+                .items_center()
+                .child(format!("{}:", t("audio.rate")));
+            for (i, o) in [44100u32, 48000, 96000].iter().enumerate() {
+                let o = *o;
+                sr_row = sr_row.child(
+                    div()
+                        .id(("audio-sr", i))
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .bg(rgb(if o == cur_sr { 0x2f4f6f } else { 0x2a2a35 }))
+                        .hover(|s| s.bg(rgb(0x3a3a48)))
+                        .text_color(rgb(if o == cur_sr { 0xd8f0ff } else { 0x9fd0ff }))
+                        .text_size(px(11.0))
+                        .child(o.to_string())
+                        .on_click(cx.listener(move |v, _e, _w, cx| {
+                            let mut sel = v.audio_sel.clone();
+                            sel.sample_rate = Some(o as f64);
+                            v.apply_audio_selection(sel);
+                            cx.notify();
+                        })),
+                );
+            }
+            rows.push(sr_row.into_any_element());
+            let mut bs_row = div()
+                .flex()
+                .gap_1()
+                .items_center()
+                .child(format!("{}:", t("audio.buffer")));
+            for (i, o) in [256u32, 512, 1024, 2048].iter().enumerate() {
+                let o = *o;
+                bs_row = bs_row.child(
+                    div()
+                        .id(("audio-bs", i))
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .bg(rgb(if o == cur_bs { 0x2f4f6f } else { 0x2a2a35 }))
+                        .hover(|s| s.bg(rgb(0x3a3a48)))
+                        .text_color(rgb(if o == cur_bs { 0xd8f0ff } else { 0x9fd0ff }))
+                        .text_size(px(11.0))
+                        .child(format!("{} smp", o))
+                        .on_click(cx.listener(move |v, _e, _w, cx| {
+                            let mut sel = v.audio_sel.clone();
+                            sel.buffer_size = Some(o);
+                            v.apply_audio_selection(sel);
+                            cx.notify();
+                        })),
+                );
+            }
+            rows.push(bs_row.into_any_element());
             if let Some(note) = &self.scan_note {
                 rows.push(
                     div()
@@ -2734,9 +2838,10 @@ impl Render for EditorView {
                     .get(plugin_path)
                     .map(|p| p.vendor.clone())
                     .unwrap_or_default();
-                let (state, color, retry, detail) = match self.plugin_state.get(&i) {
+                let (state, color, retry, detail, audio) = match self.plugin_state.get(&i) {
                     Some(PluginState::Ready { .. }) => {
-                        let detail = self.plugin_slots.get(&i).map(|slot| {
+                        let slot = self.plugin_slots.get(&i);
+                        let detail = slot.map(|slot| {
                             let n = slot.latency.samples().to_string();
                             let ms = format!("{:.1}", slot.latency.as_us() as f64 / 1000.0);
                             crate::i18n::tf(
@@ -2744,10 +2849,27 @@ impl Render for EditorView {
                                 &[("n", n.as_str()), ("ms", ms.as_str())],
                             )
                         });
-                        (t("plugin.state_ready"), 0x8fd0a0, false, detail)
+                        let audio = slot.map(|s| {
+                            let a = s.audio_diag();
+                            let dev = a
+                                .device
+                                .unwrap_or_else(|| t("audio.sys_default").to_string());
+                            let ok = a.stream_error.is_none();
+                            let state = a
+                                .stream_error
+                                .unwrap_or_else(|| t("audio.stream_ok").to_string());
+                            (
+                                format!(
+                                    "{} Hz · {} smp · {} · {}",
+                                    a.sample_rate as u32, a.block_size, dev, state
+                                ),
+                                ok,
+                            )
+                        });
+                        (t("plugin.state_ready"), 0x8fd0a0, false, detail, audio)
                     }
                     Some(PluginState::Loading { .. }) => {
-                        (t("plugin.state_loading"), 0xe0b050, false, None)
+                        (t("plugin.state_loading"), 0xe0b050, false, None, None)
                     }
                     Some(PluginState::Failed { phase, msg, .. }) => {
                         let phase = match *phase {
@@ -2760,9 +2882,10 @@ impl Render for EditorView {
                             0xe06060,
                             true,
                             Some(format!("{phase}: {msg}")),
+                            None,
                         )
                     }
-                    _ => (t("plugin.state_idle"), 0x77778a, false, None),
+                    _ => (t("plugin.state_idle"), 0x77778a, false, None, None),
                 };
                 let mut row = div()
                     .id(("output-status", i))
@@ -2784,6 +2907,16 @@ impl Render for EditorView {
                             .text_size(px(11.0))
                             .text_color(rgb(0x9999aa))
                             .child(detail),
+                    );
+                }
+                // active stream configuration (resolved device, rate, block
+                // size, stream state) — red when the stream last errored
+                if let Some((line, ok)) = audio {
+                    row = row.child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(if ok { 0x9999aa } else { 0xe06060 }))
+                            .child(line),
                     );
                 }
                 rows.push(
