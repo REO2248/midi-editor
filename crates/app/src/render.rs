@@ -61,6 +61,7 @@ impl Render for EditorView {
             muted_set,
             soloed_set,
             has_track_dest,
+            port_present,
         ) = {
             let sh = crate::lock_shared(&self.shared);
             (
@@ -79,6 +80,7 @@ impl Render for EditorView {
                 sh.muted.clone(),
                 sh.soloed.clone(),
                 sh.track_dest.contains_key(&self.sel_track),
+                sh.port_present.clone(),
             )
         };
         // revision-cached document chrome (markers, names, diagnostics, …) —
@@ -2061,6 +2063,7 @@ impl Render for EditorView {
                     Sub::Dest => self.dest_rows(
                         DestPick::Track,
                         &dests,
+                        &port_present,
                         eff_dest,
                         def_dest,
                         has_track_dest,
@@ -2069,6 +2072,7 @@ impl Render for EditorView {
                     Sub::DefDest => self.dest_rows(
                         DestPick::Default,
                         &dests,
+                        &port_present,
                         eff_dest,
                         def_dest,
                         has_track_dest,
@@ -2779,6 +2783,7 @@ impl EditorView {
         &self,
         kind: DestPick,
         dests: &[(String, midi_io::Destination)],
+        port_present: &std::collections::HashSet<(String, usize)>,
         eff_dest: usize,
         def_dest: usize,
         has_track_dest: bool,
@@ -2830,6 +2835,18 @@ impl EditorView {
                     has_track_dest && eff_dest == i
                 } else {
                     def_dest == i
+                };
+                // an offline port keeps its row + assignment — marked so it
+                // is not confused with a live endpoint
+                let offline = matches!(
+                    &dests[i].1,
+                    output::Destination::MidiPort { port_name, ord }
+                        if !port_present.contains(&(port_name.clone(), *ord))
+                );
+                let label: SharedString = if offline {
+                    format!("{label} {}", t("output.offline")).into()
+                } else {
+                    label.into()
                 };
                 rows.push(
                     Self::mi_leaf(

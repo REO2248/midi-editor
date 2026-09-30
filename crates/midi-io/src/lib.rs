@@ -7,11 +7,18 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// A stable output-destination identity — what the UI persists and MCP tools
-/// name. Ports are addressed by NAME (indexes shift as devices come and go).
+/// name. Ports are addressed by NAME (indexes shift as devices come and go);
+/// `ord` disambiguates same-name devices — the Nth enumerated port with that
+/// name (0 = first), which is the most specific handle WinMM exposes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Destination {
     /// midir output port, resolved by name at open time
-    MidiPort { port_name: String },
+    MidiPort {
+        port_name: String,
+        /// None/missing in old sidecars = 0 (first match, as before)
+        #[serde(default)]
+        ord: usize,
+    },
     /// hosted VST3 plugin instance, by bundle path
     Plugin { plugin_path: String },
 }
@@ -28,34 +35,56 @@ pub enum Error {
 
 #[derive(Debug, Clone)]
 pub struct PortInfo {
+    /// raw enumeration slot — unstable across hotplug
     pub index: usize,
     pub name: String,
+    /// how many earlier ports share this exact name (0 = first) — the
+    /// disambiguator for same-name devices
+    pub ord: usize,
+}
+
+/// Assign each name an `ord` — its position among same-named siblings — so
+/// `name` + `ord` identifies a specific device even when a system reports
+/// identical names for several units.
+fn ord_assign(names: Vec<String>) -> Vec<(String, usize)> {
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    names
+        .into_iter()
+        .map(|name| {
+            let e = seen.entry(name.clone()).or_insert(0);
+            let o = *e;
+            *e += 1;
+            (name, o)
+        })
+        .collect()
 }
 
 pub fn list_outputs() -> Result<Vec<PortInfo>, Error> {
     let out = MidiOutput::new("midi-editor").map_err(|e| Error::Init(e.to_string()))?;
-    Ok(out
+    let names: Vec<String> = out
         .ports()
         .iter()
+        .map(|p| out.port_name(p).unwrap_or_else(|_| "<unknown>".into()))
+        .collect();
+    Ok(ord_assign(names)
+        .into_iter()
         .enumerate()
-        .map(|(i, p)| PortInfo {
-            index: i,
-            name: out.port_name(p).unwrap_or_else(|_| "<unknown>".into()),
-        })
+        .map(|(index, (name, ord))| PortInfo { index, name, ord })
         .collect())
 }
 
 pub fn list_inputs() -> Result<Vec<PortInfo>, Error> {
     let mut inp = MidiInput::new("midi-editor").map_err(|e| Error::Init(e.to_string()))?;
     inp.ignore(Ignore::None);
-    Ok(inp
+    let names: Vec<String> = inp
         .ports()
         .iter()
+        .map(|p| inp.port_name(p).unwrap_or_else(|_| "<unknown>".into()))
+        .collect();
+    Ok(ord_assign(names)
+        .into_iter()
         .enumerate()
-        .map(|(i, p)| PortInfo {
-            index: i,
-            name: inp.port_name(p).unwrap_or_else(|_| "<unknown>".into()),
-        })
+        .map(|(index, (name, ord))| PortInfo { index, name, ord })
         .collect())
 }
 
@@ -64,38 +93,55 @@ pub fn list_inputs() -> Result<Vec<PortInfo>, Error> {
 pub struct Output {
     conn: MidiOutputConnection,
     pub name: String,
+    /// same-name ordinal of the port this connection is bound to
+    pub ord: usize,
 }
 
 impl Output {
     pub fn open(index: usize) -> Result<Self, Error> {
         let out = MidiOutput::new("midi-editor").map_err(|e| Error::Init(e.to_string()))?;
-        let port = out
-            .ports()
+        let ports = out.ports();
+        let port = ports
             .into_iter()
             .nth(index)
             .ok_or_else(|| Error::Connect(format!("port {index} not found")))?;
         let name = out.port_name(&port).unwrap_or_else(|_| "<unknown>".into());
+        let ord = out
+            .ports()
+            .iter()
+            .take(index)
+            .filter(|p| out.port_name(p).map(|n| n == name).unwrap_or(false))
+            .count();
         let conn = out
             .connect(&port, "midi-editor-out")
             .map_err(|e| Error::Connect(e.to_string()))?;
-        Ok(Self { conn, name })
+        Ok(Self { conn, name, ord })
     }
 
     /// Open the first output port whose name equals `name` — the stable way
     /// to address ports across sessions.
     pub fn open_named(name: &str) -> Result<Self, Error> {
+        Self::open_ord(name, 0)
+    }
+
+    /// Open the `ord`-th output port with this exact name — same-name
+    /// devices keep separate identities so a reconnect never silently
+    /// lands on a different unit with the same label.
+    pub fn open_ord(name: &str, ord: usize) -> Result<Self, Error> {
         let out = MidiOutput::new("midi-editor").map_err(|e| Error::Init(e.to_string()))?;
         let port = out
             .ports()
             .into_iter()
-            .find(|p| out.port_name(p).map(|n| n == name).unwrap_or(false))
-            .ok_or_else(|| Error::Connect(format!("port '{name}' not found")))?;
+            .filter(|p| out.port_name(p).map(|n| n == name).unwrap_or(false))
+            .nth(ord)
+            .ok_or_else(|| Error::Connect(format!("port '{name}' #{ord} not found")))?;
         let conn = out
             .connect(&port, "midi-editor-out")
             .map_err(|e| Error::Connect(e.to_string()))?;
         Ok(Self {
             conn,
             name: name.to_string(),
+            ord,
         })
     }
 
@@ -122,11 +168,15 @@ pub struct Input {
     // connection must stay alive to keep receiving
     _conn: midir::MidiInputConnection<()>,
     pub name: String,
+    /// same-name ordinal of the port this connection is bound to —
+    /// reopening with `(name, ord)` retargets the exact same endpoint
+    /// after an unplug/replug
+    pub ord: usize,
 }
 
 impl Input {
     /// `cb(us_since_open, bytes)` is called on midir's callback thread.
-    pub fn open<F>(index: usize, mut cb: F) -> Result<Self, Error>
+    pub fn open<F>(index: usize, cb: F) -> Result<Self, Error>
     where
         F: FnMut(u64, &[u8]) + Send + 'static,
     {
@@ -138,19 +188,25 @@ impl Input {
             .nth(index)
             .ok_or_else(|| Error::Connect(format!("input {index} not found")))?;
         let name = inp.port_name(&port).unwrap_or_else(|_| "<unknown>".into());
-        let t0 = std::time::Instant::now();
-        let conn = inp
-            .connect(
-                &port,
-                "midi-editor-in",
-                move |_ts, bytes, _| cb(t0.elapsed().as_micros() as u64, bytes),
-                (),
-            )
-            .map_err(|e| Error::Connect(e.to_string()))?;
-        Ok(Self { _conn: conn, name })
+        let ord = inp
+            .ports()
+            .iter()
+            .take(index)
+            .filter(|p| inp.port_name(p).map(|n| n == name).unwrap_or(false))
+            .count();
+        Self::connect_on(inp, port, name, ord, cb)
     }
 
-    pub fn open_named<F>(name: &str, mut cb: F) -> Result<Self, Error>
+    pub fn open_named<F>(name: &str, cb: F) -> Result<Self, Error>
+    where
+        F: FnMut(u64, &[u8]) + Send + 'static,
+    {
+        Self::open_ord(name, 0, cb)
+    }
+
+    /// Open the `ord`-th input port with this exact name — same-name
+    /// devices stay distinct so a reconnect binds the original endpoint.
+    pub fn open_ord<F>(name: &str, ord: usize, cb: F) -> Result<Self, Error>
     where
         F: FnMut(u64, &[u8]) + Send + 'static,
     {
@@ -159,9 +215,23 @@ impl Input {
         let port = inp
             .ports()
             .into_iter()
-            .find(|p| inp.port_name(p).map(|n| n == name).unwrap_or(false))
-            .ok_or_else(|| Error::Connect(format!("input '{name}' not found")))?;
+            .filter(|p| inp.port_name(p).map(|n| n == name).unwrap_or(false))
+            .nth(ord)
+            .ok_or_else(|| Error::Connect(format!("input '{name}' #{ord} not found")))?;
         let pname = inp.port_name(&port).unwrap_or_else(|_| name.to_string());
+        Self::connect_on(inp, port, pname, ord, cb)
+    }
+
+    fn connect_on<F>(
+        inp: MidiInput,
+        port: midir::MidiInputPort,
+        name: String,
+        ord: usize,
+        mut cb: F,
+    ) -> Result<Self, Error>
+    where
+        F: FnMut(u64, &[u8]) + Send + 'static,
+    {
         let t0 = std::time::Instant::now();
         let conn = inp
             .connect(
@@ -173,7 +243,8 @@ impl Input {
             .map_err(|e| Error::Connect(e.to_string()))?;
         Ok(Self {
             _conn: conn,
-            name: pname,
+            name,
+            ord,
         })
     }
 }
@@ -201,34 +272,73 @@ pub trait EventSink: Send {
     }
 }
 
-/// `EventSink` over a `MidiOutputConnection`.
+/// `EventSink` over a `MidiOutputConnection`. When the port disappears,
+/// the connection is dropped (one warning, not one per event) and sends are
+/// skipped until a rate-limited reopen finds the exact same `name`+`ord`
+/// endpoint again — unplug/replug recovers without restarting playback.
 pub struct PortSink {
-    out: Output,
-    /// a port that disappeared mid-play would otherwise fail every event;
-    /// one log line is enough to notice it
-    warned_dead: bool,
+    /// `None` while the port is dead
+    out: Option<Output>,
+    name: String,
+    ord: usize,
+    dead: bool,
+    /// next allowed reconnect attempt — opening a port enumerates devices,
+    /// so it is throttled rather than run per dropped event
+    next_retry: std::time::Instant,
 }
 
 impl PortSink {
     pub fn new(out: Output) -> Self {
         Self {
-            out,
-            warned_dead: false,
+            name: out.name.clone(),
+            ord: out.ord,
+            out: Some(out),
+            dead: false,
+            next_retry: std::time::Instant::now(),
+        }
+    }
+
+    fn try_reconnect(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        if now < self.next_retry {
+            return false;
+        }
+        self.next_retry = now + std::time::Duration::from_millis(500);
+        match Output::open_ord(&self.name, self.ord) {
+            Ok(mut o) => {
+                // the reconnected unit may hold stale ringing notes — clean
+                // its state before fresh events stream in
+                o.panic();
+                self.out = Some(o);
+                self.dead = false;
+                tracing::info!("midi port '{}' reconnected", self.name);
+                true
+            }
+            Err(_) => false,
         }
     }
 }
 
 impl EventSink for PortSink {
     fn send_at(&mut self, bytes: &[u8], _rem_us: u64) {
-        if let Err(e) = self.out.send(bytes) {
-            if !self.warned_dead {
-                self.warned_dead = true;
-                tracing::warn!("midi port '{}' stopped accepting events: {e}", self.out.name);
+        if self.out.is_none() && !self.try_reconnect() {
+            return;
+        }
+        let Some(out) = &mut self.out else { return };
+        if let Err(e) = out.send(bytes) {
+            // drop the dead connection: repeated sends would each fail the
+            // same way, and local held-note bookkeeping resets with it
+            self.out = None;
+            if !self.dead {
+                self.dead = true;
+                tracing::warn!("midi port '{}' stopped accepting events: {e}", self.name);
             }
         }
     }
     fn panic(&mut self) {
-        self.out.panic();
+        if let Some(out) = &mut self.out {
+            out.panic();
+        }
     }
 }
 
@@ -399,6 +509,51 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn ord_assign_disambiguates_same_name_devices() {
+        let out = ord_assign(vec![
+            "UM-1".to_string(),
+            "loopMIDI".to_string(),
+            "UM-1".to_string(),
+            "UM-1".to_string(),
+        ]);
+        assert_eq!(
+            out,
+            vec![
+                ("UM-1".to_string(), 0),
+                ("loopMIDI".to_string(), 0),
+                ("UM-1".to_string(), 1),
+                ("UM-1".to_string(), 2),
+            ]
+        );
+    }
+
+    /// Same-name devices at different enumeration positions must compare
+    /// unequal — `ord` is part of destination identity.
+    #[test]
+    fn destination_ord_distinguishes_same_name_devices() {
+        assert_eq!(
+            Destination::MidiPort {
+                port_name: "X".into(),
+                ord: 0
+            },
+            Destination::MidiPort {
+                port_name: "X".into(),
+                ord: 0
+            }
+        );
+        assert_ne!(
+            Destination::MidiPort {
+                port_name: "X".into(),
+                ord: 0
+            },
+            Destination::MidiPort {
+                port_name: "X".into(),
+                ord: 1
+            }
+        );
     }
 
     #[test]
