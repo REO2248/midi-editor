@@ -5,6 +5,7 @@
 
 mod a11y;
 mod audition;
+mod chrome;
 mod cmd;
 mod diagnostics;
 mod docevents;
@@ -29,6 +30,8 @@ mod ui_tests;
 mod watch;
 
 // re-export moved items so `use super::*` inside ui_tests/tests keeps working
+#[allow(unused_imports)]
+pub(crate) use chrome::*;
 #[allow(unused_imports)]
 pub(crate) use docevents::*;
 #[allow(unused_imports)]
