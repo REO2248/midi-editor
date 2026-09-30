@@ -187,6 +187,29 @@
     },
     {
       "deprecated": null,
+      "description": "List aftertouch (channel pressure 0xD0 / poly key pressure 0xA0) events. Args: track?, channel?, kind? (channel|poly, default both), key? (poly only).",
+      "input_schema": {
+        "properties": {
+          "channel": {
+            "type": "integer"
+          },
+          "key": {
+            "type": "integer"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "get_aftertouch",
+      "version": 1
+    },
+    {
+      "deprecated": null,
       "description": "Latest controller value per (track, channel, cc) — the current CC state. Args: track?, channel?, cc?, limit?, cursor?, fields?. Returns cc + next_cursor + revision.",
       "input_schema": {
         "properties": {
@@ -485,6 +508,26 @@
     },
     {
       "deprecated": null,
+      "description": "Delete events by id (lane/event-list deletes). Args: ids: [event-id]. Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "ids": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "name": "remove_events",
+      "version": 1
+    },
+    {
+      "deprecated": null,
       "description": "Remove a track entirely. Args: track. Optional base_revision.",
       "input_schema": {
         "properties": {
@@ -613,6 +656,38 @@
     },
     {
       "deprecated": null,
+      "description": "Insert channel-pressure (aftertouch 0xD0) events. Args: track, channel? (default track channel), points: [{tick, value}] — or scalar {tick, value}. Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "channel": {
+            "type": "integer"
+          },
+          "points": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "tick": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          },
+          "value": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "set_channel_pressure",
+      "version": 1
+    },
+    {
+      "deprecated": null,
       "description": "Set every note starting in range to exactly `ticks` long. Args: track?, from?, to?, ticks (required). Optional base_revision.",
       "input_schema": {
         "properties": {
@@ -661,6 +736,41 @@
         "type": "object"
       },
       "name": "set_pitch_bend",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Insert polyphonic key-pressure (aftertouch 0xA0) events. Args: track, channel? (default track channel), key? (default 60), points: [{tick, key, value}] — or scalar {tick, key, value}. Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "channel": {
+            "type": "integer"
+          },
+          "key": {
+            "type": "integer"
+          },
+          "points": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "tick": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          },
+          "value": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "set_poly_pressure",
       "version": 1
     },
     {

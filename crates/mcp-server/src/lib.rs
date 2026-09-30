@@ -1631,6 +1631,43 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             })),
         ),
         spec(
+            "get_aftertouch",
+                "List aftertouch (channel pressure 0xD0 / poly key pressure 0xA0) events. Args: track?, channel?, kind? (channel|poly, default both), key? (poly only).",
+                object_schema(serde_json::json!({
+                    "track": {"type": "integer"}, "channel": {"type": "integer"},
+                    "kind": {"type": "string"}, "key": {"type": "integer"},
+                }))
+        ),
+        spec(
+            "set_channel_pressure",
+                "Insert channel-pressure (aftertouch 0xD0) events. Args: track, channel? (default track channel), points: [{tick, value}] — or scalar {tick, value}. Optional base_revision.",
+                object_schema(serde_json::json!({
+                    "track": {"type": "integer"}, "channel": {"type": "integer"},
+                    "tick": {"type": "integer"}, "value": {"type": "integer"},
+                    "points": {"type": "array", "items": {"type": "object"}},
+                    "base_revision": {"type": "integer"},
+                }))
+        ),
+        spec(
+            "set_poly_pressure",
+                "Insert polyphonic key-pressure (aftertouch 0xA0) events. Args: track, channel? (default track channel), key? (default 60), points: [{tick, key, value}] — or scalar {tick, key, value}. Optional base_revision.",
+                object_schema(serde_json::json!({
+                    "track": {"type": "integer"}, "channel": {"type": "integer"},
+                    "tick": {"type": "integer"}, "key": {"type": "integer"},
+                    "value": {"type": "integer"},
+                    "points": {"type": "array", "items": {"type": "object"}},
+                    "base_revision": {"type": "integer"},
+                }))
+        ),
+        spec(
+            "remove_events",
+                "Delete events by id (lane/event-list deletes). Args: ids: [event-id]. Optional base_revision.",
+                object_schema(serde_json::json!({
+                    "ids": {"type": "array", "items": {"type": "integer"}},
+                    "base_revision": {"type": "integer"},
+                }))
+        ),
+        spec(
             "set_tempo",
             "Set/replace tempo at a tick. Args: tick, bpm, track? (default 0 = conductor; for format-2 files pass the sequence's track). Optional base_revision.",
             object_schema(serde_json::json!({
@@ -2328,6 +2365,47 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
                 "next_cursor": next, "revision": rev,
             }))
         }
+        "get_aftertouch" => {
+            let track = args["track"].as_u64().map(|v| v as usize);
+            let chan = args["channel"].as_u64().map(|v| (v.clamp(1, 16) - 1) as u8);
+            let kind = args["kind"].as_str();
+            let key = args["key"].as_u64().map(|v| v as u8);
+            let mut out = Vec::new();
+            for (ti, t) in sh.doc.tracks.iter().enumerate() {
+                if track.is_some() && track != Some(ti) {
+                    continue;
+                }
+                for e in &t.events {
+                    if let EventKind::Channel { status, data, .. } = &e.kind {
+                        let (st, ch) = (status & 0xF0, status & 0x0F);
+                        if chan.is_some() && chan != Some(ch) {
+                            continue;
+                        }
+                        let row = match st {
+                            0xD0 if kind.is_none() || kind == Some("channel") => {
+                                serde_json::json!({
+                                    "track": ti, "id": e.id, "tick": e.tick,
+                                    "kind": "channel", "channel": ch + 1,
+                                    "value": data[0],
+                                })
+                            }
+                            0xA0 if (kind.is_none() || kind == Some("poly"))
+                                && key.map_or(true, |k| k == data[0]) =>
+                            {
+                                serde_json::json!({
+                                    "track": ti, "id": e.id, "tick": e.tick,
+                                    "kind": "poly", "channel": ch + 1,
+                                    "key": data[0], "value": data[1],
+                                })
+                            }
+                            _ => continue,
+                        };
+                        out.push(row);
+                    }
+                }
+            }
+            ok_json(serde_json::json!({"count": out.len(), "aftertouch": out}))
+        }
         "list_midi_ports" => {
             drop(sh); // WinMM enumeration must not stall the editor
             let outs = midi_io::list_outputs()
@@ -2580,6 +2658,86 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
                 args["value"].as_u64().unwrap_or(8192) as u16,
             );
             apply_ops(&mut sh, "pitch bend", ops)
+        }
+        "set_channel_pressure" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let track = match req_track(&sh, args) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
+            let ch = args["channel"]
+                .as_u64()
+                .map(|c| (c.clamp(1, 16) - 1) as u8)
+                .unwrap_or_else(|| sh.doc.tracks.get(track).map(|t| t.out_channel).unwrap_or(0));
+            let mut ops = Vec::new();
+            if let Some(points) = args["points"].as_array() {
+                for p in points {
+                    ops.extend(sh.doc.set_channel_pressure_ops(
+                        track,
+                        p["tick"].as_u64().unwrap_or(0),
+                        ch,
+                        p["value"].as_u64().unwrap_or(0) as u8,
+                    ));
+                }
+            } else {
+                ops.extend(sh.doc.set_channel_pressure_ops(
+                    track,
+                    args["tick"].as_u64().unwrap_or(0),
+                    ch,
+                    args["value"].as_u64().unwrap_or(0) as u8,
+                ));
+            }
+            apply_ops(&mut sh, "channel pressure", ops)
+        }
+        "set_poly_pressure" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let track = match req_track(&sh, args) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
+            let ch = args["channel"]
+                .as_u64()
+                .map(|c| (c.clamp(1, 16) - 1) as u8)
+                .unwrap_or_else(|| sh.doc.tracks.get(track).map(|t| t.out_channel).unwrap_or(0));
+            let mut ops = Vec::new();
+            let emit = |doc: &mut Document, p: &serde_json::Value| {
+                doc.set_poly_pressure_ops(
+                    track,
+                    p["tick"].as_u64().unwrap_or(0),
+                    ch,
+                    p["key"].as_u64().unwrap_or(60) as u8,
+                    p["value"].as_u64().unwrap_or(0) as u8,
+                )
+            };
+            if let Some(points) = args["points"].as_array() {
+                for p in points {
+                    ops.extend(emit(&mut sh.doc, p));
+                }
+            } else {
+                ops.extend(emit(&mut sh.doc, args));
+            }
+            apply_ops(&mut sh, "poly pressure", ops)
+        }
+        "remove_events" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let ids: Vec<EventId> = args["ids"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
+                .unwrap_or_default();
+            if ids.is_empty() {
+                return err_json("ids required");
+            }
+            let ops = sh.doc.remove_events_ops(&ids);
+            if ops.is_empty() {
+                return err_json("no matching events");
+            }
+            apply_ops(&mut sh, "remove events", ops)
         }
         "set_tempo" => {
             if let Some(r) = check_base(&sh, args) {
@@ -4689,5 +4847,60 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty());
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn aftertouch_tools_round_trip() {
+        let sh = shared();
+        let (err, _) = call(
+            &sh,
+            "set_channel_pressure",
+            json!({"track": 1, "points": [{"tick": 240, "value": 90}, {"tick": 480, "value": 64}]}),
+        );
+        assert!(!err);
+        let (err, _) = call(
+            &sh,
+            "set_poly_pressure",
+            json!({"track": 1, "tick": 600, "key": 62, "value": 70}),
+        );
+        assert!(!err);
+
+        let (err, v) = call(&sh, "get_aftertouch", json!({}));
+        assert!(!err);
+        let at = v["aftertouch"].as_array().unwrap();
+        assert_eq!(at.len(), 3);
+        assert!(at
+            .iter()
+            .any(|r| r["kind"] == "channel" && r["value"] == 90));
+        assert!(at
+            .iter()
+            .any(|r| r["kind"] == "poly" && r["key"] == 62 && r["value"] == 70));
+
+        // kind/key filters
+        let (err, v) = call(&sh, "get_aftertouch", json!({"kind": "poly", "key": 62}));
+        assert!(!err);
+        assert_eq!(v["aftertouch"].as_array().unwrap().len(), 1);
+        let (err, v) = call(&sh, "get_aftertouch", json!({"kind": "poly", "key": 60}));
+        assert!(!err);
+        assert_eq!(v["aftertouch"].as_array().unwrap().len(), 0);
+
+        // remove_events deletes by id (re-query the poly event)
+        let (err, v) = call(&sh, "get_aftertouch", json!({"kind": "poly"}));
+        assert!(!err);
+        let pid = v["aftertouch"][0]["id"].as_u64().unwrap();
+        let (err, _) = call(&sh, "remove_events", json!({"ids": [pid]}));
+        assert!(!err);
+        let (err, v) = call(&sh, "get_aftertouch", json!({"kind": "poly"}));
+        assert!(!err);
+        assert_eq!(v["count"], 0);
+        // unknown ids error instead of silently applying nothing
+        let (err, _) = call(&sh, "remove_events", json!({"ids": [999999]}));
+        assert!(err);
+        // undo restores — edits ride the shared undo stack
+        let (err, _) = call(&sh, "undo", json!({}));
+        assert!(!err);
+        let (err, v) = call(&sh, "get_aftertouch", json!({"kind": "poly"}));
+        assert!(!err);
+        assert_eq!(v["count"], 1);
     }
 }

@@ -58,8 +58,10 @@ enum DragMode {
     Marquee,
     /// vertical drag in the velocity lane; `dkey` carries the new velocity
     Velocity,
-    /// lane drag editing a CC/PB event (`on_id` = event id; `dkey` = value)
+    /// lane drag editing a CC/PB/AT event (`on_id` = event id; `dkey` = value)
     LaneEvent,
+    /// rubber-band select inside a lane (tick × value box → `lane_sel`)
+    LaneMarquee,
     /// alt-drag: copy the selection instead of moving it
     Duplicate,
     /// erase tool: every note touched joins `erase_ids`, deleted on commit
@@ -194,6 +196,10 @@ enum LaneMode {
     /// Control Change lane, controller number in the field
     CC(u8),
     PitchBend,
+    /// channel pressure (aftertouch, 0xD0)
+    ChanAT,
+    /// polyphonic key pressure (0xA0); the key filter lives in `poly_key`
+    PolyAT,
 }
 
 impl LaneMode {
@@ -205,7 +211,9 @@ impl LaneMode {
             LaneMode::CC(10) => LaneMode::CC(11),
             LaneMode::CC(11) => LaneMode::CC(64),
             LaneMode::CC(_) => LaneMode::PitchBend,
-            LaneMode::PitchBend => LaneMode::Velocity,
+            LaneMode::PitchBend => LaneMode::ChanAT,
+            LaneMode::ChanAT => LaneMode::PolyAT,
+            LaneMode::PolyAT => LaneMode::Velocity,
         }
     }
     fn label(self) -> String {
@@ -213,7 +221,20 @@ impl LaneMode {
             LaneMode::Velocity => "Vel".to_string(),
             LaneMode::CC(n) => format!("CC{n}"),
             LaneMode::PitchBend => "PB".to_string(),
+            LaneMode::ChanAT => "CAT".to_string(),
+            LaneMode::PolyAT => "PAT".to_string(),
         }
+    }
+    /// full-scale value for the lane's y axis
+    fn vrange(self) -> f32 {
+        match self {
+            LaneMode::PitchBend => 16383.0,
+            _ => 127.0,
+        }
+    }
+    /// does this lane edit events (vs. velocity bars on the note view)
+    fn is_event_lane(self) -> bool {
+        !matches!(self, LaneMode::Velocity)
     }
 }
 
@@ -524,12 +545,17 @@ struct EditorView {
     /// selected event-list row and its scroll position handle
     ev_sel: usize,
     events_scroll: UniformListScrollHandle,
-    /// lane (velocity/CC/PB) points cache — keys on epoch + revision +
-    /// track + mode
-    lane_cache: Arc<Vec<(EventId, u64, i32)>>,
+    /// lane (velocity/CC/PB/AT) points cache — keys on epoch + revision +
+    /// track + mode (+ poly key). Tuple: (id, tick, value, key|-1)
+    lane_cache: Arc<Vec<(EventId, u64, i32, i32)>>,
     lane_key: (u64, u64),
     lane_track: usize,
     lane_mode_cached: LaneMode,
+    lane_key_cached: Option<u8>,
+    /// lane marquee selection — event ids of non-note lane points
+    lane_sel: BTreeSet<EventId>,
+    /// event-list row selection — a single event id
+    sel_event: Option<EventId>,
     /// last window-space cursor position, kept while a roll/lane drag is
     /// active so edge auto-scroll can keep the drag deltas current
     mouse_pos: Option<Point<Pixels>>,
@@ -653,6 +679,8 @@ struct EditorView {
     follow_hold: Option<std::time::Instant>,
     /// what the bottom lane edits
     lane_mode: LaneMode,
+    /// poly-aftertouch key filter: Some(k) shows only key k, None = all keys
+    poly_key: Option<u8>,
     /// live MIDI input capture while `rec` is armed
     rec: Option<Rec>,
     /// per-sink SysEx counters for the current/last playback pass — read at
@@ -1076,6 +1104,9 @@ impl EditorView {
             lane_key: (u64::MAX, u64::MAX),
             lane_track: 0,
             lane_mode_cached: LaneMode::Velocity,
+            lane_key_cached: None,
+            lane_sel: BTreeSet::new(),
+            sel_event: None,
             mouse_pos: None,
             sel_track: 0,
             selection: BTreeSet::new(),
@@ -1166,6 +1197,7 @@ impl EditorView {
             follow: Follow::Page,
             follow_hold: None,
             lane_mode: LaneMode::Velocity,
+            poly_key: None,
             rec: None,
             sysex_stats: Vec::new(),
             open_menu: None,
@@ -1569,6 +1601,7 @@ impl EditorView {
 
     fn set_lane(&mut self, m: LaneMode, cx: &mut Context<Self>) {
         self.lane_mode = m;
+        self.lane_sel.clear();
         self.persist();
         cx.notify();
     }
@@ -2025,16 +2058,19 @@ impl EditorView {
     }
 
     /// Control events of the selected track for the bottom lane, cached on
-    /// (epoch, revision, track, lane mode) — render must not rescan the
-    /// track while animating the playhead.
-    fn lane_events_cached(&mut self) -> Arc<Vec<(EventId, u64, i32)>> {
+    /// (epoch, revision, track, lane mode, poly key) — render must not rescan
+    /// the track while animating the playhead.
+    /// Tuple: (event id, tick, value, poly key or -1)
+    fn lane_events_cached(&mut self) -> Arc<Vec<(EventId, u64, i32, i32)>> {
         let key = (self.doc_epoch, self.doc(|d| d.revision()));
         if self.lane_key != key
             || self.lane_track != self.sel_track
             || self.lane_mode_cached != self.lane_mode
+            || self.lane_key_cached != self.poly_key
         {
             let tr = self.sel_track;
             let mode = self.lane_mode;
+            let pkey = self.poly_key;
             let mut v = Vec::new();
             self.doc(|d| {
                 if let Some(t) = d.tracks.get(tr) {
@@ -2042,10 +2078,21 @@ impl EditorView {
                         if let EventKind::Channel { status, data, .. } = &e.kind {
                             match (mode, status & 0xF0) {
                                 (LaneMode::CC(cc), 0xB0) if data[0] == cc => {
-                                    v.push((e.id, e.tick, data[1] as i32))
+                                    v.push((e.id, e.tick, data[1] as i32, -1))
                                 }
-                                (LaneMode::PitchBend, 0xE0) => {
-                                    v.push((e.id, e.tick, ((data[1] as i32) << 7) | data[0] as i32))
+                                (LaneMode::PitchBend, 0xE0) => v.push((
+                                    e.id,
+                                    e.tick,
+                                    ((data[1] as i32) << 7) | data[0] as i32,
+                                    -1,
+                                )),
+                                (LaneMode::ChanAT, 0xD0) => {
+                                    v.push((e.id, e.tick, data[0] as i32, -1))
+                                }
+                                (LaneMode::PolyAT, 0xA0)
+                                    if pkey.is_none() || pkey == Some(data[0]) =>
+                                {
+                                    v.push((e.id, e.tick, data[1] as i32, data[0] as i32))
                                 }
                                 _ => {}
                             }
@@ -2058,8 +2105,60 @@ impl EditorView {
             self.lane_key = key;
             self.lane_track = tr;
             self.lane_mode_cached = mode;
+            self.lane_key_cached = pkey;
         }
         self.lane_cache.clone()
+    }
+
+    /// Keys that have poly-AT events in the selected track (for the key chip).
+    fn poly_keys_present(&self) -> Vec<u8> {
+        self.doc(|d| {
+            let mut keys: Vec<u8> = d
+                .tracks
+                .get(self.sel_track)
+                .map(|t| {
+                    t.events
+                        .iter()
+                        .filter_map(|e| match &e.kind {
+                            EventKind::Channel { status, data, .. } if status & 0xF0 == 0xA0 => {
+                                Some(data[0])
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            keys.sort_unstable();
+            keys.dedup();
+            keys
+        })
+    }
+
+    /// Cycle the poly-AT key filter through the keys present in the track
+    /// (all → first key → … → last key → all). Shift steps a key at a time.
+    fn cycle_poly_key(&mut self, back: bool, cx: &mut Context<Self>) {
+        let keys = self.poly_keys_present();
+        if keys.is_empty() {
+            self.poly_key = if back {
+                self.poly_key.map(|k| k.wrapping_sub(1))
+            } else {
+                self.poly_key.map(|k| k.wrapping_add(1))
+            };
+        } else {
+            let i = self
+                .poly_key
+                .and_then(|k| keys.iter().position(|&p| p == k));
+            self.poly_key = match (i, back) {
+                (None, false) => Some(keys[0]),
+                (None, true) => Some(*keys.last().unwrap()),
+                (Some(i), false) if i + 1 < keys.len() => Some(keys[i + 1]),
+                (Some(_), false) => None,
+                (Some(0), true) => None,
+                (Some(i), true) => Some(keys[i - 1]),
+            };
+        }
+        self.persist();
+        cx.notify();
     }
 
     /// Tick position of the song end (scroll extent, minimap scale).
@@ -2586,10 +2685,7 @@ impl EditorView {
     }
 
     fn delete_selected(&mut self, cx: &mut Context<Self>) {
-        if self.selection.is_empty() {
-            return;
-        }
-        let sh = lock_shared(&self.shared);
+        let mut sh = lock_shared(&self.shared);
         let mut ops = Vec::new();
         for &on_id in &self.selection {
             let off_id = self
@@ -2601,11 +2697,78 @@ impl EditorView {
                 ops.push(op);
             }
         }
+        // lane marquee selection + event-list row selection delete whole
+        // events through the same transaction (skip ids a note op already
+        // queues — a doubly-removed id would abort the whole transaction)
+        let mut queued: BTreeSet<EventId> = BTreeSet::new();
+        for op in &ops {
+            if let Op::RemoveEvents { removed, .. } = op {
+                queued.extend(removed.iter().map(|(_, e)| e.id));
+            }
+        }
+        let extra: Vec<EventId> = self
+            .lane_sel
+            .iter()
+            .copied()
+            .chain(self.sel_event)
+            .filter(|id| !queued.contains(id))
+            .collect();
+        ops.extend(sh.doc.remove_events_ops(&extra));
         drop(sh);
         if !ops.is_empty() {
-            self.apply_tx("delete notes", ops);
+            self.apply_tx("delete", ops);
         }
         self.selection.clear();
+        self.lane_sel.clear();
+        self.sel_event = None;
+        cx.notify();
+    }
+
+    /// Adjust the event-list selection's primary value by `delta`
+    /// (velocity/CC/pressure → data[1]; program/channel pressure → data[0];
+    /// pitch bend → 14-bit). Exact per-event editing from the keyboard.
+    fn nudge_sel_event(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let Some(id) = self.sel_event else { return };
+        let sh = lock_shared(&self.shared);
+        let mut ops = Vec::new();
+        for (ti, t) in sh.doc.tracks.iter().enumerate() {
+            for e in &t.events {
+                if e.id != id {
+                    continue;
+                }
+                let EventKind::Channel { status, .. } = &e.kind else {
+                    continue;
+                };
+                let status = *status;
+                let mut after = e.clone();
+                let EventKind::Channel { data: d, .. } = &mut after.kind else {
+                    unreachable!();
+                };
+                match status & 0xF0 {
+                    0x90 | 0x80 | 0xA0 | 0xB0 => {
+                        let lo = if status & 0xF0 == 0x90 { 1 } else { 0 };
+                        d[1] = (d[1] as i32 + delta).clamp(lo, 127) as u8;
+                    }
+                    0xC0 | 0xD0 => d[0] = (d[0] as i32 + delta).clamp(0, 127) as u8,
+                    0xE0 => {
+                        let v = ((d[1] as i32) << 7 | d[0] as i32) + delta;
+                        let v = v.clamp(0, 16383);
+                        d[0] = (v & 0x7F) as u8;
+                        d[1] = (v >> 7) as u8;
+                    }
+                    _ => continue,
+                }
+                ops.push(Op::UpdateEvent {
+                    track: ti,
+                    before: e.clone(),
+                    after,
+                });
+            }
+        }
+        drop(sh);
+        if !ops.is_empty() {
+            self.apply_tx("edit event", ops);
+        }
         cx.notify();
     }
 
@@ -3317,8 +3480,39 @@ impl EditorView {
                 return;
             }
             DragMode::Move | DragMode::Duplicate => {}
+            DragMode::LaneMarquee => {
+                // rubber-band inside a lane: select every lane event in the
+                // (tick, value) box; Velocity mode selects notes instead
+                let (t0, t1) = (d.a_tick.min(d.b_tick).max(0), d.a_tick.max(d.b_tick).max(0));
+                let (v0, v1) = (d.a_key.min(d.b_key), d.a_key.max(d.b_key));
+                if self.lane_mode == LaneMode::Velocity {
+                    self.selection = self
+                        .notes
+                        .iter()
+                        .filter(|n| {
+                            n.track == self.sel_track
+                                && n.start_tick as i64 >= t0
+                                && n.start_tick as i64 <= t1
+                                && n.vel as i32 >= v0
+                                && n.vel as i32 <= v1
+                        })
+                        .map(|n| n.on_id)
+                        .collect();
+                } else {
+                    self.lane_sel = self
+                        .lane_events_cached()
+                        .iter()
+                        .filter(|(_, tick, val, _key)| {
+                            *tick as i64 >= t0 && *tick as i64 <= t1 && *val >= v0 && *val <= v1
+                        })
+                        .map(|(id, _, _, _)| *id)
+                        .collect();
+                }
+                cx.notify();
+                return;
+            }
             DragMode::LaneEvent => {
-                // CC/PB lane: update an existing event's value, or insert a
+                // CC/PB/AT lane: update an existing event's value, or insert a
                 // new one when the drag started on empty lane space
                 let mut sh = lock_shared(&self.shared);
                 let mut ops = Vec::new();
@@ -3328,13 +3522,33 @@ impl EditorView {
                     cx.notify();
                     return;
                 };
+                let lane_mode = self.lane_mode;
                 if d.on_id == 0 {
                     let ch = track_events.out_channel & 0x0F;
-                    let (status, data) = match self.lane_mode {
-                        LaneMode::CC(cc) => (0xB0 | ch, [cc, d.dkey.clamp(0, 127) as u8]),
+                    let (status, data, len) = match lane_mode {
+                        LaneMode::CC(cc) => (0xB0 | ch, [cc, d.dkey.clamp(0, 127) as u8], 2u8),
                         LaneMode::PitchBend => {
                             let v = d.dkey.clamp(0, 16383) as u16;
-                            (0xE0 | ch, [(v & 0x7F) as u8, (v >> 7) as u8])
+                            (0xE0 | ch, [(v & 0x7F) as u8, (v >> 7) as u8], 2)
+                        }
+                        LaneMode::ChanAT => (0xD0 | ch, [d.dkey.clamp(0, 127) as u8, 0], 1),
+                        LaneMode::PolyAT => {
+                            let key = self.poly_key.unwrap_or_else(|| {
+                                // no filter: use the key of a note at that tick,
+                                // else middle C
+                                self.notes
+                                    .iter()
+                                    .filter(|n| {
+                                        n.track == d.track
+                                            && n.start_tick <= d.a_tick.max(0) as u64
+                                            && n.end_tick.unwrap_or(u64::MAX)
+                                                > d.a_tick.max(0) as u64
+                                    })
+                                    .min_by_key(|n| n.start_tick)
+                                    .map(|n| n.key)
+                                    .unwrap_or(60)
+                            });
+                            (0xA0 | ch, [key, d.dkey.clamp(0, 127) as u8], 2)
                         }
                         LaneMode::Velocity => unreachable!(),
                     };
@@ -3346,11 +3560,7 @@ impl EditorView {
                             tick: self.snap_down(d.a_tick).max(0) as u64,
                             seq: 0,
                             raw_body: None,
-                            kind: EventKind::Channel {
-                                status,
-                                data,
-                                len: 2,
-                            },
+                            kind: EventKind::Channel { status, data, len },
                         }],
                     });
                 } else {
@@ -3358,13 +3568,15 @@ impl EditorView {
                         if e.id == d.on_id {
                             let mut after = e.clone();
                             if let EventKind::Channel { data, .. } = &mut after.kind {
-                                match self.lane_mode {
+                                match lane_mode {
                                     LaneMode::CC(_) => data[1] = d.dkey.clamp(0, 127) as u8,
                                     LaneMode::PitchBend => {
                                         let v = d.dkey.clamp(0, 16383) as u16;
                                         data[0] = (v & 0x7F) as u8;
                                         data[1] = (v >> 7) as u8;
                                     }
+                                    LaneMode::ChanAT => data[0] = d.dkey.clamp(0, 127) as u8,
+                                    LaneMode::PolyAT => data[1] = d.dkey.clamp(0, 127) as u8,
                                     LaneMode::Velocity => unreachable!(),
                                 }
                             }
@@ -5083,17 +5295,19 @@ impl EditorView {
             return;
         };
         match mode {
-            DragMode::Velocity | DragMode::LaneEvent => {
+            DragMode::Velocity | DragMode::LaneEvent | DragMode::LaneMarquee => {
                 let b = self.lane_bounds.get();
+                let x = f32::from(pos.x) - f32::from(b.origin.x);
                 let y = f32::from(pos.y) - f32::from(b.origin.y);
                 let h = f32::from(b.size.height).max(1.0);
-                let vrange = match self.lane_mode {
-                    LaneMode::PitchBend => 16383.0,
-                    _ => 127.0,
-                };
+                let vrange = self.lane_mode.vrange();
                 let val = ((1.0 - y / h) * vrange) as i32;
                 if let Some(d) = self.drag.as_mut() {
                     d.dkey = val;
+                    if d.mode == DragMode::LaneMarquee {
+                        d.b_tick = ((x + self.scroll_x) / self.zoom) as i64;
+                        d.b_key = val;
+                    }
                 }
             }
             _ => {
@@ -5186,7 +5400,10 @@ impl EditorView {
         }
         // vertical panning only makes sense for roll-space drags — lane
         // drags map the y axis to a value, not to pitch
-        if !matches!(mode, DragMode::Velocity | DragMode::LaneEvent) {
+        if !matches!(
+            mode,
+            DragMode::Velocity | DragMode::LaneEvent | DragMode::LaneMarquee
+        ) {
             if y < by + EDGE && y > by - SLOP {
                 dy = -SPEED;
             }
@@ -6001,6 +6218,8 @@ struct Prefs {
     sel_track: Option<usize>,
     enc: Option<String>,
     lane: Option<String>,
+    /// poly-aftertouch lane key filter (None = all keys / absent sidecar)
+    poly_key: Option<u8>,
     show_events: Option<bool>,
     tool: Option<String>,
     snap: Option<usize>,
@@ -6041,6 +6260,7 @@ impl Default for Prefs {
             scale: None,
             scale_minor: None,
             follow: None,
+            poly_key: None,
         }
     }
 }
@@ -6212,12 +6432,17 @@ impl EditorView {
         });
         self.lane_mode = match p.lane.as_deref() {
             Some("pb") => LaneMode::PitchBend,
+            Some("cat") => LaneMode::ChanAT,
+            Some("pat") => LaneMode::PolyAT,
             Some(s) if s.starts_with("cc") => s[2..]
                 .parse()
                 .map(LaneMode::CC)
                 .unwrap_or(LaneMode::Velocity),
             _ => LaneMode::Velocity,
         };
+        if let Some(k) = p.poly_key {
+            self.poly_key = (k < 128).then_some(k);
+        }
         if let Some(v) = p.show_events {
             self.show_events = v;
         }
@@ -6343,7 +6568,10 @@ impl EditorView {
                 LaneMode::Velocity => "vel".into(),
                 LaneMode::CC(c) => format!("cc{c}"),
                 LaneMode::PitchBend => "pb".into(),
+                LaneMode::ChanAT => "cat".into(),
+                LaneMode::PolyAT => "pat".into(),
             }),
+            poly_key: self.poly_key,
             show_events: Some(self.show_events),
             tool: Some(
                 match self.tool {

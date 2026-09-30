@@ -246,7 +246,7 @@ pub(crate) struct LaneA11y {
     pub ppq: u64,
     pub mode: LaneMode,
     /// (event id, tick, value 0..127 or 0..16383 for PB)
-    pub events: Arc<Vec<(EventId, u64, i32)>>,
+    pub events: Arc<Vec<(EventId, u64, i32, i32)>>,
     /// velocity mode: notes of the selected track supply the bars
     pub notes: Arc<Vec<Note>>,
     pub sel_track: usize,
@@ -318,7 +318,7 @@ impl LaneA11y {
                 }
             }
             _ => {
-                for (id, tick, val) in self.events.iter() {
+                for (id, tick, val, _key) in self.events.iter() {
                     if pushed >= MAX_NODES {
                         break;
                     }

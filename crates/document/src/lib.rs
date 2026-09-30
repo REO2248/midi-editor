@@ -1837,6 +1837,76 @@ impl Document {
         }]
     }
 
+    /// Channel pressure (aftertouch, 0xD0) point — single data byte, 0..127.
+    pub fn set_channel_pressure_ops(
+        &mut self,
+        track: usize,
+        tick: u64,
+        channel: u8,
+        value: u8,
+    ) -> Vec<Op> {
+        let seq = self.next_seq(track, tick);
+        vec![Op::InsertEvents {
+            track,
+            events: vec![Event {
+                id: self.alloc_event_id(),
+                tick,
+                seq,
+                raw_body: None,
+                kind: EventKind::Channel {
+                    status: 0xD0 | (channel & 0x0F),
+                    data: [value & 0x7F, 0],
+                    len: 1,
+                },
+            }],
+        }]
+    }
+
+    /// Polyphonic key pressure (0xA0) point — key + value, both 0..127.
+    pub fn set_poly_pressure_ops(
+        &mut self,
+        track: usize,
+        tick: u64,
+        channel: u8,
+        key: u8,
+        value: u8,
+    ) -> Vec<Op> {
+        let seq = self.next_seq(track, tick);
+        vec![Op::InsertEvents {
+            track,
+            events: vec![Event {
+                id: self.alloc_event_id(),
+                tick,
+                seq,
+                raw_body: None,
+                kind: EventKind::Channel {
+                    status: 0xA0 | (channel & 0x0F),
+                    data: [key & 0x7F, value & 0x7F],
+                    len: 2,
+                },
+            }],
+        }]
+    }
+
+    /// Remove arbitrary events by id (lane deletes, event-list deletes,
+    /// meta removal). Returns one RemoveEvents op per source track.
+    pub fn remove_events_ops(&mut self, ids: &[EventId]) -> Vec<Op> {
+        let mut by_track: std::collections::BTreeMap<usize, Vec<(usize, Event)>> =
+            std::collections::BTreeMap::new();
+        for &id in ids {
+            if let Some((ti, ei)) = self.by_id.get(&id).copied() {
+                by_track
+                    .entry(ti)
+                    .or_default()
+                    .push((ei, self.tracks[ti].events[ei].clone()));
+            }
+        }
+        by_track
+            .into_iter()
+            .map(|(track, removed)| Op::RemoveEvents { track, removed })
+            .collect()
+    }
+
     /// Set/replace the tempo at `tick` on `track` (the conductor is
     /// track 0 for format 0/1; a format-2 sequence owns its own tempo).
     pub fn set_tempo_ops(&mut self, track: usize, tick: u64, bpm: f64) -> Vec<Op> {
@@ -2651,5 +2721,64 @@ mod tests {
         );
         // before any message: nothing
         assert!(d.chase_sysex(d.tempo_map.tick_to_us(0)).is_empty());
+    }
+
+    #[test]
+    fn aftertouch_ops_edit_and_chase() {
+        let mut d = doc_with_note();
+        // insert a channel-pressure point and a poly-pressure point through the
+        // same ops the lane UI / MCP tools use
+        let base = d.revision();
+        let mut ops = d.set_channel_pressure_ops(0, 240, 0, 90);
+        ops.extend(d.set_poly_pressure_ops(0, 480, 0, 60, 70));
+        d.apply(Transaction {
+            label: "aftertouch".into(),
+            base,
+            ops,
+        })
+        .unwrap();
+        // inserted bytes are well-formed: 1-byte 0xD0, 2-byte 0xA0
+        assert!(d.tracks[0].events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::Channel { status: 0xD0, data, len: 1 } if data[0] == 90
+        )));
+        assert!(d.tracks[0].events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::Channel { status: 0xA0, data, len: 2 } if data[0] == 60 && data[1] == 70
+        )));
+        // chased state mid-song agrees with the edited values
+        let chased = d.chase_events(d.tempo_map.tick_to_us(1440) - 1);
+        let bytes = bytes_of(&chased);
+        assert!(bytes.contains(&vec![0xD0, 90]));
+        assert!(bytes.contains(&vec![0xA0, 60, 70]));
+
+        // remove_events_ops deletes by id
+        let ids: Vec<EventId> = d.tracks[0]
+            .events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.kind,
+                    EventKind::Channel { status, .. } if status & 0xF0 == 0xD0
+                        || status & 0xF0 == 0xA0
+                )
+            })
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(ids.len(), 2);
+        let ops = d.remove_events_ops(&ids);
+        let base = d.revision();
+        d.apply(Transaction {
+            label: "rm".into(),
+            base,
+            ops,
+        })
+        .unwrap();
+        assert!(!d.tracks[0].events.iter().any(|e| {
+            matches!(&e.kind, EventKind::Channel { status, .. } if status & 0xF0 == 0xD0
+                || status & 0xF0 == 0xA0)
+        }));
+        // unknown ids are skipped rather than failing the whole op batch
+        assert!(d.remove_events_ops(&[999_999]).is_empty());
     }
 }
