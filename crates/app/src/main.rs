@@ -530,6 +530,71 @@ fn empty_doc() -> Document {
     Document::from_file(f)
 }
 
+/// `EditorView::transport_points` on a bare `Document` — free so tests can
+/// drive it without a view. Tempo map + every `0x58` meter meta as `(µs,
+/// TransportCmd)`, sorted by µs.
+fn transport_points_of(d: &Document) -> Vec<(u64, output::TransportCmd)> {
+    transport_points_for(d, None)
+}
+
+/// `tr` selects the sequence in format-2 documents (each sequence has its
+/// own tempo map and meta events); `None` uses the document-level maps.
+fn transport_points_for(
+    d: &Document,
+    tr: Option<usize>,
+) -> Vec<(u64, output::TransportCmd)> {
+    let owned;
+    let (tm, tracks): (&document::TempoMap, &[document::Track]) = match tr {
+        Some(t) => {
+            owned = d.tempo_map_for(t);
+            (&owned, std::slice::from_ref(&d.tracks[t]))
+        }
+        None => (&d.tempo_map, &d.tracks),
+    };
+    let mut pts: Vec<(u64, output::TransportCmd)> = tm
+        .points()
+        .iter()
+        .map(|(_, mpq, us)| {
+            (
+                *us,
+                output::TransportCmd::Tempo(60_000_000.0 / (*mpq).max(1) as f64),
+            )
+        })
+        .collect();
+    let mut sig_pts = Vec::new();
+    for tr in tracks {
+        for e in &tr.events {
+            if let EventKind::Meta {
+                meta_type: 0x58,
+                data,
+            } = &e.kind
+            {
+                if data.len() >= 2 {
+                    sig_pts.push((
+                        tm.tick_to_us(e.tick),
+                        output::TransportCmd::TimeSig(
+                            i32::from(data[0]),
+                            1i32 << (data[1] & 0x1f),
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    // SMF defaults live outside the event stream: a map with no tempo/meta
+    // at tick 0 still plays 120bpm in 4/4 — state the plugin must be told
+    // explicitly since a chase before the first point yields nothing.
+    if !matches!(pts.first(), Some((us, _)) if *us == 0) {
+        pts.push((0, output::TransportCmd::Tempo(120.0)));
+    }
+    if !sig_pts.iter().any(|(us, _)| *us == 0) {
+        sig_pts.push((0, output::TransportCmd::TimeSig(4, 4)));
+    }
+    pts.extend(sig_pts);
+    pts.sort_by_key(|(us, _)| *us);
+    pts
+}
+
 impl EditorView {
     fn new(path: Option<PathBuf>, input: Entity<InputState>, cx: &mut Context<Self>) -> Self {
         let loaded = path.as_deref().map(mcp_server::service::load_document);
@@ -2705,9 +2770,9 @@ impl EditorView {
         let needed: BTreeSet<usize> = tagged.iter().map(|(_, tr, _)| dest_of(*tr)).collect();
         let mut sinks: Vec<Box<dyn EventSink>> = Vec::new();
         let mut sink_of: HashMap<usize, usize> = HashMap::new();
-        // host transport hints for plugin instances (arps/LFO sync): current
-        // bpm + time signature, then `playing` flipped on per used instance
-        let (bpm, sig_num, sig_den) = self.transport_hints();
+        // dest index -> the plugin's transport lane: tempo/meter map events
+        // ride the same schedule as notes and apply at block boundaries
+        let mut transport_of: HashMap<usize, usize> = HashMap::new();
         self.poll_plugin_events();
         for d in needed {
             let Some((_, dest)) = dests.get(d) else {
@@ -2741,9 +2806,9 @@ impl EditorView {
                         let slot = self.plugin_slots.get(&d).expect("slot just loaded");
                         sink_of.insert(d, sinks.len());
                         sinks.push(Box::new(slot.sink.clone()));
+                        transport_of.insert(d, sinks.len());
+                        sinks.push(Box::new(output::TransportSink::new(slot.plugin.clone())));
                         if let Ok(mut p) = slot.plugin.lock() {
-                            let _ = p.set_tempo(bpm);
-                            let _ = p.set_time_signature(sig_num, sig_den);
                             let _ = p.set_playing(true);
                         }
                     } else if let Some(PluginState::Failed { .. }) = self.plugin_state.get(&d) {
@@ -2803,6 +2868,22 @@ impl EditorView {
         // past event, before the first event at/after the position — so real
         // events at the exact play time land after (and override) the chase.
         let start_us = self.play_us;
+        // transport map -> scheduled updates on each plugin's transport
+        // lane, plus the state in effect at the start position (the chase —
+        // on loop wrap it replays from the loop point's partition, so the
+        // wrap restores loop-start tempo/meter before the next boundary)
+        let transport_pts = self.transport_points();
+        for &s in transport_of.values() {
+            for (us, cmd) in &transport_pts {
+                events.push((*us, s, output::encode_transport(cmd)));
+            }
+            for (us, cmd) in output::chase_transport(&transport_pts, start_us) {
+                events.push((us, s, output::encode_transport(&cmd)));
+            }
+        }
+        // globally sort before seek partitioning and the chase splice —
+        // transport payloads join the same ordered stream
+        events.sort_by_key(|e| e.0);
         let chase: Vec<(u64, usize, Vec<u8>)> = self
             .doc(|d| d.chase_events(start_us))
             .into_iter()
@@ -2872,42 +2953,19 @@ impl EditorView {
         self.finish_record();
     }
 
-    /// (bpm, sig_num, sig_den) the hosted plugin should see — the
-    /// document's head, or the viewed sequence's head for format 2.
-    fn transport_hints(&self) -> (f64, i32, i32) {
+    /// The document's tempo map + meter map as scheduled transport updates
+    /// `(µs, TransportCmd)`, sorted by µs. `TransportSink`s drive these into
+    /// hosted plugins so their `ProcessContext` follows mid-song changes at
+    /// audio block boundaries instead of staying at the head values.
+    /// Format-2 documents schedule from the viewed sequence's own maps.
+    fn transport_points(&self) -> Vec<(u64, output::TransportCmd)> {
         self.doc(|d| {
             let tr = if d.is_sequential() {
-                self.sel_track.min(d.tracks.len().saturating_sub(1))
+                Some(self.sel_track.min(d.tracks.len().saturating_sub(1)))
             } else {
-                0
+                None
             };
-            let bpm = d
-                .tempo_map_for(tr)
-                .points()
-                .first()
-                .map(|(_, mpq, _)| 60_000_000.0 / (*mpq).max(1) as f64)
-                .unwrap_or(120.0);
-            let mut sig = (4i32, 4i32);
-            let scan: &[document::Track] = if d.is_sequential() {
-                std::slice::from_ref(&d.tracks[tr])
-            } else {
-                &d.tracks
-            };
-            'find: for tr in scan {
-                for e in &tr.events {
-                    if let EventKind::Meta {
-                        meta_type: 0x58,
-                        data,
-                    } = &e.kind
-                    {
-                        if data.len() >= 2 {
-                            sig = (data[0] as i32, 1i32 << (data[1] & 0x1f));
-                            break 'find;
-                        }
-                    }
-                }
-            }
-            (bpm, sig.0, sig.1)
+            transport_points_for(d, tr)
         })
     }
 
@@ -4494,5 +4552,50 @@ mod tests {
         assert_eq!(rt.device.as_deref(), Some("Speakers"));
         assert_eq!(rt.sample_rate, Some(48000.0));
         assert_eq!(rt.buffer_size, Some(1024));
+    }
+
+    /// A document with mid-song tempo + meter changes produces transport
+    /// points at deterministic µs positions (the tempo map's own µs
+    /// accounting), sorted — the schedule the transport sink applies.
+    #[test]
+    fn transport_points_cover_tempo_and_meter_at_document_positions() {
+        use document::{Document, Op, Transaction};
+        let mut d = empty_doc();
+        fn apply(d: &mut Document, ops: Vec<Op>) {
+            d.apply(Transaction {
+                label: "t".into(),
+                base: d.revision(),
+                ops,
+            })
+            .unwrap();
+        }
+        let ops = d.set_time_sig_ops(0, 3, 4);
+        apply(&mut d, ops);
+        let ops = d.set_tempo_ops(960, 60.0); // 960 ticks @480ppq = 2 quarters in
+        apply(&mut d, ops);
+        let ops = d.set_time_sig_ops(1920, 6, 8);
+        apply(&mut d, ops);
+        let pts = super::transport_points_of(&d);
+        assert!(pts.windows(2).all(|w| w[0].0 <= w[1].0), "{pts:?}");
+        // head tempo 120 @0; tempo change to 60bpm lands at 1_000_000µs
+        // (two 500 ms quarters); the second sig lands one 60bpm minute later:
+        // 1_000_000 + 2 quarters * 1_000_000 = 3_000_000
+        for want in [
+            (0u64, output::TransportCmd::Tempo(120.0)),
+            (1_000_000, output::TransportCmd::Tempo(60.0)),
+            (0, output::TransportCmd::TimeSig(3, 4)),
+            (3_000_000, output::TransportCmd::TimeSig(6, 8)),
+        ] {
+            assert!(pts.contains(&want), "missing {want:?} in {pts:?}");
+        }
+        // the seek chase at 2_500_000 re-asserts 60bpm + 3/4 — the state the
+        // map had built up to that position
+        assert_eq!(
+            output::chase_transport(&pts, 2_500_000),
+            vec![
+                (2_500_000, output::TransportCmd::Tempo(60.0)),
+                (2_500_000, output::TransportCmd::TimeSig(3, 4)),
+            ]
+        );
     }
 }
