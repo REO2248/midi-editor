@@ -2258,36 +2258,6 @@ mod tests {
         addr
     }
 
-    /// Raw HTTP/1.1 POST; returns the status code.
-    async fn http_post(addr: &str, headers: &[(&str, &str)], body: &str) -> u16 {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let mut req = format!(
-            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nConnection: close\r\n",
-            body.len()
-        );
-        for (k, v) in headers {
-            req += &format!("{k}: {v}\r\n");
-        }
-        req += "\r\n";
-        req += body;
-        s.write_all(req.as_bytes()).await.unwrap();
-        let mut buf = Vec::new();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), s.read_to_end(&mut buf))
-            .await
-            .expect("response timed out");
-        String::from_utf8_lossy(&buf)
-            .split_whitespace()
-            .nth(1)
-            .and_then(|c| c.parse().ok())
-            .unwrap_or(0)
-    }
-
-    const INIT: &str = concat!(
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","#,
-        r#""params":{"protocolVersion":"2025-03-26","capabilities":{},"#,
-        r#""clientInfo":{"name":"t","version":"0"}}}"#,
-    );
     fn mcp_headers(token: Option<&str>) -> Vec<(&'static str, String)> {
         let mut h: Vec<(&'static str, String)> = vec![
             ("Content-Type", "application/json".into()),
@@ -2301,7 +2271,7 @@ mod tests {
     async fn authed_post(addr: &str, token: Option<&str>) -> u16 {
         let h = mcp_headers(token);
         let pairs: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        http_post(addr, &pairs, INIT).await
+        http_post(addr, None, &pairs, INIT).await
     }
 
     #[tokio::test]
