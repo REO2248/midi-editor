@@ -51,3 +51,44 @@ jobs:
             cargo fuzz run $t "corpus/$t" corpus/shared corpus/not_strict -- -max_total_time=45 -rss_limit_mb=2048
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
+
+  coverage:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          # llvm-cov builds into target/llvm-cov-target, covered by `target`
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      # Every workspace crate except the gpui app (its code paths need a GPU
+      # session). src/bin/ files are excluded from the REPORT only: they are
+      # manual spike/ops tools with no unit tests, so counting them would just
+      # bury the signal. Everything else — including hardware-bound midi-io
+      # and output at whatever coverage they get — stays visible per file.
+      - name: Measure coverage
+        run: |
+          cargo llvm-cov --workspace --exclude midi-editor --locked --no-report
+          New-Item -ItemType Directory -Force target/coverage | Out-Null
+          cargo llvm-cov report --ignore-filename-regex "src[\\/]bin[\\/]" --lcov --output-path target/coverage/lcov.info
+          cargo llvm-cov report --ignore-filename-regex "src[\\/]bin[\\/]" --html --output-dir target/coverage/html
+          cargo llvm-cov report --ignore-filename-regex "src[\\/]bin[\\/]" --json --summary-only | Out-File -Encoding utf8 target/coverage/coverage.json
+          cargo llvm-cov report --ignore-filename-regex "src[\\/]bin[\\/]" --summary-only
+      # Fails the job when a floored crate drops under its floor — new code
+      # in a safety-critical crate cannot land completely untested.
+      - name: Enforce per-crate floors
+        run: ./scripts/check_coverage.ps1 target/coverage/coverage.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: target/coverage/
