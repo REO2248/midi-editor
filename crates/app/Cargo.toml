@@ -3,6 +3,7 @@ name = "midi-editor"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+authors = ["REO2248"]
 description = "Pure-SMF MIDI editor — gpui app"
 
 [dependencies]
@@ -28,6 +29,10 @@ tracing-subscriber.workspace = true
 # turns `TestSupportExt::test_support()` on: elements opted in via
 # `.test_support()` expose role/label/state snapshots in test windows.
 gpui-kit = { workspace = true, features = ["test-support"] }
+
+[build-dependencies]
+# embeds icon + VERSIONINFO into midi-editor.exe (Windows only)
+embed-resource = "3"
 
 [[bin]]
 name = "midi-editor"

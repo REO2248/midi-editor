@@ -7415,6 +7415,19 @@ impl Drop for EditorView {
     }
 }
 
+/// First non-flag argument = the file to open. `args_os` (not `args`) because
+/// a shell-open verb can deliver non-UTF-8 paths on Windows and `args()`
+/// panics on them; Explorer always quotes "%1", but flags like `--foo` must
+/// never be mistaken for a filename.
+fn file_arg() -> Option<PathBuf> {
+    file_arg_from(std::env::args_os().skip(1))
+}
+
+fn file_arg_from(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<PathBuf> {
+    args.find(|a| !a.to_string_lossy().starts_with('-'))
+        .map(PathBuf::from)
+}
+
 fn main() {
     // exact build identity for bug reports — same string as Help>About and
     // MCP serverInfo: "<semver>+<commit>[.dirty]"
@@ -7435,7 +7448,7 @@ fn main() {
     diagnostics::install_panic_hook();
     diagnostics::log_boot();
     tracing::info!(log_dir = %log_dir.display(), "logging initialized");
-    let path = std::env::args().nth(1).map(PathBuf::from);
+    let path = file_arg();
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
         // the component theme (text inputs etc.) is applied in
@@ -7962,8 +7975,8 @@ fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
 #[cfg(test)]
 mod tests {
     use crate::{
-        assemble_events, empty_doc, plugin_plan, route_events, track_audible, GlobalPrefs,
-        PluginPlan, PluginState, Prefs,
+        assemble_events, empty_doc, file_arg_from, plugin_plan, route_events, track_audible,
+        GlobalPrefs, PluginPlan, PluginState, Prefs,
     };
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
@@ -8688,5 +8701,24 @@ mod tests {
         assert_eq!(got[0].2, vec![0xF0, 0x7E, 0xF7]);
         assert_eq!(got[1].2, vec![0xB0, 7, 90]);
         assert_eq!(got[2].2, note(60));
+    }
+
+    #[test]
+    fn file_arg_skips_flags_and_picks_first_path() {
+        use std::ffi::OsString;
+        let args = vec![
+            OsString::from("--fullscreen"),
+            OsString::from(r"C:\Music\my song.mid"),
+            OsString::from("extra.mid"),
+        ];
+        assert_eq!(
+            file_arg_from(args.into_iter()),
+            Some(PathBuf::from(r"C:\Music\my song.mid"))
+        );
+        assert_eq!(file_arg_from(Vec::new().into_iter()), None);
+        assert_eq!(
+            file_arg_from(vec![OsString::from("--only-flags")].into_iter()),
+            None
+        );
     }
 }

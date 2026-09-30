@@ -4343,6 +4343,7 @@ dependencies = [
  "bytes",
  "commands",
  "document",
+ "embed-resource",
  "gpui-kit",
  "mcp-server",
  "midi-io",

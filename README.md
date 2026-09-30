@@ -30,7 +30,7 @@ From Git Bash / PowerShell use the helper: `cmd /c C:\Users\Administrator\vcargo
 
 Spike binaries: `cargo run --bin midi_ports` (midir port enumeration),
 `cargo run --bin vst3_scan` (VST3 discovery + load attempt),
-`cargo run --bin mcp_bridge` (MCP stdio server).
+`cargo run --bin mcp-bridge` (MCP stdio server).
 
 ## Running
 
