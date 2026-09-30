@@ -47,6 +47,9 @@ pub(crate) fn init_logging() -> PathBuf {
     let appender = tracing_appender::rolling::Builder::new()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
         .filename_prefix("midi-editor")
+        // files land as `midi-editor.<date>.log` — the suffix makes them
+        // recognizable to humans AND to export_bundle's filter below
+        .filename_suffix("log")
         .max_log_files(LOG_KEEP)
         .build(&dir)
         .unwrap_or_else(|_| {
@@ -202,7 +205,10 @@ pub(crate) fn export_bundle(dir: &Path, host_lines: &str) -> io::Result<PathBuf>
             rd.filter_map(|e| e.ok())
                 .filter(|e| {
                     e.file_type().map(|t| t.is_file()).unwrap_or(false)
-                        && e.file_name().to_string_lossy().starts_with("midi-editor.log")
+                        && {
+                            let n = e.file_name().to_string_lossy().into_owned();
+                            n.starts_with("midi-editor.") && n.ends_with(".log")
+                        }
                 })
                 .map(|e| e.path())
                 .collect()
@@ -272,6 +278,22 @@ mod tests {
         assert!(body.contains("audio_device=ok"));
         // host_lines are run through redact_line — secrets must not survive
         assert!(!body.contains("hunter2"));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn bundle_finds_rotated_log_files() {
+        // regression: tracing-appender names files `midi-editor.<date>.log`
+        // — the bundle filter must match that shape, not `midi-editor.log*`
+        let dir = log_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("midi-editor.2099-01-01.log");
+        std::fs::write(&fake, "marker-line-rotation-shape").unwrap();
+        let d = std::env::temp_dir().join(format!("diag-bundle2-{}", std::process::id()));
+        let p = export_bundle(&d, "").unwrap();
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(body.contains("marker-line-rotation-shape"));
+        std::fs::remove_file(&fake).ok();
         std::fs::remove_dir_all(&d).ok();
     }
 }
