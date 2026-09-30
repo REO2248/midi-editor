@@ -7,6 +7,7 @@ mod geometry;
 mod i18n;
 mod icons;
 mod render;
+mod watch;
 use geometry::{
     clamp_move_delta, clamp_span, content_view, reanchor, roll_hit, ZOOM_MAX, ZOOM_MIN,
 };
@@ -358,6 +359,20 @@ struct EditorView {
     focus: FocusHandle,
     input: Entity<InputState>,
     status: SharedString,
+    /// identity of the backing .mid at open/last save — the basis for
+    /// external-change detection (see `watch.rs`)
+    file_stamp: Option<watch::FileStamp>,
+    /// a "file changed/deleted on disk" prompt is already up — only one
+    /// per external change event until the stamp is re-baselined
+    ext_prompted: bool,
+    /// some window.prompt is awaiting an answer — prompt() panics on
+    /// re-entrant use, so a second one must not be opened
+    prompt_active: bool,
+    /// last time we stat'd the backing file (2s cadence)
+    last_ext_check: std::time::Instant,
+    /// our window's handle — needed to open prompts from listeners and
+    /// the doc-watch loop where no &mut Window is passed
+    window_handle: Option<AnyWindowHandle>,
 }
 
 enum PluginState {
@@ -527,6 +542,11 @@ impl EditorView {
             focus: cx.focus_handle(),
             input,
             status,
+            file_stamp: path.as_deref().and_then(watch::stat_file),
+            ext_prompted: false,
+            prompt_active: false,
+            last_ext_check: std::time::Instant::now(),
+            window_handle: None,
         };
         v.sel_track = v.pick_default_track();
         v.refresh_derived();
@@ -569,6 +589,9 @@ impl EditorView {
         self.play_us = 0;
         self.refresh_derived();
         self.reset_view_to_content();
+        // untitled has no backing file to watch
+        self.file_stamp = None;
+        self.ext_prompted = false;
         self.status = if rec_discarded {
             format!("{} — {}", t("status.new_doc"), t("status.rec_discarded")).into()
         } else {
@@ -1563,6 +1586,24 @@ impl EditorView {
             self.save_as(cx);
             return;
         };
+        // check the backing file's identity before touching it — a save
+        // must never silently overwrite somebody else's changes
+        match watch::check_file(&p, self.file_stamp) {
+            watch::FileEvent::Unchanged => self.write_file(&p, cx),
+            // timestamp/size drifted but content is identical — safe to
+            // write, just adopt the fresh stamp
+            watch::FileEvent::Touched(s) => {
+                self.file_stamp = Some(s);
+                self.write_file(&p, cx);
+            }
+            ev => self.prompt_save_conflict(p, ev, cx),
+        }
+    }
+
+    /// The actual write shared by save() and the conflict resolutions.
+    /// `file_stamp` re-baselines only after write_atomic succeeds, so a
+    /// failed write can't make the next conflict check blind.
+    fn write_file(&mut self, p: &std::path::Path, cx: &mut Context<Self>) {
         // serialize under the lock, write outside it — and remember the
         // revision the bytes were taken at so concurrent edits stay dirty
         let (bytes, rev) = {
@@ -1574,17 +1615,216 @@ impl EditorView {
                 sh.doc.revision(),
             )
         };
-        match mcp_server::write_atomic(&p, &bytes) {
+        match mcp_server::write_atomic(p, &bytes) {
             Ok(()) => {
                 let mut sh = lock_shared(&self.shared);
                 sh.saved_revision = rev;
                 drop(sh);
+                self.file_stamp = watch::stat_file(p);
+                self.ext_prompted = false;
                 self.status = t("status.saved").into();
                 self.persist();
             }
             Err(e) => self.status = format!("{e}").into(),
         }
         cx.notify();
+    }
+
+    /// The save-time conflict prompt: Reload (take the disk version,
+    /// discarding local changes), Save As (keep local under a new path),
+    /// Overwrite (explicit — destroy the external change), or Cancel.
+    fn prompt_save_conflict(&mut self, p: PathBuf, ev: watch::FileEvent, cx: &mut Context<Self>) {
+        if self.prompt_active {
+            self.status = t("watch.save_blocked").into();
+            cx.notify();
+            return;
+        }
+        let Some(wh) = self.window_handle else {
+            self.status = t("watch.save_blocked").into();
+            cx.notify();
+            return;
+        };
+        let name = p.display().to_string();
+        let (title, detail, answers) = match ev {
+            watch::FileEvent::Missing => (
+                t("watch.missing_title").to_string(),
+                tf("watch.missing_detail", &[("p", &name)]),
+                vec![
+                    PromptButton::Ok(t("watch.save_as").into()),
+                    PromptButton::Other(t("watch.recreate").into()),
+                    PromptButton::Cancel(t("watch.cancel").into()),
+                ],
+            ),
+            _ => (
+                t("watch.changed_title").to_string(),
+                tf("watch.changed_detail", &[("p", &name)]),
+                vec![
+                    PromptButton::Other(t("watch.reload").into()),
+                    PromptButton::Ok(t("watch.save_as").into()),
+                    PromptButton::Other(t("watch.overwrite").into()),
+                    PromptButton::Cancel(t("watch.cancel").into()),
+                ],
+            ),
+        };
+        let Ok(rx) = wh.update(cx, |_, w, app| {
+            w.prompt(PromptLevel::Warning, &title, Some(&detail), &answers, app)
+        }) else {
+            return;
+        };
+        self.prompt_active = true;
+        cx.spawn(async move |this, cx| {
+            let idx = rx.await.unwrap_or(usize::MAX);
+            this.update(cx, |v, cx| {
+                v.prompt_active = false;
+                v.resolve_save_conflict(&p, ev, idx, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Apply the save-conflict answer. Index follows the button order built
+    /// in `prompt_save_conflict`; any unexpected index is Cancel.
+    fn resolve_save_conflict(
+        &mut self,
+        p: &PathBuf,
+        ev: watch::FileEvent,
+        idx: usize,
+        cx: &mut Context<Self>,
+    ) {
+        match ev {
+            // [Reload, Save As, Overwrite, Cancel]
+            watch::FileEvent::Modified => match idx {
+                // Reload = the only path that resets undo/history — and it
+                // only happens through this explicit choice
+                0 => self.open(p.clone(), cx),
+                1 => self.save_as(cx),
+                2 => self.write_file(p, cx),
+                _ => {
+                    self.status = t("watch.save_cancelled").into();
+                    cx.notify();
+                }
+            },
+            // [Save As, Recreate, Cancel]
+            watch::FileEvent::Missing => match idx {
+                0 => self.save_as(cx),
+                1 => self.write_file(p, cx),
+                _ => {
+                    self.status = t("watch.save_cancelled").into();
+                    cx.notify();
+                }
+            },
+            _ => {}
+        }
+    }
+
+    /// While-open poll, called from the doc-watch loop (~2s cadence).
+    /// Surfaces external modification or deletion with a prompt; `Touched`
+    /// just re-baselines silently. One prompt per episode — `ext_prompted`
+    /// releases only when the stamp is re-baselined by open/save.
+    fn check_external_change(&mut self, cx: &mut Context<Self>) {
+        if self.last_ext_check.elapsed() < std::time::Duration::from_secs(2) {
+            return;
+        }
+        self.last_ext_check = std::time::Instant::now();
+        if self.ext_prompted || self.prompt_active {
+            return;
+        }
+        let Some(p) = lock_shared(&self.shared).path.clone() else {
+            return;
+        };
+        match watch::check_file(&p, self.file_stamp) {
+            watch::FileEvent::Unchanged => {}
+            watch::FileEvent::Touched(s) => self.file_stamp = Some(s),
+            ev => {
+                self.ext_prompted = true;
+                self.prompt_ext_change(p, ev, cx);
+            }
+        }
+    }
+
+    /// The while-open notice. Clean doc: Enter=Reload is safe (nothing is
+    /// lost). Dirty doc: Enter=Keep Editing — Reload stays available but
+    /// can't be triggered by a reflex Enter.
+    fn prompt_ext_change(&mut self, p: PathBuf, ev: watch::FileEvent, cx: &mut Context<Self>) {
+        let Some(wh) = self.window_handle else {
+            self.ext_prompted = false;
+            return;
+        };
+        let dirty = {
+            let sh = lock_shared(&self.shared);
+            sh.doc.revision() != sh.saved_revision
+        };
+        let name = p.display().to_string();
+        let (title, detail, answers) = match (ev, dirty) {
+            (watch::FileEvent::Missing, _) => (
+                t("watch.missing_title").to_string(),
+                tf("watch.missing_open_detail", &[("p", &name)]),
+                vec![
+                    PromptButton::Ok(t("watch.keep").into()),
+                    PromptButton::Other(t("watch.save_as").into()),
+                ],
+            ),
+            (watch::FileEvent::Modified, false) => (
+                t("watch.changed_title").to_string(),
+                tf("watch.changed_open_detail", &[("p", &name)]),
+                vec![
+                    PromptButton::Ok(t("watch.reload").into()),
+                    PromptButton::Other(t("watch.keep").into()),
+                ],
+            ),
+            _ => (
+                t("watch.changed_title").to_string(),
+                tf("watch.changed_dirty_detail", &[("p", &name)]),
+                vec![
+                    PromptButton::Ok(t("watch.keep").into()),
+                    PromptButton::Other(t("watch.reload").into()),
+                ],
+            ),
+        };
+        let Ok(rx) = wh.update(cx, |_, w, app| {
+            w.prompt(PromptLevel::Warning, &title, Some(&detail), &answers, app)
+        }) else {
+            self.ext_prompted = false;
+            return;
+        };
+        self.prompt_active = true;
+        cx.spawn(async move |this, cx| {
+            let idx = rx.await.unwrap_or(usize::MAX);
+            this.update(cx, |v, cx| {
+                v.prompt_active = false;
+                v.resolve_ext_change(&p, ev, dirty, idx, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Index meaning depends on the button order chosen by
+    /// `prompt_ext_change`: Missing = [Keep, Save As]; clean-modified =
+    /// [Reload, Keep]; dirty-modified = [Keep, Reload].
+    fn resolve_ext_change(
+        &mut self,
+        p: &PathBuf,
+        ev: watch::FileEvent,
+        dirty: bool,
+        idx: usize,
+        cx: &mut Context<Self>,
+    ) {
+        match ev {
+            watch::FileEvent::Missing => {
+                if idx == 1 {
+                    self.save_as(cx);
+                }
+            }
+            watch::FileEvent::Modified => {
+                let reload = if dirty { idx == 1 } else { idx == 0 };
+                if reload {
+                    self.open(p.clone(), cx);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn save_as(&mut self, cx: &mut Context<Self>) {
@@ -1659,6 +1899,9 @@ impl EditorView {
                 // content — a saved per-file sidecar (applied next) overrides
                 self.refresh_derived();
                 self.reset_view_to_content();
+                // the freshly-opened file is the new identity baseline
+                self.file_stamp = watch::stat_file(&path);
+                self.ext_prompted = false;
                 self.apply_prefs(&path);
                 self.push_recent(&path);
                 let mut status = if load_warnings.is_empty() {
@@ -2748,7 +2991,8 @@ fn main() {
                 let input =
                     cx.new(|cx| InputState::new(window, cx).placeholder(t("field.track_name")));
                 let view = cx.new(|cx| {
-                    let v = EditorView::new(path.clone(), input, cx);
+                    let mut v = EditorView::new(path.clone(), input, cx);
+                    v.window_handle = Some(window.window_handle());
                     spawn_mcp(v.shared.clone());
                     spawn_doc_watch(cx, v.shared.clone());
                     window.focus(&v.focus.clone(), cx);
@@ -2840,6 +3084,9 @@ fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
                         v.persist();
                         v.refresh_plugins();
                     }
+                    // watch the backing .mid for external modification /
+                    // deletion (only the MIDI file — the sidecar doesn't count)
+                    v.check_external_change(cx);
                     // repaint while playing so the playhead/counter advance;
                     // also while a plugin editor is open so its native event
                     // queue gets serviced even when the app is idle

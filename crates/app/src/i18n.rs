@@ -174,6 +174,39 @@ static EN: &[(&str, &str)] = &[
     ("plugin.phase_load", "plugin load"),
     ("plugin.phase_audio", "audio start"),
     ("status.rescan", "rescanned: {n} destination(s)"),
+    ("watch.changed_title", "File changed on disk"),
+    (
+        "watch.changed_detail",
+        "{p} was modified by another program.\nReload takes the disk version (your unsaved changes are discarded). Overwrite saves your version over theirs.",
+    ),
+    (
+        "watch.changed_open_detail",
+        "{p} was modified by another program.\nReload picks up the new version.",
+    ),
+    (
+        "watch.changed_dirty_detail",
+        "{p} was modified by another program and you have unsaved changes.\nReload discards your changes.",
+    ),
+    ("watch.missing_title", "File missing on disk"),
+    (
+        "watch.missing_detail",
+        "{p} no longer exists (deleted, moved, or the drive was removed).\nSave As writes your version to a new path; Recreate restores the original file.",
+    ),
+    (
+        "watch.missing_open_detail",
+        "{p} no longer exists (deleted, moved, or the drive was removed).\nYour document stays in memory; Save As writes it to a new path.",
+    ),
+    ("watch.reload", "Reload"),
+    ("watch.save_as", "Save As…"),
+    ("watch.overwrite", "Overwrite"),
+    ("watch.recreate", "Recreate File"),
+    ("watch.keep", "Keep Editing"),
+    ("watch.cancel", "Cancel"),
+    ("watch.save_cancelled", "Save cancelled"),
+    (
+        "watch.save_blocked",
+        "file changed on disk — answer the open prompt first",
+    ),
 ];
 
 static JA: &[(&str, &str)] = &[
@@ -326,6 +359,39 @@ static JA: &[(&str, &str)] = &[
     ("tip.zout", "ズームアウト (Ctrl+-)"),
     ("tip.dest", "選択トラックの出力先"),
     ("tip.gui", "プラグインGUI"),
+    ("watch.changed_title", "ファイルがディスク上で変更されました"),
+    (
+        "watch.changed_detail",
+        "{p} が別のプログラムによって変更されました。\n「再読み込み」はディスクの内容を採用します（未保存の変更は破棄）。「上書き」はこちらの内容で上書きします。",
+    ),
+    (
+        "watch.changed_open_detail",
+        "{p} が別のプログラムによって変更されました。\n「再読み込み」で新しい内容を取り込みます。",
+    ),
+    (
+        "watch.changed_dirty_detail",
+        "{p} が別のプログラムによって変更されました。未保存の変更があります。\n「再読み込み」は変更を破棄します。",
+    ),
+    ("watch.missing_title", "ファイルが見つかりません"),
+    (
+        "watch.missing_detail",
+        "{p} が存在しません（削除・移動・ドライブの取り外し）。\n「名前を付けて保存」は新しい場所に書き出し、「再作成」は元のファイルを復元します。",
+    ),
+    (
+        "watch.missing_open_detail",
+        "{p} が存在しません（削除・移動・ドライブの取り外し）。\nドキュメントはメモリ上に残ります。「名前を付けて保存」で新しい場所に書き出せます。",
+    ),
+    ("watch.reload", "再読み込み"),
+    ("watch.save_as", "名前を付けて保存…"),
+    ("watch.overwrite", "上書き"),
+    ("watch.recreate", "ファイルを再作成"),
+    ("watch.keep", "編集を続ける"),
+    ("watch.cancel", "キャンセル"),
+    ("watch.save_cancelled", "保存をキャンセルしました"),
+    (
+        "watch.save_blocked",
+        "ファイルがディスク上で変更されています — 開いているプロンプトに先に回答してください",
+    ),
 ];
 
 fn detect_lang() -> &'static str {
