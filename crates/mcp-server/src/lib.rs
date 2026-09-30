@@ -2108,11 +2108,13 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
                 } => (Some(fps), Some(ticks_per_frame)),
                 smf_core::Division::Metrical(_) => (None, None),
             };
-            let point = |(tick, mpq, cum): &(u64, u32, u64)| serde_json::json!({
-                "tick": tick, "us_per_quarter": mpq,
-                "bpm": (60_000_000.0 / *mpq as f64 * 100.0).round() / 100.0,
-                "cumulative_us": cum,
-            });
+            let point = |(tick, mpq, cum): &(u64, u32, u64)| {
+                serde_json::json!({
+                    "tick": tick, "us_per_quarter": mpq,
+                    "bpm": (60_000_000.0 / *mpq as f64 * 100.0).round() / 100.0,
+                    "cumulative_us": cum,
+                })
+            };
             ok_json(if sh.view().is_sequential() {
                 // format 2: every sequence is timed by its own tempo map
                 serde_json::json!({

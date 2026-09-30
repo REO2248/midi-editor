@@ -855,6 +855,9 @@ fn smpte_drop_frame_boundary_from_file() {
     assert_eq!(td.format_tick(179_900), "00:00:59.29");
     assert_eq!(td.format_tick(180_000), "00:01:00.02");
     assert_eq!(td.format_tick(1_798_200), "00:10:00.00");
+}
+
+#[test]
 fn format2_is_detected_and_roundtrips() {
     let d = seq_doc(vec![
         vec![tempo(0, 500_000), chan(0, 0x90, 60, 100), chan(480, 0x80, 60, 0)],

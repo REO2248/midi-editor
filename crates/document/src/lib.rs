@@ -1534,7 +1534,9 @@ impl Document {
     /// Set/replace the tempo at `tick` on `track` (the conductor is
     /// track 0 for format 0/1; a format-2 sequence owns its own tempo).
     pub fn set_tempo_ops(&mut self, track: usize, tick: u64, bpm: f64) -> Vec<Op> {
-        let mpq = (60_000_000.0 / bpm.max(1.0)).round().clamp(1.0, 0xFF_FFFF as f64) as u32;
+        let mpq = (60_000_000.0 / bpm.max(1.0))
+            .round()
+            .clamp(1.0, 0xFF_FFFF as f64) as u32;
         let data = Bytes::copy_from_slice(&mpq.to_be_bytes()[1..]);
         // replace an existing tempo event at the same tick
         if let Some(e) = self

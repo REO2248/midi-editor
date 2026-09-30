@@ -1088,9 +1088,7 @@ impl EditorView {
                     EventKind::SysEx(d) => format!("SysEx   {}B", d.len()),
                     EventKind::Escape(d) => format!("Escape  {}B", d.len()),
                 };
-                rows.push(SharedString::from(format!(
-                    "{pos:>11}  T{ti}  {body}"
-                )));
+                rows.push(SharedString::from(format!("{pos:>11}  T{ti}  {body}")));
             }
         }
         rows
@@ -1167,7 +1165,8 @@ impl EditorView {
         });
         let ops = {
             let mut sh = lock_shared(&self.shared);
-            sh.doc.set_tempo_ops(tr, 0, (cur + delta).clamp(10.0, 400.0))
+            sh.doc
+                .set_tempo_ops(tr, 0, (cur + delta).clamp(10.0, 400.0))
         };
         self.apply_tx("set tempo", ops);
     }
@@ -1200,9 +1199,7 @@ impl EditorView {
 
     #[allow(dead_code)]
     fn insert_note(&mut self, tick: u64, key: u8, cx: &mut Context<Self>) {
-        let len = self
-            .snap_ticks()
-            .max(self.td().min_grid_ticks() as i64) as u64;
+        let len = self.snap_ticks().max(self.td().min_grid_ticks() as i64) as u64;
         self.insert_note_len(tick, key, len, cx);
     }
 
@@ -2481,7 +2478,17 @@ impl EditorView {
 
     fn start_playback(&mut self) {
         // snapshot routing state so no lock is held while opening sinks
-        let (dests, dest_of_track, muted, soloed, metronome, loop_enabled, chase_sysex, sequential, sxp) = {
+        let (
+            dests,
+            dest_of_track,
+            muted,
+            soloed,
+            metronome,
+            loop_enabled,
+            chase_sysex,
+            sequential,
+            sxp,
+        ) = {
             let sh = lock_shared(&self.shared);
             let map: HashMap<usize, usize> = (0..sh.doc.tracks.len())
                 .map(|t| (t, sh.dest_of(t)))
@@ -2748,7 +2755,10 @@ impl EditorView {
         let buf2 = buf.clone();
         // optional count-in: one bar for metrical, one second for SMPTE
         let cin_us = if self.count_in {
-            self.doc(|d| d.tempo_map_for(self.sel_track).tick_to_us(self.td().bar_ticks()))
+            self.doc(|d| {
+                d.tempo_map_for(self.sel_track)
+                    .tick_to_us(self.td().bar_ticks())
+            })
         } else {
             0
         };
@@ -3488,7 +3498,11 @@ impl EditorView {
             if let Some(c) = p.chase_sysex {
                 sh.chase_sysex = c;
             }
-            if let Some(sp) = p.sysex_policy.as_deref().and_then(midi_io::SysexPolicy::from_label) {
+            if let Some(sp) = p
+                .sysex_policy
+                .as_deref()
+                .and_then(midi_io::SysexPolicy::from_label)
+            {
                 sh.sysex_policy = sp;
             }
         }

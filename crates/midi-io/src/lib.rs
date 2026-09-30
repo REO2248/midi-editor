@@ -246,9 +246,7 @@ impl Timebase {
     /// `now` = the instant the callback delivered the message.
     /// Returns µs since `new()`, latency-compensated, never negative.
     pub fn stamp(&mut self, dev_us: u64, now: std::time::Instant) -> u64 {
-        let arrival = now
-            .saturating_duration_since(self.t0)
-            .as_micros() as u64;
+        let arrival = now.saturating_duration_since(self.t0).as_micros() as u64;
         let raw = match (dev_us != 0, self.anchor) {
             (true, Some((d0, i0))) => {
                 // anchor arrival + device-time delta: `now` enters only
@@ -1144,7 +1142,11 @@ mod tests {
         );
         assert!(lane.try_enqueue(vec![0xF0u8; 512], 4096));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while stats.last_send_us.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        while stats
+            .last_send_us
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0
+        {
             assert!(std::time::Instant::now() < deadline, "no send recorded");
             std::thread::sleep(std::time::Duration::from_millis(2));
         }

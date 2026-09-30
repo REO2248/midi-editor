@@ -238,7 +238,11 @@ mod tests {
 
     #[test]
     fn smpte_all_framerates() {
-        for (fps, want_1s) in [(24u8, "00:00:01.00"), (25, "00:00:01.00"), (30, "00:00:01.00")] {
+        for (fps, want_1s) in [
+            (24u8, "00:00:01.00"),
+            (25, "00:00:01.00"),
+            (30, "00:00:01.00"),
+        ] {
             let td = TimeDisplay::of(Division::Smpte {
                 fps,
                 ticks_per_frame: 100,
@@ -293,10 +297,7 @@ mod tests {
 
     #[test]
     fn badges_name_the_mode() {
-        assert_eq!(
-            TimeDisplay::of(Division::Metrical(480)).badge(),
-            "480ppq"
-        );
+        assert_eq!(TimeDisplay::of(Division::Metrical(480)).badge(), "480ppq");
         assert_eq!(
             TimeDisplay::of(Division::Smpte {
                 fps: 25,

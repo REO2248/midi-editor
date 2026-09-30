@@ -80,7 +80,9 @@ impl Render for EditorView {
             let sh = crate::lock_shared(&self.shared);
             (
                 // playhead ruler units come from the viewed sequence's map
-                sh.doc.tempo_map_for(self.sel_track).us_to_tick(self.play_us),
+                sh.doc
+                    .tempo_map_for(self.sel_track)
+                    .us_to_tick(self.play_us),
                 sh.path
                     .as_ref()
                     .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
@@ -2060,11 +2062,14 @@ impl Render for EditorView {
                         "tr.sxp",
                         tf(
                             "transport.sysex_pol",
-                            &[("mode", t(match sxp {
-                                midi_io::SysexPolicy::Serialize => "transport.sysex_ser",
-                                midi_io::SysexPolicy::Background => "transport.sysex_bg",
-                                midi_io::SysexPolicy::Skip => "transport.sysex_skip",
-                            }))],
+                            &[(
+                                "mode",
+                                t(match sxp {
+                                    midi_io::SysexPolicy::Serialize => "transport.sysex_ser",
+                                    midi_io::SysexPolicy::Background => "transport.sysex_bg",
+                                    midi_io::SysexPolicy::Skip => "transport.sysex_skip",
+                                }),
+                            )],
                         ),
                         "",
                         None,
@@ -2258,8 +2263,10 @@ impl Render for EditorView {
                                 cx,
                                 |v, _e, _cx| {
                                     const STEPS: [u64; 7] = [0, 1, 2, 5, 10, 20, 50];
-                                    let i =
-                                        STEPS.iter().position(|&s| s == v.in_latency_ms).unwrap_or(0);
+                                    let i = STEPS
+                                        .iter()
+                                        .position(|&s| s == v.in_latency_ms)
+                                        .unwrap_or(0);
                                     v.in_latency_ms = STEPS[(i + 1) % STEPS.len()];
                                     v.save_global();
                                 },
@@ -2487,9 +2494,12 @@ impl Render for EditorView {
                                     None,
                                     cx,
                                     move |v, _e, _cx| {
-                                        v.apply_region_op("set release velocity", move |d, t, f, to| {
-                                            d.set_release_velocity_ops(t, f, to, vel)
-                                        });
+                                        v.apply_region_op(
+                                            "set release velocity",
+                                            move |d, t, f, to| {
+                                                d.set_release_velocity_ops(t, f, to, vel)
+                                            },
+                                        );
                                     },
                                 )
                                 .into_any_element()
