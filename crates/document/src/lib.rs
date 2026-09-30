@@ -694,6 +694,39 @@ impl Document {
     }
 
     pub fn serialize(&self, opts: smf_core::WriteOptions) -> Vec<u8> {
+        self.snapshot().serialize(opts)
+    }
+
+    /// Clone just the data a save serializes — tracks without the by_id
+    /// index or tempo_map. Edits applied after the snapshot bump the live
+    /// document's revision, so they can never be marked saved by the write
+    /// that serializes this snapshot.
+    pub fn snapshot(&self) -> DocSnapshot {
+        DocSnapshot {
+            format: self.format,
+            division: self.division,
+            tracks: self.tracks.clone(),
+        }
+    }
+}
+
+/// Owned snapshot of a `Document`'s serializable state. Cheap to take —
+/// `Bytes` payloads are refcounted, so cloning tracks is a contiguous
+/// copy of event records, not the encode+write `serialize` performs.
+#[derive(Debug)]
+pub struct DocSnapshot {
+    format: u16,
+    division: Division,
+    tracks: Vec<Track>,
+}
+
+impl DocSnapshot {
+    /// events across all tracks — e.g. for gating save-progress UI
+    pub fn event_count(&self) -> usize {
+        self.tracks.iter().map(|t| t.events.len()).sum()
+    }
+
+    pub fn serialize(&self, opts: smf_core::WriteOptions) -> Vec<u8> {
         let tracks: Vec<smf_core::Track> = self
             .tracks
             .iter()
