@@ -7,6 +7,7 @@ mod geometry;
 mod i18n;
 mod icons;
 mod render;
+mod theme;
 use geometry::{
     clamp_move_delta, clamp_span, content_view, reanchor, roll_hit, ZOOM_MAX, ZOOM_MIN,
 };
@@ -29,11 +30,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 const NOTE_H: f32 = 13.0;
-const TRACK_COLORS: [u32; 8] = [
-    0x4f8cff, 0xff8c4f, 0x4fd08c, 0xd04fff, 0xffd24f, 0x4fd0ff, 0xff4f7a, 0x9dff4f,
-];
-const SEL_COLOR: u32 = 0xffffff;
-const DANGLING_COLOR: u32 = 0xff4f4f;
 
 /// What a left-drag on the piano roll is doing.
 #[derive(Clone, Copy, PartialEq)]
@@ -355,6 +351,10 @@ struct EditorView {
     recent: Vec<SharedString>,
     /// recording source — MIDI input port name; empty = first available
     midi_in: SharedString,
+    /// active color palette — dark or the high-contrast accessible palette
+    theme: theme::Theme,
+    /// user's stored HC override (None = follow the OS high-contrast flag)
+    hc_pref: Option<bool>,
     focus: FocusHandle,
     input: Entity<InputState>,
     status: SharedString,
@@ -522,6 +522,8 @@ impl EditorView {
             count_in: g.count_in,
             recent: g.recent.iter().map(|p| p.as_str().into()).collect(),
             midi_in: g.midi_in.clone().into(),
+            theme: theme::Theme::pick(g.hc),
+            hc_pref: g.hc,
             open_sub: None,
             show_events: true,
             focus: cx.focus_handle(),
@@ -2455,16 +2457,28 @@ impl EditorView {
         cx: &Context<Self>,
         on: impl Fn(&mut Self, &mut Context<Self>) + 'static,
     ) -> Stateful<Div> {
+        let th = theme::current();
         div()
             .id(label)
             .px_2()
             .py_1()
             .rounded_sm()
-            .bg(rgb(0x2a2a35))
+            .bg(rgb(th.bg_chip))
             .cursor_pointer()
-            .hover(|s| s.bg(rgb(0x3a3a48)))
+            .hover(move |s| s.bg(rgb(th.bg_chip_hover)))
             .child(t(label))
             .on_click(cx.listener(move |this, _ev, _w, cx| on(this, cx)))
+    }
+
+    /// Toggle the high-contrast palette; the override persists in the
+    /// app-wide prefs. When the OS flag was driving the theme, the first
+    /// toggle just flips the effective state.
+    fn toggle_hc(&mut self, cx: &mut Context<Self>) {
+        let on = self.theme == theme::Theme::high_contrast();
+        self.hc_pref = Some(!on);
+        self.theme = theme::Theme::pick(self.hc_pref);
+        self.save_global();
+        cx.notify();
     }
 
     /// Small chip with a literal label (symbols/numbers need no i18n key).
@@ -2475,15 +2489,16 @@ impl EditorView {
         cx: &mut Context<Self>,
         on: impl Fn(&mut Self, &ClickEvent, &mut Context<Self>) + 'static,
     ) -> Stateful<Div> {
+        let th = theme::current();
         div()
             .id(id)
             .px_2()
             .py_1()
             .rounded_sm()
-            .bg(rgb(0x2a2a35))
+            .bg(rgb(th.bg_chip))
             .cursor_pointer()
-            .hover(|s| s.bg(rgb(0x3a3a48)))
-            .text_color(rgb(0x9fd0ff))
+            .hover(move |s| s.bg(rgb(th.bg_chip_hover)))
+            .text_color(rgb(th.accent))
             .text_size(px(11.0))
             .child(label.into())
             .on_click(cx.listener(move |this, ev, _w, cx| on(this, ev, cx)))
@@ -2505,6 +2520,8 @@ struct GlobalPrefs {
     count_in: bool,
     /// MIDI input port name to record from; empty = first available port
     midi_in: String,
+    /// high-contrast override: Some(force on/off), None = follow the OS flag
+    hc: Option<bool>,
 }
 
 impl GlobalPrefs {
@@ -2674,6 +2691,7 @@ impl EditorView {
             recent: self.recent.iter().map(|r| r.to_string()).collect(),
             count_in: self.count_in,
             midi_in: self.midi_in.to_string(),
+            hc: self.hc_pref,
         }
         .save();
     }

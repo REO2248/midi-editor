@@ -67,6 +67,7 @@ static EN: &[(&str, &str)] = &[
     ("edit.vel_dn", "Velocity -20%"),
     // View
     ("view.events", "Event List"),
+    ("view.hc", "High Contrast"),
     ("view.zoom_in", "Zoom In"),
     ("view.zoom_out", "Zoom Out"),
     ("view.zoom_reset", "Zoom Reset"),
@@ -225,6 +226,7 @@ static JA: &[(&str, &str)] = &[
     ("edit.vel_up", "ベロシティ +25%"),
     ("edit.vel_dn", "ベロシティ -20%"),
     ("view.events", "イベントリスト"),
+    ("view.hc", "ハイコントラスト"),
     ("view.zoom_in", "ズームイン"),
     ("view.zoom_out", "ズームアウト"),
     ("view.zoom_reset", "ズームリセット"),
