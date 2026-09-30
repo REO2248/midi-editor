@@ -105,6 +105,14 @@ raw_hex), `get_tempo_map`, `get_meta` (names/markers/lyrics decoded),
 `get_cc` (latest CC value per track/channel/cc), `diagnostics` (import-quality
 findings), `list_midi_ports`, `list_destinations`.
 
+**File-write scope**: `save` with no `path` always writes the open
+document. An explicit `path` is scoped — it is canonicalized (following
+symlinks/junctions and `..`) and must land under the document's
+directory. Extra roots are opt-in via `MIDI_MCP_ALLOWED_ROOTS`
+(`;`-separated dirs) for the HTTP server; standalone stdio mode
+(`mcp-bridge --file`) also allows its working directory and uses
+`MIDI_MCP_STDIO_ALLOWED_ROOTS` instead.
+
 **Edit tools** — one call = one undoable transaction: `apply_patch`
 (low-level ops: insert_note / insert_events / remove_events / move_note /
 set_tempo; `base_revision` optimistic concurrency, `dry_run` previews without
