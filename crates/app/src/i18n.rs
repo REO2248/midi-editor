@@ -174,6 +174,13 @@ static EN: &[(&str, &str)] = &[
     ("plugin.phase_load", "plugin load"),
     ("plugin.phase_audio", "audio start"),
     ("status.rescan", "rescanned: {n} destination(s)"),
+    // focused region names (status bar)
+    ("focus.label", "focus"),
+    ("focus.menubar", "menu bar"),
+    ("focus.tracks", "tracks"),
+    ("focus.roll", "piano roll"),
+    ("focus.lane", "lane"),
+    ("focus.events", "event list"),
 ];
 
 static JA: &[(&str, &str)] = &[
@@ -326,6 +333,13 @@ static JA: &[(&str, &str)] = &[
     ("tip.zout", "ズームアウト (Ctrl+-)"),
     ("tip.dest", "選択トラックの出力先"),
     ("tip.gui", "プラグインGUI"),
+    // フォーカス中の領域名(ステータスバー)
+    ("focus.label", "フォーカス"),
+    ("focus.menubar", "メニューバー"),
+    ("focus.tracks", "トラック"),
+    ("focus.roll", "ピアノロール"),
+    ("focus.lane", "レーン"),
+    ("focus.events", "イベントリスト"),
 ];
 
 fn detect_lang() -> &'static str {
