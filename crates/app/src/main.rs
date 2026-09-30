@@ -2729,10 +2729,23 @@ impl EditorView {
     }
 }
 
+/// First non-flag argument = the file to open. `args_os` (not `args`) because
+/// a shell-open verb can deliver non-UTF-8 paths on Windows and `args()`
+/// panics on them; Explorer always quotes "%1", but flags like `--foo` must
+/// never be mistaken for a filename.
+fn file_arg() -> Option<PathBuf> {
+    file_arg_from(std::env::args_os().skip(1))
+}
+
+fn file_arg_from(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<PathBuf> {
+    args.find(|a| !a.to_string_lossy().starts_with('-'))
+        .map(PathBuf::from)
+}
+
 fn main() {
     output::init_env();
     std::panic::set_hook(Box::new(|i| eprintln!("panic: {i}")));
-    let path = std::env::args().nth(1).map(PathBuf::from);
+    let path = file_arg();
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
         // dark UI — gpui-component's default theme follows the OS and renders
@@ -2886,7 +2899,8 @@ fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
 
 #[cfg(test)]
 mod tests {
-    use crate::empty_doc;
+    use crate::{empty_doc, file_arg_from};
+    use std::path::PathBuf;
 
     /// Every freshly parsed document reports revision 0, so the derived-view
     /// caches must not key on the revision alone: before `doc_epoch` existed,
@@ -2896,5 +2910,24 @@ mod tests {
     #[test]
     fn fresh_documents_share_revision_zero() {
         assert_eq!(empty_doc().revision(), empty_doc().revision());
+    }
+
+    #[test]
+    fn file_arg_skips_flags_and_picks_first_path() {
+        use std::ffi::OsString;
+        let args = vec![
+            OsString::from("--fullscreen"),
+            OsString::from(r"C:\Music\my song.mid"),
+            OsString::from("extra.mid"),
+        ];
+        assert_eq!(
+            file_arg_from(args.into_iter()),
+            Some(PathBuf::from(r"C:\Music\my song.mid"))
+        );
+        assert_eq!(file_arg_from(Vec::new().into_iter()), None);
+        assert_eq!(
+            file_arg_from(vec![OsString::from("--only-flags")].into_iter()),
+            None
+        );
     }
 }

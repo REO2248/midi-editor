@@ -4,6 +4,10 @@ edition.workspace = true
 license.workspace = true
 description = "Embedded MCP server over the shared document transaction path"
 
+[[bin]]
+name = "mcp-bridge"
+path = "src/bin/mcp_bridge.rs"
+
 [dependencies]
 rmcp = { workspace = true, features = ["client", "server", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "macros", "schemars"] }
 tokio.workspace = true
