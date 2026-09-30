@@ -419,6 +419,8 @@ impl Document {
     pub fn timeline_tagged(&self) -> Vec<(u64, usize, Vec<u8>)> {
         let mut out = Vec::new();
         for (ti, t) in self.tracks.iter().enumerate() {
+            // format 2: this sequence's own tempo map, not the merged map
+            let map = self.map_scope(ti);
             for e in &t.events {
                 if let EventKind::Channel { status, data, len } = &e.kind {
                     let mut b = Vec::with_capacity(3);
@@ -427,7 +429,7 @@ impl Document {
                     if *len == 2 {
                         b.push(data[1]);
                     }
-                    out.push((self.tempo_map.tick_to_us(e.tick), ti, b));
+                    out.push((map.tick_to_us(e.tick), ti, b));
                 }
             }
         }
@@ -483,6 +485,7 @@ impl Document {
     fn sysex_wire(&self) -> Vec<(u64, usize, Vec<u8>, bool)> {
         let mut out = Vec::new();
         for (ti, t) in self.tracks.iter().enumerate() {
+            let map = self.map_scope(ti);
             let mut open: Option<(u64, Vec<u8>)> = None;
             for e in &t.events {
                 match &e.kind {
@@ -491,7 +494,7 @@ impl Document {
                             b.push(0xF7);
                             out.push((us, ti, b, false));
                         }
-                        let us = self.tempo_map.tick_to_us(e.tick);
+                        let us = map.tick_to_us(e.tick);
                         let mut b = Vec::with_capacity(p.len() + 2);
                         b.push(0xF0);
                         b.extend_from_slice(p);
@@ -549,9 +552,10 @@ impl Document {
     pub fn chase_events(&self, start_us: u64) -> Vec<(u64, usize, Vec<u8>)> {
         let mut out = Vec::new();
         for (ti, t) in self.tracks.iter().enumerate() {
+            let map = self.map_scope(ti);
             let mut chans: HashMap<u8, ChaseState> = HashMap::new();
             for e in &t.events {
-                if self.tempo_map.tick_to_us(e.tick) >= start_us {
+                if map.tick_to_us(e.tick) >= start_us {
                     break; // events sorted by (tick, seq); tick_to_us is monotonic
                 }
                 let EventKind::Channel { status, data, .. } = &e.kind else {
@@ -691,6 +695,43 @@ impl Document {
             }
         }
         out
+    }
+
+    /// Last event tick in one track — a sequence's own duration. Matters
+    /// for format 2, where each track is an independent sequence rather
+    /// than a lane of one shared timeline.
+    pub fn track_end_tick(&self, track: usize) -> u64 {
+        self.tracks
+            .get(track)
+            .and_then(|t| t.events.iter().map(|e| e.tick).max())
+            .unwrap_or(0)
+    }
+
+    /// Whether this file declares format 2 (independent sequences).
+    pub fn is_sequential(&self) -> bool {
+        self.format == 2
+    }
+
+    /// The tempo map a track's ticks convert through. Format-2 tracks are
+    /// independent sequences — each is timed by its own tempo events, so
+    /// this builds a map from that track alone. Format 0/1 tracks share
+    /// the conductor timeline and get the document-wide map.
+    pub fn tempo_map_for(&self, track: usize) -> TempoMap {
+        match self.map_scope(track) {
+            std::borrow::Cow::Borrowed(m) => m.clone(),
+            std::borrow::Cow::Owned(m) => m,
+        }
+    }
+
+    fn map_scope(&self, track: usize) -> std::borrow::Cow<'_, TempoMap> {
+        if self.is_sequential() && track < self.tracks.len() {
+            std::borrow::Cow::Owned(TempoMap::build(
+                std::slice::from_ref(&self.tracks[track]),
+                self.division,
+            ))
+        } else {
+            std::borrow::Cow::Borrowed(&self.tempo_map)
+        }
     }
 
     pub fn serialize(&self, opts: smf_core::WriteOptions) -> Vec<u8> {
@@ -1336,14 +1377,15 @@ impl Document {
         }]
     }
 
-    /// Set/replace the tempo at `tick` on the conductor track (track 0).
-    pub fn set_tempo_ops(&mut self, tick: u64, bpm: f64) -> Vec<Op> {
+    /// Set/replace the tempo at `tick` on `track` (the conductor is
+    /// track 0 for format 0/1; a format-2 sequence owns its own tempo).
+    pub fn set_tempo_ops(&mut self, track: usize, tick: u64, bpm: f64) -> Vec<Op> {
         let mpq = (60_000_000.0 / bpm.max(1.0)).round().clamp(1.0, 0xFF_FFFF as f64) as u32;
         let data = Bytes::copy_from_slice(&mpq.to_be_bytes()[1..]);
         // replace an existing tempo event at the same tick
         if let Some(e) = self
             .tracks
-            .first()
+            .get(track)
             .and_then(|t| {
                 t.events.iter().find(|e| {
                     e.tick == tick && matches!(e.kind, EventKind::Meta { meta_type: 0x51, .. })
@@ -1357,17 +1399,17 @@ impl Document {
                 data,
             };
             return vec![Op::UpdateEvent {
-                track: 0,
+                track,
                 before: e,
                 after,
             }];
         }
         vec![Op::InsertEvents {
-            track: 0,
+            track,
             events: vec![Event {
                 id: self.alloc_event_id(),
                 tick,
-                seq: self.next_seq(0, tick),
+                seq: self.next_seq(track, tick),
                 raw_body: None,
                 kind: EventKind::Meta {
                     meta_type: 0x51,
@@ -1377,14 +1419,15 @@ impl Document {
         }]
     }
 
-    /// Set/replace the time signature at `tick` on track 0 (denominator given
-    /// as the actual value — 4, 8, … — encoded to the SMF power-of-two form).
-    pub fn set_time_sig_ops(&mut self, tick: u64, num: u8, den: u8) -> Vec<Op> {
+    /// Set/replace the time signature at `tick` on `track` (denominator
+    /// given as the actual value — 4, 8, … — encoded to the SMF
+    /// power-of-two form).
+    pub fn set_time_sig_ops(&mut self, track: usize, tick: u64, num: u8, den: u8) -> Vec<Op> {
         let dd = (den.max(1) as f64).log2().round() as u8;
         let data = Bytes::copy_from_slice(&[num, dd, 24, 8]);
         if let Some(e) = self
             .tracks
-            .first()
+            .get(track)
             .and_then(|t| {
                 t.events.iter().find(|e| {
                     e.tick == tick && matches!(e.kind, EventKind::Meta { meta_type: 0x58, .. })
@@ -1398,17 +1441,17 @@ impl Document {
                 data,
             };
             return vec![Op::UpdateEvent {
-                track: 0,
+                track,
                 before: e,
                 after,
             }];
         }
         vec![Op::InsertEvents {
-            track: 0,
+            track,
             events: vec![Event {
                 id: self.alloc_event_id(),
                 tick,
-                seq: self.next_seq(0, tick),
+                seq: self.next_seq(track, tick),
                 raw_body: None,
                 kind: EventKind::Meta {
                     meta_type: 0x58,
@@ -1628,7 +1671,7 @@ impl Document {
         }]
     }
 }
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct TempoMap {
     /// (tick, us_per_quarter, cumulative_us)
     points: Vec<(u64, u32, u64)>,

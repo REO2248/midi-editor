@@ -194,11 +194,22 @@ struct DocUi {
 impl DocUi {
     /// `notes` is the already-derived note view for this revision (passed in
     /// so the pairing pass runs once per revision, not once per consumer).
-    fn build(doc: &Document, notes: &[Note], enc_override: Option<smf_core::TextEncoding>) -> Self {
+    /// `seq_sel` scopes markers/tempo/sig/song-end to one sequence for
+    /// format-2 documents (None = whole document, formats 0/1).
+    fn build(
+        doc: &Document,
+        notes: &[Note],
+        enc_override: Option<smf_core::TextEncoding>,
+        seq_sel: Option<usize>,
+    ) -> Self {
         let hint = enc_override.or_else(|| doc.text_encoding_hint());
+        let scan: &[document::Track] = match seq_sel.and_then(|i| doc.tracks.get(i)) {
+            Some(t) => std::slice::from_ref(t),
+            None => &doc.tracks,
+        };
         // meta 0x06/0x05 markers, from any track, at their tick
         let mut markers = Vec::new();
-        for t in &doc.tracks {
+        for t in scan {
             for e in &t.events {
                 if let EventKind::Meta {
                     meta_type: 0x05 | 0x06,
@@ -211,13 +222,12 @@ impl DocUi {
         }
         markers.sort_unstable();
         let tempo0 = doc
-            .tempo_map
+            .tempo_map_for(seq_sel.unwrap_or(0))
             .points()
             .first()
             .map(|(_, mpq, _)| 60_000_000.0 / *mpq as f64)
             .unwrap_or(120.0);
-        let sig = doc
-            .tracks
+        let sig = scan
             .first()
             .and_then(|t| {
                 t.events.iter().find_map(|e| match &e.kind {
@@ -250,6 +260,7 @@ impl DocUi {
             tempo0,
             song_end: notes
                 .iter()
+                .filter(|n| seq_sel.is_none_or(|i| n.track == i))
                 .map(|n| n.end_tick.unwrap_or(n.start_tick))
                 .max()
                 .unwrap_or(0),
@@ -263,18 +274,19 @@ struct EditorView {
     /// Every freshly parsed file reports revision 0, so caches keyed on the
     /// revision alone cannot tell two documents apart — opening a file after
     /// an untouched one left the roll showing the previous (often empty)
-    /// note view. Cache keys are `(doc_epoch, revision)`.
+    /// note view. Cache keys are `(doc_epoch, revision)`; event rows and
+    /// DocUi add the viewed sequence (format 2 scopes them per sequence).
     doc_epoch: u64,
     notes_key: (u64, u64),
     notes: Arc<Vec<Note>>,
-    ev_key: (u64, u64),
+    ev_key: (u64, u64, usize),
     events: Arc<Vec<SharedString>>,
     /// Document-derived UI data (markers, track names, diagnostics count…).
     /// Rebuilt only when the document key or encoding hint changes — render
     /// runs at animation-frame rate during playback and must not rescan
     /// every event each frame.
     doc_ui: Arc<DocUi>,
-    doc_ui_key: (u64, u64),
+    doc_ui_key: (u64, u64, usize),
     doc_ui_enc: Option<smf_core::TextEncoding>,
     /// lane (velocity/CC/PB) points cache — keys on epoch + revision +
     /// track + mode
@@ -459,10 +471,10 @@ impl EditorView {
             doc_epoch: 0,
             notes_key: (u64::MAX, u64::MAX),
             notes: Arc::new(vec![]),
-            ev_key: (u64::MAX, u64::MAX),
+            ev_key: (u64::MAX, u64::MAX, usize::MAX),
             events: Arc::new(vec![]),
             doc_ui: Arc::new(DocUi::default()),
-            doc_ui_key: (u64::MAX, u64::MAX),
+            doc_ui_key: (u64::MAX, u64::MAX, usize::MAX),
             doc_ui_enc: None,
             lane_cache: Arc::new(vec![]),
             lane_key: (u64::MAX, u64::MAX),
@@ -639,7 +651,7 @@ impl EditorView {
 
     fn set_enc(&mut self, enc: Option<smf_core::TextEncoding>, cx: &mut Context<Self>) {
         self.enc_override = enc;
-        self.ev_key = (u64::MAX, u64::MAX); // force event-row rebuild
+        self.ev_key = (u64::MAX, u64::MAX, usize::MAX); // force event-row rebuild
         self.refresh_derived();
         self.persist();
         cx.notify();
@@ -763,13 +775,26 @@ impl EditorView {
             self.notes = Arc::new(sh.doc.notes());
             self.notes_key = key;
         }
-        if self.ev_key != key {
+        // format 2: event rows and document chrome are scoped to the
+        // viewed sequence — its index joins the cache key
+        let seq_sel = if sh.doc.is_sequential() {
+            self.sel_track
+        } else {
+            usize::MAX
+        };
+        let vkey = (key.0, key.1, seq_sel);
+        if self.ev_key != vkey {
             self.events = Arc::new(self.build_event_rows(&sh.doc));
-            self.ev_key = key;
+            self.ev_key = vkey;
         }
-        if self.doc_ui_key != key || self.doc_ui_enc != self.enc_override {
-            self.doc_ui = Arc::new(DocUi::build(&sh.doc, &self.notes, self.enc_override));
-            self.doc_ui_key = key;
+        if self.doc_ui_key != vkey || self.doc_ui_enc != self.enc_override {
+            self.doc_ui = Arc::new(DocUi::build(
+                &sh.doc,
+                &self.notes,
+                self.enc_override,
+                (seq_sel != usize::MAX).then_some(seq_sel),
+            ));
+            self.doc_ui_key = vkey;
             self.doc_ui_enc = self.enc_override;
         }
     }
@@ -813,8 +838,33 @@ impl EditorView {
     }
 
     /// Tick position of the song end (scroll extent, minimap scale).
+    /// Format 2: the viewed sequence's own span — other sequences may be
+    /// longer, and sizing the view by them would lie about this one's end.
     fn doc_end_ticks(&self) -> u64 {
-        self.doc_ui.song_end.max(self.ppq() * 16)
+        if self.is_seq() {
+            self.doc(|d| d.track_end_tick(self.sel_track))
+                .max(self.ppq() * 16)
+        } else {
+            self.doc_ui.song_end.max(self.ppq() * 16)
+        }
+    }
+
+    /// Whether the loaded file is SMF format 2 — tracks are independent
+    /// sequences, never a single shared song timeline.
+    fn is_seq(&self) -> bool {
+        self.doc(|d| d.is_sequential())
+    }
+
+    /// Switch the viewed track/sequence. Format 2 clears the note
+    /// selection: notes of another sequence are neither visible nor
+    /// editable while this one is being shown and played.
+    fn select_track(&mut self, i: usize, cx: &mut Context<Self>) {
+        if i != self.sel_track && self.is_seq() {
+            // the sequence join in ev_key/doc_ui_key rebuilds rows/chrome
+            self.selection.clear();
+        }
+        self.sel_track = i;
+        cx.notify();
     }
 
     fn ppq(&self) -> u64 {
@@ -829,12 +879,27 @@ impl EditorView {
             Division::Metrical(p) => (p as u64).max(1),
             Division::Smpte { .. } => 480,
         };
+        let seq = doc.is_sequential();
         let hint = self.enc_override.or(doc.text_encoding_hint());
         let mut rows = Vec::new();
         for d in doc.diagnose() {
             rows.push(format!("[{}] tk{} @{}", d.code, d.track + 1, d.tick).into());
         }
+        if seq {
+            // explicit mode marker: these are sequences, not one timeline
+            rows.push(
+                format!(
+                    "[fmt2] sequence {}/{} — independent timelines",
+                    self.sel_track + 1,
+                    doc.tracks.len()
+                )
+                .into(),
+            );
+        }
         for (ti, tr) in doc.tracks.iter().enumerate() {
+            if seq && ti != self.sel_track {
+                continue; // a format-2 event list shows one sequence
+            }
             for e in &tr.events {
                 let bar = e.tick / (ppq * 4) + 1;
                 let beat = (e.tick % (ppq * 4)) / ppq + 1;
@@ -930,10 +995,23 @@ impl EditorView {
         }
     }
 
+    /// Track the tempo chip edits: the conductor for format 0/1, the
+    /// viewed sequence for format 2.
+    fn tempo_track(&self) -> usize {
+        self.doc(|d| {
+            if d.is_sequential() {
+                self.sel_track.min(d.tracks.len().saturating_sub(1))
+            } else {
+                0
+            }
+        })
+    }
+
     /// Set the tick-0 tempo to current bpm + delta (via the shared op layer).
     fn bump_tempo(&mut self, delta: f64) {
+        let tr = self.tempo_track();
         let cur = self.doc(|d| {
-            d.tempo_map
+            d.tempo_map_for(tr)
                 .points()
                 .first()
                 .map(|(_, mpq, _)| 60_000_000.0 / *mpq as f64)
@@ -941,7 +1019,7 @@ impl EditorView {
         });
         let ops = {
             let mut sh = lock_shared(&self.shared);
-            sh.doc.set_tempo_ops(0, (cur + delta).clamp(10.0, 400.0))
+            sh.doc.set_tempo_ops(tr, 0, (cur + delta).clamp(10.0, 400.0))
         };
         self.apply_tx("set tempo", ops);
     }
@@ -949,8 +1027,9 @@ impl EditorView {
     /// Cycle the tick-0 time signature through common meters.
     fn cycle_time_sig(&mut self) {
         const SIGS: [(u8, u8); 6] = [(4, 4), (3, 4), (2, 4), (5, 4), (6, 8), (7, 8)];
+        let tr = self.tempo_track();
         let cur = self.doc(|d| {
-            d.tracks.first().and_then(|t| {
+            d.tracks.get(tr).and_then(|t| {
                 t.events.iter().find_map(|e| match &e.kind {
                     EventKind::Meta {
                         meta_type: 0x58,
@@ -966,7 +1045,7 @@ impl EditorView {
         };
         let ops = {
             let mut sh = lock_shared(&self.shared);
-            sh.doc.set_time_sig_ops(0, next.0, next.1)
+            sh.doc.set_time_sig_ops(tr, 0, next.0, next.1)
         };
         self.apply_tx("set time signature", ops);
     }
@@ -1123,9 +1202,15 @@ impl EditorView {
         {
             let mut sh = lock_shared(&self.shared);
             let ntr = sh.doc.tracks.len();
+            // format 2: paste lands in the viewed sequence regardless of
+            // which sequence the clipboard notes were copied from
+            let seq_target = sh
+                .doc
+                .is_sequential()
+                .then(|| self.sel_track.min(ntr.saturating_sub(1)));
             let mut per_track: BTreeMap<usize, Vec<DocEvent>> = BTreeMap::new();
             for c in items {
-                let track = c.track.min(ntr.saturating_sub(1));
+                let track = seq_target.unwrap_or_else(|| c.track.min(ntr.saturating_sub(1)));
                 let tick = (anchor as i64 + c.dtick).max(0) as u64;
                 let ch = c.ch & 0x0F;
                 let on_id = sh.doc.alloc_event_id();
@@ -1172,8 +1257,11 @@ impl EditorView {
             cx.notify();
             return;
         }
+        // the anchor lives in the viewed sequence's timeline (per-seq map)
         let anchor = self
-            .snap_down(self.doc(|d| d.tempo_map.us_to_tick(self.play_us)) as i64)
+            .snap_down(
+                self.doc(|d| d.tempo_map_for(self.sel_track).us_to_tick(self.play_us)) as i64,
+            )
             .max(0) as u64;
         let src = self.clipboard.clone();
         self.insert_clip(&src, anchor, "paste notes", cx);
@@ -1267,7 +1355,7 @@ impl EditorView {
     /// Move the playhead to `tick`; `play` (or an already-playing transport)
     /// restarts the engine from there.
     fn seek_to_tick(&mut self, tick: u64, play: bool, cx: &mut Context<Self>) {
-        self.play_us = self.doc(|d| d.tempo_map.tick_to_us(tick));
+        self.play_us = self.doc(|d| d.tempo_map_for(self.sel_track).tick_to_us(tick));
         if play || self.playback.is_some() {
             self.stop_playback();
             self.start_playback();
@@ -1840,7 +1928,7 @@ impl EditorView {
 
     fn start_playback(&mut self) {
         // snapshot routing state so no lock is held while opening sinks
-        let (dests, dest_of_track, muted, soloed, metronome, loop_enabled, chase_sysex) = {
+        let (dests, dest_of_track, muted, soloed, metronome, loop_enabled, chase_sysex, sequential) = {
             let sh = lock_shared(&self.shared);
             let map: HashMap<usize, usize> = (0..sh.doc.tracks.len())
                 .map(|t| (t, sh.dest_of(t)))
@@ -1853,6 +1941,7 @@ impl EditorView {
                 sh.metronome,
                 sh.loop_enabled,
                 sh.chase_sysex,
+                sh.doc.is_sequential(),
             )
         };
         let dest_of = |t: usize| dest_of_track.get(&t).copied().unwrap_or(0);
@@ -1860,9 +1949,15 @@ impl EditorView {
             self.status = t("status.no_port").into();
             return;
         }
+        let sel_track = self.sel_track;
         let audible = |tr: usize| {
             if !soloed.is_empty() {
+                // explicit solo is the opt-in way to hear sequences together
                 soloed.contains(&tr)
+            } else if sequential {
+                // format 2: only the viewed sequence plays — sequences are
+                // independent patterns, not lanes of one song
+                tr == sel_track && !muted.contains(&tr)
             } else {
                 !muted.contains(&tr)
             }
@@ -1948,7 +2043,7 @@ impl EditorView {
                 let end_us = events.iter().map(|e| e.0).max().unwrap_or(0);
                 let mut beat = 0u64;
                 loop {
-                    let us = self.doc(|d| d.tempo_map.tick_to_us(beat * ppq));
+                    let us = self.doc(|d| d.tempo_map_for(self.sel_track).tick_to_us(beat * ppq));
                     if us > end_us {
                         break;
                     }
@@ -2013,18 +2108,28 @@ impl EditorView {
         self.finish_record();
     }
 
-    /// (bpm, sig_num, sig_den) of the document's head — the transport state
-    /// a hosted plugin should see.
+    /// (bpm, sig_num, sig_den) the hosted plugin should see — the
+    /// document's head, or the viewed sequence's head for format 2.
     fn transport_hints(&self) -> (f64, i32, i32) {
         self.doc(|d| {
+            let tr = if d.is_sequential() {
+                self.sel_track.min(d.tracks.len().saturating_sub(1))
+            } else {
+                0
+            };
             let bpm = d
-                .tempo_map
+                .tempo_map_for(tr)
                 .points()
                 .first()
                 .map(|(_, mpq, _)| 60_000_000.0 / (*mpq).max(1) as f64)
                 .unwrap_or(120.0);
             let mut sig = (4i32, 4i32);
-            'find: for tr in &d.tracks {
+            let scan: &[document::Track] = if d.is_sequential() {
+                std::slice::from_ref(&d.tracks[tr])
+            } else {
+                &d.tracks
+            };
+            'find: for tr in scan {
                 for e in &tr.events {
                     if let EventKind::Meta {
                         meta_type: 0x58,
@@ -2054,7 +2159,7 @@ impl EditorView {
         let buf2 = buf.clone();
         // optional one-bar count-in: capture starts after it elapses
         let cin_us = if self.count_in {
-            self.doc(|d| d.tempo_map.tick_to_us(self.ppq() * 4))
+            self.doc(|d| d.tempo_map_for(self.sel_track).tick_to_us(self.ppq() * 4))
         } else {
             0
         };
@@ -2122,7 +2227,12 @@ impl EditorView {
             if us < rec.cin_us {
                 continue;
             }
-            let tick = sh.doc.tempo_map.us_to_tick(rec.base_us + (us - rec.cin_us));
+            // the take lands in the selected track — for format 2 that
+            // sequence's own tempo map converts live-µs back to ticks
+            let tick = sh
+                .doc
+                .tempo_map_for(track)
+                .us_to_tick(rec.base_us + (us - rec.cin_us));
             events.push(document::Event {
                 id: sh.doc.alloc_event_id(),
                 tick,
@@ -2422,9 +2532,13 @@ impl EditorView {
 
     fn note_at(&self, pos: Point<Pixels>) -> Option<Note> {
         let (tick, key) = self.hit(pos);
+        let seq = self.is_seq();
         self.notes
             .iter()
             .rev()
+            // ghosts of other sequences are display-only — clicks can't
+            // select or drag them (a ghost's lane is ambiguous anyway)
+            .filter(|n| !seq || n.track == self.sel_track)
             .find(|n| {
                 n.key as i32 == key
                     && tick >= n.start_tick as i64
@@ -2436,9 +2550,11 @@ impl EditorView {
     /// Note whose right edge is within ~6px of `pos` — a resize target.
     fn edge_at(&self, pos: Point<Pixels>) -> Option<Note> {
         let (tick, key) = self.hit(pos);
+        let seq = self.is_seq();
         self.notes
             .iter()
             .rev()
+            .filter(|n| !seq || n.track == self.sel_track)
             .find(|n| {
                 n.key as i32 == key
                     && n.end_tick.is_some()
@@ -2816,7 +2932,9 @@ fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
                             }
                             mcp_server::TransportReq::Stop => v.stop_playback(),
                             mcp_server::TransportReq::Seek { tick } => {
-                                v.play_us = v.doc(|d| d.tempo_map.tick_to_us(tick));
+                                v.play_us = v.doc(|d| {
+                                    d.tempo_map_for(v.sel_track).tick_to_us(tick)
+                                });
                                 if v.playback.is_some() {
                                     v.stop_playback();
                                     v.start_playback();

@@ -204,8 +204,17 @@ fn summary_json(d: &Document, path: &Option<PathBuf>, saved_rev: u64) -> serde_j
         })).collect::<Vec<_>>(),
         "events": d.tracks.iter().map(|t| t.events.len()).sum::<usize>(),
         "notes": d.notes().len(),
+        // format 2: tracks are independent sequences — a single merged
+        // duration would lie, so report each sequence's own span
+        "sequential": d.is_sequential(),
         "last_tick": last_tick,
-        "duration_us": d.tempo_map.tick_to_us(last_tick),
+        "duration_us": (!d.is_sequential()).then(|| d.tempo_map.tick_to_us(last_tick)),
+        "durations_us": d.is_sequential().then(|| {
+            (0..d.tracks.len()).map(|i| {
+                let m = d.tempo_map_for(i);
+                m.tick_to_us(d.track_end_tick(i))
+            }).collect::<Vec<_>>()
+        }),
         "revision": d.revision(),
         "path": path,
         "dirty": d.revision() != saved_rev,
@@ -583,7 +592,7 @@ fn tool_defs() -> Vec<(&'static str, Tool)> {
             "get_tempo_map",
             tool(
                 "get_tempo_map",
-                "Tempo breakpoints: [{tick, us_per_quarter, bpm, cumulative_us}] + ppq. Read before editing tempo or converting ticks<->time.",
+                "Tempo breakpoints: [{tick, us_per_quarter, bpm, cumulative_us}] + ppq. Format-2 files report per-sequence maps (each track is an independent timeline). Read before editing tempo or converting ticks<->time.",
                 object_schema(serde_json::json!({})),
             ),
         ),
@@ -735,9 +744,10 @@ fn tool_defs() -> Vec<(&'static str, Tool)> {
             "set_tempo",
             tool(
                 "set_tempo",
-                "Set/replace tempo at a tick (conductor track). Args: tick, bpm. Optional base_revision.",
+                "Set/replace tempo at a tick. Args: tick, bpm, track? (default 0 = conductor; for format-2 files pass the sequence's track). Optional base_revision.",
                 object_schema(serde_json::json!({
                     "tick": {"type": "integer"}, "bpm": {"type": "number"},
+                    "track": {"type": "integer"},
                     "base_revision": {"type": "integer"},
                 })),
             ),
@@ -746,9 +756,10 @@ fn tool_defs() -> Vec<(&'static str, Tool)> {
             "set_time_signature",
             tool(
                 "set_time_signature",
-                "Set/replace time signature at a tick. Args: tick, num (beats/bar), den (beat value 4=quarter,8=eighth). Optional base_revision.",
+                "Set/replace time signature at a tick. Args: tick, num (beats/bar), den (beat value 4=quarter,8=eighth), track? (default 0; pass the sequence's track for format-2). Optional base_revision.",
                 object_schema(serde_json::json!({
                     "tick": {"type": "integer"}, "num": {"type": "integer"}, "den": {"type": "integer"},
+                    "track": {"type": "integer"},
                     "base_revision": {"type": "integer"},
                 })),
             ),
@@ -1011,14 +1022,27 @@ fn dispatch(
         }
         "get_tempo_map" => {
             let tm = &sh.doc.tempo_map;
-            ok_json(serde_json::json!({
-                "ppq": tm.ppq(),
-                "points": tm.points().iter().map(|(tick, mpq, cum)| serde_json::json!({
-                    "tick": tick, "us_per_quarter": mpq,
-                    "bpm": (60_000_000.0 / *mpq as f64 * 100.0).round() / 100.0,
-                    "cumulative_us": cum,
-                })).collect::<Vec<_>>(),
-            }))
+            let point = |(tick, mpq, cum): &(u64, u32, u64)| serde_json::json!({
+                "tick": tick, "us_per_quarter": mpq,
+                "bpm": (60_000_000.0 / *mpq as f64 * 100.0).round() / 100.0,
+                "cumulative_us": cum,
+            });
+            ok_json(if sh.doc.is_sequential() {
+                // format 2: every sequence is timed by its own tempo map
+                serde_json::json!({
+                    "scope": "per-sequence",
+                    "ppq": tm.ppq(),
+                    "sequences": (0..sh.doc.tracks.len()).map(|i| serde_json::json!({
+                        "track": i,
+                        "points": sh.doc.tempo_map_for(i).points().iter().map(point).collect::<Vec<_>>(),
+                    })).collect::<Vec<_>>(),
+                })
+            } else {
+                serde_json::json!({
+                    "ppq": tm.ppq(),
+                    "points": tm.points().iter().map(point).collect::<Vec<_>>(),
+                })
+            })
         }
         "get_meta" => {
             let track = args["track"].as_u64().map(|v| v as usize);
@@ -1296,6 +1320,7 @@ fn dispatch(
                 return r;
             }
             let ops = sh.doc.set_tempo_ops(
+                args["track"].as_u64().unwrap_or(0) as usize,
                 args["tick"].as_u64().unwrap_or(0),
                 args["bpm"].as_f64().unwrap_or(120.0),
             );
@@ -1306,6 +1331,7 @@ fn dispatch(
                 return r;
             }
             let ops = sh.doc.set_time_sig_ops(
+                args["track"].as_u64().unwrap_or(0) as usize,
                 args["tick"].as_u64().unwrap_or(0),
                 args["num"].as_u64().unwrap_or(4) as u8,
                 args["den"].as_u64().unwrap_or(4) as u8,
