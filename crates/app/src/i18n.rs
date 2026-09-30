@@ -174,6 +174,26 @@ static EN: &[(&str, &str)] = &[
     ("plugin.phase_load", "plugin load"),
     ("plugin.phase_audio", "audio start"),
     ("status.rescan", "rescanned: {n} destination(s)"),
+    ("recovery.title", "Unsaved work found"),
+    (
+        "recovery.found",
+        "A recovery snapshot from {ago} exists for {src}. It contains changes made after the last save.",
+    ),
+    (
+        "recovery.inspect_detail",
+        "Source: {src}\nSnapshot: {ago} · saved revision {saved} → current revision {rev} · {size} bytes · app v{ver}",
+    ),
+    ("recovery.restore", "Restore"),
+    ("recovery.discard", "Discard"),
+    ("recovery.inspect", "Inspect"),
+    ("recovery.later", "Later"),
+    ("recovery.restored", "Recovered unsaved work"),
+    ("recovery.failed", "Recovery failed: {e}"),
+    ("recovery.untitled", "(untitled)"),
+    ("time.sec_ago", "{n} s ago"),
+    ("time.min_ago", "{n} min ago"),
+    ("time.hr_ago", "{n} h ago"),
+    ("time.day_ago", "{n} d ago"),
 ];
 
 static JA: &[(&str, &str)] = &[
@@ -326,6 +346,26 @@ static JA: &[(&str, &str)] = &[
     ("tip.zout", "ズームアウト (Ctrl+-)"),
     ("tip.dest", "選択トラックの出力先"),
     ("tip.gui", "プラグインGUI"),
+    ("recovery.title", "未保存の作業があります"),
+    (
+        "recovery.found",
+        "{src} の復元スナップショット（{ago}）が見つかりました。最後の保存以降の変更が含まれています。",
+    ),
+    (
+        "recovery.inspect_detail",
+        "ソース: {src}\nスナップショット: {ago} · 保存リビジョン {saved} → 現在 {rev} · {size} バイト · アプリ v{ver}",
+    ),
+    ("recovery.restore", "復元"),
+    ("recovery.discard", "破棄"),
+    ("recovery.inspect", "詳細"),
+    ("recovery.later", "後で"),
+    ("recovery.restored", "未保存の作業を復元しました"),
+    ("recovery.failed", "復元に失敗: {e}"),
+    ("recovery.untitled", "（無題）"),
+    ("time.sec_ago", "{n} 秒前"),
+    ("time.min_ago", "{n} 分前"),
+    ("time.hr_ago", "{n} 時間前"),
+    ("time.day_ago", "{n} 日前"),
 ];
 
 fn detect_lang() -> &'static str {

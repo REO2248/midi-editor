@@ -6,6 +6,7 @@
 mod geometry;
 mod i18n;
 mod icons;
+mod recovery;
 mod render;
 use geometry::{
     clamp_move_delta, clamp_span, content_view, reanchor, roll_hit, ZOOM_MAX, ZOOM_MIN,
@@ -569,11 +570,54 @@ impl EditorView {
         self.play_us = 0;
         self.refresh_derived();
         self.reset_view_to_content();
+        // the replaced document's snapshots no longer apply
+        recovery::clear_recovery();
         self.status = if rec_discarded {
             format!("{} — {}", t("status.new_doc"), t("status.rec_discarded")).into()
         } else {
             t("status.new_doc").into()
         };
+        cx.notify();
+    }
+
+    /// Adopt a recovery snapshot in place: swaps in its document, keeps the
+    /// source path so an explicit Save writes back to it — but marks the
+    /// doc dirty via an unreachable saved_revision so nothing is written
+    /// until the user says so.
+    fn restore_snapshot(
+        &mut self,
+        meta: &recovery::SnapshotMeta,
+        payload: &[u8],
+        cx: &mut Context<Self>,
+    ) {
+        match smf_core::parse(payload) {
+            Ok(file) => {
+                let rec_discarded = self.rec.take().is_some();
+                self.stop_playback();
+                {
+                    let mut sh = lock_shared(&self.shared);
+                    sh.doc = Document::from_file(file);
+                    sh.undo = UndoStack::new(512);
+                    if sh.path.is_none() {
+                        sh.path = meta.source_path.clone();
+                    }
+                    // an unreachable marker: dirty until a verified save,
+                    // matching "recovery never overwrites without Save"
+                    sh.saved_revision = u64::MAX;
+                }
+                self.reset_view_for_new_doc();
+                if let Some(src) = &meta.source_path {
+                    self.apply_prefs(src);
+                }
+                let mut status = t("recovery.restored").to_string();
+                if rec_discarded {
+                    status = format!("{status} — {}", t("status.rec_discarded"));
+                }
+                self.status = status.into();
+            }
+            // corrupt payload — fail safely, keep the file for diagnosis
+            Err(e) => self.status = tf("recovery.failed", &[("e", &e.to_string())]).into(),
+        }
         cx.notify();
     }
 
@@ -1581,6 +1625,8 @@ impl EditorView {
                 drop(sh);
                 self.status = t("status.saved").into();
                 self.persist();
+                // a verified normal save clears recovery
+                recovery::clear_recovery();
             }
             Err(e) => self.status = format!("{e}").into(),
         }
@@ -1624,6 +1670,30 @@ impl EditorView {
         .detach();
     }
 
+    /// Post-swap view reset shared by open() and snapshot restore:
+    /// everything that referenced the old document is cleared or rebuilt.
+    fn reset_view_for_new_doc(&mut self) {
+        // the new document also reports revision 0 — bump the epoch
+        // so revision-keyed derived views cannot stay stale
+        self.doc_epoch += 1;
+        self.sel_track = self.pick_default_track();
+        self.selection.clear();
+        self.drag = None;
+        self.erase_ids.clear();
+        self.mouse_pos = None;
+        self.enc_override = None;
+        self.play_us = 0;
+        {
+            let mut sh = lock_shared(&self.shared);
+            sh.muted.clear();
+            sh.soloed.clear();
+            sh.track_dest.clear();
+        }
+        // rebuild the derived views, then land the view on the new content
+        self.refresh_derived();
+        self.reset_view_to_content();
+    }
+
     fn open(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         match load_document(&path) {
             Ok((d, load_warnings)) => {
@@ -1639,28 +1709,13 @@ impl EditorView {
                     sh.path = Some(path.clone());
                     sh.saved_revision = sh.doc.revision();
                 }
-                // the new document also reports revision 0 — bump the epoch
-                // so revision-keyed derived views cannot stay stale
-                self.doc_epoch += 1;
-                self.sel_track = self.pick_default_track();
-                self.selection.clear();
-                self.drag = None;
-                self.erase_ids.clear();
-                self.mouse_pos = None;
-                self.enc_override = None;
-                self.play_us = 0;
-                {
-                    let mut sh = lock_shared(&self.shared);
-                    sh.muted.clear();
-                    sh.soloed.clear();
-                    sh.track_dest.clear();
-                }
-                // rebuild the derived views, then land the view on the new
-                // content — a saved per-file sidecar (applied next) overrides
-                self.refresh_derived();
-                self.reset_view_to_content();
+                self.reset_view_for_new_doc();
+                // a saved per-file sidecar (applied next) overrides the
+                // just-reset view
                 self.apply_prefs(&path);
                 self.push_recent(&path);
+                // the previous document's snapshots no longer apply
+                recovery::clear_recovery();
                 let mut status = if load_warnings.is_empty() {
                     t("status.loaded").to_string()
                 } else {
@@ -2754,6 +2809,7 @@ fn main() {
                     window.focus(&v.focus.clone(), cx);
                     v
                 });
+                maybe_prompt_restore(view.clone(), path.clone(), window, cx);
                 cx.new(|cx| Root::new(view, window, cx))
             })
             .expect("failed to open window");
@@ -2786,15 +2842,153 @@ fn spawn_mcp(shared: SharedDoc) {
     });
 }
 
+/// Startup recovery. After a crash the newest snapshot that is newer than
+/// its source prompts Restore / Discard / Inspect — Inspect re-prompts
+/// with the snapshot's provenance so the decision is informed. Restore
+/// swaps the recovered document in and marks it dirty; the original file
+/// is only ever written by an explicit Save. Runs as a window task so it
+/// doesn't block app startup.
+fn maybe_prompt_restore(
+    view: Entity<EditorView>,
+    argv_path: Option<PathBuf>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    // bounded retention — stale/overflow snapshots die on startup
+    recovery::cleanup_stale(
+        &recovery::recovery_dir(),
+        recovery::KEEP_MAX,
+        recovery::MAX_AGE,
+        std::time::SystemTime::now(),
+    );
+    let Some((snap_path, meta, payload)) =
+        recovery::find_candidate(&recovery::recovery_dir(), argv_path.as_deref())
+    else {
+        return;
+    };
+    window
+        .spawn(cx, async move |wcx| {
+            let src = meta
+                .source_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| t("recovery.untitled").to_string());
+            let mut shown_details = false;
+            loop {
+                let detail = if shown_details {
+                    tf(
+                        "recovery.inspect_detail",
+                        &[
+                            ("src", &src),
+                            ("saved", &meta.saved_revision.to_string()),
+                            ("rev", &meta.current_revision.to_string()),
+                            ("size", &meta.payload_len.to_string()),
+                            ("ver", &meta.app_version),
+                            ("ago", &fmt_rel_time(meta.timestamp)),
+                        ],
+                    )
+                } else {
+                    tf(
+                        "recovery.found",
+                        &[("src", &src), ("ago", &fmt_rel_time(meta.timestamp))],
+                    )
+                };
+                let idx = wcx
+                    .prompt(
+                        PromptLevel::Warning,
+                        t("recovery.title"),
+                        Some(&detail),
+                        &[
+                            PromptButton::Ok(t("recovery.restore").into()),
+                            PromptButton::Other(t("recovery.discard").into()),
+                            PromptButton::Cancel(
+                                if shown_details {
+                                    t("recovery.later")
+                                } else {
+                                    t("recovery.inspect")
+                                }
+                                .into(),
+                            ),
+                        ],
+                    )
+                    .await
+                    .unwrap_or(usize::MAX);
+                match idx {
+                    // Restore — swap the snapshot's document into the view
+                    0 => {
+                        wcx.update(|_w, app| {
+                            view.update(app, |v, cx| {
+                                v.restore_snapshot(&meta, &payload, cx);
+                            })
+                        })
+                        .ok();
+                        break;
+                    }
+                    // Discard — explicit discard clears the snapshot
+                    1 => {
+                        let _ = std::fs::remove_file(&snap_path);
+                        break;
+                    }
+                    // Inspect — one expansion, then the same three fates
+                    _ if !shown_details => shown_details = true,
+                    // Later/dismissed — keep the snapshot, nothing happens;
+                    // the next verified save or discard clears it
+                    _ => break,
+                }
+            }
+        })
+        .detach();
+}
+
+/// "3 minutes ago" style label for snapshot timestamps.
+fn fmt_rel_time(unix_ts: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let ago = now.saturating_sub(unix_ts);
+    if ago < 60 {
+        tf("time.sec_ago", &[("n", &ago.to_string())])
+    } else if ago < 3600 {
+        tf("time.min_ago", &[("n", &(ago / 60).to_string())])
+    } else if ago < 86400 {
+        tf("time.hr_ago", &[("n", &(ago / 3600).to_string())])
+    } else {
+        tf("time.day_ago", &[("n", &(ago / 86400).to_string())])
+    }
+}
+
 /// Poll the shared doc's notify counter so MCP-driven edits repaint the UI
 /// even while the user is idle.
 fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
     cx.spawn(async move |this, cx| {
         let mut last = 0u64;
+        // autosave: the last revision a snapshot captured and the last
+        // write attempt (started one debounce early so the first dirty
+        // revision snapshots without an artificial delay)
+        let mut last_snap_rev: Option<u64> = None;
+        let mut last_snap_write =
+            std::time::Instant::now() - recovery::DEBOUNCE;
         loop {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(150))
                 .await;
+            {
+                let sh = lock_shared(&shared);
+                let rev = sh.doc.revision();
+                let doc_dirty = rev != sh.saved_revision;
+                drop(sh);
+                if doc_dirty
+                    && last_snap_rev != Some(rev)
+                    && last_snap_write.elapsed() >= recovery::DEBOUNCE
+                {
+                    last_snap_write = std::time::Instant::now();
+                    let dir = recovery::recovery_dir();
+                    if recovery::write_snapshot(&shared, &dir, std::time::SystemTime::now()).is_ok() {
+                        last_snap_rev = Some(rev);
+                    }
+                }
+            }
             let (cur, reqs) = {
                 let mut sh = lock_shared(&shared);
                 (
