@@ -21,6 +21,9 @@ Japanese is supported through the same i18n table.
   intentional schema change bump the tool's `version` (and
   `MCP_SURFACE_VERSION` when breaking), then regenerate the snapshot with
   `MCP_UPDATE_SCHEMA_SNAPSHOT=1 cargo test -p mcp-server --test schema_snapshot`.
+  `begin_transaction`/`commit_transaction`/`rollback_transaction` stage edits
+  on a private document clone; reads inside a batch see the staged copy via
+  `Shared::view()`, and `Shared::apply_or_stage` routes every edit tool.
 
 ## Invariants
 

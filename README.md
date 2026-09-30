@@ -15,7 +15,7 @@ headers + channel, tempo/time-signature editing, quantize/transpose/velocity
 ops, marker strip, MIDI-input recording, seek ruler + loop, lane editor for
 velocity/CC/pitch bend, import diagnostics with one-click normalize,
 text-encoding override, plugin GUI windows, per-file sidecar persistence, and
-a 32-tool MCP surface — all against a real .mid document.
+a 36-tool MCP surface — all against a real .mid document.
 
 ## Build (Windows)
 
@@ -139,9 +139,16 @@ table — call first for feature detection), `document_summary` (format,
 tracks, notes, duration, revision, dirty flag), `list_notes`, `query_events`
 (raw events incl. raw_hex), `get_tempo_map`, `get_meta` (names/markers/lyrics
 decoded), `get_cc` (latest CC value per track/channel/cc), `diagnostics`
-(import-quality findings), `list_midi_ports`, `list_destinations`.
+(import-quality findings), `list_midi_ports`, `list_destinations`,
+`transaction_status`.
 
-**Edit tools** — one call = one undoable transaction: `apply_patch`
+**Edit tools** — one call = one undoable transaction, or wrap many calls in a
+named checkpoint (`begin_transaction` / `commit_transaction` /
+`rollback_transaction`): staged edits land on a private copy, commit folds
+them into a single undo step, rollback leaves the document byte-for-byte
+unchanged, and a concurrent GUI edit turns the commit into a stale-revision
+conflict. `commit_transaction {dry_run:true}` validates the whole batch
+without applying. `apply_patch`
 (low-level ops: insert_note / insert_events / remove_events / move_note /
 set_tempo; `base_revision` optimistic concurrency, `dry_run` previews without
 applying), `quantize`, `transpose`, `scale_velocity`, `set_channel`,

@@ -46,6 +46,34 @@
     },
     {
       "deprecated": null,
+      "description": "Open a named checkpoint: every later edit tool stages on a private document copy (reads see staged state) until commit_transaction folds them into ONE undo step or rollback_transaction discards them. One open batch at a time; ~5min idle auto-rollback keeps abandoned sessions from pinning the document. Args: label?.",
+      "input_schema": {
+        "properties": {
+          "label": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "begin_transaction",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Fold the open transaction's staged ops into a single undo step labelled with the checkpoint name. dry_run:true validates the merged ops against the committed document without applying and keeps the transaction open. Errors with stale_base when the document changed since begin (concurrent edit) — the batch stays open for rollback/re-plan.",
+      "input_schema": {
+        "properties": {
+          "dry_run": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "name": "commit_transaction",
+      "version": 1
+    },
+    {
+      "deprecated": null,
       "description": "Delete channel events in [from,to) (notes delete whole). Args: track, from, to. Optional base_revision.",
       "input_schema": {
         "properties": {
@@ -311,6 +339,16 @@
     },
     {
       "deprecated": null,
+      "description": "Discard the open transaction. The committed document is left exactly as it was at begin_transaction (byte-for-byte) — staged ops never touched it.",
+      "input_schema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "rollback_transaction",
+      "version": 1
+    },
+    {
+      "deprecated": null,
       "description": "Serialize the document to SMF and write it. Args: path? (defaults to the document's open path)",
       "input_schema": {
         "properties": {
@@ -564,6 +602,16 @@
         "type": "object"
       },
       "name": "set_track_name",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Open-transaction state: label, base/staged revisions, staged op count, age and time until auto-rollback.",
+      "input_schema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "transaction_status",
       "version": 1
     },
     {

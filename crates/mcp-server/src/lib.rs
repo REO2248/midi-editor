@@ -50,6 +50,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 pub mod service;
 pub use persist::write_atomic;
@@ -178,6 +179,39 @@ pub struct Shared {
     /// (stdio by default; the HTTP server overwrites it at startup).
     /// Never carries the credential itself, only its provenance.
     pub mcp_security: SecurityReport,
+    /// open named transaction (begin_transaction) — staged edits live here
+    /// until commit/rollback; never blocks GUI edits on the real document
+    pub batch: Option<Batch>,
+}
+
+/// A named edit checkpoint. While open, every edit tool stages its ops on
+/// `staging` — a private copy of the document taken at `begin` — and reads
+/// see the staged state (read-your-writes inside a transaction). The real
+/// document is untouched until `commit_transaction`, so rollback or an
+/// abandoned batch leaves it byte-for-byte identical. GUI edits are never
+/// locked out: they land on the real document and turn the commit into a
+/// stale-revision conflict instead of clobbering anyone.
+pub struct Batch {
+    /// transaction label — becomes the single undo step's label on commit
+    pub label: String,
+    /// `doc.revision()` at begin; commit refuses when it no longer matches
+    pub base: u64,
+    pub staging: Document,
+    /// ops accepted so far, in call order — merged into one `Transaction`
+    pub ops: Vec<Op>,
+    pub last_activity: Instant,
+}
+
+/// Idle time after which an open batch is rolled back automatically — an
+/// abandoned agent session must not pin a document clone forever.
+pub const BATCH_TTL: Duration = Duration::from_secs(300);
+
+/// Result of routing an edit through `apply_or_stage`.
+pub enum StageOutcome {
+    /// committed on the real document (no batch open) — new revision
+    Committed(u64),
+    /// staged into the open batch
+    Staged { pending_ops: usize, staged_revision: u64 },
 }
 
 pub type SharedDoc = Arc<Mutex<Shared>>;
@@ -205,6 +239,7 @@ impl Shared {
             gui_attached: false,
             transport_req: Vec::new(),
             mcp_security: SecurityReport::stdio(),
+            batch: None,
         }
     }
 
@@ -240,6 +275,179 @@ impl Shared {
         self.gui_notify.fetch_add(1, Ordering::Relaxed);
         Ok(rev)
     }
+
+    /// The document edit tools and reads see: the staged copy while a batch
+    /// is open (read-your-writes), else the committed document.
+    pub fn view(&self) -> &Document {
+        self.batch.as_ref().map(|b| &b.staging).unwrap_or(&self.doc)
+    }
+
+    pub fn view_mut(&mut self) -> &mut Document {
+        if let Some(b) = &mut self.batch {
+            &mut b.staging
+        } else {
+            &mut self.doc
+        }
+    }
+
+    /// Drop a batch that went idle — called once per dispatch so abandoned
+    /// sessions need no timer thread.
+    pub fn expire_batch(&mut self) {
+        if self
+            .batch
+            .as_ref()
+            .is_some_and(|b| b.last_activity.elapsed() > BATCH_TTL)
+        {
+            self.batch = None;
+        }
+    }
+
+    /// Open a named transaction. One at a time — a second begin is an error
+    /// naming the open checkpoint (a caller cannot silently hijack it).
+    pub fn begin_batch(&mut self, label: String) -> Result<u64, CallToolResponse> {
+        if let Some(b) = &self.batch {
+            return Err(err_json(
+                serde_json::json!({
+                    "error": "batch_open",
+                    "open_label": b.label,
+                    "staged_ops": b.ops.len(),
+                    "hint": "commit_transaction or rollback_transaction first",
+                })
+                .to_string(),
+            ));
+        }
+        let base = self.doc.revision();
+        self.batch = Some(Batch {
+            label,
+            base,
+            staging: self.doc.clone(),
+            ops: Vec::new(),
+            last_activity: Instant::now(),
+        });
+        Ok(base)
+    }
+
+    /// Route an edit: stage into the open batch, or commit as one undo step.
+    /// A staged apply is still atomic per call — a failing call cannot
+    /// corrupt the checkpoint.
+    pub fn apply_or_stage(
+        &mut self,
+        label: &str,
+        ops: Vec<Op>,
+    ) -> Result<StageOutcome, ApplyError> {
+        if let Some(b) = &mut self.batch {
+            let tx = Transaction {
+                label: label.into(),
+                base: b.staging.revision(),
+                ops,
+            };
+            let rev = b.staging.apply(tx.clone())?;
+            b.ops.extend(tx.ops);
+            b.last_activity = Instant::now();
+            return Ok(StageOutcome::Staged {
+                pending_ops: b.ops.len(),
+                staged_revision: rev,
+            });
+        }
+        Ok(StageOutcome::Committed(self.apply(label, ops)?))
+    }
+
+    /// Commit the staged ops as ONE transaction on the real document — one
+    /// undo step labelled after the checkpoint. `dry_run` validates the
+    /// merged ops against a clone of the committed document and keeps the
+    /// batch open. A document changed since begin yields a stale-revision
+    /// conflict; the batch stays open so the caller can inspect and decide.
+    pub fn commit_batch(&mut self, dry_run: bool) -> Result<serde_json::Value, CallToolResponse> {
+        let Some(b) = self.batch.take() else {
+            return Err(err_json("no open transaction"));
+        };
+        let (events_changed, tracks_touched) = ops_stats(&b.ops);
+        let n_ops = b.ops.len();
+        let label = b.label.clone();
+        let cur = self.doc.revision();
+        if cur != b.base {
+            let resp = err_json(
+                serde_json::json!({
+                    "error": "stale_base",
+                    "batch_base_revision": b.base,
+                    "current_revision": cur,
+                    "hint": "the document changed since begin_transaction (concurrent edit); re-read it, then re-plan — or rollback_transaction",
+                })
+                .to_string(),
+            );
+            self.batch = Some(b);
+            return Err(resp);
+        }
+        if dry_run {
+            let mut check = self.doc.clone();
+            let result = check.apply(Transaction {
+                label: label.clone(),
+                base: cur,
+                ops: b.ops.clone(),
+            });
+            self.batch = Some(b);
+            return match result {
+                Ok(rev) => Ok(serde_json::json!({
+                    "dry_run": true,
+                    "valid": true,
+                    "label": label,
+                    "ops": n_ops,
+                    "events_changed": events_changed,
+                    "tracks_touched": tracks_touched,
+                    "would_be_revision": rev,
+                })),
+                Err(e) => Err(err_json(format!("dry_run failed: {e}"))),
+            };
+        }
+        match self.apply(&label, b.ops.clone()) {
+            Ok(rev) => Ok(serde_json::json!({
+                "committed": true,
+                "label": label,
+                "ops": n_ops,
+                "events_changed": events_changed,
+                "tracks_touched": tracks_touched,
+                "revision": rev,
+            })),
+            Err(e) => {
+                let resp = err_json(e.to_string());
+                self.batch = Some(b);
+                Err(resp)
+            }
+        }
+    }
+}
+
+/// (events touched, sorted track indices) across an op list — the
+/// changed-event accounting transaction_history/commit report.
+pub fn ops_stats(ops: &[Op]) -> (usize, Vec<usize>) {
+    let mut events = 0usize;
+    let mut tracks = std::collections::BTreeSet::new();
+    for op in ops {
+        match op {
+            Op::InsertEvents { track, events: ev } => {
+                events += ev.len();
+                tracks.insert(*track);
+            }
+            Op::RemoveEvents { track, removed } => {
+                events += removed.len();
+                tracks.insert(*track);
+            }
+            Op::UpdateEvent { track, .. } => {
+                events += 1;
+                tracks.insert(*track);
+            }
+            Op::InsertTrack { index, track }
+            | Op::RemoveTrack { index, track } => {
+                events += track.events.len();
+                tracks.insert(*index);
+            }
+            Op::UpdateTrack { index, after, .. } => {
+                events += after.events.len();
+                tracks.insert(*index);
+            }
+        }
+    }
+    (events, tracks.into_iter().collect())
 }
 
 #[derive(Clone)]
@@ -353,7 +561,7 @@ fn note_json(n: &document::Note) -> serde_json::Value {
 /// to feature-detect the running editor and its tool surface instead of
 /// probing behavior through trial-and-error mutations.
 fn editor_info_json(sh: &Shared) -> serde_json::Value {
-    let division = match sh.doc.division {
+    let division = match sh.view().division {
         smf_core::Division::Metrical(ppq) => {
             serde_json::json!({"kind": "metrical", "ppq": ppq})
         }
@@ -369,10 +577,13 @@ fn editor_info_json(sh: &Shared) -> serde_json::Value {
         "mcp_surface_version": MCP_SURFACE_VERSION,
         "transports": ["streamable-http", "stdio-bridge"],
         "document": {
-            "format": sh.doc.format,
+            "format": sh.view().format,
             "division": division,
-            "tracks": sh.doc.tracks.len(),
-            "revision": sh.doc.revision(),
+            "tracks": sh.view().tracks.len(),
+            "revision": sh.view().revision(),
+            "open_transaction": sh.batch.as_ref().map(|b| serde_json::json!({
+                "label": b.label, "staged_ops": b.ops.len(),
+            })),
         },
         "features": {
             "smf": {
@@ -389,6 +600,7 @@ fn editor_info_json(sh: &Shared) -> serde_json::Value {
                 "dry_run": true,
                 "base_revision": true,
                 "atomic_transactions": true,
+                "batch_transactions": true,
             },
             // these only work while the desktop app hosts the document
             "transport": sh.gui_attached,
@@ -406,8 +618,10 @@ fn editor_info_json(sh: &Shared) -> serde_json::Value {
     })
 }
 
-fn summary_json(sh: &Shared) -> serde_json::Value {
-    let d = &sh.doc;
+/// `document_summary` over document `d` — `sh.view()` inside a batch (staged
+/// state, read-your-writes) or `sh.doc` otherwise; `sh` supplies path,
+/// saved-revision, and the security report.
+fn summary_json(d: &Document, sh: &Shared) -> serde_json::Value {
     let last_tick = doc_last_tick(d);
     serde_json::json!({
         "format": d.format,
@@ -694,7 +908,8 @@ impl ServerHandler for MidiService {
             ))
             .with_instructions(
                 "Pure-SMF MIDI editor. All edits go through Document::apply transactions; \
-                 one tool call = one undo step. Ticks are absolute PPQ ticks; keys 0-127; \
+                 one tool call = one undo step, or begin_transaction groups many calls into \
+                 one named checkpoint commit. Ticks are absolute PPQ ticks; keys 0-127; \
                  channels 0-15. Use query_events to find event ids for edits.",
             )
     }
@@ -749,6 +964,30 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         spec(
             "document_summary",
             "JSON summary: format/division, per-track names+counts, note count, duration, revision, dirty flag",
+            object_schema(serde_json::json!({})),
+        ),
+        spec(
+            "begin_transaction",
+            "Open a named checkpoint: every later edit tool stages on a private document copy (reads see staged state) until commit_transaction folds them into ONE undo step or rollback_transaction discards them. One open batch at a time; ~5min idle auto-rollback keeps abandoned sessions from pinning the document. Args: label?.",
+            object_schema(serde_json::json!({
+                "label": {"type": "string"},
+            })),
+        ),
+        spec(
+            "commit_transaction",
+            "Fold the open transaction's staged ops into a single undo step labelled with the checkpoint name. dry_run:true validates the merged ops against the committed document without applying and keeps the transaction open. Errors with stale_base when the document changed since begin (concurrent edit) — the batch stays open for rollback/re-plan.",
+            object_schema(serde_json::json!({
+                "dry_run": {"type": "boolean"},
+            })),
+        ),
+        spec(
+            "rollback_transaction",
+            "Discard the open transaction. The committed document is left exactly as it was at begin_transaction (byte-for-byte) — staged ops never touched it.",
+            object_schema(serde_json::json!({})),
+        ),
+        spec(
+            "transaction_status",
+            "Open-transaction state: label, base/staged revisions, staged op count, age and time until auto-rollback.",
             object_schema(serde_json::json!({})),
         ),
         spec(
@@ -990,11 +1229,63 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
     // recover from a poisoned lock: a panic in an earlier critical section
     // must not take down every later request
     let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+    sh.expire_batch();
     match name {
         "editor_info" => ok_json(editor_info_json(&sh)),
-        "document_summary" => ok_json(summary_json(&sh)),
+        "document_summary" => {
+            let mut v = summary_json(sh.view(), &sh);
+            if let Some(b) = &sh.batch {
+                v["transaction"] = serde_json::json!({
+                    "open": true, "label": b.label,
+                    "base_revision": b.base, "staged_ops": b.ops.len(),
+                });
+            }
+            ok_json(v)
+        }
+        "begin_transaction" => {
+            let label = args["label"]
+                .as_str()
+                .unwrap_or("mcp transaction")
+                .to_string();
+            match sh.begin_batch(label) {
+                Ok(base) => {
+                    let b = sh.batch.as_ref().unwrap();
+                    ok_json(serde_json::json!({
+                        "open": true, "label": b.label, "base_revision": base,
+                        "ttl_seconds": BATCH_TTL.as_secs(),
+                    }))
+                }
+                Err(r) => r,
+            }
+        }
+        "commit_transaction" => {
+            let dry = args["dry_run"].as_bool().unwrap_or(false);
+            match sh.commit_batch(dry) {
+                Ok(v) => ok_json(v),
+                Err(r) => r,
+            }
+        }
+        "rollback_transaction" => match sh.batch.take() {
+            Some(b) => ok_json(serde_json::json!({
+                "rolled_back": true, "label": b.label,
+                "discarded_ops": b.ops.len(),
+            })),
+            None => err_json("no open transaction"),
+        },
+        "transaction_status" => match &sh.batch {
+            Some(b) => ok_json(serde_json::json!({
+                "open": true,
+                "label": b.label,
+                "base_revision": b.base,
+                "staged_ops": b.ops.len(),
+                "staged_revision": b.staging.revision(),
+                "age_s": b.last_activity.elapsed().as_secs(),
+                "expires_in_s": BATCH_TTL.saturating_sub(b.last_activity.elapsed()).as_secs(),
+            })),
+            None => ok_json(serde_json::json!({"open": false})),
+        },
         "diagnostics" => {
-            let diags = sh.doc.diagnose();
+            let diags = sh.view().diagnose();
             ok_json(serde_json::json!({
                 "count": diags.len().min(MAX_DIAG_RESULTS),
                 "total": diags.len(),
@@ -1018,17 +1309,18 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
                         .collect()
                 })
                 .unwrap_or_default();
-            let before = sh.doc.diagnose().len();
+            let before = sh.view().diagnose().len();
             let codes: Vec<&str> = code_strs.iter().map(String::as_str).collect();
-            let ops = sh.doc.fix_ops(&codes);
+            let ops = sh.view_mut().fix_ops(&codes);
             if ops.is_empty() {
                 return ok_json(serde_json::json!({"fixed": 0, "remaining": before}));
             }
-            match sh.apply("normalize", ops) {
-                Ok(rev) => {
-                    let remaining = sh.doc.diagnose().len();
-                    ok_json(
-                        serde_json::json!({"fixed": before - remaining, "remaining": remaining, "revision": rev}),
+            match sh.apply_or_stage("normalize", ops) {
+                Ok(outcome) => {
+                    let remaining = sh.view().diagnose().len();
+                    apply_reply(
+                        outcome,
+                        serde_json::json!({"fixed": before - remaining, "remaining": remaining}),
                     )
                 }
                 Err(e) => err_json(e.to_string()),
@@ -1043,7 +1335,7 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
                 .unwrap_or(500)
                 .min(MAX_QUERY_LIMIT as u64) as usize;
             let notes: Vec<_> = sh
-                .doc
+                .view()
                 .notes()
                 .into_iter()
                 .filter(|n| n.start_tick >= from && n.start_tick <= to)
@@ -1067,7 +1359,7 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
             // collect light (tick, seq, track, idx) refs only; JSON encoding
             // happens for the offset/limit window, not for every match
             let mut hits: Vec<(u64, u32, usize, usize)> = Vec::new();
-            for (ti, t) in sh.doc.tracks.iter().enumerate() {
+            for (ti, t) in sh.view().tracks.iter().enumerate() {
                 if track.is_some() && track != Some(ti) {
                     continue;
                 }
@@ -1084,7 +1376,7 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
                 .skip(offset)
                 .take(limit)
                 .map(|(_, _, ti, ei)| {
-                    let mut j = event_json(&sh.doc.tracks[ti].events[ei]);
+                    let mut j = event_json(&sh.view().tracks[ti].events[ei]);
                     j["track"] = ti.into();
                     j
                 })
@@ -1092,12 +1384,8 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
             ok_json(serde_json::json!({"total": total, "events": evs}))
         }
         "apply_patch" => {
-            let base = args["base_revision"].as_u64();
-            if base.is_some() && base != Some(sh.doc.revision()) {
-                return err_json(format!(
-                    "stale base_revision: current is {}; call document_summary",
-                    sh.doc.revision()
-                ));
+            if let Some(r) = check_base(&sh, args) {
+                return r;
             }
             let label = args["label"].as_str().unwrap_or("mcp patch");
             let ops_json = args["ops"].as_array().cloned().unwrap_or_default();
@@ -1108,7 +1396,7 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
                     ops_json.len()
                 ));
             }
-            let ops = match build_ops(&mut sh.doc, &ops_json) {
+            let ops = match build_ops(sh.view_mut(), &ops_json) {
                 Ok(o) => o,
                 Err(PatchError::Msg(m)) => return err_json(m),
             };
@@ -1139,12 +1427,17 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
                     "dry_run": true, "applied": false, "ops": detail,
                 }));
             }
-            match sh.apply(label, ops) {
-                Ok(rev) => ok_json(serde_json::json!({"applied": true, "revision": rev})),
+            match sh.apply_or_stage(label, ops) {
+                Ok(outcome) => apply_reply(outcome, serde_json::json!({})),
                 Err(e) => err_json(e.to_string()),
             }
         }
         "undo" => {
+            if sh.batch.is_some() {
+                return err_json(
+                    "an edit transaction is open — commit_transaction or rollback_transaction first",
+                );
+            }
             let res = {
                 let Shared { doc, undo, .. } = &mut *sh;
                 undo.undo(doc)
@@ -1158,6 +1451,11 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
             }
         }
         "redo" => {
+            if sh.batch.is_some() {
+                return err_json(
+                    "an edit transaction is open — commit_transaction or rollback_transaction first",
+                );
+            }
             let res = {
                 let Shared { doc, undo, .. } = &mut *sh;
                 undo.redo(doc)
@@ -1193,7 +1491,7 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
             }
         }
         "get_tempo_map" => {
-            let tm = &sh.doc.tempo_map;
+            let tm = &sh.view().tempo_map;
             ok_json(serde_json::json!({
                 "ppq": tm.ppq(),
                 "points": tm.points().iter().map(|(tick, mpq, cum)| serde_json::json!({
@@ -1206,9 +1504,9 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
         "get_meta" => {
             let track = args["track"].as_u64().map(|v| v as usize);
             let mt = args["meta_type"].as_u64().map(|v| v as u8);
-            let hint = sh.doc.text_encoding_hint();
+            let hint = sh.view().text_encoding_hint();
             let mut out = Vec::new();
-            for (ti, t) in sh.doc.tracks.iter().enumerate() {
+            for (ti, t) in sh.view().tracks.iter().enumerate() {
                 if track.is_some() && track != Some(ti) {
                     continue;
                 }
@@ -1241,7 +1539,7 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
             let ccn = args["cc"].as_u64().map(|v| v as u8);
             // latest value wins; events are already tick-sorted
             let mut latest: HashMap<(usize, u8, u8), (u64, u8)> = HashMap::new();
-            for (ti, t) in sh.doc.tracks.iter().enumerate() {
+            for (ti, t) in sh.view().tracks.iter().enumerate() {
                 if track.is_some() && track != Some(ti) {
                     continue;
                 }
@@ -1288,7 +1586,7 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
                 Some(t) => t as usize,
                 None => return err_json("track required"),
             };
-            if track >= sh.doc.tracks.len() {
+            if track >= sh.view().tracks.len() {
                 return err_json(format!("no track {track}"));
             }
             let d = &args["destination"];
@@ -1338,9 +1636,7 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
                 return r;
             }
             let (from, to) = region(args);
-            let grid = args["grid"]
-                .as_u64()
-                .unwrap_or_else(|| sh.doc.tempo_map.ppq() / 4);
+            let grid = args["grid"].as_u64().unwrap_or_else(|| sh.view().tempo_map.ppq() / 4);
             let strength = args["strength"].as_u64().unwrap_or(100) as u32;
             let tracks = match sel_tracks(&sh, args) {
                 Ok(t) => t,
@@ -1348,7 +1644,7 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
             };
             let mut ops = Vec::new();
             for t in tracks {
-                ops.extend(sh.doc.quantize_ops(t, from, to, grid, strength));
+                ops.extend(sh.view_mut().quantize_ops(t, from, to, grid, strength));
             }
             apply_ops(&mut sh, "quantize", ops)
         }
@@ -1364,7 +1660,7 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
             };
             let mut ops = Vec::new();
             for t in tracks {
-                ops.extend(sh.doc.transpose_ops(t, from, to, st));
+                ops.extend(sh.view_mut().transpose_ops(t, from, to, st));
             }
             apply_ops(&mut sh, "transpose", ops)
         }
@@ -1380,7 +1676,7 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
             };
             let mut ops = Vec::new();
             for t in tracks {
-                ops.extend(sh.doc.scale_velocity_ops(t, from, to, f));
+                ops.extend(sh.view_mut().scale_velocity_ops(t, from, to, f));
             }
             apply_ops(&mut sh, "scale velocity", ops)
         }
@@ -1396,7 +1692,7 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
             };
             let mut ops = Vec::new();
             for t in tracks {
-                ops.extend(sh.doc.set_channel_ops(t, from, to, ch));
+                ops.extend(sh.view_mut().set_channel_ops(t, from, to, ch));
             }
             apply_ops(&mut sh, "set channel", ops)
         }
@@ -1412,8 +1708,8 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
             let ch = args["channel"]
                 .as_u64()
                 .map(|c| (c.clamp(1, 16) - 1) as u8)
-                .unwrap_or_else(|| sh.doc.tracks.get(track).map(|t| t.out_channel).unwrap_or(0));
-            let ops = sh.doc.set_program_ops(
+                .unwrap_or_else(|| sh.view().tracks.get(track).map(|t| t.out_channel).unwrap_or(0));
+            let ops = sh.view_mut().set_program_ops(
                 track,
                 tick,
                 ch,
@@ -1434,11 +1730,11 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
             let ch = args["channel"]
                 .as_u64()
                 .map(|c| (c.clamp(1, 16) - 1) as u8)
-                .unwrap_or_else(|| sh.doc.tracks.get(track).map(|t| t.out_channel).unwrap_or(0));
+                .unwrap_or_else(|| sh.view().tracks.get(track).map(|t| t.out_channel).unwrap_or(0));
             let mut ops = Vec::new();
             if let Some(points) = args["points"].as_array() {
                 for p in points {
-                    ops.extend(sh.doc.set_cc_ops(
+                    ops.extend(sh.view_mut().set_cc_ops(
                         track,
                         p["tick"].as_u64().unwrap_or(0),
                         ch,
@@ -1447,7 +1743,7 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
                     ));
                 }
             } else {
-                ops.extend(sh.doc.set_cc_ops(
+                ops.extend(sh.view_mut().set_cc_ops(
                     track,
                     args["tick"].as_u64().unwrap_or(0),
                     ch,
@@ -1468,8 +1764,8 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
             let ch = args["channel"]
                 .as_u64()
                 .map(|c| (c.clamp(1, 16) - 1) as u8)
-                .unwrap_or_else(|| sh.doc.tracks.get(track).map(|t| t.out_channel).unwrap_or(0));
-            let ops = sh.doc.set_pitch_bend_ops(
+                .unwrap_or_else(|| sh.view().tracks.get(track).map(|t| t.out_channel).unwrap_or(0));
+            let ops = sh.view_mut().set_pitch_bend_ops(
                 track,
                 args["tick"].as_u64().unwrap_or(0),
                 ch,
@@ -1481,7 +1777,7 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
             if let Some(r) = check_base(&sh, args) {
                 return r;
             }
-            let ops = sh.doc.set_tempo_ops(
+            let ops = sh.view_mut().set_tempo_ops(
                 args["tick"].as_u64().unwrap_or(0),
                 args["bpm"].as_f64().unwrap_or(120.0),
             );
@@ -1491,7 +1787,7 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
             if let Some(r) = check_base(&sh, args) {
                 return r;
             }
-            let ops = sh.doc.set_time_sig_ops(
+            let ops = sh.view_mut().set_time_sig_ops(
                 args["tick"].as_u64().unwrap_or(0),
                 args["num"].as_u64().unwrap_or(4) as u8,
                 args["den"].as_u64().unwrap_or(4) as u8,
@@ -1506,7 +1802,7 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
                 Ok(t) => t,
                 Err(r) => return r,
             };
-            let ops = sh.doc.set_track_channel_ops(
+            let ops = sh.view_mut().set_track_channel_ops(
                 track,
                 (args["channel"].as_u64().unwrap_or(1).clamp(1, 16) - 1) as u8,
             );
@@ -1521,7 +1817,7 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
                 Err(r) => return r,
             };
             let ops = sh
-                .doc
+                .view_mut()
                 .set_track_name_ops(track, args["name"].as_str().unwrap_or(""));
             apply_ops(&mut sh, "set track name", ops)
         }
@@ -1529,7 +1825,7 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
             if let Some(r) = check_base(&sh, args) {
                 return r;
             }
-            let ops = sh.doc.add_track_ops(args["name"].as_str());
+            let ops = sh.view_mut().add_track_ops(args["name"].as_str());
             apply_ops(&mut sh, "add track", ops)
         }
         "remove_track" => {
@@ -1540,7 +1836,7 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
                 Ok(t) => t,
                 Err(r) => return r,
             };
-            let ops = sh.doc.remove_track_ops(track);
+            let ops = sh.view_mut().remove_track_ops(track);
             apply_ops(&mut sh, "remove track", ops)
         }
         "delete_range" => {
@@ -1552,7 +1848,7 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
                 Err(r) => return r,
             };
             let (from, to) = region(args);
-            let ops = sh.doc.delete_range_ops(track, from, to);
+            let ops = sh.view_mut().delete_range_ops(track, from, to);
             apply_ops(&mut sh, "delete range", ops)
         }
         "duplicate_range" => {
@@ -1566,10 +1862,8 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
             let from = args["from"].as_u64().unwrap_or(0);
             // default `to` = end of song: a full u64::MAX span would push
             // every copy to a nonsense saturated tick
-            let to = args["to"]
-                .as_u64()
-                .unwrap_or_else(|| doc_last_tick(&sh.doc));
-            let ops = sh.doc.duplicate_range_ops(track, from, to);
+            let to = args["to"].as_u64().unwrap_or_else(|| doc_last_tick(sh.view()));
+            let ops = sh.view_mut().duplicate_range_ops(track, from, to);
             apply_ops(&mut sh, "duplicate range", ops)
         }
         _ => err_json(format!("unknown tool '{name}'")),
@@ -1578,9 +1872,9 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
 
 fn check_base(sh: &Shared, args: &serde_json::Value) -> Option<CallToolResponse> {
     match args["base_revision"].as_u64() {
-        Some(b) if b != sh.doc.revision() => Some(err_json(format!(
+        Some(b) if b != sh.view().revision() => Some(err_json(format!(
             "stale base_revision: current is {}; call document_summary",
-            sh.doc.revision()
+            sh.view().revision()
         ))),
         _ => None,
     }
@@ -1594,10 +1888,10 @@ fn check_base(sh: &Shared, args: &serde_json::Value) -> Option<CallToolResponse>
 fn req_track(sh: &Shared, args: &serde_json::Value) -> Result<usize, CallToolResponse> {
     match args["track"].as_u64() {
         None => Err(err_json("'track' is required")),
-        Some(t) if (t as usize) < sh.doc.tracks.len() => Ok(t as usize),
+        Some(t) if (t as usize) < sh.view().tracks.len() => Ok(t as usize),
         Some(t) => Err(err_json(format!(
             "no track {t} (document has {})",
-            sh.doc.tracks.len()
+            sh.view().tracks.len()
         ))),
     }
 }
@@ -1621,11 +1915,11 @@ fn region(args: &serde_json::Value) -> (u64, u64) {
 #[allow(clippy::result_large_err)] // see req_track
 fn sel_tracks(sh: &Shared, args: &serde_json::Value) -> Result<Vec<usize>, CallToolResponse> {
     match args["track"].as_u64() {
-        None => Ok((0..sh.doc.tracks.len()).collect()),
-        Some(t) if (t as usize) < sh.doc.tracks.len() => Ok(vec![t as usize]),
+        None => Ok((0..sh.view().tracks.len()).collect()),
+        Some(t) if (t as usize) < sh.view().tracks.len() => Ok(vec![t as usize]),
         Some(t) => Err(err_json(format!(
             "no track {t} (document has {})",
-            sh.doc.tracks.len()
+            sh.view().tracks.len()
         ))),
     }
 }
@@ -1634,10 +1928,30 @@ fn apply_ops(sh: &mut Shared, label: &str, ops: Vec<Op>) -> CallToolResponse {
     if ops.is_empty() {
         return ok_json(serde_json::json!({"applied": false, "ops": 0}));
     }
-    match sh.apply(label, ops) {
-        Ok(rev) => ok_json(serde_json::json!({"applied": true, "revision": rev})),
+    match sh.apply_or_stage(label, ops) {
+        Ok(outcome) => apply_reply(outcome, serde_json::json!({})),
         Err(e) => err_json(e.to_string()),
     }
+}
+
+/// Uniform mutation reply: `{applied, revision}` committed, or
+/// `{staged, pending_ops, staged_revision}` inside an open transaction.
+fn apply_reply(outcome: StageOutcome, mut v: serde_json::Value) -> CallToolResponse {
+    match outcome {
+        StageOutcome::Committed(rev) => {
+            v["applied"] = true.into();
+            v["revision"] = rev.into();
+        }
+        StageOutcome::Staged {
+            pending_ops,
+            staged_revision,
+        } => {
+            v["staged"] = true.into();
+            v["pending_ops"] = pending_ops.into();
+            v["staged_revision"] = staged_revision.into();
+        }
+    }
+    ok_json(v)
 }
 
 fn dest_label(d: &Destination) -> String {
@@ -2294,6 +2608,136 @@ mod tests {
             ticks,
             vec![(0, 0x90), (480, 0x90), (480, 0x80), (960, 0x80)]
         );
+    }
+
+    #[test]
+    fn transaction_commit_is_one_undo_step() {
+        let sh = shared();
+        let rev0 = sh.lock().unwrap().doc.revision();
+        let (err, v) = call(&sh, "begin_transaction", json!({"label": "fix chorus"}));
+        assert!(!err);
+        assert_eq!(v["base_revision"], rev0);
+        // stage two separate edits
+        let (err, v) = call(
+            &sh,
+            "apply_patch",
+            json!({"ops": [{"op": "insert_note", "track": 1, "key": 62, "start": 0, "dur": 240}]}),
+        );
+        assert!(!err);
+        assert_eq!(v["staged"], true);
+        // reads inside the batch see staged state; the real doc is untouched
+        let (_err, v) = call(&sh, "list_notes", json!({}));
+        assert_eq!(v["count"], 2);
+        assert_eq!(
+            sh.lock().unwrap().doc.notes().len(),
+            1,
+            "real document unchanged while staged"
+        );
+        let (err, _) = call(&sh, "set_track_name", json!({"track": 1, "name": "Chorus"}));
+        assert!(!err);
+        // commit merges both calls into ONE undo step
+        let (err, v) = call(&sh, "commit_transaction", json!({}));
+        assert!(!err);
+        assert_eq!(v["committed"], true);
+        assert_eq!(v["label"], "fix chorus");
+        assert_eq!(v["ops"], 2);
+        assert_eq!(sh.lock().unwrap().doc.notes().len(), 2);
+        let (err, v) = call(&sh, "undo", json!({}));
+        assert!(!err);
+        assert_eq!(v["undone"], "fix chorus");
+        assert_eq!(note_count(&sh), 1, "single undo reverted both edits");
+        assert!(sh.lock().unwrap().doc.tracks[1].name.is_none());
+    }
+
+    #[test]
+    fn rollback_leaves_document_unchanged() {
+        let sh = shared();
+        let before = sh
+            .lock()
+            .unwrap()
+            .doc
+            .serialize(smf_core::WriteOptions {
+                running_status: false,
+            });
+        call(&sh, "begin_transaction", json!({"label": "experiment"}));
+        call(
+            &sh,
+            "apply_patch",
+            json!({"ops": [{"op": "insert_note", "track": 1, "key": 65, "start": 0, "dur": 120}]}),
+        );
+        call(&sh, "set_tempo", json!({"tick": 0, "bpm": 90.0}));
+        let (err, v) = call(&sh, "rollback_transaction", json!({}));
+        assert!(!err);
+        assert_eq!(v["discarded_ops"], 2);
+        let shg = sh.lock().unwrap();
+        let after = shg.doc.serialize(smf_core::WriteOptions {
+            running_status: false,
+        });
+        assert_eq!(before, after, "byte-for-byte unchanged after rollback");
+        assert_eq!(shg.doc.revision(), 0);
+    }
+
+    #[test]
+    fn commit_reports_stale_conflict_on_concurrent_edit() {
+        let sh = shared();
+        call(&sh, "begin_transaction", json!({"label": "agent work"}));
+        call(
+            &sh,
+            "apply_patch",
+            json!({"ops": [{"op": "insert_note", "track": 1, "key": 60, "start": 960, "dur": 120}]}),
+        );
+        // a GUI edit lands on the real document mid-batch
+        let ops = sh.lock().unwrap().doc.add_track_ops(Some("gui track"));
+        sh.lock().unwrap().apply("gui edit", ops).unwrap();
+        let (err, v) = call(&sh, "commit_transaction", json!({}));
+        assert!(err);
+        assert_eq!(v["error"], "stale_base");
+        // the conflicted batch stays open — caller decides (rollback here)
+        let (err, v) = call(&sh, "transaction_status", json!({}));
+        assert!(!err);
+        assert_eq!(v["open"], true);
+        call(&sh, "rollback_transaction", json!({}));
+    }
+
+    #[test]
+    fn dry_run_commit_validates_and_keeps_batch() {
+        let sh = shared();
+        call(&sh, "begin_transaction", json!({}));
+        call(
+            &sh,
+            "apply_patch",
+            json!({"ops": [{"op": "insert_note", "track": 1, "key": 60, "start": 0, "dur": 120}]}),
+        );
+        let (err, v) = call(&sh, "commit_transaction", json!({"dry_run": true}));
+        assert!(!err);
+        assert_eq!(v["valid"], true);
+        assert_eq!(v["would_be_revision"], 1);
+        assert_eq!(sh.lock().unwrap().doc.revision(), 0, "dry run applied nothing");
+        let (_err, v) = call(&sh, "transaction_status", json!({}));
+        assert_eq!(v["open"], true, "batch still open after dry_run");
+        let (err, v) = call(&sh, "commit_transaction", json!({}));
+        assert!(!err && v["committed"] == true);
+    }
+
+    #[test]
+    fn abandoned_batch_expires() {
+        let sh = shared();
+        call(&sh, "begin_transaction", json!({"label": "forgotten"}));
+        // push the checkpoint past its TTL
+        sh.lock().unwrap().batch.as_mut().unwrap().last_activity =
+            Instant::now() - Duration::from_secs(400);
+        let (err, v) = call(&sh, "transaction_status", json!({}));
+        assert!(!err);
+        assert_eq!(v["open"], false, "idle batch auto-rolled-back");
+        assert_eq!(sh.lock().unwrap().doc.revision(), 0);
+    }
+
+    #[test]
+    fn undo_is_blocked_while_batch_open() {
+        let sh = shared();
+        call(&sh, "begin_transaction", json!({}));
+        let (err, _) = call(&sh, "undo", json!({}));
+        assert!(err);
     }
 
     #[test]
