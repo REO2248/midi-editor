@@ -2459,6 +2459,31 @@ impl EditorView {
             }
             changed = true;
         }
+        // a plugin reporting kLatencyChanged gets its latency re-read into
+        // the shared tracker — the sink compensates on its next event, with
+        // no reload and no dropped audio. service_host_requests performs the
+        // VST3-required stop/deactivate/reactivate lifecycle for latency and
+        // I/O requests inside the isolated helper's own control thread.
+        // try_lock keeps a busy audio block from stalling a UI frame; the
+        // next frame picks the flag up.
+        for (d, slot) in &self.plugin_slots {
+            if !matches!(self.plugin_state.get(d), Some(PluginState::Ready { .. })) {
+                continue;
+            }
+            let latency_changed = slot
+                .plugin
+                .try_lock()
+                .map(|mut p| {
+                    p.service_host_requests()
+                        .map(|f| f.latency_changed())
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if latency_changed {
+                slot.refresh_latency();
+                changed = true;
+            }
+        }
         if self.play_pending {
             let needed_loading = {
                 let sh = lock_shared(&self.shared);
