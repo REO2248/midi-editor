@@ -77,6 +77,18 @@ after load and before playback, and kept even while a plugin is missing —
 incompatible or corrupt state files are skipped with a status note, never
 fatal.
 
+Plugin scanning is cached app-wide in
+`%APPDATA%/midi-editor/plugin_scan_cache.json`: each bundle is fingerprinted
+(file count + size + newest mtime inside the `.vst3`), and unchanged bundles
+reuse their last probe result, so a plugin that crashed or timed out is
+quarantined with its reason instead of slowing every startup. Updating the
+bundle on disk invalidates the entry and triggers a fresh probe
+automatically. The Output menu offers **Rescan changed plugins** (cached,
+default) and **Rescan all plugins** (ignores the cache); quarantined entries
+appear in the Plugin Host Status panel where a click re-probes just that
+bundle. The per-plugin probe bound defaults to 10 s and can be overridden via
+`probe_timeout_secs` in `prefs.json`.
+
 ## MCP server
 
 The app embeds a Streamable-HTTP MCP server at `http://127.0.0.1:7878/mcp`

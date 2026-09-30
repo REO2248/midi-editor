@@ -361,6 +361,13 @@ struct EditorView {
     save_rx: Option<std::sync::mpsc::Receiver<Result<mcp_server::service::SaveOutcome, String>>>,
     scan_note: Option<String>,
     scan_probe_used: Option<bool>,
+    /// Plugins served from the scan cache in the last scan (status display).
+    scan_cached: usize,
+    /// Bundles the cache holds as failed (crash/timeout) — shown in the
+    /// Output status panel where each can be force-retried.
+    quarantined: Vec<(PathBuf, String)>,
+    /// Per-plugin probe bound (global pref, seconds).
+    probe_timeout_secs: u64,
     host_diag: output::HostDiag,
     show_output_status: bool,
     /// explicit audio configuration for hosted plugins (device/rate/buffer);
@@ -471,6 +478,16 @@ enum PluginState {
         phase: &'static str,
         msg: String,
     },
+}
+
+/// How a plugin (re)scan treats the persistent scan cache.
+enum ScanMode {
+    /// Serve unchanged bundles from the cache; probe only new/changed paths.
+    Changed,
+    /// Ignore the cache entirely and re-probe every bundle found.
+    All,
+    /// Force-re-probe one bundle (a quarantined plugin the user retried).
+    Retry(PathBuf),
 }
 
 /// Captured (µs, raw channel bytes) pairs from the input callback.
@@ -706,6 +723,11 @@ impl EditorView {
             save_rx: None,
             scan_note: None,
             scan_probe_used: None,
+            scan_cached: 0,
+            quarantined: Vec::new(),
+            probe_timeout_secs: g
+                .probe_timeout_secs
+                .unwrap_or(output::DEFAULT_SCAN_TIMEOUT.as_secs()),
             host_diag: hd,
             show_output_status: false,
             audio_sel: output::AudioSelection {
@@ -768,7 +790,7 @@ impl EditorView {
             }
             v.push_recent(p);
         }
-        v.rescan_plugins();
+        v.rescan_plugins(ScanMode::Changed);
         v
     }
 
@@ -3145,12 +3167,24 @@ impl EditorView {
         self.status = tf("status.rec_done", &[("n", &n.to_string())]).into();
     }
 
-    fn rescan_plugins(&mut self) {
+    fn rescan_plugins(&mut self, mode: ScanMode) {
         self.status = t("status.scanning").into();
         let (tx, rx) = std::sync::mpsc::channel();
         self.scan_rx = Some(rx);
+        let cache_file = scan_cache_path();
+        let timeout = std::time::Duration::from_secs(self.probe_timeout_secs);
         let handle = std::thread::spawn(move || {
-            let _ = tx.send(output::discover_plugins());
+            let (all, retry) = match &mode {
+                ScanMode::All => (true, None),
+                ScanMode::Retry(p) => (false, Some(p.as_path())),
+                ScanMode::Changed => (false, None),
+            };
+            let _ = tx.send(output::discover_plugins_cached(
+                Some(&cache_file),
+                timeout,
+                all,
+                retry,
+            ));
         });
         self.shutdown.track_scan(handle);
     }
@@ -3165,38 +3199,40 @@ impl EditorView {
     }
 
     fn apply_catalog(&mut self, report: output::ScanReport) {
-        let skipped = report.skipped.len();
         self.scan_probe_used = Some(report.probe_used);
+        self.scan_cached = report.cached_ok;
+        self.quarantined = report.quarantined.clone();
         self.plugin_meta = report
             .plugins
             .iter()
             .cloned()
             .map(|p| (p.path.to_string_lossy().into_owned(), p))
             .collect();
-        self.scan_note = if skipped == 0 {
+        let fmt_skip = |(p, r): &(PathBuf, String)| {
+            format!(
+                "{} — {}",
+                p.file_stem()
+                    .map(|s| s.to_string_lossy())
+                    .unwrap_or_default(),
+                r
+            )
+        };
+        let mut note: Vec<String> = report.skipped.iter().map(fmt_skip).collect();
+        note.extend(
+            report
+                .quarantined
+                .iter()
+                .map(|s| format!("{}: {}", t("output.quarantined_short"), fmt_skip(s))),
+        );
+        self.scan_note = if note.is_empty() {
             None
         } else {
-            Some(
-                report
-                    .skipped
-                    .iter()
-                    .map(|(p, r)| {
-                        format!(
-                            "{} — {}",
-                            p.file_stem()
-                                .map(|s| s.to_string_lossy())
-                                .unwrap_or_default(),
-                            r
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("; "),
-            )
+            Some(note.join("; "))
         };
         let fresh = build_dest_catalog(&report.plugins);
         tracing::info!(
             dests = fresh.len(),
-            skipped,
+            skipped = report.skipped.len(),
             probe_used = report.probe_used,
             "destination catalog applied"
         );
@@ -3694,6 +3730,9 @@ struct GlobalPrefs {
     /// preferred buffer size in samples; None = 512
     #[serde(default)]
     buffer_size: Option<u32>,
+    /// Per-plugin probe bound in seconds (default
+    /// `output::DEFAULT_SCAN_TIMEOUT`); quarantined entries respect it too.
+    probe_timeout_secs: Option<u64>,
 }
 
 impl Default for GlobalPrefs {
@@ -3707,6 +3746,7 @@ impl Default for GlobalPrefs {
             audio_device: None,
             sample_rate: None,
             buffer_size: None,
+            probe_timeout_secs: None,
         }
     }
 }
@@ -3747,6 +3787,12 @@ impl GlobalPrefs {
         let _ = std::fs::create_dir_all(&dir);
         let _ = persist::json::save_json(&dir.join("prefs.json"), self);
     }
+}
+
+/// App-wide plugin scan cache + quarantine list — shared across songs, so it
+/// lives next to prefs.json rather than in a per-file sidecar.
+fn scan_cache_path() -> PathBuf {
+    GlobalPrefs::path().join("plugin_scan_cache.json")
 }
 
 /// Session state that cannot live inside the SMF: per-track output
@@ -4011,6 +4057,7 @@ impl EditorView {
             audio_device: self.audio_sel.device.clone(),
             sample_rate: self.audio_sel.sample_rate,
             buffer_size: self.audio_sel.buffer_size,
+            probe_timeout_secs: Some(self.probe_timeout_secs),
             ..Default::default()
         }
         .save();

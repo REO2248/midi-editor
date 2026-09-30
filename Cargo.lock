@@ -5248,6 +5248,7 @@ dependencies = [
  "cpal",
  "midi-io",
  "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "tracing",
  "vst3-host",
