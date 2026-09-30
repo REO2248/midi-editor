@@ -155,7 +155,10 @@ static EN: &[(&str, &str)] = &[
     ("output.audio", "Audio device"),
     ("output.scan", "Plugin scan"),
     ("output.missing", "missing"),
-    ("output.helper_hint", "Place vst3-host-helper.exe and vst3-host-probe.exe next to midi-editor.exe"),
+    (
+        "output.helper_hint",
+        "Place vst3-host-helper.exe and vst3-host-probe.exe next to midi-editor.exe",
+    ),
     ("output.probe_used", "probe: isolated"),
     ("output.probe_unused", "probe: unavailable (filename scan)"),
     ("output.close", "Close"),
@@ -163,7 +166,10 @@ static EN: &[(&str, &str)] = &[
     ("plugin.loading", "loading {name}…"),
     ("plugin.ready", "{name} ready"),
     ("plugin.failed", "{name} failed to load"),
-    ("plugin.waiting", "waiting for {name}… playback starts when ready"),
+    (
+        "plugin.waiting",
+        "waiting for {name}… playback starts when ready",
+    ),
     ("plugin.timeout", "timed out after 20 s"),
     ("plugin.gui_failed", "plugin editor failed"),
     ("plugin.state_ready", "ready"),
@@ -337,7 +343,11 @@ fn detect_lang() -> &'static str {
     }
     // OS UI language — coarse prefix match is enough for shipped locales
     let lang = std::env::var("LANG").unwrap_or_default();
-    if lang.starts_with("ja") { "ja" } else { "en" }
+    if lang.starts_with("ja") {
+        "ja"
+    } else {
+        "en"
+    }
 }
 
 fn table() -> &'static HashMap<&'static str, &'static str> {
@@ -355,7 +365,10 @@ pub fn t(key: &'static str) -> &'static str {
     if let Some(v) = table().get(key) {
         return v;
     }
-    EN.iter().find(|(k, _)| *k == key).map(|(_, v)| *v).unwrap_or(key)
+    EN.iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| *v)
+        .unwrap_or(key)
 }
 
 #[allow(dead_code)]
@@ -367,7 +380,6 @@ pub fn tf(key: &'static str, args: &[(&str, &str)]) -> String {
     }
     s
 }
-
 
 #[allow(dead_code)]
 /// Current locale id ("en", "ja").
@@ -411,4 +423,3 @@ mod tests {
         assert!(s.contains("42"), "placeholder substituted: {s}");
     }
 }
-

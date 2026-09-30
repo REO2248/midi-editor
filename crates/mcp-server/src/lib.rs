@@ -14,11 +14,11 @@ use bytes::Bytes;
 use commands::UndoStack;
 use document::{ApplyError, Document, Event, EventId, Op, Transaction};
 use midi_io::Destination;
-use smf_core::EventKind;
-use std::collections::{HashMap, HashSet};
 use rmcp::model::*;
 use rmcp::service::{RequestContext, ServiceExt};
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
+use smf_core::EventKind;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -304,11 +304,18 @@ fn build_ops(doc: &mut Document, ops: &[serde_json::Value]) -> Result<Vec<Op>, P
                         let status = c["status"].as_u64().unwrap_or(0x90) as u8;
                         let data: Vec<u8> = c["data"]
                             .as_array()
-                            .map(|a| a.iter().filter_map(|v| v.as_u64().map(|x| x as u8)).collect())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_u64().map(|x| x as u8))
+                                    .collect()
+                            })
                             .unwrap_or_default();
                         EventKind::Channel {
                             status,
-                            data: [data.first().copied().unwrap_or(0), data.get(1).copied().unwrap_or(0)],
+                            data: [
+                                data.first().copied().unwrap_or(0),
+                                data.get(1).copied().unwrap_or(0),
+                            ],
                             len: data.len().clamp(1, 2) as u8,
                         }
                     } else if let Some(m) = kind_json.get("meta") {
@@ -327,10 +334,9 @@ fn build_ops(doc: &mut Document, ops: &[serde_json::Value]) -> Result<Vec<Op>, P
                             data: Bytes::from(data),
                         }
                     } else if let Some(h) = kind_json["sysex_hex"].as_str() {
-                        EventKind::SysEx(Bytes::from(
-                            hex_to_bytes(h)
-                                .ok_or_else(|| PatchError::Msg("invalid or oversized sysex_hex".into()))?,
-                        ))
+                        EventKind::SysEx(Bytes::from(hex_to_bytes(h).ok_or_else(|| {
+                            PatchError::Msg("invalid or oversized sysex_hex".into())
+                        })?))
                     } else {
                         return Err(PatchError::Msg("bad event kind".into()));
                     };
@@ -380,10 +386,8 @@ fn build_ops(doc: &mut Document, ops: &[serde_json::Value]) -> Result<Vec<Op>, P
                     })?;
                     let before = doc.tracks[et].events[ei].clone();
                     let mut after = before.clone();
-                    after.tick = (base_tick as i64
-                        + dtick
-                        + if eid != on_id { dlen } else { 0 })
-                    .max(0) as u64;
+                    after.tick = (base_tick as i64 + dtick + if eid != on_id { dlen } else { 0 })
+                        .max(0) as u64;
                     if let EventKind::Channel { data, .. } = &mut after.kind {
                         data[0] = (note.key as i32 + dkey).clamp(0, 127) as u8;
                     }
@@ -409,7 +413,13 @@ fn build_ops(doc: &mut Document, ops: &[serde_json::Value]) -> Result<Vec<Op>, P
                 let existing = doc.tracks.first().and_then(|t| {
                     t.events.iter().find(|e| {
                         e.tick == tick
-                            && matches!(e.kind, EventKind::Meta { meta_type: 0x51, .. })
+                            && matches!(
+                                e.kind,
+                                EventKind::Meta {
+                                    meta_type: 0x51,
+                                    ..
+                                }
+                            )
                     })
                 });
                 match existing {
@@ -458,7 +468,10 @@ fn err_json(msg: impl Into<String>) -> CallToolResponse {
 impl ServerHandler for MidiService {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("midi-editor", env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new(
+                "midi-editor",
+                env!("CARGO_PKG_VERSION"),
+            ))
             .with_instructions(
                 "Pure-SMF MIDI editor. All edits go through Document::apply transactions; \
                  one tool call = one undo step. Ticks are absolute PPQ ticks; keys 0-127; \
@@ -467,7 +480,10 @@ impl ServerHandler for MidiService {
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        tool_defs().into_iter().find(|(n, _)| *n == name).map(|(_, t)| t)
+        tool_defs()
+            .into_iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, t)| t)
     }
 
     fn list_tools(
@@ -820,11 +836,7 @@ fn tool_defs() -> Vec<(&'static str, Tool)> {
     ]
 }
 
-fn dispatch(
-    name: &str,
-    args: &serde_json::Value,
-    shared: SharedDoc,
-) -> CallToolResponse {
+fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallToolResponse {
     // recover from a poisoned lock: a panic in an earlier critical section
     // must not take down every later request
     let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -846,7 +858,11 @@ fn dispatch(
         "normalize" => {
             let code_strs: Vec<String> = args["codes"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
             let before = sh.doc.diagnose().len();
             let codes: Vec<&str> = code_strs.iter().map(String::as_str).collect();
@@ -857,7 +873,9 @@ fn dispatch(
             match sh.apply("normalize", ops) {
                 Ok(rev) => {
                     let remaining = sh.doc.diagnose().len();
-                    ok_json(serde_json::json!({"fixed": before - remaining, "remaining": remaining, "revision": rev}))
+                    ok_json(
+                        serde_json::json!({"fixed": before - remaining, "remaining": remaining, "revision": rev}),
+                    )
                 }
                 Err(e) => err_json(e.to_string()),
             }
@@ -866,7 +884,10 @@ fn dispatch(
             let track = args["track"].as_u64().map(|v| v as usize);
             let from = args["from_tick"].as_u64().unwrap_or(0);
             let to = args["to_tick"].as_u64().unwrap_or(u64::MAX);
-            let limit = args["limit"].as_u64().unwrap_or(500).min(MAX_QUERY_LIMIT as u64) as usize;
+            let limit = args["limit"]
+                .as_u64()
+                .unwrap_or(500)
+                .min(MAX_QUERY_LIMIT as u64) as usize;
             let notes: Vec<_> = sh
                 .doc
                 .notes()
@@ -884,7 +905,10 @@ fn dispatch(
             let track = args["track"].as_u64().map(|v| v as usize);
             let from = args["from_tick"].as_u64().unwrap_or(0);
             let to = args["to_tick"].as_u64().unwrap_or(u64::MAX);
-            let limit = args["limit"].as_u64().unwrap_or(500).min(MAX_QUERY_LIMIT as u64) as usize;
+            let limit = args["limit"]
+                .as_u64()
+                .unwrap_or(500)
+                .min(MAX_QUERY_LIMIT as u64) as usize;
             let offset = args["offset"].as_u64().unwrap_or(0) as usize;
             // collect light (tick, seq, track, idx) refs only; JSON encoding
             // happens for the offset/limit window, not for every match
@@ -1037,8 +1061,7 @@ fn dispatch(
                         // only 0x01-0x0F are text-family metas; the rest
                         // (tempo, time sig, ports, ...) are binary payloads
                         let text = if (0x01..=0x0f).contains(meta_type) {
-                            serde_json::Value::String(
-                                smf_core::decode_text(data, hint))
+                            serde_json::Value::String(smf_core::decode_text(data, hint))
                         } else {
                             serde_json::Value::Null
                         };
@@ -1067,7 +1090,9 @@ fn dispatch(
                     if let EventKind::Channel { status, data, .. } = &e.kind {
                         if status & 0xF0 == 0xB0 {
                             let (ch, cc, val) = (status & 0x0F, data[0], data[1]);
-                            if chan.is_some() && chan != Some(ch) || ccn.is_some() && ccn != Some(cc) {
+                            if chan.is_some() && chan != Some(ch)
+                                || ccn.is_some() && ccn != Some(cc)
+                            {
                                 continue;
                             }
                             latest.insert((ti, ch, cc), (e.tick, val));
@@ -1154,7 +1179,9 @@ fn dispatch(
                 return r;
             }
             let (from, to) = region(args);
-            let grid = args["grid"].as_u64().unwrap_or_else(|| sh.doc.tempo_map.ppq() / 4);
+            let grid = args["grid"]
+                .as_u64()
+                .unwrap_or_else(|| sh.doc.tempo_map.ppq() / 4);
             let strength = args["strength"].as_u64().unwrap_or(100) as u32;
             let tracks = match sel_tracks(&sh, args) {
                 Ok(t) => t,
@@ -1334,7 +1361,9 @@ fn dispatch(
                 Ok(t) => t,
                 Err(r) => return r,
             };
-            let ops = sh.doc.set_track_name_ops(track, args["name"].as_str().unwrap_or(""));
+            let ops = sh
+                .doc
+                .set_track_name_ops(track, args["name"].as_str().unwrap_or(""));
             apply_ops(&mut sh, "set track name", ops)
         }
         "add_track" => {
@@ -1378,7 +1407,9 @@ fn dispatch(
             let from = args["from"].as_u64().unwrap_or(0);
             // default `to` = end of song: a full u64::MAX span would push
             // every copy to a nonsense saturated tick
-            let to = args["to"].as_u64().unwrap_or_else(|| doc_last_tick(&sh.doc));
+            let to = args["to"]
+                .as_u64()
+                .unwrap_or_else(|| doc_last_tick(&sh.doc));
             let ops = sh.doc.duplicate_range_ops(track, from, to);
             apply_ops(&mut sh, "duplicate range", ops)
         }
@@ -1521,11 +1552,7 @@ pub async fn serve_stdio(doc: SharedDoc) -> anyhow::Result<()> {
 /// Serve Streamable-HTTP on `addr` (e.g. "127.0.0.1:7878") at path `/mcp`.
 /// When `token` is Some, requests must carry `Authorization: Bearer <token>`.
 /// Host/Origin validation stays at rmcp's loopback defaults.
-pub async fn serve_http(
-    doc: SharedDoc,
-    addr: &str,
-    token: Option<String>,
-) -> anyhow::Result<()> {
+pub async fn serve_http(doc: SharedDoc, addr: &str, token: Option<String>) -> anyhow::Result<()> {
     use axum::middleware::Next;
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::{

@@ -223,7 +223,10 @@ impl EventSink for PortSink {
         if let Err(e) = self.out.send(bytes) {
             if !self.warned_dead {
                 self.warned_dead = true;
-                tracing::warn!("midi port '{}' stopped accepting events: {e}", self.out.name);
+                tracing::warn!(
+                    "midi port '{}' stopped accepting events: {e}",
+                    self.out.name
+                );
             }
         }
     }
@@ -297,7 +300,9 @@ impl Playback {
                     let (us, sink_idx, bytes) = &events[i];
                     i += 1;
                     let us = *us;
-                    let Some(sink) = sinks.get_mut(*sink_idx) else { continue };
+                    let Some(sink) = sinks.get_mut(*sink_idx) else {
+                        continue;
+                    };
                     let target = t0 + std::time::Duration::from_micros(us - base_us)
                         - std::time::Duration::from_micros(sink.lead_us());
                     loop {
@@ -362,9 +367,7 @@ impl Playback {
     /// True while the playback thread is alive (also true at end-of-timeline
     /// until the final panic has been sent).
     pub fn is_running(&self) -> bool {
-        self.thread
-            .as_ref()
-            .is_some_and(|t| !t.is_finished())
+        self.thread.as_ref().is_some_and(|t| !t.is_finished())
     }
 
     pub fn stop(&mut self) {
@@ -408,7 +411,12 @@ mod tests {
             (0u64, 0usize, vec![0x90, 60, 100]),
             (5_000u64, 0usize, vec![0x80, 60, 0]),
         ];
-        let mut pb = Playback::start(vec![Box::new(RecordingSink(log.clone()))], events, 0, Some(0));
+        let mut pb = Playback::start(
+            vec![Box::new(RecordingSink(log.clone()))],
+            events,
+            0,
+            Some(0),
+        );
         // wait for at least two passes: a wrap happened and the schedule
         // replayed through it
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

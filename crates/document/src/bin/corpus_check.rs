@@ -9,7 +9,11 @@ fn main() {
         .skip(1)
         .flat_map(|dir| {
             std::fs::read_dir(&dir)
-                .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect::<Vec<_>>())
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .map(|e| e.path())
+                        .collect::<Vec<_>>()
+                })
                 .unwrap_or_else(|e| {
                     eprintln!("{dir}: read_dir failed: {e}");
                     Vec::new()

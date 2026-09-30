@@ -1932,9 +1932,11 @@ impl EditorView {
             .filter(|(_, tr, _)| audible(*tr))
             .filter_map(|(us, tr, b)| sink_of.get(&dest_of(tr)).map(|&s| (us, s, b)))
             .collect();
-        events.extend(tagged.into_iter().filter_map(|(us, tr, b)| {
-            sink_of.get(&dest_of(tr)).map(|&s| (us, s, b))
-        }));
+        events.extend(
+            tagged
+                .into_iter()
+                .filter_map(|(us, tr, b)| sink_of.get(&dest_of(tr)).map(|&s| (us, s, b))),
+        );
         if metronome {
             // prefer a plain MIDI port for clicks; fall back to any sink
             let click_sink = dests

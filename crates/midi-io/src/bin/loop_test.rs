@@ -5,17 +5,30 @@ use std::time::Duration;
 fn main() {
     let outs = midi_io::list_outputs().unwrap();
     let ins = midi_io::list_inputs().unwrap();
-    let li = ins.iter().position(|p| p.name.contains("loopMIDI")).expect("loopMIDI input");
-    let lo = outs.iter().position(|p| p.name.contains("loopMIDI")).expect("loopMIDI output");
+    let li = ins
+        .iter()
+        .position(|p| p.name.contains("loopMIDI"))
+        .expect("loopMIDI input");
+    let lo = outs
+        .iter()
+        .position(|p| p.name.contains("loopMIDI"))
+        .expect("loopMIDI output");
 
     // input listener
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     let mut inp = midir::MidiInput::new("probe").unwrap();
     inp.ignore(midir::Ignore::None);
     let port = &inp.ports()[li];
-    let _conn = inp.connect(port, "probe-in", move |_ts, bytes, _| {
-        let _ = tx.send(bytes.to_vec());
-    }, ()).unwrap();
+    let _conn = inp
+        .connect(
+            port,
+            "probe-in",
+            move |_ts, bytes, _| {
+                let _ = tx.send(bytes.to_vec());
+            },
+            (),
+        )
+        .unwrap();
 
     let mut out = midi_io::Output::open(lo).unwrap();
     out.send(&[0x90, 60, 100]).unwrap();

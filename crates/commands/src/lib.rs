@@ -173,7 +173,10 @@ mod tests {
         let mut doc = Document::from_file(smf_core::File {
             format: 1,
             division: smf_core::Division::Metrical(480),
-            tracks: vec![smf_core::Track { events: vec![] }, smf_core::Track { events: vec![] }],
+            tracks: vec![
+                smf_core::Track { events: vec![] },
+                smf_core::Track { events: vec![] },
+            ],
             warnings: vec![],
         });
         let mut stack = UndoStack::new(512);
