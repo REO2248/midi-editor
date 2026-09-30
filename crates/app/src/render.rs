@@ -7,6 +7,7 @@ use crate::a11y;
 use crate::geometry::{drag_window, tick_window, ZOOM_MAX, ZOOM_MIN};
 use crate::i18n::{t, tf};
 use crate::icons::icon;
+use crate::theme::metrics;
 use crate::*;
 use gpui_kit::base::{ObservedElement, TestSupportExt};
 use gpui_kit::component::input::Input;
@@ -54,6 +55,9 @@ impl Render for EditorView {
         }
         self.win_active = active;
         self.refresh_derived();
+        let th = self.theme;
+        // chrome helpers (menus, chips, icon buttons) read the same palette
+        theme::set_current(th);
         // keep both scroll axes inside the content (resizes, zooms, edits all
         // self-heal here) and edge-scroll while a drag is parked at a border;
         // `panning` keeps animation frames flowing only while it actually moves
@@ -301,7 +305,7 @@ impl Render for EditorView {
                     } else if n.end_tick.is_none() {
                         DANGLING_COLOR
                     } else {
-                        let c = TRACK_COLORS[n.track % TRACK_COLORS.len()];
+                        let c = th.track_colors[n.track % th.track_colors.len()];
                         if n.track == active_track {
                             c
                         } else {
@@ -370,8 +374,8 @@ impl Render for EditorView {
             .pr_3()
             .bg(rgb(BG_BAR))
             .border_b_1()
-            .border_color(rgb(BORDER_C))
-            .text_size(px(12.0))
+            .border_color(rgb(th.border))
+            .text_size(px(metrics::TEXT_LG))
             .child(
                 div()
                     .w(px(96.0))
@@ -419,8 +423,8 @@ impl Render for EditorView {
         }
         menu_bar = menu_bar.child(div().flex_1()).child(
             div()
-                .text_size(px(12.0))
-                .text_color(rgb(if dirty { 0xffd24f } else { 0x9a9ab0 }))
+                .text_size(px(metrics::TEXT_LG))
+                .text_color(rgb(if dirty { th.warn } else { th.icon_off }))
                 .whitespace_nowrap()
                 .child(format!("{title}{}", if dirty { " •" } else { "" })),
         );
@@ -574,8 +578,8 @@ impl Render for EditorView {
                     .border_1()
                     .border_color(rgb(BORDER_C))
                     .rounded_sm()
-                    .text_color(rgb(0x8fd0a0))
-                    .text_size(px(12.0))
+                    .text_color(rgb(th.lcd))
+                    .text_size(px(metrics::TEXT_LG))
                     .font_family("Cascadia Mono")
                     .whitespace_nowrap()
                     .child(pos.clone()),
@@ -640,8 +644,8 @@ impl Render for EditorView {
                     .border_color(rgb(BORDER_C))
                     .rounded_sm()
                     .cursor_pointer()
-                    .text_color(rgb(0x8fd0a0))
-                    .text_size(px(12.0))
+                    .text_color(rgb(th.lcd))
+                    .text_size(px(metrics::TEXT_LG))
                     .font_family("Cascadia Mono")
                     .whitespace_nowrap()
                     .tooltip(move |_w, cx| cx.new(|_| Tip(t("tip.tempo").into())).into())
@@ -769,7 +773,7 @@ impl Render for EditorView {
                     .child(
                         div()
                             .pl_1()
-                            .text_size(px(11.0))
+                            .text_size(px(metrics::TEXT_MD))
                             .font_family("Cascadia Mono")
                             .text_color(rgb(if SNAPS[self.snap_idx].0 > 0 {
                                 0xd8d8e0
@@ -890,9 +894,9 @@ impl Render for EditorView {
                     .px_2()
                     .h(px(26.0))
                     .border_b_1()
-                    .border_color(rgb(BORDER_C))
-                    .text_size(px(11.0))
-                    .text_color(rgb(0x77778a))
+                    .border_color(rgb(th.border))
+                    .text_size(px(metrics::TEXT_MD))
+                    .text_color(rgb(th.text_muted))
                     .child(format!("{} ({})", t("events.header"), self.events.len()))
                     .child(div().flex_1())
                     .children((n_diags > 0).then(|| {
@@ -906,8 +910,8 @@ impl Render for EditorView {
                             ))
                             .ml_2()
                             .px_1()
-                            .text_size(px(10.0))
-                            .text_color(rgb(0xffb454))
+                            .text_size(px(metrics::TEXT_SM))
+                            .text_color(rgb(th.warn_alt))
                             .cursor_pointer()
                             .child(format!("{} {} [fix]", n_diags, t("events.issues")))
                             .on_click(cx.listener(|v, _e, _w, cx| {
@@ -943,9 +947,9 @@ impl Render for EditorView {
                                         .aria_label(events[i].clone())
                                         .h(px(18.0))
                                         .px_2()
-                                        .text_size(px(11.0))
+                                        .text_size(px(metrics::TEXT_MD))
                                         .font_family("Cascadia Mono")
-                                        .text_color(rgb(0xb8b8c8))
+                                        .text_color(rgb(th.events_text))
                                         .child(events[i].clone())
                                 })
                                 .collect()
@@ -972,9 +976,9 @@ impl Render for EditorView {
                     .flex()
                     .items_center()
                     .border_b_1()
-                    .border_color(rgb(BORDER_C))
-                    .text_size(px(11.0))
-                    .text_color(rgb(0x77778a))
+                    .border_color(rgb(th.border))
+                    .text_size(px(metrics::TEXT_MD))
+                    .text_color(rgb(th.text_muted))
                     .child(t(if is_seq {
                         "tracks.header_seq"
                     } else {
@@ -995,7 +999,7 @@ impl Render for EditorView {
                         let sel = self.sel_track == i;
                         let muted = muted_set.contains(&i);
                         let soloed = soloed_set.contains(&i);
-                        let color = TRACK_COLORS[i % TRACK_COLORS.len()];
+                        let color = th.track_colors[i % th.track_colors.len()];
                         // screen-reader description: channel + mute/solo state
                         let mut desc = tf(
                             "a11y.ch",
@@ -1043,8 +1047,13 @@ impl Render for EditorView {
                                 div()
                                     .flex_1()
                                     .px_1()
-                                    .text_size(px(11.0))
-                                    .text_color(rgb(if muted { 0x707080 } else { 0xd8d8e0 }))
+                                    .text_size(px(metrics::TEXT_MD))
+                                    .text_color(rgb(if muted {
+                                        th.text_muted_name
+                                    } else {
+                                        th.text
+                                    }))
+                                    .when(muted, |s| s.italic())
                                     .overflow_hidden()
                                     .child(name.to_string()),
                             )
@@ -1211,7 +1220,7 @@ impl Render for EditorView {
                                 let c = if lane_selection.contains(&n.on_id) {
                                     SEL_COLOR
                                 } else {
-                                    TRACK_COLORS[n.track % TRACK_COLORS.len()]
+                                    th.track_colors[n.track % th.track_colors.len()]
                                 };
                                 window.paint_quad(fill(
                                     Bounds::new(point(x, y), size(px(2.0), bh)),
@@ -1304,7 +1313,7 @@ impl Render for EditorView {
                     let nw = ((n.end_tick.unwrap_or(n.start_tick) - n.start_tick).max(1) as f32
                         * sx)
                         .max(1.5);
-                    let c = TRACK_COLORS[n.track % TRACK_COLORS.len()];
+                    let c = th.track_colors[n.track % th.track_colors.len()];
                     let c = if n.track == mini_active {
                         c
                     } else {
@@ -2066,11 +2075,11 @@ impl Render for EditorView {
             .items_center()
             .gap_2()
             .px_2()
-            .h(px(24.0))
-            .bg(rgb(BG_BAR))
+            .h(px(metrics::MENU_ROW))
+            .bg(rgb(th.bg_bar))
             .border_t_1()
-            .border_color(rgb(BORDER_C))
-            .text_size(px(11.0))
+            .border_color(rgb(th.border))
+            .text_size(px(metrics::TEXT_MD))
             .child(
                 // live region: UIA announces aria_label changes politely —
                 // `status` only changes on real events, so no flooding
@@ -2305,6 +2314,18 @@ impl Render for EditorView {
                         |v, _e, _cx| {
                             v.show_events = !v.show_events;
                             v.persist();
+                        },
+                    )
+                    .into_any_element(),
+                    Self::mi_sub("v.theme", t("view.theme"), Sub::Theme, cx).into_any_element(),
+                    Self::mi(
+                        "v.hc",
+                        t("view.hc"),
+                        "",
+                        Some(self.theme == theme::Theme::high_contrast()),
+                        cx,
+                        |v, _e, cx| {
+                            v.toggle_hc(cx);
                         },
                     )
                     .into_any_element(),
@@ -2665,7 +2686,7 @@ impl Render for EditorView {
             };
             // dropdown panel under the clicked label
             let popup_max_h = (f32::from(window.viewport_size().height) - 40.0).max(120.0);
-            let popup_h = (items.len() as f32 * 24.0 + 16.0).min(popup_max_h);
+            let popup_h = (items.len() as f32 * metrics::MENU_ROW + 16.0).min(popup_max_h);
             let popup = div()
                 .id("menu-popup")
                 .test_support()
@@ -3033,6 +3054,27 @@ impl Render for EditorView {
                             })
                             .collect()
                     }
+                    Sub::Theme => {
+                        let opts = [
+                            ("theme.system", theme::ThemeMode::System),
+                            ("theme.dark", theme::ThemeMode::Dark),
+                            ("theme.light", theme::ThemeMode::Light),
+                        ];
+                        opts.into_iter()
+                            .enumerate()
+                            .map(|(i, (key, mode))| {
+                                Self::mi_leaf(
+                                    ("theme", i),
+                                    t(key),
+                                    "",
+                                    Some(self.theme_mode == mode),
+                                    cx,
+                                    move |v, _e, cx| v.set_theme_mode(mode, cx),
+                                )
+                                .into_any_element()
+                            })
+                            .collect()
+                    }
                     Sub::AudVel => [64u8, 80, 100, 112, 127]
                         .into_iter()
                         .enumerate()
@@ -3093,7 +3135,7 @@ impl Render for EditorView {
                     }
                 };
                 let vh = f32::from(window.viewport_size().height);
-                let desired = rows.len() as f32 * 24.0 + 16.0;
+                let desired = rows.len() as f32 * metrics::MENU_ROW + 16.0;
                 let max_h = (vh - 40.0).max(120.0);
                 let h = desired.min(max_h);
                 let top = (y - 30.0).clamp(0.0, (vh - h - 8.0).max(0.0));
@@ -3185,7 +3227,7 @@ impl Render for EditorView {
                 .border_color(rgb(0x3c3c4a))
                 .rounded_lg()
                 .shadow_lg()
-                .text_size(px(12.0))
+                .text_size(px(metrics::TEXT_LG))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|_v, _e, _w, cx| cx.stop_propagation()),
@@ -3245,8 +3287,8 @@ impl Render for EditorView {
                 if path.is_none() {
                     row = row.child(
                         div()
-                            .text_size(px(11.0))
-                            .text_color(rgb(0x9999aa))
+                            .text_size(px(metrics::TEXT_MD))
+                            .text_color(rgb(th.text_dim))
                             .child(hint),
                     );
                 }
@@ -3473,8 +3515,8 @@ impl Render for EditorView {
                 if let Some(detail) = detail {
                     row = row.child(
                         div()
-                            .text_size(px(11.0))
-                            .text_color(rgb(0x9999aa))
+                            .text_size(px(metrics::TEXT_MD))
+                            .text_color(rgb(th.text_dim))
                             .child(detail),
                     );
                 }
@@ -3557,7 +3599,7 @@ impl Render for EditorView {
                 .border_color(rgb(0x3c3c4a))
                 .rounded_lg()
                 .shadow_lg()
-                .text_size(px(12.0))
+                .text_size(px(metrics::TEXT_LG))
                 .child(
                     div()
                         .text_size(px(14.0))
@@ -3741,11 +3783,11 @@ impl EditorView {
         div()
             .id(id)
             .role(Role::Label)
-            .h(px(18.0))
+            .h(px(metrics::MENU_HEAD))
             .px_2()
             .mx_1()
-            .text_size(px(9.5))
-            .text_color(rgb(0x7a7a90))
+            .text_size(px(metrics::TEXT_XS))
+            .text_color(rgb(theme::current().text_head))
             .child(label.into())
     }
 
@@ -3989,6 +4031,7 @@ impl EditorView {
         cx: &mut Context<Self>,
         f: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> ObservedElement<Stateful<Div>> {
+        let th = theme::current();
         let label: SharedString = label.into();
         let shortcut: SharedString = shortcut.into();
         div()
@@ -4012,28 +4055,28 @@ impl EditorView {
             })
             .flex()
             .items_center()
-            .h(px(24.0))
+            .h(px(metrics::MENU_ROW))
             .px_2()
             .mx_1()
             .rounded_sm()
             .cursor_pointer()
-            .hover(|s| s.bg(rgb(0x2f2f42)))
-            .text_size(px(12.0))
-            .text_color(rgb(0xd8d8e0))
+            .hover(move |s| s.bg(rgb(th.bg_hover)))
+            .text_size(px(metrics::TEXT_LG))
+            .text_color(rgb(th.text))
             .whitespace_nowrap()
             .child(
                 div()
-                    .w(px(14.0))
-                    .text_size(px(10.0))
-                    .text_color(rgb(0x8fd0a0))
+                    .w(px(metrics::CHECK_W))
+                    .text_size(px(metrics::TEXT_SM))
+                    .text_color(rgb(th.lcd))
                     .child(if check == Some(true) { "✓" } else { "" }),
             )
             .child(div().flex_1().child(label))
             .child(
                 div()
                     .pl_2()
-                    .text_color(rgb(badge_color.unwrap_or(0x666677)))
-                    .text_size(px(10.0))
+                    .text_color(rgb(badge_color.unwrap_or(th.text_faint)))
+                    .text_size(px(metrics::TEXT_SM))
                     .child(shortcut),
             )
             .on_mouse_move(cx.listener(move |v, _e: &MouseMoveEvent, _w, cx| {
@@ -4084,6 +4127,7 @@ impl EditorView {
         sub: Sub,
         cx: &mut Context<Self>,
     ) -> ObservedElement<Stateful<Div>> {
+        let th = theme::current();
         div()
             .id(id)
             .test_support()
@@ -4091,22 +4135,22 @@ impl EditorView {
             .aria_label(label)
             .flex()
             .items_center()
-            .h(px(24.0))
+            .h(px(metrics::MENU_ROW))
             .px_2()
             .mx_1()
             .rounded_sm()
             .cursor_pointer()
-            .hover(|s| s.bg(rgb(0x2f2f42)))
-            .text_size(px(12.0))
-            .text_color(rgb(0xd8d8e0))
+            .hover(move |s| s.bg(rgb(th.bg_hover)))
+            .text_size(px(metrics::TEXT_LG))
+            .text_color(rgb(th.text))
             .whitespace_nowrap()
-            .child(div().w(px(14.0)))
+            .child(div().w(px(metrics::CHECK_W)))
             .child(div().flex_1().child(label))
             .child(
                 div()
                     .pl_2()
-                    .text_color(rgb(0x666677))
-                    .text_size(px(10.0))
+                    .text_color(rgb(th.text_faint))
+                    .text_size(px(metrics::TEXT_SM))
                     .child("▸"),
             )
             .on_mouse_move(cx.listener(move |v, e: &MouseMoveEvent, _w, cx| {
@@ -4146,6 +4190,7 @@ struct Tip(SharedString);
 
 impl Render for Tip {
     fn render(&mut self, _w: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let th = theme::current();
         div()
             .px_2()
             .py_1()
@@ -4154,8 +4199,8 @@ impl Render for Tip {
             .border_color(rgb(0x3c3c4a))
             .rounded_md()
             .shadow_lg()
-            .text_size(px(11.0))
-            .text_color(rgb(0xd8d8e0))
+            .text_size(px(metrics::TEXT_MD))
+            .text_color(rgb(th.text))
             .whitespace_nowrap()
             .child(self.0.clone())
     }
@@ -4164,7 +4209,11 @@ impl Render for Tip {
 impl EditorView {
     /// 1px vertical separator between toolbar icon groups.
     fn vsep() -> Div {
-        div().w(px(1.0)).h(px(20.0)).mx_1().bg(rgb(0x2a2a35))
+        div()
+            .w(px(1.0))
+            .h(px(metrics::VSEP_H))
+            .mx_1()
+            .bg(rgb(theme::current().border))
     }
 
     /// Icon button: 26px square, tooltip, neutral gray icon.
@@ -4177,25 +4226,34 @@ impl EditorView {
         cx: &mut Context<Self>,
         f: impl Fn(&mut Self, &ClickEvent, &mut Context<Self>) + 'static,
     ) -> ObservedElement<Stateful<Div>> {
+        let th = theme::current();
         div()
             .id(id)
             .test_support()
             .role(Role::Button)
             .aria_label(tip)
             .aria_toggled(if on { Toggled::True } else { Toggled::False })
-            .w(px(26.0))
-            .h(px(26.0))
+            .w(px(metrics::ICON_BTN))
+            .h(px(metrics::ICON_BTN))
             .flex()
             .items_center()
             .justify_center()
             .rounded_sm()
             .cursor_pointer()
-            .bg(if on { rgb(0x2b3d4f) } else { rgb(BG_PANEL) })
+            .bg(if on {
+                rgb(th.accent_bg)
+            } else {
+                rgb(th.bg_panel)
+            })
             .border_1()
-            .border_color(if on { rgb(0x3d5a75) } else { rgb(BG_PANEL) })
-            .hover(|s| s.bg(rgb(0x2f2f42)))
+            .border_color(if on {
+                rgb(th.accent_edge)
+            } else {
+                rgb(th.bg_panel)
+            })
+            .hover(move |s| s.bg(rgb(th.bg_hover)))
             .tooltip(move |_w, cx| cx.new(|_| Tip(tip.into())).into())
-            .child(icon(ic, 16.0, if on { ACCENT } else { 0x9a9ab0 }))
+            .child(icon(ic, 16.0, if on { th.accent } else { th.icon_off }))
             .on_click(cx.listener(move |v, e, _w, cx| {
                 f(v, e, cx);
                 cx.notify();
@@ -4212,21 +4270,30 @@ impl EditorView {
         cx: &mut Context<Self>,
         f: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> Stateful<Div> {
+        let th = theme::current();
         div()
             .id(id)
-            .w(px(26.0))
-            .h(px(26.0))
+            .w(px(metrics::ICON_BTN))
+            .h(px(metrics::ICON_BTN))
             .flex()
             .items_center()
             .justify_center()
             .rounded_sm()
             .cursor_pointer()
-            .bg(if on { rgb(0x2b3d4f) } else { rgb(BG_PANEL) })
+            .bg(if on {
+                rgb(th.accent_bg)
+            } else {
+                rgb(th.bg_panel)
+            })
             .border_1()
-            .border_color(if on { rgb(0x3d5a75) } else { rgb(BG_PANEL) })
-            .hover(|s| s.bg(rgb(0x2f2f42)))
+            .border_color(if on {
+                rgb(th.accent_edge)
+            } else {
+                rgb(th.bg_panel)
+            })
+            .hover(move |s| s.bg(rgb(th.bg_hover)))
             .tooltip(move |_w, cx| cx.new(|_| Tip(tip.into())).into())
-            .child(icon(ic, 16.0, if on { ACCENT } else { 0x9a9ab0 }))
+            .child(icon(ic, 16.0, if on { th.accent } else { th.icon_off }))
             .on_click(cx.listener(move |v, _e, w, cx| {
                 f(v, w, cx);
                 cx.notify();
@@ -4243,25 +4310,34 @@ impl EditorView {
         cx: &mut Context<Self>,
         f: impl Fn(&mut Self, &ClickEvent, &mut Context<Self>) + 'static,
     ) -> ObservedElement<Stateful<Div>> {
+        let th = theme::current();
         div()
             .id(id)
             .test_support()
             .role(Role::Button)
             .aria_label(tip)
             .aria_toggled(if on { Toggled::True } else { Toggled::False })
-            .w(px(26.0))
-            .h(px(26.0))
+            .w(px(metrics::ICON_BTN))
+            .h(px(metrics::ICON_BTN))
             .flex()
             .items_center()
             .justify_center()
             .rounded_sm()
             .cursor_pointer()
-            .bg(if on { rgb(0x2b3d4f) } else { rgb(BG_PANEL) })
+            .bg(if on {
+                rgb(th.accent_bg)
+            } else {
+                rgb(th.bg_panel)
+            })
             .border_1()
-            .border_color(if on { rgb(0x3d5a75) } else { rgb(BG_PANEL) })
-            .hover(|s| s.bg(rgb(0x2f2f42)))
+            .border_color(if on {
+                rgb(th.accent_edge)
+            } else {
+                rgb(th.bg_panel)
+            })
+            .hover(move |s| s.bg(rgb(th.bg_hover)))
             .tooltip(move |_w, cx| cx.new(|_| Tip(tip.into())).into())
-            .child(icon(ic, 16.0, if on { accent } else { 0x9a9ab0 }))
+            .child(icon(ic, 16.0, if on { accent } else { th.icon_off }))
             .on_click(cx.listener(move |v, e, _w, cx| {
                 f(v, e, cx);
                 cx.notify();

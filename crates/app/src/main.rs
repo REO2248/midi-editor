@@ -14,6 +14,7 @@ mod plugin_state;
 mod recovery;
 mod render;
 mod shutdown;
+mod theme;
 mod watch;
 
 use audition::Audition;
@@ -40,9 +41,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 const NOTE_H: f32 = 13.0;
-const TRACK_COLORS: [u32; 8] = [
-    0x4f8cff, 0xff8c4f, 0x4fd08c, 0xd04fff, 0xffd24f, 0x4fd0ff, 0xff4f7a, 0x9dff4f,
-];
 const SEL_COLOR: u32 = 0xffffff;
 const DANGLING_COLOR: u32 = 0xff4f4f;
 
@@ -124,6 +122,7 @@ enum Sub {
     Oct,
     AudVel,
     AudDur,
+    Theme,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -483,6 +482,16 @@ struct EditorView {
     midi_in: SharedString,
     /// manual input-latency compensation in ms (global pref)
     in_latency_ms: u64,
+    /// active color palette — dark, light, or high-contrast accessible
+    theme: theme::Theme,
+    /// user's stored HC override (None = follow the OS high-contrast flag)
+    hc_pref: Option<bool>,
+    /// appearance preference (System follows the OS light/dark flag)
+    theme_mode: theme::ThemeMode,
+    /// last OS appearance seen — from `window.appearance()` updates
+    sys_dark: bool,
+    /// keeps the OS appearance-change observer alive
+    _appearance: Option<Subscription>,
     focus: FocusHandle,
     input: Entity<InputState>,
     status: SharedString,
@@ -714,7 +723,12 @@ fn transport_points_for(d: &Document, tr: Option<usize>) -> Vec<(u64, output::Tr
 }
 
 impl EditorView {
-    fn new(path: Option<PathBuf>, input: Entity<InputState>, cx: &mut Context<Self>) -> Self {
+    fn new(
+        path: Option<PathBuf>,
+        input: Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let loaded = path.as_deref().map(mcp_server::service::load_document);
         // the warning(s) belong in the status line, not swallowed
         let (doc, status): (Document, SharedString) = match loaded {
@@ -848,6 +862,14 @@ impl EditorView {
             recent: g.recent.iter().map(|p| p.as_str().into()).collect(),
             midi_in: g.midi_in.clone().into(),
             in_latency_ms: g.in_latency_ms,
+            theme_mode: theme::ThemeMode::from_pref(g.theme.as_deref()),
+            sys_dark: matches!(
+                window.appearance(),
+                WindowAppearance::Dark | WindowAppearance::VibrantDark
+            ),
+            theme: theme::Theme::dark(), // replaced by apply_theme below
+            hc_pref: g.hc,
+            _appearance: None,
             open_sub: None,
             show_events: true,
             audition: Audition::spawn(),
@@ -878,6 +900,11 @@ impl EditorView {
             v.perform_shutdown();
             async {}
         }));
+        // the OS flips light/dark under a running app — follow it while
+        // the preference is System
+        v._appearance =
+            Some(cx.observe_window_appearance(window, |v, w, cx| v.on_sys_appearance(w, cx)));
+        v.apply_theme(cx);
         v.sel_track = v.pick_default_track();
         v.refresh_derived();
         if let Some(p) = &path {
@@ -889,6 +916,38 @@ impl EditorView {
         }
         v.rescan_plugins(ScanMode::Changed);
         v
+    }
+
+    /// Recompute the active palette from prefs + OS flags and push the
+    /// matching mode onto gpui-component so text inputs stay legible.
+    fn apply_theme(&mut self, cx: &mut Context<Self>) {
+        self.theme = theme::Theme::resolve(self.hc_pref, self.theme_mode, self.sys_dark);
+        let mode = if self.theme == theme::Theme::light() {
+            gpui_kit::component::theme::ThemeMode::Light
+        } else {
+            gpui_kit::component::theme::ThemeMode::Dark
+        };
+        gpui_kit::component::theme::Theme::change(mode, None, cx);
+        cx.notify();
+    }
+
+    fn set_theme_mode(&mut self, mode: theme::ThemeMode, cx: &mut Context<Self>) {
+        self.theme_mode = mode;
+        self.apply_theme(cx);
+        self.save_global();
+    }
+
+    fn on_sys_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dark = matches!(
+            window.appearance(),
+            WindowAppearance::Dark | WindowAppearance::VibrantDark
+        );
+        if dark != self.sys_dark {
+            self.sys_dark = dark;
+            if self.theme_mode == theme::ThemeMode::System {
+                self.apply_theme(cx);
+            }
+        }
     }
 
     fn doc<R>(&self, f: impl FnOnce(&Document) -> R) -> R {
@@ -3904,6 +3963,16 @@ impl EditorView {
             .on_click(cx.listener(move |this, _ev, _w, cx| on(this, cx)))
     }
 
+    /// Toggle the high-contrast palette; the override persists in the
+    /// app-wide prefs. When the OS flag was driving the theme, the first
+    /// toggle just flips the effective state.
+    fn toggle_hc(&mut self, cx: &mut Context<Self>) {
+        let on = self.theme == theme::Theme::high_contrast();
+        self.hc_pref = Some(!on);
+        self.apply_theme(cx);
+        self.save_global();
+    }
+
     /// Small chip with a literal label (symbols/numbers need no i18n key).
     /// `on` receives the ClickEvent so chips can honour Shift=×10 etc.
     /// `a11y_name` is the screen-reader name (visible labels are often terse).
@@ -3974,6 +4043,10 @@ struct GlobalPrefs {
     /// max preview sustain in ms (None = 400)
     #[serde(default)]
     aud_ms: Option<u64>,
+    /// high-contrast override: Some(force on/off), None = follow the OS flag
+    hc: Option<bool>,
+    /// appearance mode: "system" | "dark" | "light" (None = system)
+    theme: Option<String>,
 }
 
 impl Default for GlobalPrefs {
@@ -3991,6 +4064,8 @@ impl Default for GlobalPrefs {
             audition: None,
             aud_vel: None,
             aud_ms: None,
+            hc: None,
+            theme: None,
         }
     }
 }
@@ -4323,6 +4398,8 @@ impl EditorView {
             audition: Some(self.aud_enabled),
             aud_vel: Some(self.aud_vel),
             aud_ms: Some(self.aud_ms),
+            hc: self.hc_pref,
+            theme: Some(self.theme_mode.name().to_string()),
             ..Default::default()
         }
         .save();
@@ -4401,20 +4478,15 @@ fn main() {
     let path = std::env::args().nth(1).map(PathBuf::from);
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
-        // dark UI — gpui-component's default theme follows the OS and renders
-        // the text input's selection overlay white; pin dark explicitly
-        gpui_kit::component::theme::Theme::change(
-            gpui_kit::component::theme::ThemeMode::Dark,
-            None,
-            cx,
-        );
+        // the component theme (text inputs etc.) is applied in
+        // EditorView::apply_theme once prefs resolve the effective palette
         let path = path.clone();
         cx.spawn(async move |cx| {
             cx.open_window(WindowOptions::default(), move |window, cx| {
                 let input =
                     cx.new(|cx| InputState::new(window, cx).placeholder(t("field.track_name")));
                 let view = cx.new(|cx| {
-                    let mut v = EditorView::new(path.clone(), input, cx);
+                    let mut v = EditorView::new(path.clone(), input, window, cx);
                     v.window_handle = Some(window.window_handle());
                     let (mcp_stop, mcp_thread) = spawn_mcp(v.shared.clone());
                     v.shutdown.track_mcp(mcp_stop, mcp_thread);
@@ -5224,6 +5296,7 @@ mod tests {
             EditorView::new(
                 None,
                 cx.new(|cx| InputState::new(window, cx).placeholder(t("field.track_name"))),
+                window,
                 cx,
             )
         });
