@@ -5224,13 +5224,19 @@ impl EditorView {
                 if enabled {
                     el = el
                         .hover(|s| s.bg(rgb(th.bg_hover)))
-                        .on_mouse_move(cx.listener(move |v, _e: &MouseMoveEvent, _w, cx| {
+                        .on_mouse_move(cx.listener(move |v, e: &MouseMoveEvent, _w, cx| {
                             if in_sub {
                                 v.sub_sel = Some(i);
                             } else {
                                 v.menu_sel = Some(i);
-                                // leaving a submenu parent closes the cascade
-                                v.open_sub = None;
+                                // leaving a submenu's parent row closes the
+                                // cascade — only for rows ABOVE its anchor: a
+                                // diagonal sweep into the submenu's lower items
+                                // crosses the below-anchor rows inside the
+                                // parent and must not unmount it mid-flight
+                                if v.open_sub.is_some_and(|(_, y)| f32::from(e.position.y) < y) {
+                                    v.open_sub = None;
+                                }
                             }
                             cx.notify();
                         }))
