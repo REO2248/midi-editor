@@ -15,7 +15,7 @@ headers + channel, tempo/time-signature editing, quantize/transpose/velocity
 ops, marker strip, MIDI-input recording, seek ruler + loop, lane editor for
 velocity/CC/pitch bend, import diagnostics with one-click normalize,
 text-encoding override, plugin GUI windows, per-file sidecar persistence, and
-a 31-tool MCP surface — all against a real .mid document.
+a 32-tool MCP surface — all against a real .mid document.
 
 ## Build (Windows)
 
@@ -99,11 +99,13 @@ Claude Desktop `claude_desktop_config.json`:
 }
 ```
 
-**Read tools**: `document_summary` (format, tracks, notes, duration,
-revision, dirty flag), `list_notes`, `query_events` (raw events incl.
-raw_hex), `get_tempo_map`, `get_meta` (names/markers/lyrics decoded),
-`get_cc` (latest CC value per track/channel/cc), `diagnostics` (import-quality
-findings), `list_midi_ports`, `list_destinations`.
+**Read tools**: `editor_info` (semver, commit, MCP surface version, SMF
+features, destination kinds, live feature flags, per-tool version/deprecation
+table — call first for feature detection), `document_summary` (format,
+tracks, notes, duration, revision, dirty flag), `list_notes`, `query_events`
+(raw events incl. raw_hex), `get_tempo_map`, `get_meta` (names/markers/lyrics
+decoded), `get_cc` (latest CC value per track/channel/cc), `diagnostics`
+(import-quality findings), `list_midi_ports`, `list_destinations`.
 
 **Edit tools** — one call = one undoable transaction: `apply_patch`
 (low-level ops: insert_note / insert_events / remove_events / move_note /
