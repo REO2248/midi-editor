@@ -345,24 +345,24 @@ impl Render for EditorView {
             .border_b_1()
             .border_color(rgb(BORDER_C))
             // file ops
-            .child(Self::ibtn(
+            .child(Self::ibtn_w(
                 "i.new",
                 "note_add",
                 t("tip.new"),
                 false,
                 cx,
-                |v, _e, cx| {
-                    v.new_file(cx);
+                |v, w, cx| {
+                    v.confirm_discard_or_save(PendingAction::NewFile, w, cx);
                 },
             ))
-            .child(Self::ibtn(
+            .child(Self::ibtn_w(
                 "i.open",
                 "folder_open",
                 t("tip.open"),
                 false,
                 cx,
-                |v, _e, cx| {
-                    v.open_dialog(cx);
+                |v, w, cx| {
+                    v.confirm_discard_or_save(PendingAction::OpenDialog, w, cx);
                 },
             ))
             .child(Self::ibtn(
@@ -1590,12 +1590,12 @@ impl Render for EditorView {
         let menu_layer = self.open_menu.map(|(m, mx)| {
             let items: Vec<AnyElement> = match m {
                 TopMenu::File => vec![
-                    Self::mi("f.new", t("menu.new"), "", None, cx, |v, _e, cx| {
-                        v.new_file(cx);
+                    Self::mi("f.new", t("menu.new"), "", None, cx, |v, w, cx| {
+                        v.confirm_discard_or_save(PendingAction::NewFile, w, cx);
                     })
                     .into_any_element(),
-                    Self::mi("f.open", t("menu.open"), "Ctrl+O", None, cx, |v, _e, cx| {
-                        v.open_dialog(cx);
+                    Self::mi("f.open", t("menu.open"), "Ctrl+O", None, cx, |v, w, cx| {
+                        v.confirm_discard_or_save(PendingAction::OpenDialog, w, cx);
                     })
                     .into_any_element(),
                     Self::mi_sub("f.recent", t("menu.recent"), Sub::Recent, cx).into_any_element(),
@@ -2208,8 +2208,12 @@ impl Render for EditorView {
                                         "",
                                         None,
                                         cx,
-                                        move |v, _e, cx| {
-                                            v.open(path.clone(), cx);
+                                        move |v, w, cx| {
+                                            v.confirm_discard_or_save(
+                                                PendingAction::OpenPath(path.clone()),
+                                                w,
+                                                cx,
+                                            );
                                         },
                                     )
                                     .into_any_element()
@@ -2699,8 +2703,12 @@ impl Render for EditorView {
                     (true, false, "z") => this.undo(cx),
                     (true, false, "y") | (true, true, "z") => this.redo(cx),
                     (true, false, "s") => this.save(cx),
-                    (true, false, "o") => this.open_dialog(cx),
-                    (true, false, "n") => this.new_file(cx),
+                    (true, false, "o") => {
+                        this.confirm_discard_or_save(PendingAction::OpenDialog, w, cx)
+                    }
+                    (true, false, "n") => {
+                        this.confirm_discard_or_save(PendingAction::NewFile, w, cx)
+                    }
                     (true, false, "a") => this.select_all(cx),
                     (true, false, "=") | (true, false, "+") => this.zoom_by(1.3, cx),
                     (true, false, "-") => this.zoom_by(1.0 / 1.3, cx),
@@ -2749,14 +2757,14 @@ impl Render for EditorView {
             // drag a .mid file anywhere to open it
             .can_drop(|drag: &dyn Any, _w, _cx| drag.is::<ExternalPaths>())
             .drag_over::<ExternalPaths>(|s, _p, _w, _cx| s.bg(rgb(0x16202e)))
-            .on_drop(cx.listener(|v, paths: &ExternalPaths, _w, cx| {
+            .on_drop(cx.listener(|v, paths: &ExternalPaths, w, cx| {
                 if let Some(p) = paths.paths().iter().find(|p| {
                     matches!(
                         p.extension().and_then(|e| e.to_str()),
                         Some("mid") | Some("smf") | Some("midi")
                     )
                 }) {
-                    v.open(p.clone(), cx);
+                    v.confirm_discard_or_save(PendingAction::OpenPath(p.clone()), w, cx);
                 }
             }))
     }
@@ -3168,6 +3176,37 @@ impl EditorView {
             .child(icon(ic, 16.0, if on { ACCENT } else { 0x9a9ab0 }))
             .on_click(cx.listener(move |v, e, _w, cx| {
                 f(v, e, cx);
+                cx.notify();
+            }))
+    }
+
+    /// `ibtn` whose handler also receives the window — needed by actions
+    /// that open a window-level prompt such as the discard guard.
+    fn ibtn_w(
+        id: &'static str,
+        ic: &'static str,
+        tip: &'static str,
+        on: bool,
+        cx: &mut Context<Self>,
+        f: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> Stateful<Div> {
+        div()
+            .id(id)
+            .w(px(26.0))
+            .h(px(26.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_sm()
+            .cursor_pointer()
+            .bg(if on { rgb(0x2b3d4f) } else { rgb(BG_PANEL) })
+            .border_1()
+            .border_color(if on { rgb(0x3d5a75) } else { rgb(BG_PANEL) })
+            .hover(|s| s.bg(rgb(0x2f2f42)))
+            .tooltip(move |_w, cx| cx.new(|_| Tip(tip.into())).into())
+            .child(icon(ic, 16.0, if on { ACCENT } else { 0x9a9ab0 }))
+            .on_click(cx.listener(move |v, _e, w, cx| {
+                f(v, w, cx);
                 cx.notify();
             }))
     }

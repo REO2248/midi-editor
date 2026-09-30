@@ -174,6 +174,19 @@ static EN: &[(&str, &str)] = &[
     ("plugin.phase_load", "plugin load"),
     ("plugin.phase_audio", "audio start"),
     ("status.rescan", "rescanned: {n} destination(s)"),
+    ("guard.unsaved", "You have unsaved changes."),
+    (
+        "guard.unsaved_rec",
+        "You have unsaved changes and a recording in progress.",
+    ),
+    ("guard.rec_only", "A recording is in progress."),
+    (
+        "guard.detail",
+        "Do you want to save before continuing? Choosing Don't Save discards the work.",
+    ),
+    ("guard.save", "Save"),
+    ("guard.dont_save", "Don't Save"),
+    ("guard.cancel", "Cancel"),
 ];
 
 static JA: &[(&str, &str)] = &[
@@ -326,6 +339,19 @@ static JA: &[(&str, &str)] = &[
     ("tip.zout", "ズームアウト (Ctrl+-)"),
     ("tip.dest", "選択トラックの出力先"),
     ("tip.gui", "プラグインGUI"),
+    ("guard.unsaved", "保存されていない変更があります。"),
+    (
+        "guard.unsaved_rec",
+        "未保存の変更と録音中のテイクがあります。",
+    ),
+    ("guard.rec_only", "録音中のテイクがあります。"),
+    (
+        "guard.detail",
+        "続行する前に保存しますか？「保存しない」を選ぶと変更は破棄されます。",
+    ),
+    ("guard.save", "保存"),
+    ("guard.dont_save", "保存しない"),
+    ("guard.cancel", "キャンセル"),
 ];
 
 fn detect_lang() -> &'static str {

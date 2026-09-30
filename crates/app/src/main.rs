@@ -4,6 +4,7 @@
 //! `Document::apply(Transaction)` so undo is shared with MCP edits.
 
 mod geometry;
+mod guard;
 mod i18n;
 mod icons;
 mod render;
@@ -52,6 +53,20 @@ enum DragMode {
     Duplicate,
     /// erase tool: every note touched joins `erase_ids`, deleted on commit
     Erase,
+}
+
+/// A document-replacing action parked behind the discard guard
+/// (`guard.rs`). `CloseWindow` covers window close and, transitively, app
+/// quit — quitting always goes through closing the last window.
+#[derive(Clone)]
+pub(crate) enum PendingAction {
+    NewFile,
+    /// show the open-file dialog once the guard passes
+    OpenDialog,
+    /// open this path (recent menu, drag/drop, a future CLI hand-off)
+    OpenPath(PathBuf),
+    /// remove the editor window
+    CloseWindow,
 }
 
 /// Menubar dropdown that is currently open.
@@ -358,6 +373,14 @@ struct EditorView {
     focus: FocusHandle,
     input: Entity<InputState>,
     status: SharedString,
+    /// a Save/Don't-Save/Cancel prompt is awaiting an answer — repeat
+    /// triggers must not stack another one (`window.prompt` is not re-entrant)
+    guard_active: bool,
+    /// the discard guard approved closing: the re-entrant
+    /// `on_window_should_close` that `remove_window` fires must pass
+    close_confirmed: bool,
+    /// our window's handle — for guard tasks that resolve asynchronously
+    window_handle: Option<AnyWindowHandle>,
 }
 
 enum PluginState {
@@ -527,6 +550,9 @@ impl EditorView {
             focus: cx.focus_handle(),
             input,
             status,
+            guard_active: false,
+            close_confirmed: false,
+            window_handle: None,
         };
         v.sel_track = v.pick_default_track();
         v.refresh_derived();
@@ -1555,36 +1581,63 @@ impl EditorView {
     }
 
     fn save(&mut self, cx: &mut Context<Self>) {
-        let path = {
-            let sh = lock_shared(&self.shared);
-            sh.path.clone()
-        };
-        let Some(p) = path else {
+        if lock_shared(&self.shared).path.is_none() {
             self.save_as(cx);
             return;
+        }
+        self.try_save(cx);
+        cx.notify();
+    }
+
+    /// Write to the current backing path. Returns false — leaving the
+    /// document dirty — when there is no path (callers route through a
+    /// Save-As prompt) or the write fails; the caller still sees the error
+    /// in the status line.
+    fn try_save(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(p) = lock_shared(&self.shared).path.clone() else {
+            return false;
         };
-        // serialize under the lock, write outside it — and remember the
-        // revision the bytes were taken at so concurrent edits stay dirty
-        let (bytes, rev) = {
-            let sh = lock_shared(&self.shared);
-            (
-                sh.doc.serialize(smf_core::WriteOptions {
-                    running_status: false,
-                }),
-                sh.doc.revision(),
-            )
-        };
-        match mcp_server::write_atomic(&p, &bytes) {
+        let ok = match save_document(&self.shared, &p) {
             Ok(()) => {
-                let mut sh = lock_shared(&self.shared);
-                sh.saved_revision = rev;
-                drop(sh);
                 self.status = t("status.saved").into();
                 self.persist();
+                true
             }
-            Err(e) => self.status = format!("{e}").into(),
-        }
+            Err(e) => {
+                self.status = format!("{e}").into();
+                false
+            }
+        };
         cx.notify();
+        ok
+    }
+
+    /// The guard's save step — `NeedsPath` sends the flow through a
+    /// Save-As prompt instead of writing silently.
+    fn save_for_guard(&mut self, cx: &mut Context<Self>) -> guard::SaveOutcome {
+        if lock_shared(&self.shared).path.is_none() {
+            return guard::SaveOutcome::NeedsPath;
+        }
+        if self.try_save(cx) {
+            guard::SaveOutcome::Saved
+        } else {
+            guard::SaveOutcome::Failed
+        }
+    }
+
+    /// Run an action the discard guard cleared (or that never needed it).
+    fn perform_pending(&mut self, action: PendingAction, cx: &mut Context<Self>) {
+        match action {
+            PendingAction::NewFile => self.new_file(cx),
+            PendingAction::OpenDialog => self.open_dialog(cx),
+            PendingAction::OpenPath(p) => self.open(p, cx),
+            PendingAction::CloseWindow => {
+                self.close_confirmed = true;
+                if let Some(wh) = self.window_handle {
+                    wh.update(cx, |_, w, _app| w.remove_window()).ok();
+                }
+            }
+        }
     }
 
     fn save_as(&mut self, cx: &mut Context<Self>) {
@@ -2497,6 +2550,25 @@ fn load_document(path: &std::path::Path) -> Result<(Document, Vec<String>), Stri
     Ok((Document::from_file(file), warnings))
 }
 
+/// Serialize under the lock, write atomically outside it, and only then
+/// mark `saved_revision` — a failed write leaves the document dirty.
+fn save_document(shared: &SharedDoc, path: &std::path::Path) -> Result<(), String> {
+    // remember the revision the bytes were taken at so concurrent edits
+    // during the write stay dirty
+    let (bytes, rev) = {
+        let sh = lock_shared(shared);
+        (
+            sh.doc.serialize(smf_core::WriteOptions {
+                running_status: false,
+            }),
+            sh.doc.revision(),
+        )
+    };
+    mcp_server::write_atomic(path, &bytes).map_err(|e| e.to_string())?;
+    lock_shared(shared).saved_revision = rev;
+    Ok(())
+}
+
 /// App-wide preferences: recent files + record count-in + recording source.
 /// Stored at %APPDATA%/midi-editor/prefs.json (unlike the per-song sidecar).
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -2748,11 +2820,27 @@ fn main() {
                 let input =
                     cx.new(|cx| InputState::new(window, cx).placeholder(t("field.track_name")));
                 let view = cx.new(|cx| {
-                    let v = EditorView::new(path.clone(), input, cx);
+                    let mut v = EditorView::new(path.clone(), input, cx);
+                    v.window_handle = Some(window.window_handle());
                     spawn_mcp(v.shared.clone());
                     spawn_doc_watch(cx, v.shared.clone());
                     window.focus(&v.focus.clone(), cx);
                     v
+                });
+                // the close button (and any quit path going through window
+                // close) runs the same discard guard as New/Open
+                let weak = view.downgrade();
+                window.on_window_should_close(cx, move |window, cx| {
+                    let Some(view) = weak.upgrade() else {
+                        return true;
+                    };
+                    view.update(cx, |v, cx| {
+                        if v.close_confirmed || !v.needs_discard_guard() {
+                            return true;
+                        }
+                        v.confirm_discard_or_save(PendingAction::CloseWindow, window, cx);
+                        false
+                    })
                 });
                 cx.new(|cx| Root::new(view, window, cx))
             })
