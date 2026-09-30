@@ -1932,9 +1932,11 @@ impl EditorView {
             .filter(|(_, tr, _)| audible(*tr))
             .filter_map(|(us, tr, b)| sink_of.get(&dest_of(tr)).map(|&s| (us, s, b)))
             .collect();
-        events.extend(tagged.into_iter().filter_map(|(us, tr, b)| {
-            sink_of.get(&dest_of(tr)).map(|&s| (us, s, b))
-        }));
+        events.extend(
+            tagged
+                .into_iter()
+                .filter_map(|(us, tr, b)| sink_of.get(&dest_of(tr)).map(|&s| (us, s, b))),
+        );
         if metronome {
             // prefer a plain MIDI port for clicks; fall back to any sink
             let click_sink = dests
@@ -2730,6 +2732,14 @@ impl EditorView {
 }
 
 fn main() {
+    // --smoke <in.mid> [copy.mid]: load via the normal document path, print a
+    // document summary, optionally save a copy, exit. Package validation runs
+    // this on machines with no audio hardware or GPU session, so it must run
+    // before any audio/VST environment setup or gpui init.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("--smoke") {
+        std::process::exit(smoke(&argv));
+    }
     output::init_env();
     std::panic::set_hook(Box::new(|i| eprintln!("panic: {i}")));
     let path = std::env::args().nth(1).map(PathBuf::from);
@@ -2760,6 +2770,60 @@ fn main() {
         })
         .detach();
     });
+}
+
+/// Headless package-validation path used by release CI: parse the input,
+/// build the document (by_id index + tempo map), report a summary in the
+/// same shape as the MCP `document_summary` tool, and when an output path
+/// is given serialize a copy through the normal save path.
+fn smoke(argv: &[String]) -> i32 {
+    let Some(input) = argv.get(2).map(PathBuf::from) else {
+        eprintln!("usage: midi-editor --smoke <in.mid> [copy.mid]");
+        return 2;
+    };
+    let bytes = match std::fs::read(&input) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("smoke: read {}: {e}", input.display());
+            return 1;
+        }
+    };
+    let file = match smf_core::parse(&bytes) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("smoke: parse {}: {e}", input.display());
+            return 1;
+        }
+    };
+    let doc = document::Document::from_file(file);
+    let last_tick = doc
+        .tracks
+        .iter()
+        .flat_map(|t| t.events.iter().map(|e| e.tick))
+        .max()
+        .unwrap_or(0);
+    let summary = serde_json::json!({
+        "format": doc.format,
+        "division": format!("{:?}", doc.division),
+        "tracks": doc.tracks.len(),
+        "events": doc.tracks.iter().map(|t| t.events.len()).sum::<usize>(),
+        "notes": doc.notes().len(),
+        "last_tick": last_tick,
+        "duration_us": doc.tempo_map.tick_to_us(last_tick),
+        "revision": doc.revision(),
+    });
+    println!("smoke summary: {summary}");
+    if let Some(out) = argv.get(3).map(PathBuf::from) {
+        let bytes = doc.serialize(smf_core::WriteOptions {
+            running_status: true,
+        });
+        if let Err(e) = std::fs::write(&out, &bytes) {
+            eprintln!("smoke: write {}: {e}", out.display());
+            return 1;
+        }
+        println!("smoke wrote {} bytes to {}", bytes.len(), out.display());
+    }
+    0
 }
 
 /// In-app MCP server: Streamable-HTTP on 127.0.0.1:7878/mcp on its own
