@@ -115,9 +115,118 @@ impl Output {
     }
 }
 
+/// Delivery-latency counters for a recording input — the jitter that WOULD
+/// have been recorded had we kept timestamping by callback delivery. `gap`
+/// = arrival-stamp minus device-stamp, in µs; shared so the app can read a
+/// summary when the take finishes.
+#[derive(Debug)]
+pub struct InputDiag {
+    /// callbacks that carried a backend timestamp
+    pub stamped: std::sync::atomic::AtomicU64,
+    /// callbacks with no backend timestamp (arrival fallback)
+    pub unstamped: std::sync::atomic::AtomicU64,
+    /// worst callback delivery delay seen (µs)
+    pub gap_max_us: std::sync::atomic::AtomicU64,
+    /// most recent delivery delay (µs)
+    pub gap_last_us: std::sync::atomic::AtomicU64,
+}
+
+impl InputDiag {
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            stamped: 0.into(),
+            unstamped: 0.into(),
+            gap_max_us: 0.into(),
+            gap_last_us: 0.into(),
+        })
+    }
+    fn note(&self, stamped: bool, gap_us: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if stamped {
+            self.stamped.fetch_add(1, Relaxed);
+            self.gap_last_us.store(gap_us, Relaxed);
+            self.gap_max_us.fetch_max(gap_us, Relaxed);
+        } else {
+            self.unstamped.fetch_add(1, Relaxed);
+        }
+    }
+}
+
+/// How to timestamp incoming messages.
+#[derive(Debug, Default)]
+pub struct InputOpts {
+    /// subtracted from every stamped µs — manual compensation for a known
+    /// input pipeline delay (keyboard/USB/driver), in µs
+    pub latency_us: u64,
+    /// shared jitter counters, updated per callback
+    pub diag: Option<std::sync::Arc<InputDiag>>,
+}
+
+/// Maps backend device timestamps onto the "µs since open" domain used for
+/// recording. midir's callback timestamp is backend-defined (µs since
+/// `midiInStart` on WinMM): a device-side clock that does not shift when the
+/// callback thread is scheduled late. The first timestamped message anchors
+/// the map — it is stamped by arrival, keeping the recording's t=0 on the
+/// same base callers already use — and later messages advance by device-time
+/// deltas, so callback delivery delay no longer moves recorded placement.
+/// A message with no backend stamp falls back to arrival time.
+pub struct Timebase {
+    t0: std::time::Instant,
+    /// (first backend µs, its arrival instant)
+    anchor: Option<(u64, std::time::Instant)>,
+    latency_us: u64,
+    diag: Option<std::sync::Arc<InputDiag>>,
+}
+
+impl Timebase {
+    pub fn new(latency_us: u64, diag: Option<std::sync::Arc<InputDiag>>) -> Self {
+        Self::new_at(latency_us, diag, std::time::Instant::now())
+    }
+
+    fn new_at(
+        latency_us: u64,
+        diag: Option<std::sync::Arc<InputDiag>>,
+        t0: std::time::Instant,
+    ) -> Self {
+        Self {
+            t0,
+            anchor: None,
+            latency_us,
+            diag,
+        }
+    }
+
+    /// `dev_us` = backend timestamp in µs (0 = backend supplied none);
+    /// `now` = the instant the callback delivered the message.
+    /// Returns µs since `new()`, latency-compensated, never negative.
+    pub fn stamp(&mut self, dev_us: u64, now: std::time::Instant) -> u64 {
+        let arrival = now
+            .saturating_duration_since(self.t0)
+            .as_micros() as u64;
+        let raw = match (dev_us != 0, self.anchor) {
+            (true, Some((d0, i0))) => {
+                // anchor arrival + device-time delta: `now` enters only
+                // through the anchor, so a delayed callback cannot shift it
+                let base = i0.saturating_duration_since(self.t0).as_micros() as u64;
+                base.saturating_add(dev_us.saturating_sub(d0))
+            }
+            _ => arrival,
+        };
+        if dev_us != 0 && self.anchor.is_none() {
+            self.anchor = Some((dev_us, now));
+        }
+        if let Some(d) = &self.diag {
+            d.note(dev_us != 0, arrival.saturating_sub(raw));
+        }
+        raw.saturating_sub(self.latency_us)
+    }
+}
+
 /// One open input connection. Timestamps each incoming message in µs relative
 /// to the moment `open` returned (not midir's platform epoch) so callers can
-/// place recorded events on the playback timeline directly.
+/// place recorded events on the playback timeline directly. When the backend
+/// supplies a device timestamp (WinMM does), `Timebase` uses it so callback
+/// scheduling latency is not recorded as timing error.
 pub struct Input {
     // connection must stay alive to keep receiving
     _conn: midir::MidiInputConnection<()>,
@@ -126,7 +235,14 @@ pub struct Input {
 
 impl Input {
     /// `cb(us_since_open, bytes)` is called on midir's callback thread.
-    pub fn open<F>(index: usize, mut cb: F) -> Result<Self, Error>
+    pub fn open<F>(index: usize, cb: F) -> Result<Self, Error>
+    where
+        F: FnMut(u64, &[u8]) + Send + 'static,
+    {
+        Self::open_opts(index, InputOpts::default(), cb)
+    }
+
+    pub fn open_opts<F>(index: usize, opts: InputOpts, cb: F) -> Result<Self, Error>
     where
         F: FnMut(u64, &[u8]) + Send + 'static,
     {
@@ -138,19 +254,17 @@ impl Input {
             .nth(index)
             .ok_or_else(|| Error::Connect(format!("input {index} not found")))?;
         let name = inp.port_name(&port).unwrap_or_else(|_| "<unknown>".into());
-        let t0 = std::time::Instant::now();
-        let conn = inp
-            .connect(
-                &port,
-                "midi-editor-in",
-                move |_ts, bytes, _| cb(t0.elapsed().as_micros() as u64, bytes),
-                (),
-            )
-            .map_err(|e| Error::Connect(e.to_string()))?;
-        Ok(Self { _conn: conn, name })
+        Self::connect_on(inp, port, name, opts, cb)
     }
 
-    pub fn open_named<F>(name: &str, mut cb: F) -> Result<Self, Error>
+    pub fn open_named<F>(name: &str, cb: F) -> Result<Self, Error>
+    where
+        F: FnMut(u64, &[u8]) + Send + 'static,
+    {
+        Self::open_named_opts(name, InputOpts::default(), cb)
+    }
+
+    pub fn open_named_opts<F>(name: &str, opts: InputOpts, cb: F) -> Result<Self, Error>
     where
         F: FnMut(u64, &[u8]) + Send + 'static,
     {
@@ -162,19 +276,29 @@ impl Input {
             .find(|p| inp.port_name(p).map(|n| n == name).unwrap_or(false))
             .ok_or_else(|| Error::Connect(format!("input '{name}' not found")))?;
         let pname = inp.port_name(&port).unwrap_or_else(|_| name.to_string());
-        let t0 = std::time::Instant::now();
+        Self::connect_on(inp, port, pname, opts, cb)
+    }
+
+    fn connect_on<F>(
+        inp: MidiInput,
+        port: midir::MidiInputPort,
+        name: String,
+        opts: InputOpts,
+        mut cb: F,
+    ) -> Result<Self, Error>
+    where
+        F: FnMut(u64, &[u8]) + Send + 'static,
+    {
+        let mut tb = Timebase::new(opts.latency_us, opts.diag);
         let conn = inp
             .connect(
                 &port,
                 "midi-editor-in",
-                move |_ts, bytes, _| cb(t0.elapsed().as_micros() as u64, bytes),
+                move |ts, bytes, _| cb(tb.stamp(ts, std::time::Instant::now()), bytes),
                 (),
             )
             .map_err(|e| Error::Connect(e.to_string()))?;
-        Ok(Self {
-            _conn: conn,
-            name: pname,
-        })
+        Ok(Self { _conn: conn, name })
     }
 }
 
@@ -933,5 +1057,85 @@ mod tests {
             assert_eq!(SysexPolicy::from_label(p.label()), Some(p));
             assert_ne!(p.cycle(), p);
         }
+    }
+
+    // --- recording timebase (backend timestamps) ---------------------------
+
+    /// Artificially delaying callback delivery must NOT shift recorded
+    /// placement when the backend supplies timestamps — the issue's core
+    /// acceptance criterion. Three messages stamped 10ms apart on the device
+    /// arrive 0ms, 200ms and 800ms late; the stamps keep the 10ms spacing.
+    #[test]
+    fn backend_timestamp_immune_to_callback_delay() {
+        let t0 = std::time::Instant::now();
+        let mut tb = Timebase::new_at(0, None, t0);
+        let ms = std::time::Duration::from_millis;
+        // first timestamped message anchors: stamped by arrival
+        let s0 = tb.stamp(100_000, t0 + ms(50));
+        assert_eq!(s0, 50_000);
+        // same +10ms device time, delivered 200ms late
+        let s1 = tb.stamp(110_000, t0 + ms(260));
+        // +10ms more, delivered 800ms late
+        let s2 = tb.stamp(120_000, t0 + ms(1_060));
+        assert_eq!(s1 - s0, 10_000, "device delta must drive the stamp");
+        assert_eq!(s2 - s1, 10_000, "device delta must drive the stamp");
+        // arrival-stamping would have produced 210ms and 800ms spacings
+    }
+
+    /// Without a backend timestamp (dev_us == 0) the stamp is arrival time —
+    /// recording still works on backends that can't timestamp.
+    #[test]
+    fn no_backend_timestamp_falls_back_to_arrival() {
+        let t0 = std::time::Instant::now();
+        let mut tb = Timebase::new_at(0, None, t0);
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(tb.stamp(0, t0 + ms(30)), 30_000);
+        assert_eq!(tb.stamp(0, t0 + ms(45)), 45_000);
+        // a timestamped message later still anchors normally
+        let s = tb.stamp(500_000, t0 + ms(60));
+        assert_eq!(s, 60_000);
+        let s2 = tb.stamp(505_000, t0 + ms(360));
+        assert_eq!(s2 - s, 5_000);
+    }
+
+    /// Manual input-latency compensation subtracts from every stamp.
+    #[test]
+    fn latency_compensation_subtracts() {
+        let t0 = std::time::Instant::now();
+        let mut tb = Timebase::new_at(5_000, None, t0);
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(tb.stamp(0, t0 + ms(30)), 25_000);
+        // never goes negative
+        assert_eq!(tb.stamp(0, t0 + ms(2)), 0);
+    }
+
+    /// The diag counters record the delivery delay that the device stamp
+    /// absorbed — the jitter stat the app surfaces in debug mode.
+    #[test]
+    fn diag_records_delivery_gap() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let t0 = std::time::Instant::now();
+        let diag = InputDiag::new();
+        let mut tb = Timebase::new_at(0, Some(diag.clone()), t0);
+        let ms = std::time::Duration::from_millis;
+        tb.stamp(100_000, t0 + ms(50)); // anchor: gap 0
+        tb.stamp(110_000, t0 + ms(300)); // delivered 240ms late
+        tb.stamp(0, t0 + ms(310)); // unstamped fallback
+        assert_eq!(diag.stamped.load(Relaxed), 2);
+        assert_eq!(diag.unstamped.load(Relaxed), 1);
+        assert_eq!(diag.gap_max_us.load(Relaxed), 240_000);
+    }
+
+    /// Device timestamps stay monotonic for the map even if a callback is
+    /// reordered: a dev_us behind the anchor still lands at the anchor base.
+    #[test]
+    fn timebase_never_goes_backwards_under_anchor() {
+        let t0 = std::time::Instant::now();
+        let mut tb = Timebase::new_at(0, None, t0);
+        let ms = std::time::Duration::from_millis;
+        let s0 = tb.stamp(100_000, t0 + ms(50));
+        // a counter restart/rewind clamps to the anchor's stamp, not a jump back
+        let s1 = tb.stamp(50_000, t0 + ms(60));
+        assert_eq!(s1, s0);
     }
 }

@@ -397,6 +397,8 @@ struct EditorView {
     recent: Vec<SharedString>,
     /// recording source — MIDI input port name; empty = first available
     midi_in: SharedString,
+    /// manual input-latency compensation in ms (global pref)
+    in_latency_ms: u64,
     focus: FocusHandle,
     input: Entity<InputState>,
     status: SharedString,
@@ -452,6 +454,9 @@ struct Rec {
     base_us: u64,
     /// count-in duration — input before this is discarded
     cin_us: u64,
+    /// jitter counters — how much callback-delivery delay the backend
+    /// timestamps absorbed this take (surfaced as a debug diagnostic)
+    diag: std::sync::Arc<midi_io::InputDiag>,
 }
 
 /// Output destination catalog: real MIDI ports by name, then discovered
@@ -601,6 +606,7 @@ impl EditorView {
             count_in: g.count_in,
             recent: g.recent.iter().map(|p| p.as_str().into()).collect(),
             midi_in: g.midi_in.clone().into(),
+            in_latency_ms: g.in_latency_ms,
             open_sub: None,
             show_events: true,
             focus: cx.focus_handle(),
@@ -2728,10 +2734,15 @@ impl EditorView {
                 .unwrap_or_else(|e| e.into_inner())
                 .push((us, b.to_vec()));
         };
+        let diag = midi_io::InputDiag::new();
+        let opts = midi_io::InputOpts {
+            latency_us: self.in_latency_ms * 1000,
+            diag: Some(diag.clone()),
+        };
         let opened = if self.midi_in.is_empty() {
-            midi_io::Input::open(0, cb)
+            midi_io::Input::open_opts(0, opts, cb)
         } else {
-            midi_io::Input::open_named(&self.midi_in, cb)
+            midi_io::Input::open_named_opts(&self.midi_in, opts, cb)
         };
         match opened {
             Ok(input) => {
@@ -2740,6 +2751,7 @@ impl EditorView {
                     buf,
                     base_us: self.play_us,
                     cin_us,
+                    diag,
                 });
                 if self.playback.is_none() {
                     self.start_playback();
@@ -2806,6 +2818,20 @@ impl EditorView {
             });
         }
         let n = events.len();
+        // timing diagnostic: how much callback delivery delay the backend
+        // timestamps absorbed — would have been recorded as timing error
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let (st, un, gap) = (
+                rec.diag.stamped.load(Relaxed),
+                rec.diag.unstamped.load(Relaxed),
+                rec.diag.gap_max_us.load(Relaxed),
+            );
+            tracing::debug!(
+                "rec input timing: {st} device-stamped, {un} arrival-fallback, worst callback delay {}ms",
+                gap / 1000
+            );
+        }
         drop(sh);
         if n == 0 {
             self.status = t("status.rec_no_events").into();
@@ -3201,6 +3227,11 @@ struct GlobalPrefs {
     /// MIDI input port name to record from; empty = first available port
     #[serde(default)]
     midi_in: String,
+    /// manual input-latency compensation subtracted from every recorded
+    /// timestamp, in ms — for keyboards/interfaces with a known pipeline
+    /// delay. Missing in older prefs files.
+    #[serde(default)]
+    in_latency_ms: u64,
 }
 
 impl Default for GlobalPrefs {
@@ -3210,6 +3241,7 @@ impl Default for GlobalPrefs {
             recent: Vec::new(),
             count_in: false,
             midi_in: String::new(),
+            in_latency_ms: 0,
         }
     }
 }
@@ -3481,6 +3513,7 @@ impl EditorView {
             recent: self.recent.iter().map(|r| r.to_string()).collect(),
             count_in: self.count_in,
             midi_in: self.midi_in.to_string(),
+            in_latency_ms: self.in_latency_ms,
             ..Default::default()
         }
         .save();
