@@ -24,6 +24,11 @@ Japanese is supported through the same i18n table.
   `begin_transaction`/`commit_transaction`/`rollback_transaction` stage edits
   on a private document clone; reads inside a batch see the staged copy via
   `Shared::view()`, and `Shared::apply_or_stage` routes every edit tool.
+  `Shared::history`/`last_mcp_tx` record every committed transaction for
+  `transaction_history`/`changes_since_revision` and the GUI status line.
+  `list_notes`/`query_events`/`get_meta`/`get_cc` paginate via
+  `{revision}.key…` cursors (see `cursor_arg`) — a cursor minted at another
+  revision is a `stale_cursor` error, never a wrong page.
 
 ## Invariants
 

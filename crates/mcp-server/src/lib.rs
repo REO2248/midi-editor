@@ -887,6 +887,77 @@ fn note_json(n: &document::Note) -> serde_json::Value {
     })
 }
 
+// ── pagination ──────────────────────────────────────────────────────────
+// A cursor is `{revision}.{sort-key fields joined by '.'}` — the key of the
+// previous page's last row, minted under a document revision. Positions are
+// only stable on a fixed revision, so a revision mismatch is a structured
+// stale-cursor error (with a restart hint), never a silently wrong page.
+fn parse_cursor(s: &str, key_len: usize) -> Result<Vec<u64>, serde_json::Value> {
+    let bad = || {
+        serde_json::json!({
+            "error": "bad_cursor",
+            "hint": "cursors are opaque — re-issue the query without 'cursor'",
+        })
+    };
+    let parts: Vec<_> = s.split('.').collect();
+    if parts.len() != key_len + 1 {
+        return Err(bad());
+    }
+    parts
+        .iter()
+        .map(|p| p.parse::<u64>().map_err(|_| bad()))
+        .collect()
+}
+
+/// `args["cursor"]` → resume key, or an error response (bad shape / stale).
+fn cursor_arg(
+    sh: &Shared,
+    args: &serde_json::Value,
+    key_len: usize,
+) -> Result<Option<Vec<u64>>, CallToolResponse> {
+    match &args["cursor"] {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(s) => match parse_cursor(s, key_len) {
+            Err(e) => Err(err_json(e.to_string())),
+            Ok(c) => {
+                let cur = sh.view().revision();
+                if c[0] != cur {
+                    return Err(err_json(
+                        serde_json::json!({
+                            "error": "stale_cursor",
+                            "cursor_revision": c[0],
+                            "current_revision": cur,
+                            "hint": "document changed — restart pagination without 'cursor'",
+                        })
+                        .to_string(),
+                    ));
+                }
+                Ok(Some(c[1..].to_vec()))
+            }
+        },
+        _ => Err(err_json("'cursor' must be a string")),
+    }
+}
+
+/// `args["fields"]` — top-level key allowlist applied to each emitted row so
+/// callers can drop heavy fields (raw_hex/data_hex) they don't need.
+fn field_projection(args: &serde_json::Value) -> Option<Vec<String>> {
+    args["fields"].as_array().map(|a| {
+        a.iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect()
+    })
+}
+
+fn project_fields(mut v: serde_json::Value, fields: &Option<Vec<String>>) -> serde_json::Value {
+    if let Some(f) = fields {
+        if let Some(m) = v.as_object_mut() {
+            m.retain(|k, _| f.iter().any(|x| x == k));
+        }
+    }
+    v
+}
+
 /// The `editor_info` response — one call gives an agent everything it needs
 /// to feature-detect the running editor and its tool surface instead of
 /// probing behavior through trial-and-error mutations.
@@ -932,6 +1003,10 @@ fn editor_info_json(sh: &Shared) -> serde_json::Value {
                 "atomic_transactions": true,
                 "batch_transactions": true,
                 "transaction_history": true,
+            },
+            "queries": {
+                "cursor_pagination": true,
+                "field_projection": true,
             },
             // these only work while the desktop app hosts the document
             "transport": sh.gui_attached,
@@ -1337,23 +1412,27 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ),
         spec(
             "list_notes",
-            "Paired note view (NoteOn+NoteOff). Args: track?, from_tick?, to_tick?, limit?",
+            "Paired note view (NoteOn+NoteOff). Args: track?, from_tick?, to_tick?, limit? (default 500, max 10000), cursor?, fields? (row key allowlist). Returns notes + next_cursor + revision; a stale cursor returns a structured restart hint.",
             object_schema(serde_json::json!({
                 "track": {"type": "integer"},
                 "from_tick": {"type": "integer"},
                 "to_tick": {"type": "integer"},
                 "limit": {"type": "integer"},
+                "cursor": {"type": "string"},
+                "fields": {"type": "array", "items": {"type": "string"}},
             })),
         ),
         spec(
             "query_events",
-            "Raw SMF events (id, tick, seq, kind, raw_hex). Args: track?, from_tick?, to_tick?, limit?, offset?",
+            "Raw SMF events (id, tick, seq, kind, raw_hex) in chronological (tick, seq, track, id) order. Args: track?, from_tick?, to_tick?, limit? (default 500, max 10000), cursor?, fields? (omit e.g. raw_hex to slim rows), offset? (legacy). Returns events + next_cursor + revision.",
             object_schema(serde_json::json!({
                 "track": {"type": "integer"},
                 "from_tick": {"type": "integer"},
                 "to_tick": {"type": "integer"},
                 "limit": {"type": "integer"},
                 "offset": {"type": "integer"},
+                "cursor": {"type": "string"},
+                "fields": {"type": "array", "items": {"type": "string"}},
             })),
         ),
         spec(
@@ -1404,19 +1483,25 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ),
         spec(
             "get_meta",
-            "Meta events (names, markers, lyrics, text, tempo, time-sig) with text decoded (UTF-8/SJIS). Args: track?, meta_type? (hex int)",
+            "Meta events (names, markers, lyrics, text, tempo, time-sig) with text decoded (UTF-8/SJIS), track-major order. Args: track?, meta_type? (hex int), limit?, cursor?, fields? (omit data_hex to slim rows). Returns meta + next_cursor + revision.",
             object_schema(serde_json::json!({
                 "track": {"type": "integer"},
                 "meta_type": {"type": "integer"},
+                "limit": {"type": "integer"},
+                "cursor": {"type": "string"},
+                "fields": {"type": "array", "items": {"type": "string"}},
             })),
         ),
         spec(
             "get_cc",
-            "Latest controller value per (track, channel, cc) — the current CC state. Args: track?, channel?, cc?",
+            "Latest controller value per (track, channel, cc) — the current CC state. Args: track?, channel?, cc?, limit?, cursor?, fields?. Returns cc + next_cursor + revision.",
             object_schema(serde_json::json!({
                 "track": {"type": "integer"},
                 "channel": {"type": "integer"},
                 "cc": {"type": "integer"},
+                "limit": {"type": "integer"},
+                "cursor": {"type": "string"},
+                "fields": {"type": "array", "items": {"type": "string"}},
             })),
         ),
         spec(
@@ -1677,21 +1762,38 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
             let track = args["track"].as_u64().map(|v| v as usize);
             let from = args["from_tick"].as_u64().unwrap_or(0);
             let to = args["to_tick"].as_u64().unwrap_or(u64::MAX);
-            let limit = args["limit"]
-                .as_u64()
-                .unwrap_or(500)
-                .min(MAX_QUERY_LIMIT as u64) as usize;
-            let notes: Vec<_> = sh
+            let limit = args["limit"].as_u64().unwrap_or(500).min(MAX_QUERY_LIMIT as u64) as usize;
+            let fields = field_projection(&args);
+            let after = match cursor_arg(&sh, &args, 4) {
+                Ok(a) => a,
+                Err(r) => return r,
+            };
+            // total sort key (start, key, track, on_id) — deterministic on a
+            // fixed revision, so a cursor page neither duplicates nor skips
+            let key =
+                |n: &document::Note| (n.start_tick, n.key as u64, n.track as u64, n.on_id);
+            let mut notes: Vec<_> = sh
                 .view()
                 .notes()
                 .into_iter()
                 .filter(|n| n.start_tick >= from && n.start_tick <= to)
                 .filter(|n| track.is_none() || Some(n.track) == track)
-                .take(limit)
                 .collect();
+            notes.sort_by_key(|n| key(n));
+            let pos = after.map_or(0, |c| {
+                notes.partition_point(|n| key(n) <= (c[0], c[1], c[2], c[3]))
+            });
+            let end = (pos + limit).min(notes.len());
+            let rev = sh.view().revision();
+            let next = (end > pos && end < notes.len()).then(|| {
+                let k = key(&notes[end - 1]);
+                format!("{}.{}.{}.{}.{}", rev, k.0, k.1, k.2, k.3)
+            });
             ok_json(serde_json::json!({
-                "count": notes.len(),
-                "notes": notes.iter().map(note_json).collect::<Vec<_>>(),
+                "count": end - pos,
+                "notes": notes[pos..end].iter().map(|n| project_fields(note_json(n), &fields)).collect::<Vec<_>>(),
+                "next_cursor": next,
+                "revision": rev,
             }))
         }
         "query_events" => {
@@ -1703,32 +1805,49 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
                 .unwrap_or(500)
                 .min(MAX_QUERY_LIMIT as u64) as usize;
             let offset = args["offset"].as_u64().unwrap_or(0) as usize;
-            // collect light (tick, seq, track, idx) refs only; JSON encoding
-            // happens for the offset/limit window, not for every match
-            let mut hits: Vec<(u64, u32, usize, usize)> = Vec::new();
+            let fields = field_projection(&args);
+            let after = match cursor_arg(&sh, &args, 4) {
+                Ok(a) => a,
+                Err(r) => return r,
+            };
+            // collect light (tick, seq, track, id, idx) refs only; JSON
+            // encoding happens for the window, not for every match
+            let mut hits: Vec<(u64, u32, u64, u64, usize)> = Vec::new();
             for (ti, t) in sh.view().tracks.iter().enumerate() {
                 if track.is_some() && track != Some(ti) {
                     continue;
                 }
                 for (ei, e) in t.events.iter().enumerate() {
                     if e.tick >= from && e.tick <= to {
-                        hits.push((e.tick, e.seq, ti, ei));
+                        hits.push((e.tick, e.seq, ti as u64, e.id, ei));
                     }
                 }
             }
-            hits.sort_by_key(|h| (h.0, h.1));
+            // total chronological key (tick, seq, track, id) — no ties
+            hits.sort_by_key(|h| (h.0, h.1, h.2, h.3));
             let total = hits.len();
-            let evs: Vec<_> = hits
-                .into_iter()
-                .skip(offset)
-                .take(limit)
-                .map(|(_, _, ti, ei)| {
-                    let mut j = event_json(&sh.view().tracks[ti].events[ei]);
+            let pos = after.map_or(0, |c| {
+                hits.partition_point(|h| (h.0, h.1, h.2, h.3) <= (c[0], c[1] as u32, c[2], c[3]))
+            });
+            let pos = (pos + offset).min(total); // legacy offset still honored
+            let end = (pos + limit).min(total);
+            let rev = sh.view().revision();
+            let next = (end > pos && end < total).then(|| {
+                let h = &hits[end - 1];
+                format!("{}.{}.{}.{}.{}", rev, h.0, h.1, h.2, h.3)
+            });
+            let evs: Vec<_> = hits[pos..end]
+                .iter()
+                .map(|&(_, _, ti, _, ei)| {
+                    let mut j = event_json(&sh.view().tracks[ti as usize].events[ei]);
                     j["track"] = ti.into();
-                    j
+                    project_fields(j, &fields)
                 })
                 .collect();
-            ok_json(serde_json::json!({"total": total, "events": evs}))
+            ok_json(serde_json::json!({
+                "total": total, "count": evs.len(), "events": evs,
+                "next_cursor": next, "revision": rev,
+            }))
         }
         "apply_patch" => {
             if let Some(r) = check_base(&sh, args) {
@@ -1956,39 +2075,79 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
         "get_meta" => {
             let track = args["track"].as_u64().map(|v| v as usize);
             let mt = args["meta_type"].as_u64().map(|v| v as u8);
+            let limit = args["limit"].as_u64().unwrap_or(500).min(MAX_QUERY_LIMIT as u64) as usize;
+            let fields = field_projection(&args);
+            let after = match cursor_arg(&sh, &args, 4) {
+                Ok(a) => a,
+                Err(r) => return r,
+            };
             let hint = sh.view().text_encoding_hint();
-            let mut out = Vec::new();
+            // light refs first; JSON encoding only for the page window
+            let mut hits: Vec<(u64, u64, u32, u64, usize)> = Vec::new();
             for (ti, t) in sh.view().tracks.iter().enumerate() {
                 if track.is_some() && track != Some(ti) {
                     continue;
                 }
-                for e in &t.events {
-                    if let EventKind::Meta { meta_type, data } = &e.kind {
+                for (ei, e) in t.events.iter().enumerate() {
+                    if let EventKind::Meta { meta_type, .. } = &e.kind {
                         if mt.is_some() && mt != Some(*meta_type) {
                             continue;
                         }
-                        // only 0x01-0x0F are text-family metas; the rest
-                        // (tempo, time sig, ports, ...) are binary payloads
-                        let text = if (0x01..=0x0f).contains(meta_type) {
-                            serde_json::Value::String(smf_core::decode_text(data, hint))
-                        } else {
-                            serde_json::Value::Null
-                        };
-                        out.push(serde_json::json!({
+                        hits.push((ti as u64, e.tick, e.seq, e.id, ei));
+                    }
+                }
+            }
+            // track-major stable key (track, tick, seq, id)
+            hits.sort_by_key(|h| (h.0, h.1, h.2, h.3));
+            let pos = after.map_or(0, |c| {
+                hits.partition_point(|h| (h.0, h.1, h.2, h.3) <= (c[0], c[1], c[2] as u32, c[3]))
+            });
+            let end = (pos + limit).min(hits.len());
+            let rev = sh.view().revision();
+            let next = (end > pos && end < hits.len()).then(|| {
+                let h = &hits[end - 1];
+                format!("{}.{}.{}.{}.{}", rev, h.0, h.1, h.2, h.3)
+            });
+            let out: Vec<_> = hits[pos..end]
+                .iter()
+                .map(|&(ti, _, _, _, ei)| {
+                    let e = &sh.view().tracks[ti as usize].events[ei];
+                    let EventKind::Meta { meta_type, data } = &e.kind else {
+                        unreachable!()
+                    };
+                    // only 0x01-0x0F are text-family metas; the rest
+                    // (tempo, time sig, ports, ...) are binary payloads
+                    let text = if (0x01..=0x0f).contains(meta_type) {
+                        serde_json::Value::String(smf_core::decode_text(data, hint))
+                    } else {
+                        serde_json::Value::Null
+                    };
+                    project_fields(
+                        serde_json::json!({
                             "track": ti, "id": e.id, "tick": e.tick,
                             "type": format!("0x{meta_type:02x}"),
                             "text": text,
                             "data_hex": bytes_hex(data),
-                        }));
-                    }
-                }
-            }
-            ok_json(serde_json::json!({"count": out.len(), "meta": out}))
+                        }),
+                        &fields,
+                    )
+                })
+                .collect();
+            ok_json(serde_json::json!({
+                "count": out.len(), "meta": out,
+                "next_cursor": next, "revision": rev,
+            }))
         }
         "get_cc" => {
             let track = args["track"].as_u64().map(|v| v as usize);
             let chan = args["channel"].as_u64().map(|v| v as u8);
             let ccn = args["cc"].as_u64().map(|v| v as u8);
+            let limit = args["limit"].as_u64().unwrap_or(500).min(MAX_QUERY_LIMIT as u64) as usize;
+            let fields = field_projection(&args);
+            let after = match cursor_arg(&sh, &args, 3) {
+                Ok(a) => a,
+                Err(r) => return r,
+            };
             // latest value wins; events are already tick-sorted
             let mut latest: HashMap<(usize, u8, u8), (u64, u8)> = HashMap::new();
             for (ti, t) in sh.view().tracks.iter().enumerate() {
@@ -2011,11 +2170,27 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
             }
             let mut rows: Vec<_> = latest.into_iter().collect();
             rows.sort_by_key(|(k, _)| *k);
+            // cursor key is the row's own (track, channel, cc)
+            let pos = after.map_or(0, |c| {
+                rows.partition_point(|(k, _)| {
+                    (k.0 as u64, k.1 as u64, k.2 as u64) <= (c[0], c[1], c[2])
+                })
+            });
+            let end = (pos + limit).min(rows.len());
+            let rev = sh.view().revision();
+            let next = (end > pos && end < rows.len()).then(|| {
+                let k = &rows[end - 1].0;
+                format!("{}.{}.{}.{}", rev, k.0, k.1, k.2)
+            });
             ok_json(serde_json::json!({
-                "count": rows.len(),
-                "cc": rows.iter().map(|((t, ch, cc), (tick, v))| serde_json::json!({
-                    "track": t, "channel": ch + 1, "cc": cc, "value": v, "at_tick": tick,
-                })).collect::<Vec<_>>(),
+                "count": end - pos,
+                "cc": rows[pos..end].iter().map(|((t, ch, cc), (tick, v))| project_fields(
+                    serde_json::json!({
+                        "track": t, "channel": ch + 1, "cc": cc, "value": v, "at_tick": tick,
+                    }),
+                    &fields,
+                )).collect::<Vec<_>>(),
+                "next_cursor": next, "revision": rev,
             }))
         }
         "list_midi_ports" => {
@@ -3289,6 +3464,137 @@ mod tests {
         // to fall back to a full document query instead of trusting a gap
         let (_, v) = call(&sh, "changes_since_revision", json!({"revision": 0}));
         assert_eq!(v["truncated"], true);
+    }
+
+    /// Walk a paginated tool to exhaustion, returning every row emitted.
+    fn paged(
+        sh: &SharedDoc,
+        tool: &str,
+        args: serde_json::Value,
+        rows: &str,
+    ) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        let mut cursor = serde_json::Value::Null;
+        for _ in 0..100 {
+            let mut a = args.clone();
+            a["cursor"] = cursor;
+            let (err, v) = call(sh, tool, a);
+            assert!(!err, "{tool} errored: {v}");
+            out.extend(v[rows].as_array().unwrap().clone());
+            match v["next_cursor"].as_str() {
+                Some(c) => cursor = c.into(),
+                None => return out,
+            }
+        }
+        panic!("{tool}: pagination did not terminate");
+    }
+
+    #[test]
+    fn list_notes_paginates_without_gaps() {
+        let sh = shared(); // fixture already has one note (key 60 @0-480)
+        let ops: Vec<_> = (1..7)
+            .map(|i| {
+                json!({"op": "insert_note", "track": 1, "key": 60 + i,
+                       "start": i * 480, "dur": 240})
+            })
+            .collect();
+        call(&sh, "apply_patch", json!({"ops": ops}));
+        let rows = paged(&sh, "list_notes", json!({"limit": 3}), "notes");
+        assert_eq!(rows.len(), 7);
+        let ids: std::collections::HashSet<_> =
+            rows.iter().map(|n| n["on_id"].as_u64().unwrap()).collect();
+        assert_eq!(ids.len(), 7, "no duplicates across pages");
+        let starts: Vec<_> = rows.iter().map(|n| n["start"].as_u64().unwrap()).collect();
+        let mut sorted = starts.clone();
+        sorted.sort();
+        assert_eq!(starts, sorted, "pages stay in (start, key, track, id) order");
+    }
+
+    #[test]
+    fn query_events_pages_and_field_projection() {
+        let sh = shared();
+        call(
+            &sh,
+            "apply_patch",
+            json!({"ops": (0..4).map(|i| json!({"op": "insert_note", "track": 1,
+                "key": 64, "start": i * 960, "dur": 120})).collect::<Vec<_>>()}),
+        );
+        // 1 fixture note + 4 inserted = 10 channel events
+        let rows = paged(
+            &sh,
+            "query_events",
+            json!({"limit": 4, "fields": ["id", "tick"]}),
+            "events",
+        );
+        assert_eq!(rows.len(), 10);
+        let ids: std::collections::HashSet<_> =
+            rows.iter().map(|e| e["id"].as_u64().unwrap()).collect();
+        assert_eq!(ids.len(), 10);
+        for e in &rows {
+            let obj = e.as_object().unwrap();
+            assert_eq!(obj.len(), 2, "fields projection dropped everything else");
+            assert!(obj.contains_key("id") && obj.contains_key("tick"));
+        }
+    }
+
+    #[test]
+    fn stale_cursor_is_reported() {
+        let sh = shared();
+        call(
+            &sh,
+            "apply_patch",
+            json!({"ops": (0..4).map(|i| json!({"op": "insert_note", "track": 1,
+                "key": 64, "start": i * 960, "dur": 120})).collect::<Vec<_>>()}),
+        );
+        let (_, v) = call(&sh, "query_events", json!({"limit": 2}));
+        let cursor = v["next_cursor"].as_str().unwrap().to_string();
+        // any mutation bumps the revision the cursor was minted under
+        call(
+            &sh,
+            "apply_patch",
+            json!({"ops": [{"op": "insert_note", "track": 1, "key": 70}]}),
+        );
+        let (err, v) = call(&sh, "query_events", json!({"cursor": cursor}));
+        assert!(err);
+        let s = v.to_string();
+        assert!(s.contains("stale_cursor") && s.contains("current_revision") && s.contains("hint"));
+        let (err, _) = call(&sh, "list_notes", json!({"cursor": "not-a-cursor"}));
+        assert!(err, "malformed cursors are rejected, not ignored");
+    }
+
+    #[test]
+    fn meta_and_cc_reads_paginate() {
+        let sh = shared();
+        let evs: Vec<_> = (0..5)
+            .map(|i| {
+                json!({"tick": i * 240, "kind": {"meta": {"type": 3, "data_utf8": format!("m{i}")}}})
+            })
+            .chain((0..4).map(|i| {
+                json!({"tick": i * 120, "kind": {"channel": {"status": 176, "data": [20 + i, i]}}})
+            }))
+            .collect();
+        call(
+            &sh,
+            "apply_patch",
+            json!({"ops": [{"op": "insert_events", "track": 0, "events": evs}]}),
+        );
+        let metas = paged(&sh, "get_meta", json!({"meta_type": 3, "limit": 2}), "meta");
+        assert_eq!(metas.len(), 5);
+        let ids: std::collections::HashSet<_> =
+            metas.iter().map(|m| m["id"].as_u64().unwrap()).collect();
+        assert_eq!(ids.len(), 5);
+        let ccs = paged(&sh, "get_cc", json!({"limit": 2}), "cc");
+        assert_eq!(ccs.len(), 4, "one row per (track,channel,cc)");
+        // projection drops the per-row heavy field
+        let metas = paged(
+            &sh,
+            "get_meta",
+            json!({"meta_type": 3, "limit": 100, "fields": ["id", "tick"]}),
+            "meta",
+        );
+        for m in &metas {
+            assert!(m.get("data_hex").is_none() && m.get("text").is_none());
+        }
     }
 
     #[test]
