@@ -419,6 +419,8 @@ struct DocUi {
     track_chs: Vec<u8>,
     sig: String,
     tempo0: f64,
+    /// detected GM/GS/XG reset SysEx — a display hint for patch naming
+    mode_hint: Option<smf_core::ModeHint>,
     /// last tick with a note — the scrollable extent of the timeline
     song_end: u64,
 }
@@ -490,6 +492,7 @@ impl DocUi {
             track_chs,
             sig,
             tempo0,
+            mode_hint: doc.synth_mode(),
             song_end: notes
                 .iter()
                 .filter(|n| seq_sel.is_none_or(|i| n.track == i))
@@ -2235,6 +2238,11 @@ impl EditorView {
         let seq = doc.is_sequential();
         let hint = self.enc_override.or(doc.text_encoding_hint());
         let rpn_tags = Self::rpn_row_tags(doc);
+        let pc_names: HashMap<EventId, (u8, u8, Option<String>)> = doc
+            .program_changes()
+            .iter()
+            .map(|p| (p.id, (p.bank_msb, p.bank_lsb, doc.program_name(p))))
+            .collect();
         let mut rows = Vec::new();
         let mut refs = Vec::new();
         for d in doc.diagnose() {
@@ -2278,28 +2286,40 @@ impl EditorView {
                             0xE0 => "PB     ",
                             _ => "Ch?    ",
                         };
-                        let tag = if status & 0xF0 == 0xB0 {
-                            match data[0] {
-                                6 | 38 | 98..=101 => {
-                                    let part = match data[0] {
-                                        6 => "data-msb",
-                                        38 => "data-lsb",
-                                        99 | 101 => "sel-msb",
-                                        _ => "sel-lsb",
-                                    };
-                                    match rpn_tags.get(&e.id) {
-                                        Some(label) => format!("  [{label} {part}]"),
-                                        None if data[0] == 6 || data[0] == 38 => {
-                                            "  [unbound data-entry]".into()
-                                        }
-                                        None => "  [unbound selector]".into(),
+                        // RPN/NRPN member CCs get their entry label; ch10
+                        // notes get GM percussion names; program changes get
+                        // bank + friendly patch name (unknown banks numeric)
+                        let mut tag = String::new();
+                        if status & 0xF0 == 0xB0 {
+                            if matches!(data[0], 6 | 38 | 98..=101) {
+                                let part = match data[0] {
+                                    6 => "data-msb",
+                                    38 => "data-lsb",
+                                    99 | 101 => "sel-msb",
+                                    _ => "sel-lsb",
+                                };
+                                tag = match rpn_tags.get(&e.id) {
+                                    Some(label) => format!("  [{label} {part}]"),
+                                    None if data[0] == 6 || data[0] == 38 => {
+                                        "  [unbound data-entry]".into()
                                     }
-                                }
-                                _ => String::new(),
+                                    None => "  [unbound selector]".into(),
+                                };
                             }
-                        } else {
-                            String::new()
-                        };
+                        } else if status & 0xF0 == 0x90 || status & 0xF0 == 0x80 {
+                            if (status & 0x0F) == 9 {
+                                if let Some(d) = smf_core::gm_drum_name(data[0]) {
+                                    tag = format!("  [{d}]");
+                                }
+                            }
+                        } else if status & 0xF0 == 0xC0 {
+                            if let Some((msb, lsb, name)) = pc_names.get(&e.id) {
+                                tag = match name {
+                                    Some(n) => format!("  bank {msb}.{lsb}  [{n}]"),
+                                    None => format!("  bank {msb}.{lsb}"),
+                                };
+                            }
+                        }
                         format!("{name} ch{ch:<2} {:>3} {:>3}{tag}", data[0], data[1])
                     }
                     EventKind::Meta { meta_type, data } => match *meta_type {

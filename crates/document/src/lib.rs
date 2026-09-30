@@ -1087,6 +1087,19 @@ impl RpnEntry {
     }
 }
 
+/// A program-change event with the bank select state in effect at its tick.
+/// Derived view — never written back to the event list.
+#[derive(Debug, Clone)]
+pub struct ProgramChange {
+    pub track: usize,
+    pub channel: u8,
+    pub tick: u64,
+    pub id: EventId,
+    pub bank_msb: u8,
+    pub bank_lsb: u8,
+    pub program: u8,
+}
+
 /// Per-(track, channel) state reconstructed by `Document::chase_events` while
 /// scanning the prefix before the play position. `None` = never set (or reset
 /// by CC121) → nothing is emitted for that slot.
@@ -2059,6 +2072,55 @@ impl Document {
         out
     }
 
+    /// First recognized mode-reset SysEx anywhere in the file (GM1/GM2/GS/XG).
+    /// A display hint only — detection never edits bytes.
+    pub fn synth_mode(&self) -> Option<smf_core::ModeHint> {
+        self.tracks
+            .iter()
+            .flat_map(|t| t.events.iter())
+            .find_map(|e| match &e.kind {
+                EventKind::SysEx(p) => smf_core::reset_hint(p),
+                _ => None,
+            })
+    }
+
+    /// Program changes with their effective bank-select context: CC0 (bank
+    /// MSB) and CC32 (bank LSB) state at the moment of each PC event, tracked
+    /// per (track, channel). Purely derived — raw bytes untouched.
+    pub fn program_changes(&self) -> Vec<ProgramChange> {
+        let mut out = Vec::new();
+        for (ti, t) in self.tracks.iter().enumerate() {
+            let mut bank = [(0u8, 0u8); 16];
+            for e in &t.events {
+                match e.kind {
+                    EventKind::Channel { status, data, len } => match status & 0xF0 {
+                        0xB0 if len == 2 && data[0] == 0 => {
+                            bank[(status & 0x0F) as usize].0 = data[1];
+                        }
+                        0xB0 if len == 2 && data[0] == 32 => {
+                            bank[(status & 0x0F) as usize].1 = data[1];
+                        }
+                        0xC0 if len == 1 => {
+                            let (msb, lsb) = bank[(status & 0x0F) as usize];
+                            out.push(ProgramChange {
+                                track: ti,
+                                channel: status & 0x0F,
+                                tick: e.tick,
+                                id: e.id,
+                                bank_msb: msb,
+                                bank_lsb: lsb,
+                                program: data[0],
+                            });
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+        }
+        out
+    }
+
     /// Find the RPN/NRPN entry containing `id` (selector or data event).
     pub fn rpn_entry_containing(&self, id: EventId) -> Option<RpnEntry> {
         self.rpn_entries()
@@ -2232,6 +2294,26 @@ impl Document {
             .into_iter()
             .map(|(track, removed)| Op::RemoveEvents { track, removed })
             .collect()
+    }
+
+    /// Friendly name for a program change under the file's detected mode.
+    /// Only banks we can name unambiguously resolve — GM-family melodic bank
+    /// (0,0) maps to the GM table on every mode; percussion kits resolve via
+    /// `smf_core::kit_name`. Unknown banks stay numeric (None).
+    pub fn program_name(&self, pc: &ProgramChange) -> Option<String> {
+        let mode = self.synth_mode();
+        if pc.channel == 9 {
+            let m = mode.unwrap_or(smf_core::ModeHint::Gm1);
+            return smf_core::kit_name(m, pc.bank_msb).map(|k| format!("{k} #{}", pc.program));
+        }
+        if pc.bank_msb == 0 && pc.bank_lsb == 0 {
+            let name = smf_core::gm_program_name(pc.program);
+            return Some(match mode {
+                Some(m) => format!("{}: {name}", m.label()),
+                None => name.to_string(),
+            });
+        }
+        None
     }
 
     /// Set/replace the tempo at `tick` on `track` (the conductor is
@@ -2788,7 +2870,11 @@ mod tests {
             kind: EventKind::Channel {
                 status,
                 data: [d0, d1],
-                len: 2,
+                len: if matches!(status & 0xF0, 0xC0 | 0xD0) {
+                    1
+                } else {
+                    2
+                },
             },
         }
     }
@@ -3238,5 +3324,65 @@ mod tests {
         let e = d.rpn_entries().remove(0);
         assert_eq!(e.param_name(), Some("Coarse Tuning"));
         assert_eq!(e.value(), Some(5));
+    }
+    // ---- GM/GS/XG names ----
+
+    #[test]
+    fn program_names_and_mode_hints() {
+        let d = chase_doc(vec![
+            sx(
+                0,
+                &[0x41, 0x10, 0x42, 0x12, 0x40, 0x00, 0x7F, 0x00, 0x41, 0xF7],
+            ), // GS reset
+            ev(0, 0xB0, 0, 0),   // ch1 bank msb 0
+            ev(0, 0xB0, 32, 0),  // ch1 bank lsb 0
+            ev(10, 0xC0, 24, 0), // PC 24 on bank 0.0
+            ev(20, 0xB0, 0, 5),  // ch1 bank msb → 5
+            ev(30, 0xC0, 9, 0),  // PC 9 on bank 5.0 (unknown → numeric)
+            ev(40, 0xB9, 0, 0),  // ch10 bank msb 0
+            ev(50, 0xC9, 0, 0),  // ch10 program → kit
+            ev(60, 0x99, 36, 100),
+        ]);
+        assert_eq!(d.synth_mode(), Some(smf_core::ModeHint::Gs));
+        let pcs = d.program_changes();
+        assert_eq!(pcs.len(), 3);
+        assert_eq!(
+            (pcs[0].bank_msb, pcs[0].bank_lsb, pcs[0].program),
+            (0, 0, 24)
+        );
+        assert_eq!(
+            d.program_name(&pcs[0]).as_deref(),
+            Some("GS: Acoustic Guitar (nylon)")
+        );
+        assert_eq!(pcs[1].bank_msb, 5);
+        assert!(d.program_name(&pcs[1]).is_none()); // unknown bank stays numeric
+        assert_eq!(pcs[2].channel, 9);
+        assert_eq!(d.program_name(&pcs[2]).as_deref(), Some("Standard Kit #0"));
+
+        // no reset SysEx → still GM names on bank 0, just unlabeled by mode
+        let d2 = chase_doc(vec![ev(0, 0xC0, 0, 0)]);
+        assert_eq!(d2.synth_mode(), None);
+        assert_eq!(
+            d2.program_name(&d2.program_changes()[0]).as_deref(),
+            Some("Acoustic Grand Piano")
+        );
+
+        // XG file: drum bank 127 resolves to the XG kit label
+        let d3 = chase_doc(vec![
+            sx(0, &[0x43, 0x10, 0x4C, 0x00, 0x00, 0x7E, 0x00, 0xF7]), // XG on
+            ev(0, 0xB9, 0, 127),
+            ev(10, 0xC9, 1, 0),
+        ]);
+        assert_eq!(d3.synth_mode(), Some(smf_core::ModeHint::Xg));
+        assert_eq!(
+            d3.program_name(&d3.program_changes()[0]).as_deref(),
+            Some("XG Drums #1")
+        );
+
+        // viewing never mutates
+        let n = d.tracks[0].events.len();
+        d.program_changes();
+        d.synth_mode();
+        assert_eq!(d.tracks[0].events.len(), n);
     }
 }

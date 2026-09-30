@@ -242,6 +242,16 @@
     },
     {
       "deprecated": null,
+      "description": "Instrument context: detected synth mode (gm1/gm2/gs/xg from reset SysEx) + every program change with effective bank MSB/LSB and friendly name (GM table; GS/XG drum kits on channel 10). Names are display-only — unknown banks return null names and stay numeric. No args.",
+      "input_schema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "get_instruments",
+      "version": 1
+    },
+    {
+      "deprecated": null,
       "description": "Meta events (names, markers, lyrics, text, tempo, time-sig) with text decoded (UTF-8/SJIS), track-major order. Args: track?, meta_type? (hex int), limit?, cursor?, fields? (omit data_hex to slim rows). Returns meta + next_cursor + revision.",
       "input_schema": {
         "properties": {

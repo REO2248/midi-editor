@@ -1699,6 +1699,11 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             })),
         ),
         spec(
+            "get_instruments",
+            "Instrument context: detected synth mode (gm1/gm2/gs/xg from reset SysEx) + every program change with effective bank MSB/LSB and friendly name (GM table; GS/XG drum kits on channel 10). Names are display-only — unknown banks return null names and stay numeric. No args.",
+            object_schema(serde_json::json!({})),
+        ),
+        spec(
             "remove_events",
                 "Delete events by id (lane/event-list deletes). Args: ids: [event-id]. Optional base_revision.",
                 object_schema(serde_json::json!({
@@ -2880,6 +2885,21 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
             };
             let ops = sh.doc.update_rpn_param_ops(&entry, pm as u8, pl as u8);
             apply_ops(&mut sh, "update rpn param", ops)
+        }
+        "get_instruments" => {
+            let mode = sh.doc.synth_mode();
+            let pcs = sh.doc.program_changes();
+            ok_json(serde_json::json!({
+                "mode": mode.map(|m| m.label()),
+                "count": pcs.len(),
+                "programs": pcs.iter().map(|p| serde_json::json!({
+                    "track": p.track, "channel": p.channel + 1, "tick": p.tick,
+                    "bank_msb": p.bank_msb, "bank_lsb": p.bank_lsb,
+                    "program": p.program,
+                    "name": sh.doc.program_name(p),
+                    "id": p.id,
+                })).collect::<Vec<_>>(),
+            }))
         }
         "set_tempo" => {
             if let Some(r) = check_base(&sh, args) {
@@ -5035,6 +5055,31 @@ mod tests {
         assert!(!err);
         let (err, v) = call(&sh, "get_rpn", json!({}));
         assert!(!err && v["count"] == 2);
+    }
+
+    #[test]
+    fn instruments_report_mode_and_names() {
+        let sh = shared();
+        // inject: GS reset + bank-select pair + PC on ch1, PC on ch10
+        let (err, _) = call(
+            &sh,
+            "apply_patch",
+            json!({"ops": [{"op": "insert_events", "track": 1, "events": [
+                {"tick": 0, "kind": {"sysex_hex": "41 10 42 12 40 00 7f 00 41 f7"}},
+                {"tick": 0, "kind": {"channel": {"status": 176, "data": [0, 0]}}},
+                {"tick": 0, "kind": {"channel": {"status": 176, "data": [32, 0]}}},
+                {"tick": 10, "kind": {"channel": {"status": 192, "data": [24]}}},
+                {"tick": 20, "kind": {"channel": {"status": 201, "data": [0]}}},
+            ]}]}),
+        );
+        assert!(!err);
+        let (err, v) = call(&sh, "get_instruments", json!({}));
+        assert!(!err);
+        assert_eq!(v["mode"], "GS");
+        assert_eq!(v["count"], 2);
+        assert_eq!(v["programs"][0]["name"], "GS: Acoustic Guitar (nylon)");
+        assert_eq!(v["programs"][1]["name"], "Standard Kit #0");
+        assert_eq!(v["programs"][1]["channel"], 10);
     }
 
     #[test]
