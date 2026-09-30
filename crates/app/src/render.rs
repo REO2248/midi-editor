@@ -97,6 +97,16 @@ impl Render for EditorView {
             format!("{bar}.{beat}.{:>3}", playhead_tick % ppq)
         };
 
+        // playhead follow — suspended while a drag is live or the user just
+        // scrolled manually (`follow_hold`)
+        if self.playback.is_some()
+            && self.follow != Follow::Off
+            && self.drag.is_none()
+            && !self.follow_hold.is_some_and(|t| t > std::time::Instant::now())
+        {
+            self.follow_playhead(playhead_tick);
+        }
+
         // --- piano roll canvas -------------------------------------------------
         let notes = self.notes.clone();
         let (scroll_x, scroll_y, zoom) = (self.scroll_x, self.scroll_y, self.zoom);
@@ -1118,6 +1128,8 @@ impl Render for EditorView {
                     } else {
                         this.scroll_x = (this.scroll_x + d.x.to_f64() as f32).max(0.0);
                         this.scroll_y = (this.scroll_y + d.y.to_f64() as f32).max(0.0);
+                        // manual pan pauses playhead-follow briefly
+                        this.follow_hold = Some(std::time::Instant::now() + FOLLOW_HOLD);
                     }
                     this.clamp_scroll();
                     cx.notify();
@@ -1773,6 +1785,111 @@ impl Render for EditorView {
                     )
                     .into_any_element(),
                     Self::msep().into_any_element(),
+                    Self::mi(
+                        "v.follow_off",
+                        t("view.follow_off"),
+                        "",
+                        Some(self.follow == Follow::Off),
+                        cx,
+                        |v, _e, _cx| {
+                            v.follow = Follow::Off;
+                            v.follow_hold = None;
+                            v.persist();
+                        },
+                    )
+                    .into_any_element(),
+                    Self::mi(
+                        "v.follow_page",
+                        t("view.follow_page"),
+                        "",
+                        Some(self.follow == Follow::Page),
+                        cx,
+                        |v, _e, _cx| {
+                            v.follow = Follow::Page;
+                            v.follow_hold = None;
+                            v.persist();
+                        },
+                    )
+                    .into_any_element(),
+                    Self::mi(
+                        "v.follow_smooth",
+                        t("view.follow_smooth"),
+                        "",
+                        Some(self.follow == Follow::Smooth),
+                        cx,
+                        |v, _e, _cx| {
+                            v.follow = Follow::Smooth;
+                            v.follow_hold = None;
+                            v.persist();
+                        },
+                    )
+                    .into_any_element(),
+                    Self::msep().into_any_element(),
+                    Self::mi(
+                        "v.zsel",
+                        t("view.zoom_sel"),
+                        "Z",
+                        None,
+                        cx,
+                        |v, _e, cx| v.zoom_to_selection(cx),
+                    )
+                    .into_any_element(),
+                    Self::mi(
+                        "v.zsong",
+                        t("view.zoom_song"),
+                        "Shift+Z",
+                        None,
+                        cx,
+                        |v, _e, cx| v.zoom_to_song(cx),
+                    )
+                    .into_any_element(),
+                    Self::msep().into_any_element(),
+                    Self::mi(
+                        "v.goplay",
+                        t("view.go_playhead"),
+                        "G",
+                        None,
+                        cx,
+                        |v, _e, cx| v.go_playhead(cx),
+                    )
+                    .into_any_element(),
+                    Self::mi(
+                        "v.mkprev",
+                        t("view.marker_prev"),
+                        ",",
+                        None,
+                        cx,
+                        |v, _e, cx| v.marker_step(-1, cx),
+                    )
+                    .into_any_element(),
+                    Self::mi(
+                        "v.mknext",
+                        t("view.marker_next"),
+                        ".",
+                        None,
+                        cx,
+                        |v, _e, cx| v.marker_step(1, cx),
+                    )
+                    .into_any_element(),
+                    Self::mi(
+                        "v.evprev",
+                        t("view.event_prev"),
+                        "Shift+,",
+                        None,
+                        cx,
+                        |v, _e, cx| v.event_step(-1, cx),
+                    )
+                    .into_any_element(),
+                    Self::mi(
+                        "v.evnext",
+                        t("view.event_next"),
+                        "Shift+.",
+                        None,
+                        cx,
+                        |v, _e, cx| v.event_step(1, cx),
+                    )
+                    .into_any_element(),
+                    Self::msep().into_any_element(),
                     Self::mi_sub("v.lane", t("view.lane"), Sub::Lane, cx).into_any_element(),
                     Self::mi_sub("v.enc", t("view.encoding"), Sub::Enc, cx).into_any_element(),
                 ],
@@ -2375,7 +2492,7 @@ impl Render for EditorView {
 
         // shortcuts overlay (F1 / Help > Keyboard Shortcuts)
         let help_layer = self.help_open.then(|| {
-            const ROWS: [(&str, &str); 21] = [
+            const ROWS: [(&str, &str); 25] = [
                 ("Space", "Play / stop"),
                 ("F1", "This panel"),
                 ("Esc", "Close menus / clear selection"),
@@ -2396,6 +2513,10 @@ impl Render for EditorView {
                 ("Double-click ruler", "Play from here"),
                 ("Click minimap", "Jump to position"),
                 ("Ctrl+wheel", "Zoom timeline"),
+                ("Z / Shift+Z", "Zoom to selection / song"),
+                ("G", "Go to playhead (resumes follow)"),
+                (", / .", "Previous / next marker"),
+                ("Shift+, / .", "Previous / next event"),
                 ("Drag .mid file", "Drop to open"),
             ];
             let panel = div()
@@ -2735,6 +2856,13 @@ impl Render for EditorView {
                     (false, false, "1") => this.set_tool(Tool::Select, cx),
                     (false, false, "2") => this.set_tool(Tool::Draw, cx),
                     (false, false, "3") => this.set_tool(Tool::Erase, cx),
+                    (false, false, "z") => this.zoom_to_selection(cx),
+                    (false, true, "z") => this.zoom_to_song(cx),
+                    (false, false, "g") => this.go_playhead(cx),
+                    (false, false, ",") => this.marker_step(-1, cx),
+                    (false, false, ".") => this.marker_step(1, cx),
+                    (false, true, ",") => this.event_step(-1, cx),
+                    (false, true, ".") => this.event_step(1, cx),
                     (false, false, " ") => this.toggle_play(cx),
                     _ => {}
                 }
