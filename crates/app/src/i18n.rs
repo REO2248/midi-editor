@@ -365,6 +365,13 @@ static EN: &[(&str, &str)] = &[
     ("a11y.sig", "Time signature {sig}"),
     ("a11y.rename", "Rename selected track"),
     ("a11y.enc", "Text encoding: {enc}"),
+    // focused region names (status bar)
+    ("focus.label", "focus"),
+    ("focus.menubar", "menu bar"),
+    ("focus.tracks", "tracks"),
+    ("focus.roll", "piano roll"),
+    ("focus.lane", "lane"),
+    ("focus.events", "event list"),
 ];
 
 static JA: &[(&str, &str)] = &[
@@ -708,6 +715,13 @@ static JA: &[(&str, &str)] = &[
     ("a11y.sig", "拍子 {sig}"),
     ("a11y.rename", "選択トラック名を変更"),
     ("a11y.enc", "テキストエンコーディング: {enc}"),
+    // フォーカス中の領域名(ステータスバー)
+    ("focus.label", "フォーカス"),
+    ("focus.menubar", "メニューバー"),
+    ("focus.tracks", "トラック"),
+    ("focus.roll", "ピアノロール"),
+    ("focus.lane", "レーン"),
+    ("focus.events", "イベントリスト"),
 ];
 
 fn detect_lang() -> &'static str {

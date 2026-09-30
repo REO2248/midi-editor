@@ -7,6 +7,7 @@ use crate::a11y;
 use crate::geometry::{drag_window, tick_window, ZOOM_MAX, ZOOM_MIN};
 use crate::i18n::{t, tf};
 use crate::icons::icon;
+use crate::menu::{LeafRow, MenuRow, MENUS};
 use crate::theme::metrics;
 use crate::*;
 use gpui_kit::base::{ObservedElement, TestSupportExt};
@@ -58,6 +59,25 @@ impl Render for EditorView {
         let th = self.theme;
         // chrome helpers (menus, chips, icon buttons) read the same palette
         theme::set_current(th);
+        // a hidden region must never hold keyboard focus
+        self.repair_focus(window, cx);
+        // `sel_track` can outlive its track if an MCP edit removed it
+        let n_tracks = self.doc(|d| d.tracks.len());
+        if n_tracks > 0 {
+            self.sel_track = self.sel_track.min(n_tracks - 1);
+        }
+        let area = self.area(window, cx);
+        // remember the last working region — menu commands restore focus to it
+        if area != FocusArea::MenuBar {
+            self.last_area = area;
+        }
+        // menu models rebuild every frame while open; drop them when closed
+        if self.open_menu.is_none() {
+            self.menu_rows.clear();
+            self.sub_rows.clear();
+            self.menu_sel = None;
+            self.sub_sel = None;
+        }
         // keep both scroll axes inside the content (resizes, zooms, edits all
         // self-heal here) and edge-scroll while a drag is parked at a border;
         // `panning` keeps animation frames flowing only while it actually moves
@@ -206,6 +226,12 @@ impl Render for EditorView {
                 }
             },
         );
+        // keyboard edit cursor — only when the roll context owns focus and no
+        // note selection exists (a selection is itself the edit target)
+        let show_cursor = area == FocusArea::Roll && self.selection.is_empty();
+        let cursor_t = self.cursor_tick;
+        let cursor_k = self.cursor_key;
+        let cursor_len = self.cursor_insert_len();
 
         let roll = canvas(
             move |bounds, _window, _cx| {
@@ -353,6 +379,31 @@ impl Render for EditorView {
                         rgb(0x50ff9f),
                     ));
                 }
+                // edit cursor — marks where Enter inserts / where keys edit;
+                // folded out keys (row -1) paint nothing
+                if show_cursor {
+                    let cur_row = if (0..=127).contains(&cursor_k) {
+                        row_of[cursor_k as usize]
+                    } else {
+                        -1
+                    };
+                    if cur_row >= 0 {
+                        let cx0 = bounds.origin.x + px(cursor_t as f32 * zoom - scroll_x);
+                        let cy0 =
+                            bounds.origin.y + px(cur_row as f32 * note_h - scroll_y) + px(1.0);
+                        let cw = (cursor_len as f32 * zoom).max(3.0);
+                        let ch = (note_h - 2.0).max(1.0);
+                        window.paint_quad(outline(
+                            Bounds::new(point(cx0, cy0), size(px(cw), px(ch))),
+                            rgb(ACCENT),
+                            BorderStyle::Solid,
+                        ));
+                        window.paint_quad(fill(
+                            Bounds::new(point(cx0 + px(cw) + px(1.0), cy0), size(px(1.5), px(ch))),
+                            rgb(ACCENT),
+                        ));
+                    }
+                }
                 // marquee rubber band — corners are keys from hit(); paint
                 // in row space so the band matches what commit_drag selects
                 if let Some((a_t, a_k, b_t, b_k)) = marquee {
@@ -393,15 +444,7 @@ impl Render for EditorView {
 
         // --- menu bar -----------------------------------------------------------
         let open_menu = self.open_menu;
-        let menus: [(TopMenu, &str, f32); 7] = [
-            (TopMenu::File, "menu.file", 46.0),
-            (TopMenu::Edit, "menu.edit", 46.0),
-            (TopMenu::View, "menu.view", 52.0),
-            (TopMenu::Track, "menu.track", 58.0),
-            (TopMenu::Output, "menu.output", 62.0),
-            (TopMenu::Transport, "menu.transport", 90.0),
-            (TopMenu::Help, "menu.help", 50.0),
-        ];
+        let menu_focused = area == FocusArea::MenuBar;
         let mut menu_bar = div()
             .id("menu-bar")
             .test_support()
@@ -414,8 +457,37 @@ impl Render for EditorView {
             .pr_3()
             .bg(rgb(BG_BAR))
             .border_b_1()
-            .border_color(rgb(th.border))
+            .border_color(rgb(if menu_focused { th.accent } else { th.border }))
             .text_size(px(metrics::TEXT_LG))
+            .track_focus(&self.menu_fh)
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+                // open menus are driven by the root handler
+                if this.open_menu.is_some() {
+                    return;
+                }
+                match ev.keystroke.key.as_str() {
+                    "left" | "right" => {
+                        let d: usize = if ev.keystroke.key == "left" {
+                            MENUS.len() - 1
+                        } else {
+                            1
+                        };
+                        this.menu_bar_sel = (this.menu_bar_sel + d) % MENUS.len();
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                    "down" | "enter" | " " => {
+                        let m = MENUS[this.menu_bar_sel.min(MENUS.len() - 1)].0;
+                        this.open_menu_at(m, cx);
+                        cx.stop_propagation();
+                    }
+                    "escape" => {
+                        w.focus(&this.roll_fh, cx);
+                        cx.stop_propagation();
+                    }
+                    _ => {}
+                }
+            }))
             .child(
                 div()
                     .w(px(96.0))
@@ -425,8 +497,12 @@ impl Render for EditorView {
                     .child(t("app.title")),
             );
         let mut mx = 96.0f32;
-        for (m, key, w) in menus {
+        for (i, (m, key, w)) in MENUS.iter().enumerate() {
+            let m = *m;
+            let key = *key;
+            let w = *w;
             let is_open = open_menu.map(|(mm, _)| mm) == Some(m);
+            let bar_sel = menu_focused && i == self.menu_bar_sel;
             menu_bar = menu_bar.child(
                 div()
                     .id(key)
@@ -441,13 +517,27 @@ impl Render for EditorView {
                     .justify_center()
                     .cursor_pointer()
                     .rounded_sm()
-                    .bg(if is_open { rgb(BG_RAISED) } else { rgb(BG_BAR) })
-                    .text_color(rgb(if is_open { 0xffffff } else { 0x9a9ab0 }))
+                    .bg(if is_open || bar_sel {
+                        rgb(BG_RAISED)
+                    } else {
+                        rgb(BG_BAR)
+                    })
+                    .text_color(rgb(if is_open || bar_sel {
+                        0xffffff
+                    } else {
+                        0x9a9ab0
+                    }))
                     .hover(|s| s.bg(rgb(0x1d1d28)))
                     .child(t(key))
-                    .on_click(cx.listener(move |v, _e, _w, cx| {
-                        v.open_menu = if is_open { None } else { Some((m, mx)) };
-                        v.open_sub = None;
+                    .on_click(cx.listener(move |v, _e, w, cx| {
+                        w.focus(&v.menu_fh, cx);
+                        v.menu_bar_sel = i;
+                        if is_open {
+                            v.open_menu = None;
+                            v.open_sub = None;
+                        } else {
+                            v.open_menu_at(m, cx);
+                        }
                         cx.notify();
                     }))
                     .on_mouse_move(cx.listener(move |v, _e, _w, cx| {
@@ -455,6 +545,9 @@ impl Render for EditorView {
                         if v.open_menu.is_some() && v.open_menu.map(|(mm, _)| mm) != Some(m) {
                             v.open_menu = Some((m, mx));
                             v.open_sub = None;
+                            v.menu_sel = None;
+                            v.sub_sel = None;
+                            v.menu_bar_sel = i;
                             cx.notify();
                         }
                     })),
@@ -915,6 +1008,7 @@ impl Render for EditorView {
                 })
             }));
         // --- event list: right-docked panel -------------------------------------
+        let events_focused = area == FocusArea::Events;
         let events_panel = div()
             .id("events-panel")
             .test_support()
@@ -926,7 +1020,24 @@ impl Render for EditorView {
             .flex_col()
             .bg(rgb(BG_PANEL))
             .border_l_1()
-            .border_color(rgb(BORDER_C))
+            .border_color(rgb(if events_focused { ACCENT } else { BORDER_C }))
+            .track_focus(&self.events_fh)
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| {
+                if this.open_menu.is_some() {
+                    return;
+                }
+                match ev.keystroke.key.as_str() {
+                    "up" => this.ev_step(-1, cx),
+                    "down" => this.ev_step(1, cx),
+                    "pageup" => this.ev_step(-20, cx),
+                    "pagedown" => this.ev_step(20, cx),
+                    "home" => this.ev_step(i64::MIN, cx),
+                    "end" => this.ev_step(i64::MAX, cx),
+                    "enter" => this.ev_activate(cx),
+                    _ => return,
+                }
+                cx.stop_propagation();
+            }))
             .child(
                 div()
                     .flex()
@@ -971,6 +1082,8 @@ impl Render for EditorView {
                 let events = self.events.clone();
                 let refs = self.event_refs.clone();
                 let sel = self.sel_events.clone();
+                let ev_sel = self.ev_sel;
+                let ev_focused = area == FocusArea::Events;
                 let view = cx.entity();
                 div()
                     .id("events-list")
@@ -986,30 +1099,33 @@ impl Render for EditorView {
                                     let selected = refs[i]
                                         .map(|(_, _, id)| sel.contains(&id))
                                         .unwrap_or(false);
+                                    let cur = i == ev_sel;
                                     let view = view.clone();
                                     div()
                                         .id(("ev", i))
                                         .test_support()
                                         .role(Role::ListItem)
-                                        .aria_label(events[i].clone())
+                                        .aria_label(events[i].text.clone())
                                         .h(px(18.0))
                                         .px_2()
                                         .text_size(px(metrics::TEXT_MD))
                                         .font_family("Cascadia Mono")
-                                        .text_color(if selected {
+                                        .text_color(if selected || cur {
                                             rgb(0xffffff)
                                         } else {
                                             rgb(th.events_text)
                                         })
                                         .bg(if selected {
                                             rgba(0x4f8cff44)
+                                        } else if cur && ev_focused {
+                                            rgba(0xffffff14)
                                         } else {
                                             rgba(0x00000000)
                                         })
                                         .cursor_pointer()
                                         .hover(|s| s.bg(rgba(0xffffff12)))
-                                        .child(events[i].clone())
-                                        .on_mouse_down(MouseButton::Left, move |ev, _w, cx| {
+                                        .child(events[i].text.clone())
+                                        .on_mouse_down(MouseButton::Left, move |ev, w, cx| {
                                             view.update(cx, |this, cx| {
                                                 this.ev_row_click(
                                                     i,
@@ -1017,12 +1133,14 @@ impl Render for EditorView {
                                                     ev.modifiers.shift,
                                                     cx,
                                                 );
+                                                w.focus(&this.events_fh, cx);
                                             });
                                         })
                                 })
                                 .collect()
                         })
-                        .h_full(),
+                        .h_full()
+                        .track_scroll(&self.events_scroll),
                     )
             })
             .child(self.prop_panel(cx));
@@ -1030,6 +1148,7 @@ impl Render for EditorView {
         let body = div().flex().flex_1().min_h(px(0.0));
 
         // --- track column: select / mute / solo -------------------------------
+        let tracks_focused = area == FocusArea::Tracks;
         let track_col = div()
             .w(px(150.0))
             .h_full()
@@ -1037,7 +1156,40 @@ impl Render for EditorView {
             .flex_col()
             .bg(rgb(0x1b1b24))
             .border_r_1()
-            .border_color(rgb(BORDER_C))
+            .border_color(rgb(if tracks_focused { ACCENT } else { BORDER_C }))
+            .track_focus(&self.tracks_fh)
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+                if this.open_menu.is_some() {
+                    return;
+                }
+                // the rename input inside this column owns its keys; Enter /
+                // Escape are handled at the root
+                if this.input.read(cx).focus_handle(cx).is_focused(w) {
+                    return;
+                }
+                let i = this.sel_track;
+                match ev.keystroke.key.as_str() {
+                    "up" => this.track_step(-1, cx),
+                    "down" => this.track_step(1, cx),
+                    "home" => {
+                        this.sel_track = 0;
+                        cx.notify();
+                    }
+                    "end" => {
+                        let n = this.doc(|d| d.tracks.len());
+                        if n > 0 {
+                            this.sel_track = n - 1;
+                        }
+                        cx.notify();
+                    }
+                    "m" => this.toggle_mute(i),
+                    "s" => this.toggle_solo(i),
+                    "c" => this.cycle_chan(i),
+                    "enter" | "f2" => this.focus_rename(w, cx),
+                    _ => return,
+                }
+                cx.stop_propagation();
+            }))
             .child(
                 div()
                     .px_2()
@@ -1102,10 +1254,11 @@ impl Render for EditorView {
                             .cursor_pointer()
                             .bg(if sel { rgb(0x2a2a3a) } else { rgb(0x1b1b24) })
                             .hover(|s| s.bg(rgb(0x252532)))
-                            .on_click(cx.listener(move |v, _e, _w, cx| {
+                            .on_click(cx.listener(move |v, _e, w, cx| {
                                 // format 2: this click also picks the
                                 // sequence being viewed/played
                                 v.select_track(i, cx);
+                                w.focus(&v.tracks_fh, cx);
                             }))
                             .child(div().w(px(10.0)).h(px(10.0)).rounded_sm().bg(rgb(if muted {
                                 0x555560
@@ -1140,15 +1293,10 @@ impl Render for EditorView {
                                     .px_1()
                                     .text_size(px(9.0))
                                     .text_color(rgb(if muted { 0xffb454 } else { 0x707080 }))
-                                    .on_click(cx.listener(move |v, _e: &ClickEvent, _w, cx| {
+                                    .on_click(cx.listener(move |v, _e: &ClickEvent, w, cx| {
                                         cx.stop_propagation();
-                                        {
-                                            let mut sh = crate::lock_shared(&v.shared);
-                                            if !sh.muted.remove(&i) {
-                                                sh.muted.insert(i);
-                                            }
-                                        }
-                                        v.persist();
+                                        v.toggle_mute(i);
+                                        w.focus(&v.tracks_fh, cx);
                                         cx.notify();
                                     }))
                                     .child("M"),
@@ -1167,15 +1315,10 @@ impl Render for EditorView {
                                     .px_1()
                                     .text_size(px(9.0))
                                     .text_color(rgb(if soloed { 0xffd24f } else { 0x707080 }))
-                                    .on_click(cx.listener(move |v, _e: &ClickEvent, _w, cx| {
+                                    .on_click(cx.listener(move |v, _e: &ClickEvent, w, cx| {
                                         cx.stop_propagation();
-                                        {
-                                            let mut sh = crate::lock_shared(&v.shared);
-                                            if !sh.soloed.remove(&i) {
-                                                sh.soloed.insert(i);
-                                            }
-                                        }
-                                        v.persist();
+                                        v.toggle_solo(i);
+                                        w.focus(&v.tracks_fh, cx);
                                         cx.notify();
                                     }))
                                     .child("S"),
@@ -1197,19 +1340,10 @@ impl Render for EditorView {
                                     .px_1()
                                     .text_size(px(9.0))
                                     .text_color(rgb(0x7070a0))
-                                    .on_click(cx.listener(move |v, _e: &ClickEvent, _w, cx| {
+                                    .on_click(cx.listener(move |v, _e: &ClickEvent, w, cx| {
                                         cx.stop_propagation();
-                                        let ops = {
-                                            let mut sh = crate::lock_shared(&v.shared);
-                                            let cur = sh
-                                                .doc
-                                                .tracks
-                                                .get(i)
-                                                .map(|t| t.out_channel)
-                                                .unwrap_or(0);
-                                            sh.doc.set_track_channel_ops(i, (cur + 1) % 16)
-                                        };
-                                        v.apply_tx("set track channel", ops);
+                                        v.cycle_chan(i);
+                                        w.focus(&v.tracks_fh, cx);
                                         cx.notify();
                                     }))
                                     .child(format!(
@@ -1236,12 +1370,7 @@ impl Render for EditorView {
                         t("a11y.rename"),
                         cx,
                         |v, _e, cx| {
-                            let name = v.input.read(cx).value().to_string();
-                            let ops = {
-                                let mut sh = crate::lock_shared(&v.shared);
-                                sh.doc.set_track_name_ops(v.sel_track, &name)
-                            };
-                            v.apply_tx("set track name", ops);
+                            v.apply_rename(cx);
                             cx.notify();
                         },
                     )),
@@ -1520,7 +1649,8 @@ impl Render for EditorView {
                         .child(minimap.size_full())
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
+                            cx.listener(|this, ev: &MouseDownEvent, w, cx| {
+                                w.focus(&this.roll_fh, cx);
                                 this.seek_minimap(f32::from(ev.position.x));
                                 cx.notify();
                             }),
@@ -1566,7 +1696,8 @@ impl Render for EditorView {
                         .child(ruler.size_full())
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
+                            cx.listener(|this, ev: &MouseDownEvent, w, cx| {
+                                w.focus(&this.roll_fh, cx);
                                 let b = this.ruler_bounds.get();
                                 let x = f32::from(ev.position.x) - f32::from(b.origin.x);
                                 let tick = ((x + this.scroll_x) / this.zoom).max(0.0) as u64;
@@ -1693,7 +1824,7 @@ impl Render for EditorView {
                                     MouseButton::Left,
                                     cx.listener(|this, ev: &MouseDownEvent, w, cx| {
                                         cx.stop_propagation();
-                                        w.focus(&this.focus, cx);
+                                        w.focus(&this.roll_fh, cx);
                                         this.mouse_pos = Some(ev.position);
                                         if let Some(k) = this.kbd_key(ev.position) {
                                             let ch = this.sel_track_ch();
@@ -1758,6 +1889,24 @@ impl Render for EditorView {
                                 .h_full()
                                 .relative()
                                 .overflow_hidden()
+                                .border_1()
+                                .border_color(if area == FocusArea::Roll {
+                                    rgb(ACCENT)
+                                } else {
+                                    rgba(0x00000000)
+                                })
+                                .track_focus(&self.roll_fh)
+                                .on_key_down(cx.listener(
+                                    |this, ev: &KeyDownEvent, _w, cx| {
+                                        if this.open_menu.is_some() {
+                                            return;
+                                        }
+                                        if ev.keystroke.key == "enter" {
+                                            this.cursor_activate(cx);
+                                            cx.stop_propagation();
+                                        }
+                                    },
+                                ))
                                 .child(roll.size_full())
                                 // drum view: GM names on the folded rows'
                                 // left edge
@@ -1793,7 +1942,7 @@ impl Render for EditorView {
                         .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, ev: &MouseDownEvent, w, cx| {
-                        w.focus(&this.focus, cx);
+                        w.focus(&this.roll_fh, cx);
                         this.mouse_pos = Some(ev.position);
                         let shift = ev.modifiers.shift;
                         // erase tool: any note under the cursor joins the stroke
@@ -1974,8 +2123,38 @@ impl Render for EditorView {
                         .w_full()
                         .bg(rgb(0x14141a))
                         .border_t_1()
-                        .border_color(rgb(0x2a2a35))
+                        .border_color(rgb(if area == FocusArea::Lane {
+                            ACCENT
+                        } else {
+                            0x2a2a35
+                        }))
                         .relative()
+                        .track_focus(&self.lane_fh)
+                        .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| {
+                            if this.open_menu.is_some() {
+                                return;
+                            }
+                            let shift = ev.keystroke.modifiers.shift;
+                            match (shift, ev.keystroke.key.as_str()) {
+                                // left/right share the roll's edit cursor
+                                (false, "left") => this.cursor_move(-this.snap_ticks(), 0, cx),
+                                (false, "right") => this.cursor_move(this.snap_ticks(), 0, cx),
+                                (true, "left") => this.cursor_move(-1, 0, cx),
+                                (true, "right") => this.cursor_move(1, 0, cx),
+                                // up/down edit velocities of selected notes
+                                (false, "up") => this.nudge_vel(8, cx),
+                                (false, "down") => this.nudge_vel(-8, cx),
+                                (true, "up") => this.nudge_vel(1, cx),
+                                (true, "down") => this.nudge_vel(-1, cx),
+                                (false, "v") => {
+                                    this.lane_mode = this.lane_mode.cycle();
+                                    this.persist();
+                                    cx.notify();
+                                }
+                                _ => return,
+                            }
+                            cx.stop_propagation();
+                        }))
                         .child(lane.size_full())
                         .child(
                             // lane-mode chip: Vel -> CC1 -> CC7 -> CC10 ->
@@ -2008,12 +2187,14 @@ impl Render for EditorView {
                         )
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
+                            cx.listener(|this, ev: &MouseDownEvent, w, cx| {
+                                w.focus(&this.lane_fh, cx);
                                 this.mouse_pos = Some(ev.position);
                                 let b = this.lane_bounds.get();
                                 let x = f32::from(ev.position.x) - f32::from(b.origin.x);
                                 let y = f32::from(ev.position.y) - f32::from(b.origin.y);
                                 let tick = ((x + this.scroll_x) / this.zoom).max(0.0) as u64;
+                                this.cursor_tick = tick; // share the roll's edit cursor
                                 let h = f32::from(b.size.height);
                                 match this.lane_mode {
                                     LaneMode::Velocity => {
@@ -2228,6 +2409,12 @@ impl Render for EditorView {
                         cx.new(|_| Tip(tip.into())).into()
                     })
             })
+            .child(
+                div()
+                    .text_color(rgb(0x77778a))
+                    .whitespace_nowrap()
+                    .child(format!("{}: {}", t("focus.label"), t(area.key()))),
+            )
             .child(Self::chip(
                 "st-lane",
                 lane_mode.label(),
@@ -2277,37 +2464,31 @@ impl Render for EditorView {
 
         // --- open menu dropdown --------------------------------------------------
         let menu_layer = self.open_menu.map(|(m, mx)| {
-            let items: Vec<AnyElement> = match m {
+            let items: Vec<MenuRow> = match m {
                 TopMenu::File => vec![
                     Self::mi("f.new", t("menu.new"), "", None, cx, |v, w, cx| {
                         v.confirm_discard_or_save(PendingAction::NewFile, w, cx);
-                    })
-                    .into_any_element(),
+                    }),
                     Self::mi("f.open", t("menu.open"), "Ctrl+O", None, cx, |v, w, cx| {
                         v.confirm_discard_or_save(PendingAction::OpenDialog, w, cx);
-                    })
-                    .into_any_element(),
-                    Self::mi_sub("f.recent", t("menu.recent"), Sub::Recent, cx).into_any_element(),
-                    Self::msep("ms1").into_any_element(),
+                    }),
+                    Self::mi_sub("f.recent", t("menu.recent"), Sub::Recent, cx),
+                    Self::msep(),
                     Self::mi("f.save", t("menu.save"), "Ctrl+S", None, cx, |v, _e, cx| {
                         v.save(cx);
-                    })
-                    .into_any_element(),
+                    }),
                     Self::mi("f.savas", t("menu.save_as"), "", None, cx, |v, _e, cx| {
                         v.save_as(cx);
-                    })
-                    .into_any_element(),
+                    }),
                 ],
                 TopMenu::Edit => vec![
                     Self::mi("e.undo", t("menu.undo"), "Ctrl+Z", None, cx, |v, _e, cx| {
                         v.undo(cx);
-                    })
-                    .into_any_element(),
+                    }),
                     Self::mi("e.redo", t("menu.redo"), "Ctrl+Y", None, cx, |v, _e, cx| {
                         v.redo(cx);
-                    })
-                    .into_any_element(),
-                    Self::msep("ms2").into_any_element(),
+                    }),
+                    Self::msep(),
                     Self::mi(
                         "e.selall",
                         t("menu.select_all"),
@@ -2317,17 +2498,14 @@ impl Render for EditorView {
                         |v, _e, cx| {
                             v.select_all(cx);
                         },
-                    )
-                    .into_any_element(),
-                    Self::msep("ms3").into_any_element(),
+                    ),
+                    Self::msep(),
                     Self::mi("e.cut", t("edit.cut"), "Ctrl+X", None, cx, |v, _e, cx| {
                         v.copy_selected(true, cx);
-                    })
-                    .into_any_element(),
+                    }),
                     Self::mi("e.copy", t("edit.copy"), "Ctrl+C", None, cx, |v, _e, cx| {
                         v.copy_selected(false, cx);
-                    })
-                    .into_any_element(),
+                    }),
                     Self::mi(
                         "e.paste",
                         t("edit.paste"),
@@ -2337,8 +2515,7 @@ impl Render for EditorView {
                         |v, _e, cx| {
                             v.paste(cx);
                         },
-                    )
-                    .into_any_element(),
+                    ),
                     Self::mi(
                         "e.dup",
                         t("edit.duplicate"),
@@ -2348,17 +2525,15 @@ impl Render for EditorView {
                         |v, _e, cx| {
                             v.duplicate_selected(cx);
                         },
-                    )
-                    .into_any_element(),
+                    ),
                     Self::mi("e.del", t("menu.delete"), "Del", None, cx, |v, _e, cx| {
                         v.delete_selected(cx);
-                    })
-                    .into_any_element(),
-                    Self::msep("ms4").into_any_element(),
-                    Self::mi_sub("e.tool", t("edit.tool"), Sub::Tool, cx).into_any_element(),
-                    Self::mi_sub("e.snap", t("edit.snap"), Sub::Snap, cx).into_any_element(),
-                    Self::msep("ms5").into_any_element(),
-                    Self::mi_sub("e.quant", t("edit.quantize"), Sub::Quant, cx).into_any_element(),
+                    }),
+                    Self::msep(),
+                    Self::mi_sub("e.tool", t("edit.tool"), Sub::Tool, cx),
+                    Self::mi_sub("e.snap", t("edit.snap"), Sub::Snap, cx),
+                    Self::msep(),
+                    Self::mi_sub("e.quant", t("edit.quantize"), Sub::Quant, cx),
                     Self::mi(
                         "e.trup",
                         t("edit.transpose_up"),
@@ -2370,8 +2545,7 @@ impl Render for EditorView {
                                 d.transpose_ops(t, f, to, 1)
                             });
                         },
-                    )
-                    .into_any_element(),
+                    ),
                     Self::mi(
                         "e.trdn",
                         t("edit.transpose_dn"),
@@ -2383,27 +2557,23 @@ impl Render for EditorView {
                                 d.transpose_ops(t, f, to, -1)
                             });
                         },
-                    )
-                    .into_any_element(),
-                    Self::mi_sub("e.oct", t("edit.octave"), Sub::Oct, cx).into_any_element(),
-                    Self::msep("ms6").into_any_element(),
+                    ),
+                    Self::mi_sub("e.oct", t("edit.octave"), Sub::Oct, cx),
+                    Self::msep(),
                     Self::mi("e.human", t("edit.humanize"), "", None, cx, |v, _e, _cx| {
                         v.apply_region_op("humanize", |d, t, f, to| {
                             // revision as seed: identical ops replay the same
                             // take; a different doc state reseeds the jitter
                             d.humanize_ops(t, f, to, 12, 8, d.revision())
                         });
-                    })
-                    .into_any_element(),
+                    }),
                     Self::mi("e.split", t("edit.split"), "", None, cx, |v, _e, cx| {
                         v.split_at_playhead(cx);
-                    })
-                    .into_any_element(),
-                    Self::mi_sub("e.swing", t("edit.swing"), Sub::Swing, cx).into_any_element(),
+                    }),
+                    Self::mi_sub("e.swing", t("edit.swing"), Sub::Swing, cx),
                     Self::mi("e.join", t("edit.join"), "", None, cx, |v, _e, _cx| {
                         v.apply_region_op("join", |d, t, f, to| d.join_ops(t, f, to));
-                    })
-                    .into_any_element(),
+                    }),
                     Self::mi(
                         "e.fixov",
                         t("edit.fix_overlaps"),
@@ -2415,28 +2585,22 @@ impl Render for EditorView {
                                 d.fix_overlaps_ops(t, f, to)
                             });
                         },
-                    )
-                    .into_any_element(),
-                    Self::mi_sub("e.legato", t("edit.legato"), Sub::LegatoGap, cx)
-                        .into_any_element(),
-                    Self::mi_sub("e.len", t("edit.set_length"), Sub::LenSet, cx).into_any_element(),
-                    Self::mi_sub("e.velset", t("edit.set_velocity"), Sub::VelSet, cx)
-                        .into_any_element(),
-                    Self::mi_sub("e.relset", t("edit.set_release"), Sub::RelSet, cx)
-                        .into_any_element(),
-                    Self::msep("ms7").into_any_element(),
+                    ),
+                    Self::mi_sub("e.legato", t("edit.legato"), Sub::LegatoGap, cx),
+                    Self::mi_sub("e.len", t("edit.set_length"), Sub::LenSet, cx),
+                    Self::mi_sub("e.velset", t("edit.set_velocity"), Sub::VelSet, cx),
+                    Self::mi_sub("e.relset", t("edit.set_release"), Sub::RelSet, cx),
+                    Self::msep(),
                     Self::mi("e.velup", t("edit.vel_up"), "", None, cx, |v, _e, _cx| {
                         v.apply_region_op("vel ×1.25", |d, t, f, to| {
                             d.scale_velocity_ops(t, f, to, 1.25)
                         });
-                    })
-                    .into_any_element(),
+                    }),
                     Self::mi("e.veldn", t("edit.vel_dn"), "", None, cx, |v, _e, _cx| {
                         v.apply_region_op("vel ×0.8", |d, t, f, to| {
                             d.scale_velocity_ops(t, f, to, 0.8)
                         });
-                    })
-                    .into_any_element(),
+                    }),
                 ],
                 TopMenu::View => vec![
                     Self::mi(
@@ -2449,9 +2613,8 @@ impl Render for EditorView {
                             v.show_events = !v.show_events;
                             v.persist();
                         },
-                    )
-                    .into_any_element(),
-                    Self::mi_sub("v.theme", t("view.theme"), Sub::Theme, cx).into_any_element(),
+                    ),
+                    Self::mi_sub("v.theme", t("view.theme"), Sub::Theme, cx),
                     Self::mi(
                         "v.hc",
                         t("view.hc"),
@@ -2461,9 +2624,8 @@ impl Render for EditorView {
                         |v, _e, cx| {
                             v.toggle_hc(cx);
                         },
-                    )
-                    .into_any_element(),
-                    Self::msep("ms8").into_any_element(),
+                    ),
+                    Self::msep(),
                     Self::mi(
                         "v.zin",
                         t("view.zoom_in"),
@@ -2473,8 +2635,7 @@ impl Render for EditorView {
                         |v, _e, cx| {
                             v.zoom_by(1.3, cx);
                         },
-                    )
-                    .into_any_element(),
+                    ),
                     Self::mi(
                         "v.zout",
                         t("view.zoom_out"),
@@ -2484,8 +2645,7 @@ impl Render for EditorView {
                         |v, _e, cx| {
                             v.zoom_by(1.0 / 1.3, cx);
                         },
-                    )
-                    .into_any_element(),
+                    ),
                     Self::mi(
                         "v.z0",
                         t("view.zoom_reset"),
@@ -2495,10 +2655,9 @@ impl Render for EditorView {
                         |v, _e, cx| {
                             v.zoom_set(0.08, cx);
                         },
-                    )
-                    .into_any_element(),
-                    Self::msep("ms9").into_any_element(),
-                    Self::mi_sub("v.rowh", t("view.row_height"), Sub::RowH, cx).into_any_element(),
+                    ),
+                    Self::msep(),
+                    Self::mi_sub("v.rowh", t("view.row_height"), Sub::RowH, cx),
                     Self::mi(
                         "v.fold",
                         t("view.fold"),
@@ -2508,8 +2667,7 @@ impl Render for EditorView {
                         |v, _e, cx| {
                             v.set_fold(!v.fold, cx);
                         },
-                    )
-                    .into_any_element(),
+                    ),
                     Self::mi(
                         "v.drum",
                         t("view.drum"),
@@ -2519,20 +2677,18 @@ impl Render for EditorView {
                         |v, _e, cx| {
                             v.set_drum(!v.drum, cx);
                         },
-                    )
-                    .into_any_element(),
-                    Self::mi_sub("v.scale", t("view.scale"), Sub::Scale, cx).into_any_element(),
-                    Self::msep("ms9b").into_any_element(),
-                    Self::mi_sub("v.lane", t("view.lane"), Sub::Lane, cx).into_any_element(),
-                    Self::mi_sub("v.enc", t("view.encoding"), Sub::Enc, cx).into_any_element(),
+                    ),
+                    Self::mi_sub("v.scale", t("view.scale"), Sub::Scale, cx),
+                    Self::msep(),
+                    Self::mi_sub("v.lane", t("view.lane"), Sub::Lane, cx),
+                    Self::mi_sub("v.enc", t("view.encoding"), Sub::Enc, cx),
                 ],
                 TopMenu::Track => {
                     let mut items = vec![
                         Self::mi("t.rename", t("track.rename"), "", None, cx, |v, w, cx| {
                             v.focus_rename(w, cx);
-                        })
-                        .into_any_element(),
-                        Self::msep("ms10").into_any_element(),
+                        }),
+                        Self::msep(),
                         Self::mi(
                             "t.mute",
                             t("track.mute"),
@@ -2549,8 +2705,7 @@ impl Render for EditorView {
                                 }
                                 v.persist();
                             },
-                        )
-                        .into_any_element(),
+                        ),
                         Self::mi(
                             "t.solo",
                             t("track.solo"),
@@ -2567,72 +2722,65 @@ impl Render for EditorView {
                                 }
                                 v.persist();
                             },
-                        )
-                        .into_any_element(),
-                        Self::msep("ms11").into_any_element(),
-                        Self::mi_sub("t.chan", t("track.channel"), Sub::Chan, cx)
-                            .into_any_element(),
-                        Self::mi_sub("t.dest", t("track.dest"), Sub::Dest, cx).into_any_element(),
+                        ),
+                        Self::msep(),
+                        Self::mi_sub("t.chan", t("track.channel"), Sub::Chan, cx),
+                        Self::mi_sub("t.dest", t("track.dest"), Sub::Dest, cx),
                     ];
                     if sel_is_plugin {
-                        items.push(Self::msep("ms12").into_any_element());
-                        items.push(
-                            Self::mi(
-                                "t.gui",
-                                t("track.plugin_gui"),
-                                "",
-                                None,
-                                cx,
-                                |v, _e, _cx| {
-                                    v.open_plugin_gui();
-                                },
-                            )
-                            .into_any_element(),
-                        );
+                        items.push(Self::msep());
+                        items.push(Self::mi(
+                            "t.gui",
+                            t("track.plugin_gui"),
+                            "",
+                            None,
+                            cx,
+                            |v, _e, _cx| {
+                                v.open_plugin_gui();
+                            },
+                        ));
                     }
                     items
                 }
                 TopMenu::Output => {
                     let mut items = vec![
-                        Self::mi_sub("o.def", t("output.default_dest"), Sub::DefDest, cx)
-                            .into_any_element(),
-                        Self::mi_sub("o.in", t("output.midi_in"), Sub::InPort, cx)
-                            .into_any_element(),
-                        Self::msep("ms13").into_any_element(),
+                        Self::mi_sub("o.def", t("output.default_dest"), Sub::DefDest, cx),
+                        Self::mi_sub("o.in", t("output.midi_in"), Sub::InPort, cx),
+                        Self::msep(),
                     ];
                     if sel_is_plugin {
-                        items.push(
-                            Self::mi(
-                                "o.gui",
-                                if self.plugin_window.is_some() {
-                                    t("output.editor_close")
-                                } else {
-                                    t("output.editor_open")
-                                },
-                                "",
-                                Some(self.plugin_window.is_some()),
-                                cx,
-                                |v, _e, _cx| v.open_plugin_gui(),
-                            )
-                            .into_any_element(),
-                        );
+                        items.push(Self::mi(
+                            "o.gui",
+                            if self.plugin_window.is_some() {
+                                t("output.editor_close")
+                            } else {
+                                t("output.editor_open")
+                            },
+                            "",
+                            Some(self.plugin_window.is_some()),
+                            cx,
+                            |v, _e, _cx| v.open_plugin_gui(),
+                        ));
                     }
                     if sel_plugin_failed {
-                        items.push(
-                            Self::mi("o.retry", t("output.retry"), "", None, cx, |v, _e, _cx| {
+                        items.push(Self::mi(
+                            "o.retry",
+                            t("output.retry"),
+                            "",
+                            None,
+                            cx,
+                            |v, _e, _cx| {
                                 let d = crate::lock_shared(&v.shared).dest_of(v.sel_track);
                                 v.ensure_plugin(d, true);
-                            })
-                            .into_any_element(),
-                        );
+                            },
+                        ));
                     }
                     items.extend([
-                        Self::msep("ms14").into_any_element(),
+                        Self::msep(),
                         Self::mi("o.rescan", t("output.rescan"), "", None, cx, |v, _e, cx| {
                             v.rescan_plugins(crate::ScanMode::Changed);
                             cx.notify();
-                        })
-                        .into_any_element(),
+                        }),
                         Self::mi(
                             "o.rescan_all",
                             t("output.rescan_all"),
@@ -2643,8 +2791,7 @@ impl Render for EditorView {
                                 v.rescan_plugins(crate::ScanMode::All);
                                 cx.notify();
                             },
-                        )
-                        .into_any_element(),
+                        ),
                         Self::mi(
                             "o.audio",
                             t("output.audio_settings"),
@@ -2655,8 +2802,7 @@ impl Render for EditorView {
                                 v.show_output_status = true;
                                 cx.notify();
                             },
-                        )
-                        .into_any_element(),
+                        ),
                         Self::mi(
                             "o.status",
                             t("output.host_status"),
@@ -2667,8 +2813,7 @@ impl Render for EditorView {
                                 v.show_output_status = true;
                                 cx.notify();
                             },
-                        )
-                        .into_any_element(),
+                        ),
                     ]);
                     items
                 }
@@ -2682,8 +2827,7 @@ impl Render for EditorView {
                         |v, _e, cx| {
                             v.toggle_play(cx);
                         },
-                    )
-                    .into_any_element(),
+                    ),
                     Self::mi(
                         "tr.rec",
                         t("transport.record"),
@@ -2693,8 +2837,7 @@ impl Render for EditorView {
                         |v, _e, _cx| {
                             v.toggle_record();
                         },
-                    )
-                    .into_any_element(),
+                    ),
                     Self::mi(
                         "tr.loop",
                         t("transport.loop"),
@@ -2708,8 +2851,7 @@ impl Render for EditorView {
                             }
                             v.persist();
                         },
-                    )
-                    .into_any_element(),
+                    ),
                     Self::mi(
                         "tr.met",
                         t("transport.met"),
@@ -2723,8 +2865,7 @@ impl Render for EditorView {
                             }
                             v.persist();
                         },
-                    )
-                    .into_any_element(),
+                    ),
                     Self::mi(
                         "tr.chsy",
                         t("transport.chase_sysex"),
@@ -2738,8 +2879,7 @@ impl Render for EditorView {
                             }
                             v.persist();
                         },
-                    )
-                    .into_any_element(),
+                    ),
                     Self::mi(
                         "tr.sxp",
                         tf(
@@ -2763,8 +2903,7 @@ impl Render for EditorView {
                             }
                             v.persist();
                         },
-                    )
-                    .into_any_element(),
+                    ),
                     Self::mi(
                         "tr.cin",
                         t("transport.count_in"),
@@ -2775,9 +2914,8 @@ impl Render for EditorView {
                             v.count_in = !v.count_in;
                             v.save_global();
                         },
-                    )
-                    .into_any_element(),
-                    Self::msep("ms8").into_any_element(),
+                    ),
+                    Self::msep(),
                     Self::mi(
                         "tr.aud",
                         t("transport.audition"),
@@ -2792,12 +2930,9 @@ impl Render for EditorView {
                             }
                             v.save_global();
                         },
-                    )
-                    .into_any_element(),
-                    Self::mi_sub("tr.audv", t("transport.aud_vel"), Sub::AudVel, cx)
-                        .into_any_element(),
-                    Self::mi_sub("tr.audd", t("transport.aud_dur"), Sub::AudDur, cx)
-                        .into_any_element(),
+                    ),
+                    Self::mi_sub("tr.audv", t("transport.aud_vel"), Sub::AudVel, cx),
+                    Self::mi_sub("tr.audd", t("transport.aud_dur"), Sub::AudDur, cx),
                 ],
                 TopMenu::Help => vec![
                     Self::mi(
@@ -2810,8 +2945,7 @@ impl Render for EditorView {
                             v.help_open = !v.help_open;
                             cx.notify();
                         },
-                    )
-                    .into_any_element(),
+                    ),
                     Self::mi("h.about", t("help.about"), "", None, cx, |v, _e, _cx| {
                         v.status = concat!(
                             "midi-editor ",
@@ -2819,17 +2953,14 @@ impl Render for EditorView {
                             " — pure-SMF editor"
                         )
                         .into();
-                    })
-                    .into_any_element(),
+                    }),
                     Self::mi("h.mcp", t("help.mcp"), "", None, cx, |v, _e, _cx| {
                         v.status =
                             "MCP: http://127.0.0.1:7878/mcp (mcp-bridge for stdio clients)".into();
-                    })
-                    .into_any_element(),
+                    }),
                     Self::mi("h.logs", t("help.open_logs"), "", None, cx, |v, _e, cx| {
                         v.open_logs(cx);
-                    })
-                    .into_any_element(),
+                    }),
                     Self::mi(
                         "h.diag",
                         t("help.export_diag"),
@@ -2839,10 +2970,11 @@ impl Render for EditorView {
                         |v, _e, cx| {
                             v.export_diagnostics(cx);
                         },
-                    )
-                    .into_any_element(),
+                    ),
                 ],
             };
+            // keep the last-rendered model for keyboard navigation
+            self.menu_rows = items.clone();
             // dropdown panel under the clicked label
             let popup_max_h = (f32::from(window.viewport_size().height) - 40.0).max(120.0);
             let popup_h = (items.len() as f32 * metrics::MENU_ROW + 16.0).min(popup_max_h);
@@ -2866,7 +2998,12 @@ impl Render for EditorView {
                 .border_color(rgb(BORDER_C))
                 .rounded_md()
                 .shadow_lg()
-                .children(items)
+                .children(
+                    items
+                        .iter()
+                        .enumerate()
+                        .map(|(i, r)| Self::row_el(r, i, self.menu_sel == Some(i), false, cx)),
+                )
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|_v, _e, _w, cx| cx.stop_propagation()),
@@ -2874,7 +3011,7 @@ impl Render for EditorView {
             // cascading submenu (also inside the overlay so clicks elsewhere close all)
             let sub_popup = self.open_sub.map(|(s, y)| {
                 let x2 = mx + 208.0;
-                let rows: Vec<AnyElement> = match s {
+                let rows: Vec<MenuRow> = match s {
                     Sub::Chan => (0u8..16)
                         .map(|ch| {
                             let cur = track_chs.get(self.sel_track).copied().unwrap_or(0);
@@ -2894,7 +3031,6 @@ impl Render for EditorView {
                                     v.apply_tx("set track channel", ops);
                                 },
                             )
-                            .into_any_element()
                         })
                         .collect(),
                     Sub::Dest => self.dest_rows(
@@ -2917,7 +3053,7 @@ impl Render for EditorView {
                     ),
                     Sub::InPort => {
                         let ports = midi_io::list_inputs().unwrap_or_default();
-                        let mut rows: Vec<AnyElement> = vec![Self::mi_leaf(
+                        let mut rows: Vec<MenuRow> = vec![Self::mi_leaf(
                             "in.default",
                             t("output.first_input"),
                             "",
@@ -2927,8 +3063,7 @@ impl Render for EditorView {
                                 v.midi_in = "".into();
                                 v.save_global();
                             },
-                        )
-                        .into_any_element()];
+                        )];
                         rows.extend(ports.iter().enumerate().map(|(i, p)| {
                             let name = p.name.clone();
                             Self::mi_leaf(
@@ -2942,44 +3077,37 @@ impl Render for EditorView {
                                     v.save_global();
                                 },
                             )
-                            .into_any_element()
                         }));
                         if ports.is_empty() {
-                            rows.push(
-                                Self::mi_leaf(
-                                    "in.none",
-                                    t("output.no_inputs"),
-                                    "",
-                                    None,
-                                    cx,
-                                    |_, _, _| {},
-                                )
-                                .into_any_element(),
-                            );
-                        }
-                        // manual input-latency compensation, cycles presets
-                        rows.push(
-                            Self::mi_leaf(
-                                "in.lat",
-                                tf(
-                                    "output.in_latency",
-                                    &[("ms", self.in_latency_ms.to_string().as_str())],
-                                ),
+                            rows.push(Self::mi_dis(
+                                "in.none",
+                                t("output.no_inputs"),
                                 "",
                                 None,
                                 cx,
-                                |v, _e, _cx| {
-                                    const STEPS: [u64; 7] = [0, 1, 2, 5, 10, 20, 50];
-                                    let i = STEPS
-                                        .iter()
-                                        .position(|&s| s == v.in_latency_ms)
-                                        .unwrap_or(0);
-                                    v.in_latency_ms = STEPS[(i + 1) % STEPS.len()];
-                                    v.save_global();
-                                },
-                            )
-                            .into_any_element(),
-                        );
+                                |_, _, _| {},
+                            ));
+                        }
+                        // manual input-latency compensation, cycles presets
+                        rows.push(Self::mi_leaf(
+                            "in.lat",
+                            tf(
+                                "output.in_latency",
+                                &[("ms", self.in_latency_ms.to_string().as_str())],
+                            ),
+                            "",
+                            None,
+                            cx,
+                            |v, _e, _cx| {
+                                const STEPS: [u64; 7] = [0, 1, 2, 5, 10, 20, 50];
+                                let i = STEPS
+                                    .iter()
+                                    .position(|&s| s == v.in_latency_ms)
+                                    .unwrap_or(0);
+                                v.in_latency_ms = STEPS[(i + 1) % STEPS.len()];
+                                v.save_global();
+                            },
+                        ));
                         rows
                     }
                     Sub::Lane => {
@@ -3004,7 +3132,6 @@ impl Render for EditorView {
                                     cx,
                                     move |v, _e, cx| v.set_lane(*lm, cx),
                                 )
-                                .into_any_element()
                             })
                             .collect()
                     }
@@ -3025,7 +3152,6 @@ impl Render for EditorView {
                                     cx,
                                     move |v, _e, cx| v.set_tool(tool, cx),
                                 )
-                                .into_any_element()
                             })
                             .collect()
                     }
@@ -3040,8 +3166,7 @@ impl Render for EditorView {
                                 None,
                                 cx,
                                 |v, _e, cx| v.vzoom_by(1.25, cx),
-                            )
-                            .into_any_element(),
+                            ),
                             Self::mi_leaf(
                                 "rowh.dn",
                                 t("view.row_shorter"),
@@ -3049,8 +3174,7 @@ impl Render for EditorView {
                                 None,
                                 cx,
                                 |v, _e, cx| v.vzoom_by(1.0 / 1.25, cx),
-                            )
-                            .into_any_element(),
+                            ),
                             Self::mi_leaf(
                                 "rowh.reset",
                                 t("view.row_reset"),
@@ -3064,29 +3188,25 @@ impl Render for EditorView {
                                         cx,
                                     );
                                 },
-                            )
-                            .into_any_element(),
-                            Self::msep("ms.rowh").into_any_element(),
+                            ),
+                            Self::msep(),
                         ];
                         for (i, h) in [8.0f32, 13.0, 18.0, 26.0, 34.0].iter().enumerate() {
                             let h = *h;
-                            rows.push(
-                                Self::mi_leaf(
-                                    ("rowh.preset", i),
-                                    format!("{h}px"),
-                                    "",
-                                    Some((self.note_h - h).abs() < 0.5),
-                                    cx,
-                                    move |v, _e, cx| {
-                                        v.vzoom_set(
-                                            h,
-                                            f32::from(v.roll_bounds.get().size.height) / 2.0,
-                                            cx,
-                                        );
-                                    },
-                                )
-                                .into_any_element(),
-                            );
+                            rows.push(Self::mi_leaf(
+                                ("rowh.preset", i),
+                                format!("{h}px"),
+                                "",
+                                Some((self.note_h - h).abs() < 0.5),
+                                cx,
+                                move |v, _e, cx| {
+                                    v.vzoom_set(
+                                        h,
+                                        f32::from(v.roll_bounds.get().size.height) / 2.0,
+                                        cx,
+                                    );
+                                },
+                            ));
                         }
                         rows
                     }
@@ -3102,8 +3222,7 @@ impl Render for EditorView {
                                 Some(self.scale_sel == -1),
                                 cx,
                                 |v, _e, cx| v.set_scale(-1, false, cx),
-                            )
-                            .into_any_element(),
+                            ),
                             Self::mi_leaf(
                                 "scale.auto",
                                 t("view.scale_auto"),
@@ -3111,9 +3230,8 @@ impl Render for EditorView {
                                 Some(self.scale_sel == -2),
                                 cx,
                                 |v, _e, cx| v.set_scale(-2, false, cx),
-                            )
-                            .into_any_element(),
-                            Self::msep("ms.scl0").into_any_element(),
+                            ),
+                            Self::msep(),
                             Self::mi_leaf(
                                 "scale.minor",
                                 t("view.scale_minor"),
@@ -3124,22 +3242,18 @@ impl Render for EditorView {
                                     let sel = if v.scale_sel >= 0 { v.scale_sel } else { 0 };
                                     v.set_scale(sel, !v.scale_minor, cx);
                                 },
-                            )
-                            .into_any_element(),
-                            Self::msep("ms.scl1").into_any_element(),
+                            ),
+                            Self::msep(),
                         ];
                         for (i, name) in PC_NAMES.iter().enumerate() {
-                            rows.push(
-                                Self::mi_leaf(
-                                    ("scale.root", i),
-                                    *name,
-                                    "",
-                                    Some(self.scale_sel == i as i8),
-                                    cx,
-                                    move |v, _e, cx| v.set_scale(i as i8, v.scale_minor, cx),
-                                )
-                                .into_any_element(),
-                            );
+                            rows.push(Self::mi_leaf(
+                                ("scale.root", i),
+                                *name,
+                                "",
+                                Some(self.scale_sel == i as i8),
+                                cx,
+                                move |v, _e, cx| v.set_scale(i as i8, v.scale_minor, cx),
+                            ));
                         }
                         rows
                     }
@@ -3155,20 +3269,18 @@ impl Render for EditorView {
                                 cx,
                                 move |v, _e, cx| v.set_snap(i, cx),
                             )
-                            .into_any_element()
                         })
                         .collect(),
                     Sub::Recent => {
                         if self.recent.is_empty() {
-                            vec![Self::mi_leaf(
+                            vec![Self::mi_dis(
                                 "recent.empty",
                                 t("menu.recent_empty"),
                                 "",
                                 None,
                                 cx,
                                 |_v, _e, _cx| {},
-                            )
-                            .into_any_element()]
+                            )]
                         } else {
                             self.recent
                                 .iter()
@@ -3194,7 +3306,6 @@ impl Render for EditorView {
                                             );
                                         },
                                     )
-                                    .into_any_element()
                                 })
                                 .collect()
                         }
@@ -3217,7 +3328,6 @@ impl Render for EditorView {
                                         });
                                     },
                                 )
-                                .into_any_element()
                             })
                             .collect()
                     }
@@ -3231,7 +3341,6 @@ impl Render for EditorView {
                                         d.transpose_ops(t, f, to, st)
                                     });
                                 })
-                                .into_any_element()
                             })
                             .collect()
                     }
@@ -3266,7 +3375,6 @@ impl Render for EditorView {
                                         d.set_length_ops(t, f, to, ticks)
                                     });
                                 })
-                                .into_any_element()
                             })
                             .collect()
                     }
@@ -3288,7 +3396,6 @@ impl Render for EditorView {
                                         d.legato_ops(t, f, to, gap)
                                     });
                                 })
-                                .into_any_element()
                             })
                             .collect()
                     }
@@ -3310,7 +3417,6 @@ impl Render for EditorView {
                                         d.swing_ops(t, f, to, grid, amount)
                                     });
                                 })
-                                .into_any_element()
                             })
                             .collect()
                     }
@@ -3336,7 +3442,6 @@ impl Render for EditorView {
                                         });
                                     },
                                 )
-                                .into_any_element()
                             })
                             .collect()
                     }
@@ -3367,7 +3472,6 @@ impl Render for EditorView {
                                         );
                                     },
                                 )
-                                .into_any_element()
                             })
                             .collect()
                     }
@@ -3388,7 +3492,6 @@ impl Render for EditorView {
                                     cx,
                                     move |v, _e, cx| v.set_theme_mode(mode, cx),
                                 )
-                                .into_any_element()
                             })
                             .collect()
                     }
@@ -3407,7 +3510,6 @@ impl Render for EditorView {
                                     v.save_global();
                                 },
                             )
-                            .into_any_element()
                         })
                         .collect(),
                     Sub::AudDur => [150u64, 300, 500, 1000]
@@ -3425,7 +3527,6 @@ impl Render for EditorView {
                                     v.save_global();
                                 },
                             )
-                            .into_any_element()
                         })
                         .collect(),
                     Sub::Enc => {
@@ -3446,11 +3547,11 @@ impl Render for EditorView {
                                     cx,
                                     move |v, _e, cx| v.set_enc(e, cx),
                                 )
-                                .into_any_element()
                             })
                             .collect()
                     }
                 };
+                self.sub_rows = rows.clone();
                 let vh = f32::from(window.viewport_size().height);
                 let desired = rows.len() as f32 * metrics::MENU_ROW + 16.0;
                 let max_h = (vh - 40.0).max(120.0);
@@ -3476,7 +3577,11 @@ impl Render for EditorView {
                     .border_color(rgb(BORDER_C))
                     .rounded_md()
                     .shadow_lg()
-                    .children(rows)
+                    .children(
+                        rows.iter()
+                            .enumerate()
+                            .map(|(i, r)| Self::row_el(r, i, self.sub_sel == Some(i), true, cx)),
+                    )
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|_v, _e, _w, cx| cx.stop_propagation()),
@@ -3506,9 +3611,11 @@ impl Render for EditorView {
 
         // shortcuts overlay (F1 / Help > Keyboard Shortcuts)
         let help_layer = self.help_open.then(|| {
-            const ROWS: [(&str, &str); 21] = [
+            const ROWS: [(&str, &str); 29] = [
                 ("Space", "Play / stop"),
                 ("F1", "This panel"),
+                ("F10", "Focus the menu bar"),
+                ("Tab / Shift+Tab", "Move focus between regions"),
                 ("Esc", "Close menus / clear selection"),
                 ("Ctrl+N / O / S", "New / Open / Save"),
                 ("Ctrl+Z / Y", "Undo / redo"),
@@ -3517,17 +3624,23 @@ impl Render for EditorView {
                 ("Ctrl+D", "Duplicate selection"),
                 ("Del", "Delete selection"),
                 ("1 / 2 / 3", "Select / draw / erase tool"),
-                ("← →", "Nudge by grid step"),
+                ("← →", "Nudge by grid step / move cursor"),
                 ("Shift+← →", "Nudge by 1 tick"),
-                ("↑ ↓", "Transpose by semitone"),
+                ("↑ ↓", "Transpose by semitone / move cursor"),
                 ("Shift+↑ ↓", "Transpose by octave"),
+                ("Enter (roll)", "Select note / insert note at cursor"),
+                ("↑ ↓ (tracks)", "Select track"),
+                ("M / S / C (tracks)", "Mute / solo / channel"),
+                ("Enter / F2 (tracks)", "Rename track"),
+                ("← → ↑ ↓ (menus)", "Navigate menus"),
+                ("↑ ↓ + Enter (event list)", "Select event / seek to it"),
+                ("↑ ↓ (lane)", "Velocity of selected notes"),
                 ("Alt+drag note", "Duplicate note(s)"),
                 ("Right-edge drag", "Resize note"),
                 ("Click ruler", "Seek playhead"),
                 ("Double-click ruler", "Play from here"),
                 ("Click minimap", "Jump to position"),
                 ("Ctrl+wheel", "Zoom timeline"),
-                ("Drag .mid file", "Drop to open"),
             ];
             let panel = div()
                 .id("help-panel")
@@ -3651,8 +3764,24 @@ impl Render for EditorView {
             // live instances onto it. The resolved per-stream device shows
             // on each plugin row below — a selected device that disappears
             // falls back to the system default there.
-            rows.push(Self::msep("o.ms").into_any_element());
-            rows.push(Self::mhead("mh.audio", t("output.cat_audio")).into_any_element());
+            rows.push(
+                div()
+                    .h(px(1.0))
+                    .mx_2()
+                    .my_1()
+                    .bg(rgb(th.border))
+                    .into_any_element(),
+            );
+            rows.push(
+                div()
+                    .h(px(metrics::MENU_HEAD))
+                    .px_2()
+                    .mx_1()
+                    .text_size(px(metrics::TEXT_XS))
+                    .text_color(rgb(th.text_head))
+                    .child(t("output.cat_audio"))
+                    .into_any_element(),
+            );
             let mut dev_picks: Vec<(usize, String, Option<String>)> =
                 vec![(0, t("audio.sys_default").to_string(), None)];
             dev_picks.extend(
@@ -3752,8 +3881,24 @@ impl Render for EditorView {
                         .into_any_element(),
                 );
             }
-            rows.push(Self::msep("ms15").into_any_element());
-            rows.push(Self::mhead("mh.panel", t("output.cat_vst3")).into_any_element());
+            rows.push(
+                div()
+                    .h(px(1.0))
+                    .mx_2()
+                    .my_1()
+                    .bg(rgb(0x2a2a35))
+                    .into_any_element(),
+            );
+            rows.push(
+                div()
+                    .h(px(18.0))
+                    .px_2()
+                    .mx_1()
+                    .text_size(px(9.5))
+                    .text_color(rgb(0x7a7a90))
+                    .child(t("output.cat_vst3"))
+                    .into_any_element(),
+            );
             for (i, (name, dest)) in dests.iter().enumerate() {
                 let output::Destination::Plugin { plugin_path, .. } = dest else {
                     continue;
@@ -3860,7 +4005,16 @@ impl Render for EditorView {
             // quarantine: bundles the cache recorded as crash/timeout and
             // skipped this scan — each row force-retries that one plugin
             if !self.quarantined.is_empty() {
-                rows.push(Self::mhead("mh.quar", t("output.quarantined_short")).into_any_element());
+                rows.push(
+                    div()
+                        .h(px(metrics::MENU_HEAD))
+                        .px_2()
+                        .mx_1()
+                        .text_size(px(metrics::TEXT_XS))
+                        .text_color(rgb(th.text_head))
+                        .child(t("output.quarantined_short"))
+                        .into_any_element(),
+                );
             }
             for (i, (path, reason)) in self.quarantined.iter().enumerate() {
                 let name = path
@@ -4007,13 +4161,49 @@ impl Render for EditorView {
                 cx.notify();
             }))
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
-                // typing in the track-name field must not trigger editor keys
-                if this.input.read(cx).focus_handle(cx).is_focused(w) {
-                    return;
-                }
                 let k = ev.keystroke.key.as_str();
                 let ctrl = ev.keystroke.modifiers.control;
                 let shift = ev.keystroke.modifiers.shift;
+                // the rename input owns its keys: Enter commits, Escape and
+                // Tab move focus back out
+                if this.input.read(cx).focus_handle(cx).is_focused(w) {
+                    match (ctrl, k) {
+                        (false, "enter") => this.commit_rename(w, cx),
+                        (false, "escape") => w.focus(&this.tracks_fh, cx),
+                        (false, "tab") => {
+                            if shift {
+                                w.focus_prev(cx);
+                            } else {
+                                w.focus_next(cx);
+                            }
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+                // while a menu is open, menu navigation owns arrows/enter/
+                // escape; other chords (Ctrl+S …) still work
+                if this.open_menu.is_some() && this.menu_key(ev, w, cx) {
+                    return;
+                }
+                // modal overlays swallow Tab — focus must never move behind
+                // them where the ring can't be seen (Esc closes them)
+                if !ctrl && k == "tab" {
+                    if this.help_open || this.show_output_status {
+                        return;
+                    }
+                    if shift {
+                        w.focus_prev(cx);
+                    } else {
+                        w.focus_next(cx);
+                    }
+                    return;
+                }
+                if !ctrl && k == "f10" {
+                    this.menu_bar_sel = 0;
+                    w.focus(&this.menu_fh, cx);
+                    return;
+                }
                 let st = {
                     let s = this.snap_ticks();
                     if s > 0 {
@@ -4049,14 +4239,6 @@ impl Render for EditorView {
                     (true, false, "c") => this.copy_selected(false, cx),
                     (true, false, "v") => this.paste(cx),
                     (true, false, "d") => this.duplicate_selected(cx),
-                    (false, false, "left") => this.nudge(-st, 0, cx),
-                    (false, false, "right") => this.nudge(st, 0, cx),
-                    (false, true, "left") => this.nudge(-1, 0, cx),
-                    (false, true, "right") => this.nudge(1, 0, cx),
-                    (false, false, "up") => this.nudge(0, 1, cx),
-                    (false, false, "down") => this.nudge(0, -1, cx),
-                    (false, true, "up") => this.nudge(0, 12, cx),
-                    (false, true, "down") => this.nudge(0, -12, cx),
                     (false, false, "f1") => {
                         this.help_open = !this.help_open;
                         cx.notify();
@@ -4068,6 +4250,25 @@ impl Render for EditorView {
                     (false, false, "2") => this.set_tool(Tool::Draw, cx),
                     (false, false, "3") => this.set_tool(Tool::Erase, cx),
                     (false, false, " ") => this.toggle_play(cx),
+                    // arrows/edit keys act on the roll only while the roll
+                    // context (its handle or the root fallback) owns focus —
+                    // tracks/lane/events have their own bindings
+                    (false, s, "left" | "right" | "up" | "down" | "enter")
+                        if this.roll_fh.contains_focused(w, cx) || this.focus.is_focused(w) =>
+                    {
+                        match (s, k) {
+                            (false, "left") => this.roll_arrow(-st, 0, cx),
+                            (false, "right") => this.roll_arrow(st, 0, cx),
+                            (true, "left") => this.roll_arrow(-1, 0, cx),
+                            (true, "right") => this.roll_arrow(1, 0, cx),
+                            (false, "up") => this.roll_arrow(0, 1, cx),
+                            (false, "down") => this.roll_arrow(0, -1, cx),
+                            (true, "up") => this.roll_arrow(0, 12, cx),
+                            (true, "down") => this.roll_arrow(0, -12, cx),
+                            (false, "enter") => this.cursor_activate(cx),
+                            _ => {}
+                        }
+                    }
                     _ => {}
                 }
             }))
@@ -4097,16 +4298,9 @@ impl Render for EditorView {
 // --- menubar helpers -----------------------------------------------------------
 
 impl EditorView {
-    fn mhead(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stateful<Div> {
-        div()
-            .id(id)
-            .role(Role::Label)
-            .h(px(metrics::MENU_HEAD))
-            .px_2()
-            .mx_1()
-            .text_size(px(metrics::TEXT_XS))
-            .text_color(rgb(theme::current().text_head))
-            .child(label.into())
+    /// Section header row inside a dropdown.
+    fn mhead(label: impl Into<SharedString>) -> MenuRow {
+        MenuRow::Head(label.into())
     }
 
     fn dest_rows(
@@ -4118,30 +4312,27 @@ impl EditorView {
         def_dest: usize,
         has_track_dest: bool,
         cx: &mut Context<Self>,
-    ) -> Vec<AnyElement> {
+    ) -> Vec<MenuRow> {
         let mut rows = Vec::new();
         if kind == DestPick::Track {
-            rows.push(
-                Self::mi_leaf(
-                    "dest.default",
-                    t("track.default_dest"),
-                    "",
-                    Some(!has_track_dest),
-                    cx,
-                    |v, _e, _cx| {
-                        crate::lock_shared(&v.shared)
-                            .track_dest
-                            .remove(&v.sel_track);
-                        // a preview routed to the old destination must stop
-                        v.audition_off();
-                        v.persist();
-                    },
-                )
-                .into_any_element(),
-            );
-            rows.push(Self::msep("ms16").into_any_element());
+            rows.push(Self::mi_leaf(
+                "dest.default",
+                t("track.default_dest"),
+                "",
+                Some(!has_track_dest),
+                cx,
+                |v, _e, _cx| {
+                    crate::lock_shared(&v.shared)
+                        .track_dest
+                        .remove(&v.sel_track);
+                    // a preview routed to the old destination must stop
+                    v.audition_off();
+                    v.persist();
+                },
+            ));
+            rows.push(Self::msep());
         }
-        rows.push(Self::mhead("mh.midi", t("output.cat_midi")).into_any_element());
+        rows.push(Self::mhead(t("output.cat_midi")));
         let midi: Vec<(usize, String)> = dests
             .iter()
             .enumerate()
@@ -4150,17 +4341,14 @@ impl EditorView {
             })
             .collect();
         if midi.is_empty() {
-            rows.push(
-                Self::mi_leaf(
-                    "dest.noports",
-                    t("output.no_ports"),
-                    "",
-                    None,
-                    cx,
-                    |_v, _e, _cx| {},
-                )
-                .into_any_element(),
-            );
+            rows.push(Self::mi_dis(
+                "dest.noports",
+                t("output.no_ports"),
+                "",
+                None,
+                cx,
+                |_v, _e, _cx| {},
+            ));
         } else {
             for (i, label) in midi {
                 let selected = if kind == DestPick::Track {
@@ -4180,30 +4368,27 @@ impl EditorView {
                 } else {
                     label.into()
                 };
-                rows.push(
-                    Self::mi_leaf(
-                        ("dest", i),
-                        label,
-                        "",
-                        Some(selected),
-                        cx,
-                        move |v, _e, _cx| {
-                            let mut sh = crate::lock_shared(&v.shared);
-                            if kind == DestPick::Track {
-                                sh.track_dest.insert(v.sel_track, i);
-                            } else {
-                                sh.default_dest = i;
-                            }
-                            drop(sh);
-                            v.audition_off();
-                            v.persist();
-                        },
-                    )
-                    .into_any_element(),
-                );
+                rows.push(Self::mi_leaf(
+                    ("dest", i),
+                    label,
+                    "",
+                    Some(selected),
+                    cx,
+                    move |v, _e, _cx| {
+                        let mut sh = crate::lock_shared(&v.shared);
+                        if kind == DestPick::Track {
+                            sh.track_dest.insert(v.sel_track, i);
+                        } else {
+                            sh.default_dest = i;
+                        }
+                        drop(sh);
+                        v.audition_off();
+                        v.persist();
+                    },
+                ));
             }
         }
-        rows.push(Self::msep("ms17").into_any_element());
+        rows.push(Self::msep());
         let plugins: Vec<(usize, String, String, String)> = dests
             .iter()
             .enumerate()
@@ -4225,38 +4410,30 @@ impl EditorView {
                 vendors.insert(vendor.clone());
             }
         }
-        rows.push(
-            Self::mhead(
-                "mh.vst",
-                format!("{} ({})", t("output.cat_vst3"), plugins.len()),
-            )
-            .into_any_element(),
-        );
+        rows.push(Self::mhead(format!(
+            "{} ({})",
+            t("output.cat_vst3"),
+            plugins.len()
+        )));
         if plugins.is_empty() {
             if self.scan_rx.is_some() {
-                rows.push(
-                    Self::mi_leaf(
-                        "dest.scanning",
-                        t("status.scanning"),
-                        "",
-                        None,
-                        cx,
-                        |_v, _e, _cx| {},
-                    )
-                    .into_any_element(),
-                );
+                rows.push(Self::mi_dis(
+                    "dest.scanning",
+                    t("status.scanning"),
+                    "",
+                    None,
+                    cx,
+                    |_v, _e, _cx| {},
+                ));
             } else {
-                rows.push(
-                    Self::mi_leaf(
-                        "dest.noplugins",
-                        t("output.no_plugins"),
-                        "",
-                        None,
-                        cx,
-                        |_v, _e, _cx| {},
-                    )
-                    .into_any_element(),
-                );
+                rows.push(Self::mi_dis(
+                    "dest.noplugins",
+                    t("output.no_plugins"),
+                    "",
+                    None,
+                    cx,
+                    |_v, _e, _cx| {},
+                ));
             }
         } else {
             let mut plugins = plugins;
@@ -4271,9 +4448,7 @@ impl EditorView {
             for (i, label, path, vendor) in plugins {
                 if vendors.len() >= 2 && vendor != last_vendor {
                     last_vendor = vendor.clone();
-                    rows.push(
-                        Self::mhead(("mh.vendor", i), format!("  {vendor}")).into_any_element(),
-                    );
+                    rows.push(Self::mhead(format!("  {vendor}")));
                 }
                 let (badge, color) = match self.plugin_state.get(&i) {
                     Some(PluginState::Ready { .. }) => ("●", Some(0x8fd0a0)),
@@ -4298,13 +4473,13 @@ impl EditorView {
                     def_dest == i
                 };
                 let path2 = path.clone();
-                let row = Self::mi_inner(
+                rows.push(Self::mi_plugin(
                     ("plugin", i),
                     label,
                     badge,
                     color,
                     Some(selected),
-                    false,
+                    detail,
                     cx,
                     move |v, _e, _cx| {
                         let mut sh = crate::lock_shared(&v.shared);
@@ -4319,111 +4494,31 @@ impl EditorView {
                         v.ensure_plugin(i, true);
                         let _ = path2;
                     },
-                );
-                let row = if let Some(detail) = detail {
-                    row.tooltip(move |_w, cx| {
-                        let detail = detail.clone();
-                        cx.new(|_| Tip(detail.into())).into()
-                    })
-                } else {
-                    row
-                };
-                rows.push(row.into_any_element());
+                ));
             }
         }
         rows
     }
 
-    /// One dropdown row: optional check glyph, label, right-aligned shortcut.
-    /// Clicking closes the whole menu and runs `f`. Dropdown rows clear the
-    /// open cascade on hover; submenu leaf rows (`mi_leaf`) must NOT clear it,
-    /// or hovering a submenu item unmounts its own submenu before the click.
-    #[allow(clippy::too_many_arguments)] // GPUI builder plumbing, not logic
-    fn mi_inner(
-        id: impl Into<ElementId>,
-        label: impl Into<SharedString>,
-        shortcut: impl Into<SharedString>,
-        badge_color: Option<u32>,
-        check: Option<bool>,
-        clears_sub: bool,
-        cx: &mut Context<Self>,
-        f: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
-    ) -> ObservedElement<Stateful<Div>> {
-        let th = theme::current();
-        let label: SharedString = label.into();
-        let shortcut: SharedString = shortcut.into();
-        div()
-            .id(id)
-            .test_support()
-            .role(if check.is_some() {
-                Role::MenuItemCheckBox
-            } else {
-                Role::MenuItem
-            })
-            .aria_label(label.clone())
-            .when(check.is_some(), |this| {
-                this.aria_toggled(if check == Some(true) {
-                    Toggled::True
-                } else {
-                    Toggled::False
-                })
-            })
-            .when(!shortcut.is_empty(), |this| {
-                this.aria_keyshortcuts(shortcut.clone())
-            })
-            .flex()
-            .items_center()
-            .h(px(metrics::MENU_ROW))
-            .px_2()
-            .mx_1()
-            .rounded_sm()
-            .cursor_pointer()
-            .hover(move |s| s.bg(rgb(th.bg_hover)))
-            .text_size(px(metrics::TEXT_LG))
-            .text_color(rgb(th.text))
-            .whitespace_nowrap()
-            .child(
-                div()
-                    .w(px(metrics::CHECK_W))
-                    .text_size(px(metrics::TEXT_SM))
-                    .text_color(rgb(th.lcd))
-                    .child(if check == Some(true) { "✓" } else { "" }),
-            )
-            .child(div().flex_1().child(label))
-            .child(
-                div()
-                    .pl_2()
-                    .text_color(rgb(badge_color.unwrap_or(th.text_faint)))
-                    .text_size(px(metrics::TEXT_SM))
-                    .child(shortcut),
-            )
-            .on_mouse_move(cx.listener(move |v, _e: &MouseMoveEvent, _w, cx| {
-                // leaving a submenu parent closes the cascade
-                if clears_sub && v.open_sub.is_some() {
-                    v.open_sub = None;
-                    cx.notify();
-                }
-            }))
-            .on_click(cx.listener(move |v, e, w, cx| {
-                cx.stop_propagation();
-                v.open_menu = None;
-                v.open_sub = None;
-                let _ = e;
-                f(v, w, cx);
-                cx.notify();
-            }))
-    }
-
-    /// Dropdown row — clears the open cascade when hovered.
+    /// Dropdown leaf row; hovering clears the open cascade.
     fn mi(
         id: impl Into<ElementId>,
         label: impl Into<SharedString>,
         shortcut: &'static str,
         check: Option<bool>,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
         f: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
-    ) -> ObservedElement<Stateful<Div>> {
-        Self::mi_inner(id, label, shortcut, None, check, true, cx, f)
+    ) -> MenuRow {
+        MenuRow::Leaf(LeafRow {
+            id: id.into(),
+            label: label.into(),
+            shortcut: shortcut.into(),
+            check,
+            badge_color: None,
+            detail: None,
+            enabled: true,
+            act: std::rc::Rc::new(f),
+        })
     }
 
     /// Submenu leaf row — must not clear the cascade it lives in.
@@ -4434,77 +4529,243 @@ impl EditorView {
         check: Option<bool>,
         cx: &mut Context<Self>,
         f: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
-    ) -> ObservedElement<Stateful<Div>> {
-        Self::mi_inner(id, label, shortcut, None, check, false, cx, f)
+    ) -> MenuRow {
+        Self::mi(id, label, shortcut, check, cx, f)
     }
 
-    /// Dropdown row that cascades: hovering opens its submenu at the row's y.
+    /// Informational row ("no MIDI ports", "scanning…") — dimmed, not
+    /// keyboard-selectable and not activatable.
+    fn mi_dis(
+        id: impl Into<ElementId>,
+        label: impl Into<SharedString>,
+        shortcut: &'static str,
+        check: Option<bool>,
+        _cx: &mut Context<Self>,
+        f: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> MenuRow {
+        MenuRow::Leaf(LeafRow {
+            id: id.into(),
+            label: label.into(),
+            shortcut: shortcut.into(),
+            check,
+            badge_color: None,
+            detail: None,
+            enabled: false,
+            act: std::rc::Rc::new(f),
+        })
+    }
+
+    /// Plugin destination row — status badge + failure-detail tooltip.
+    #[allow(clippy::too_many_arguments)] // GPUI builder plumbing, not logic
+    fn mi_plugin(
+        id: impl Into<ElementId>,
+        label: impl Into<SharedString>,
+        badge: &'static str,
+        badge_color: Option<u32>,
+        check: Option<bool>,
+        detail: Option<String>,
+        _cx: &mut Context<Self>,
+        f: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> MenuRow {
+        MenuRow::Leaf(LeafRow {
+            id: id.into(),
+            label: label.into(),
+            shortcut: badge.into(),
+            check,
+            badge_color,
+            detail: detail.map(Into::into),
+            enabled: true,
+            act: std::rc::Rc::new(f),
+        })
+    }
+
+    /// Dropdown row that cascades into `sub`.
     fn mi_sub(
         id: &'static str,
-        label: &'static str,
+        label: impl Into<SharedString>,
         sub: Sub,
-        cx: &mut Context<Self>,
-    ) -> ObservedElement<Stateful<Div>> {
-        let th = theme::current();
-        div()
-            .id(id)
-            .test_support()
-            .role(Role::MenuItem)
-            .aria_label(label)
-            .flex()
-            .items_center()
-            .h(px(metrics::MENU_ROW))
-            .px_2()
-            .mx_1()
-            .rounded_sm()
-            .cursor_pointer()
-            .hover(move |s| s.bg(rgb(th.bg_hover)))
-            .text_size(px(metrics::TEXT_LG))
-            .text_color(rgb(th.text))
-            .whitespace_nowrap()
-            .child(div().w(px(metrics::CHECK_W)))
-            .child(div().flex_1().child(label))
-            .child(
-                div()
-                    .pl_2()
-                    .text_color(rgb(th.text_faint))
-                    .text_size(px(metrics::TEXT_SM))
-                    .child("▸"),
-            )
-            .on_mouse_move(cx.listener(move |v, e: &MouseMoveEvent, _w, cx| {
-                // Only hover-open when no cascade is up: once one is open, a
-                // diagonal cursor path toward a submenu item would cross the
-                // sibling rows and replace the submenu mid-flight (classic
-                // "safe triangle" problem). Siblings still switch via click.
-                let y = f32::from(e.position.y);
-                if v.open_sub.is_none() {
-                    v.open_sub = Some((sub, y));
-                    cx.notify();
-                }
-            }))
-            .on_click(cx.listener(move |v, e: &ClickEvent, _w, cx| {
-                cx.stop_propagation();
-                v.open_sub = Some((sub, f32::from(e.position().y)));
-                cx.notify();
-            }))
+        _cx: &mut Context<Self>,
+    ) -> MenuRow {
+        MenuRow::Sub {
+            id: id.into(),
+            label: label.into(),
+            sub,
+        }
     }
 
     /// Dropdown separator line.
-    fn msep(id: impl Into<ElementId>) -> Stateful<Div> {
-        div()
-            .id(id)
-            .role(Role::Splitter)
-            .h(px(1.0))
-            .mx_2()
-            .my_1()
-            .bg(rgb(0x2a2a35))
+    fn msep() -> MenuRow {
+        MenuRow::Sep
     }
 
-    /// Event-properties inspector: exact numeric rows for the selected
-    /// event / note / track. Clicking an editable row loads its value into
-    /// the input; Apply commits through one transaction. Byte-level rows
-    /// (meta payload, sysex, escape) are flagged with a warning tint.
+    /// Render one menu model row. `i` is its index in `menu_rows` (dropdown)
+    /// or `sub_rows` (cascade); `selected` marks the keyboard selection which
+    /// mouse hover also drives, so both inputs highlight the same row.
+    fn row_el(
+        row: &MenuRow,
+        i: usize,
+        selected: bool,
+        in_sub: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let th = theme::current();
+        match row {
+            MenuRow::Sep => div()
+                .h(px(1.0))
+                .mx_2()
+                .my_1()
+                .bg(rgb(th.border))
+                .into_any_element(),
+            MenuRow::Head(l) => div()
+                .id(("mhead", i))
+                .role(Role::Label)
+                .h(px(metrics::MENU_HEAD))
+                .px_2()
+                .mx_1()
+                .text_size(px(metrics::TEXT_XS))
+                .text_color(rgb(th.text_head))
+                .child(l.clone())
+                .into_any_element(),
+            MenuRow::Sub { id, label, sub } => {
+                let sub = *sub;
+                div()
+                    .id(id.clone())
+                    .test_support()
+                    .role(Role::MenuItem)
+                    .aria_label(label.clone())
+                    .flex()
+                    .items_center()
+                    .h(px(metrics::MENU_ROW))
+                    .px_2()
+                    .mx_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .bg(if selected {
+                        rgb(th.bg_hover)
+                    } else {
+                        rgba(0x00000000)
+                    })
+                    .hover(|s| s.bg(rgb(th.bg_hover)))
+                    .text_size(px(metrics::TEXT_LG))
+                    .text_color(rgb(th.text))
+                    .whitespace_nowrap()
+                    .child(div().w(px(metrics::CHECK_W)))
+                    .child(div().flex_1().child(label.clone()))
+                    .child(
+                        div()
+                            .pl_2()
+                            .text_color(rgb(th.text_faint))
+                            .text_size(px(metrics::TEXT_SM))
+                            .child("▸"),
+                    )
+                    .on_mouse_move(cx.listener(move |v, e: &MouseMoveEvent, _w, cx| {
+                        v.menu_sel = Some(i);
+                        // Only hover-open when no cascade is up: once one is
+                        // open, a diagonal cursor path toward a submenu item
+                        // would cross the sibling rows and replace the submenu
+                        // mid-flight (classic "safe triangle" problem).
+                        if v.open_sub.is_none() {
+                            v.open_sub = Some((sub, f32::from(e.position.y)));
+                        }
+                        cx.notify();
+                    }))
+                    .on_click(cx.listener(move |v, e: &ClickEvent, _w, cx| {
+                        cx.stop_propagation();
+                        v.menu_sel = Some(i);
+                        v.open_sub = Some((sub, f32::from(e.position().y)));
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            }
+            MenuRow::Leaf(l) => {
+                let act = l.act.clone();
+                let enabled = l.enabled;
+                let mut el = div()
+                    .id(l.id.clone())
+                    .test_support()
+                    .role(if l.check.is_some() {
+                        Role::MenuItemCheckBox
+                    } else {
+                        Role::MenuItem
+                    })
+                    .aria_label(l.label.clone())
+                    .when(l.check.is_some(), |this| {
+                        this.aria_toggled(if l.check == Some(true) {
+                            Toggled::True
+                        } else {
+                            Toggled::False
+                        })
+                    })
+                    .when(!l.shortcut.is_empty(), |this| {
+                        this.aria_keyshortcuts(l.shortcut.clone())
+                    })
+                    .flex()
+                    .items_center()
+                    .h(px(metrics::MENU_ROW))
+                    .px_2()
+                    .mx_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .bg(if selected {
+                        rgb(th.bg_hover)
+                    } else {
+                        rgba(0x00000000)
+                    })
+                    .text_size(px(metrics::TEXT_LG))
+                    .text_color(rgb(if enabled { th.text } else { th.text_faint }))
+                    .whitespace_nowrap()
+                    .child(
+                        div()
+                            .w(px(metrics::CHECK_W))
+                            .text_size(px(metrics::TEXT_SM))
+                            .text_color(rgb(th.lcd))
+                            .child(if l.check == Some(true) { "✓" } else { "" }),
+                    )
+                    .child(div().flex_1().child(l.label.clone()))
+                    .child(
+                        div()
+                            .pl_2()
+                            .text_color(rgb(l.badge_color.unwrap_or(th.text_faint)))
+                            .text_size(px(metrics::TEXT_SM))
+                            .child(l.shortcut.clone()),
+                    );
+                if enabled {
+                    el = el
+                        .hover(|s| s.bg(rgb(th.bg_hover)))
+                        .on_mouse_move(cx.listener(move |v, _e: &MouseMoveEvent, _w, cx| {
+                            if in_sub {
+                                v.sub_sel = Some(i);
+                            } else {
+                                v.menu_sel = Some(i);
+                                // leaving a submenu parent closes the cascade
+                                v.open_sub = None;
+                            }
+                            cx.notify();
+                        }))
+                        .on_click(cx.listener(move |v, _e, w, cx| {
+                            cx.stop_propagation();
+                            v.open_menu = None;
+                            v.open_sub = None;
+                            act(v, w, cx);
+                            cx.notify();
+                        }));
+                }
+                if let Some(detail) = l.detail.clone() {
+                    el = el.tooltip(move |_w, cx| {
+                        let detail = detail.clone();
+                        cx.new(|_| Tip(detail)).into()
+                    });
+                }
+                el.into_any_element()
+            }
+        }
+    }
+
+    /// Inspector panel under the event list: shows the selected events' or
+    /// notes' fields; clicking a field row starts an edit applied to every
+    /// selected row.
     fn prop_panel(&self, cx: &mut Context<Self>) -> Div {
+        let th = theme::current();
         let (title, rows) = self.doc(|d| self.prop_rows(d));
         let any_warn = rows.iter().any(|r| r.warn);
         let mut panel = div()
@@ -4512,13 +4773,13 @@ impl EditorView {
             .flex_col()
             .gap_y(px(2.0))
             .border_t_1()
-            .border_color(rgb(0x2a2a35))
+            .border_color(rgb(th.border))
             .px_2()
             .py_1()
             .child(
                 div()
-                    .text_size(px(10.0))
-                    .text_color(rgb(0x9a9ab0))
+                    .text_size(px(metrics::TEXT_SM))
+                    .text_color(rgb(th.text_dim))
                     .child(title),
             );
         for (ix, r) in rows.into_iter().enumerate() {
@@ -4526,11 +4787,15 @@ impl EditorView {
                 .id(("prop-row", ix))
                 .flex()
                 .gap_2()
-                .text_size(px(11.0))
+                .text_size(px(metrics::TEXT_MD))
                 .child(
                     div()
                         .w(px(86.0))
-                        .text_color(if r.warn { rgb(0xffb060) } else { rgb(0x9a9ab0) })
+                        .text_color(if r.warn {
+                            rgb(th.warn)
+                        } else {
+                            rgb(th.text_dim)
+                        })
                         .child(if r.warn {
                             SharedString::from(format!("{}!", r.label))
                         } else {
@@ -4540,7 +4805,7 @@ impl EditorView {
                 .child(
                     div()
                         .font_family("Cascadia Mono")
-                        .text_color(rgb(0xd8d8e0))
+                        .text_color(rgb(th.text))
                         .overflow_hidden()
                         .child(r.value.clone()),
                 );
@@ -4573,8 +4838,8 @@ impl EditorView {
         if any_warn {
             foot = foot.child(
                 div()
-                    .text_size(px(10.0))
-                    .text_color(rgb(0xffb060))
+                    .text_size(px(metrics::TEXT_SM))
+                    .text_color(rgb(th.warn))
                     .child(t("prop.raw_warn")),
             );
         }

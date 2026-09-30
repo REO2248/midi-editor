@@ -10,6 +10,7 @@ mod geometry;
 mod guard;
 mod i18n;
 mod icons;
+mod menu;
 mod plugin_state;
 mod recovery;
 mod render;
@@ -22,6 +23,7 @@ use geometry::{
     clamp_move_delta, clamp_span, content_view, reanchor, roll_hit, ZOOM_MAX, ZOOM_MIN,
 };
 use i18n::{t, tf};
+use menu::{menu_x, next_selectable, row_y, MenuRow, MENUS};
 
 use commands::UndoStack;
 use document::{Document, Event as DocEvent, EventId, Note, Op, TimeDisplay};
@@ -75,6 +77,36 @@ pub(crate) enum PendingAction {
     OpenPath(PathBuf),
     /// remove the editor window
     CloseWindow,
+}
+
+/// Keyboard-focusable regions. Each maps to a `FocusHandle` tracked by its
+/// container div, so GPUI dispatch, Tab traversal and focus rings are native.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FocusArea {
+    MenuBar,
+    Tracks,
+    Roll,
+    Lane,
+    Events,
+}
+
+impl FocusArea {
+    fn key(self) -> &'static str {
+        match self {
+            FocusArea::MenuBar => "focus.menubar",
+            FocusArea::Tracks => "focus.tracks",
+            FocusArea::Roll => "focus.roll",
+            FocusArea::Lane => "focus.lane",
+            FocusArea::Events => "focus.events",
+        }
+    }
+}
+
+/// One event-list row: display text plus the event's tick for seek-on-Enter.
+#[derive(Clone)]
+struct EvRow {
+    tick: u64,
+    text: SharedString,
 }
 
 /// Menubar dropdown that is currently open.
@@ -443,7 +475,7 @@ struct EditorView {
     notes_key: (u64, u64),
     notes: Arc<Vec<Note>>,
     ev_key: (u64, u64, usize),
-    events: Arc<Vec<SharedString>>,
+    events: Arc<Vec<EvRow>>,
     /// Document-derived UI data (markers, track names, diagnostics count…).
     /// Rebuilt only when the document key or encoding hint changes — render
     /// runs at animation-frame rate during playback and must not rescan
@@ -451,6 +483,31 @@ struct EditorView {
     doc_ui: Arc<DocUi>,
     doc_ui_key: (u64, u64, usize),
     doc_ui_enc: Option<smf_core::TextEncoding>,
+    /// region focus handles — Tab traversal follows DOM order
+    menu_fh: FocusHandle,
+    tracks_fh: FocusHandle,
+    roll_fh: FocusHandle,
+    lane_fh: FocusHandle,
+    events_fh: FocusHandle,
+    /// highlighted menubar label while the bar holds keyboard focus
+    menu_bar_sel: usize,
+    /// last non-menubar focus region — commands restore focus to it so a
+    /// menu round-trip returns the user where they were
+    last_area: FocusArea,
+    /// keyboard selection inside the open dropdown / cascade (indexes into
+    /// `menu_rows` / `sub_rows`)
+    menu_sel: Option<usize>,
+    sub_sel: Option<usize>,
+    /// row model of the open menu / submenu, rebuilt each frame while open
+    /// so labels, checks and enabled flags are always live
+    menu_rows: Vec<MenuRow>,
+    sub_rows: Vec<MenuRow>,
+    /// piano-roll edit cursor — used to move/insert when nothing is selected
+    cursor_tick: u64,
+    cursor_key: i32,
+    /// selected event-list row and its scroll position handle
+    ev_sel: usize,
+    events_scroll: UniformListScrollHandle,
     /// lane (velocity/CC/PB) points cache — keys on epoch + revision +
     /// track + mode
     lane_cache: Arc<Vec<(EventId, u64, i32)>>,
@@ -956,6 +1013,21 @@ impl EditorView {
             doc_ui: Arc::new(DocUi::default()),
             doc_ui_key: (u64::MAX, u64::MAX, usize::MAX),
             doc_ui_enc: None,
+            menu_fh: cx.focus_handle().tab_stop(true),
+            tracks_fh: cx.focus_handle().tab_stop(true),
+            roll_fh: cx.focus_handle().tab_stop(true),
+            lane_fh: cx.focus_handle().tab_stop(true),
+            events_fh: cx.focus_handle().tab_stop(true),
+            menu_bar_sel: 0,
+            last_area: FocusArea::Roll,
+            menu_sel: None,
+            sub_sel: None,
+            menu_rows: Vec::new(),
+            sub_rows: Vec::new(),
+            cursor_tick: 0,
+            cursor_key: 60,
+            ev_sel: 0,
+            events_scroll: UniformListScrollHandle::new(),
             lane_cache: Arc::new(vec![]),
             lane_key: (u64::MAX, u64::MAX),
             lane_track: 0,
@@ -1294,6 +1366,9 @@ impl EditorView {
         let (x, y) = content_view(first, mid_row, self.zoom, self.note_h);
         self.scroll_x = x;
         self.scroll_y = y;
+        self.cursor_tick = first;
+        self.cursor_key = mid.unwrap_or(60);
+        self.ev_sel = 0;
     }
 
     fn set_enc(&mut self, enc: Option<smf_core::TextEncoding>, cx: &mut Context<Self>) {
@@ -1461,8 +1536,20 @@ impl EditorView {
         cx.notify();
     }
 
-    /// Focus the track-name input (Track > Rename).
+    /// Focus the track-name input with the current name selected (Track >
+    /// Rename, or Enter/F2 while the track list is focused).
     fn focus_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.doc(|d| {
+            d.tracks
+                .get(self.sel_track)
+                .and_then(|t| t.name.as_ref())
+                .map(|b| smf_core::decode_text(b, self.enc_override.or(d.text_encoding_hint())))
+                .unwrap_or_default()
+        });
+        self.input.update(cx, |i, cx| {
+            i.set_value(name, window, cx);
+            i.select_all(window, cx);
+        });
         let fh = self.input.read(cx).focus_handle(cx);
         window.focus(&fh, cx);
         cx.notify();
@@ -1513,6 +1600,8 @@ impl EditorView {
                 .map(|&(_, _, id)| id)
                 .collect();
             self.sel_events.retain(|id| ids.contains(id));
+            // the row count changes with edits — keep the selection valid
+            self.ev_sel = self.ev_sel.min(self.events.len().saturating_sub(1));
             self.ev_key = vkey;
         }
         if self.doc_ui_key != vkey || self.doc_ui_enc != self.enc_override {
@@ -1642,26 +1731,30 @@ impl EditorView {
     fn build_event_rows(
         &self,
         doc: &Document,
-    ) -> (Vec<SharedString>, Vec<Option<(usize, usize, EventId)>>) {
+    ) -> (Vec<EvRow>, Vec<Option<(usize, usize, EventId)>>) {
         let td = doc.time_display();
         let seq = doc.is_sequential();
         let hint = self.enc_override.or(doc.text_encoding_hint());
         let mut rows = Vec::new();
         let mut refs = Vec::new();
         for d in doc.diagnose() {
-            rows.push(format!("[{}] tk{} @{}", d.code, d.track + 1, d.tick).into());
+            rows.push(EvRow {
+                tick: d.tick,
+                text: format!("[{}] tk{} @{}", d.code, d.track + 1, d.tick).into(),
+            });
             refs.push(None);
         }
         if seq {
             // explicit mode marker: these are sequences, not one timeline
-            rows.push(
-                format!(
+            rows.push(EvRow {
+                tick: 0,
+                text: format!(
                     "[fmt2] sequence {}/{} — independent timelines",
                     self.sel_track + 1,
                     doc.tracks.len()
                 )
                 .into(),
-            );
+            });
             refs.push(None);
         }
         for (ti, tr) in doc.tracks.iter().enumerate() {
@@ -1708,7 +1801,10 @@ impl EditorView {
                     EventKind::SysEx(d) => format!("SysEx   {}B", d.len()),
                     EventKind::Escape(d) => format!("Escape  {}B", d.len()),
                 };
-                rows.push(SharedString::from(format!("{pos:>11}  T{ti}  {body}")));
+                rows.push(EvRow {
+                    tick: e.tick,
+                    text: SharedString::from(format!("{pos:>11}  T{ti}  {body}")),
+                });
                 refs.push(Some((ti, ei, e.id)));
             }
         }
@@ -1730,6 +1826,7 @@ impl EditorView {
     /// toggle, shift = range from the last anchor. Diagnostic rows (no ref)
     /// just clear the inspector selection.
     fn ev_row_click(&mut self, row: usize, ctrl: bool, shift: bool, cx: &mut Context<Self>) {
+        self.ev_sel = row;
         let Some(&Some((_, _, id))) = self.event_refs.get(row) else {
             self.sel_events.clear();
             self.prop_field = None;
@@ -2348,6 +2445,375 @@ impl EditorView {
             self.apply_tx("nudge", ops);
         }
         cx.notify();
+    }
+
+    // --- keyboard focus & navigation ----------------------------------------
+
+    /// The focus area currently holding keyboard focus. The root handle and
+    /// the roll handle both count as `Roll` — the canvas is the default
+    /// editing context.
+    fn area(&self, window: &Window, cx: &App) -> FocusArea {
+        if self.menu_fh.contains_focused(window, cx) {
+            FocusArea::MenuBar
+        } else if self.tracks_fh.contains_focused(window, cx) {
+            FocusArea::Tracks
+        } else if self.lane_fh.contains_focused(window, cx) {
+            FocusArea::Lane
+        } else if self.events_fh.contains_focused(window, cx) {
+            FocusArea::Events
+        } else {
+            FocusArea::Roll
+        }
+    }
+
+    /// Focus handle for a region (with visibility fallbacks).
+    fn fh_for(&self, area: FocusArea) -> FocusHandle {
+        match area {
+            FocusArea::MenuBar => self.menu_fh.clone(),
+            FocusArea::Tracks => self.tracks_fh.clone(),
+            FocusArea::Roll => self.roll_fh.clone(),
+            FocusArea::Lane => self.lane_fh.clone(),
+            FocusArea::Events if self.show_events => self.events_fh.clone(),
+            FocusArea::Events => self.roll_fh.clone(),
+        }
+    }
+
+    /// Focus can never be absent or land on a hidden region — reroute it.
+    /// Called from render each frame so nothing can leave focus invisible.
+    fn repair_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if window.focused(cx).is_none() {
+            window.focus(&self.roll_fh, cx);
+        }
+        if !self.show_events && self.events_fh.contains_focused(window, cx) {
+            window.focus(&self.roll_fh, cx);
+        }
+    }
+
+    /// Open dropdown `m` under its menubar label (used by mouse and keys).
+    fn open_menu_at(&mut self, m: TopMenu, cx: &mut Context<Self>) {
+        self.open_menu = Some((m, menu_x(m)));
+        self.open_sub = None;
+        self.menu_sel = None;
+        self.sub_sel = None;
+        self.menu_bar_sel = MENUS.iter().position(|(mm, _, _)| *mm == m).unwrap_or(0);
+        cx.notify();
+    }
+
+    /// Switch the open dropdown to a neighbouring menubar entry.
+    fn menu_sibling(&mut self, dir: i64, cx: &mut Context<Self>) {
+        let Some((m, _)) = self.open_menu else {
+            return;
+        };
+        let i = MENUS.iter().position(|(mm, _, _)| *mm == m).unwrap_or(0) as i64;
+        let ni = (i + dir).rem_euclid(MENUS.len() as i64) as usize;
+        self.open_menu_at(MENUS[ni].0, cx);
+    }
+
+    /// Arrow-key movement inside the open dropdown/cascade.
+    fn menu_step(&mut self, dir: i32, cx: &mut Context<Self>) {
+        if self.open_sub.is_some() {
+            self.sub_sel = next_selectable(&self.sub_rows, self.sub_sel, dir);
+        } else {
+            self.menu_sel = next_selectable(&self.menu_rows, self.menu_sel, dir);
+        }
+        cx.notify();
+    }
+
+    /// Open the cascade for the selected submenu row.
+    fn open_selected_sub(&mut self, cx: &mut Context<Self>) {
+        if let Some(i) = self.menu_sel {
+            if let Some(MenuRow::Sub { sub, .. }) = self.menu_rows.get(i) {
+                let y = row_y(&self.menu_rows, i);
+                self.open_sub = Some((*sub, y));
+                self.sub_sel = None;
+            }
+        }
+        cx.notify();
+    }
+
+    /// Enter/Space on the highlighted row: run a leaf, descend into a ▸ row.
+    fn menu_activate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.open_sub.is_none() {
+            if let Some(i) = self.menu_sel {
+                if matches!(self.menu_rows.get(i), Some(MenuRow::Sub { .. })) {
+                    self.open_selected_sub(cx);
+                    return;
+                }
+            }
+        }
+        let (rows, sel) = if self.open_sub.is_some() {
+            (&self.sub_rows, self.sub_sel)
+        } else {
+            (&self.menu_rows, self.menu_sel)
+        };
+        let act = match sel.and_then(|i| rows.get(i)) {
+            Some(MenuRow::Leaf(l)) => Some(l.act.clone()),
+            _ => None,
+        };
+        if let Some(act) = act {
+            self.open_menu = None;
+            self.open_sub = None;
+            self.menu_sel = None;
+            self.sub_sel = None;
+            act(self, window, cx);
+            // restore focus to the region the command ran against
+            let fh = self.fh_for(self.last_area);
+            window.focus(&fh, cx);
+        }
+    }
+
+    /// Keyboard control for the open menu. Returns true when the key was
+    /// consumed; unhandled keys keep bubbling so chords still work.
+    fn menu_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.open_menu.is_none() {
+            return false;
+        }
+        match ev.keystroke.key.as_str() {
+            "left" => {
+                if self.open_sub.is_some() {
+                    self.open_sub = None;
+                    self.sub_sel = None;
+                    cx.notify();
+                } else {
+                    self.menu_sibling(-1, cx);
+                }
+            }
+            "right" => {
+                if self.open_sub.is_none() {
+                    let is_sub = self
+                        .menu_sel
+                        .and_then(|i| self.menu_rows.get(i))
+                        .is_some_and(|r| matches!(r, MenuRow::Sub { .. }));
+                    if is_sub {
+                        self.open_selected_sub(cx);
+                    } else {
+                        self.menu_sibling(1, cx);
+                    }
+                }
+            }
+            "up" => self.menu_step(-1, cx),
+            "down" => self.menu_step(1, cx),
+            "enter" | " " => {
+                // nothing highlighted yet: select the first row rather than
+                // firing it — Enter activates on the next press
+                if self.menu_sel.is_none() && self.sub_sel.is_none() {
+                    self.menu_step(1, cx);
+                } else {
+                    self.menu_activate(window, cx);
+                }
+            }
+            "escape" => {
+                self.open_menu = None;
+                self.open_sub = None;
+                self.menu_sel = None;
+                self.sub_sel = None;
+                cx.notify();
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Arrows on the roll: nudge the selection, or move the edit cursor when
+    /// nothing is selected (Enter inserts at the cursor).
+    fn roll_arrow(&mut self, dtick: i64, dkey: i32, cx: &mut Context<Self>) {
+        if self.selection.is_empty() {
+            self.cursor_move(dtick, dkey, cx);
+        } else {
+            self.nudge(dtick, dkey, cx);
+        }
+    }
+
+    /// Note length used by cursor inserts — same rule as `insert_note`.
+    fn cursor_insert_len(&self) -> u64 {
+        self.snap_ticks().max(self.ppq() as i64 / 4) as u64
+    }
+
+    /// Move the roll edit cursor and scroll it into view.
+    fn cursor_move(&mut self, dtick: i64, dkey: i32, cx: &mut Context<Self>) {
+        self.cursor_tick = (self.cursor_tick as i64 + dtick).max(0) as u64;
+        self.cursor_key = (self.cursor_key + dkey).clamp(0, 127);
+        self.ensure_cursor_visible();
+        cx.notify();
+    }
+
+    /// Scroll the roll so the edit cursor is on screen with a small margin.
+    fn ensure_cursor_visible(&mut self) {
+        let b = self.roll_bounds.get();
+        let w = f32::from(b.size.width);
+        let h = f32::from(b.size.height);
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        let x0 = self.cursor_tick as f32 * self.zoom;
+        let x1 = x0 + self.cursor_insert_len() as f32 * self.zoom;
+        let margin = 32.0;
+        if x0 < self.scroll_x + margin {
+            self.scroll_x = (x0 - margin).max(0.0);
+        } else if x1 > self.scroll_x + w - margin {
+            self.scroll_x = (x1 - w + margin).max(0.0);
+        }
+        let row_top = (127 - self.cursor_key) as f32 * NOTE_H;
+        let row_bot = row_top + NOTE_H;
+        if row_top < self.scroll_y + margin {
+            self.scroll_y = (row_top - margin).max(0.0);
+        } else if row_bot > self.scroll_y + h - margin {
+            self.scroll_y = row_bot - h + margin;
+        }
+        self.clamp_scroll();
+    }
+
+    /// Enter on the roll: select the note under the cursor, or insert a new
+    /// note at it when the cell is empty.
+    fn cursor_activate(&mut self, cx: &mut Context<Self>) {
+        let end = self.cursor_tick + self.cursor_insert_len();
+        let hit = self.notes.iter().find(|n| {
+            n.track == self.sel_track
+                && n.key == self.cursor_key as u8
+                && n.start_tick < end
+                && n.end_tick.unwrap_or(n.start_tick + 1) > self.cursor_tick
+        });
+        if let Some(n) = hit {
+            self.selection = BTreeSet::from([n.on_id]);
+            cx.notify();
+        } else {
+            let len = self.cursor_insert_len();
+            self.insert_note_len(self.cursor_tick, self.cursor_key as u8, len, cx);
+        }
+    }
+
+    /// ±track selection from the keyboard.
+    fn track_step(&mut self, dir: i64, cx: &mut Context<Self>) {
+        let n = self.doc(|d| d.tracks.len());
+        if n == 0 {
+            return;
+        }
+        let i = (self.sel_track as i64 + dir).clamp(0, n as i64 - 1) as usize;
+        if i != self.sel_track {
+            self.sel_track = i;
+            cx.notify();
+        }
+    }
+
+    fn toggle_mute(&mut self, i: usize) {
+        {
+            let mut sh = lock_shared(&self.shared);
+            if !sh.muted.remove(&i) {
+                sh.muted.insert(i);
+            }
+        }
+        self.persist();
+    }
+
+    fn toggle_solo(&mut self, i: usize) {
+        {
+            let mut sh = lock_shared(&self.shared);
+            if !sh.soloed.remove(&i) {
+                sh.soloed.insert(i);
+            }
+        }
+        self.persist();
+    }
+
+    fn cycle_chan(&mut self, i: usize) {
+        let ops = {
+            let mut sh = lock_shared(&self.shared);
+            let cur = sh.doc.tracks.get(i).map(|t| t.out_channel).unwrap_or(0);
+            sh.doc.set_track_channel_ops(i, (cur + 1) % 16)
+        };
+        self.apply_tx("set track channel", ops);
+    }
+
+    /// Apply the rename field to the selected track.
+    fn apply_rename(&mut self, cx: &mut Context<Self>) {
+        let name = self.input.read(cx).value().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let ops = {
+            let mut sh = lock_shared(&self.shared);
+            sh.doc.set_track_name_ops(self.sel_track, &name)
+        };
+        self.apply_tx("set track name", ops);
+    }
+
+    /// Enter in the rename field: commit the name and hand focus back to
+    /// the track list so focus never stays trapped in the input.
+    fn commit_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_rename(cx);
+        window.focus(&self.tracks_fh, cx);
+        cx.notify();
+    }
+
+    /// Up/down in the lane: ±velocity on the selected notes.
+    fn nudge_vel(&mut self, dv: i32, cx: &mut Context<Self>) {
+        if self.selection.is_empty() {
+            return;
+        }
+        let mut ops = Vec::new();
+        {
+            let sh = lock_shared(&self.shared);
+            for n in self
+                .notes
+                .iter()
+                .filter(|n| self.selection.contains(&n.on_id))
+            {
+                let nv = (n.vel as i32 + dv).clamp(1, 127) as u8;
+                if nv == n.vel {
+                    continue;
+                }
+                let Some(track) = sh.doc.tracks.get(n.track) else {
+                    continue;
+                };
+                for e in track.events.iter() {
+                    if e.id != n.on_id {
+                        continue;
+                    }
+                    let mut after = e.clone();
+                    if let EventKind::Channel { data, .. } = &mut after.kind {
+                        data[1] = nv;
+                    }
+                    ops.push(Op::UpdateEvent {
+                        track: n.track,
+                        before: e.clone(),
+                        after,
+                    });
+                }
+            }
+        }
+        if !ops.is_empty() {
+            self.apply_tx("set velocity", ops);
+        }
+        cx.notify();
+    }
+
+    /// Move the event-list selection by `dir` rows, scrolling it into view.
+    fn ev_step(&mut self, dir: i64, cx: &mut Context<Self>) {
+        let n = self.events.len();
+        if n == 0 {
+            return;
+        }
+        let i = (self.ev_sel as i64 + dir).clamp(0, n as i64 - 1) as usize;
+        if i != self.ev_sel {
+            self.ev_sel = i;
+            // keyboard navigation selects like a plain click — the
+            // inspector follows the cursor row
+            if let Some(&Some((_, _, id))) = self.event_refs.get(i) {
+                self.sel_events = BTreeSet::from([id]);
+                self.prop_field = None;
+            }
+            self.events_scroll
+                .scroll_to_item(i, ScrollStrategy::Nearest);
+            cx.notify();
+        }
+    }
+
+    /// Enter on the event list: move the playhead to the row's tick.
+    fn ev_activate(&mut self, cx: &mut Context<Self>) {
+        if let Some(row) = self.events.get(self.ev_sel) {
+            let tick = row.tick;
+            self.seek_to_tick(tick, false, cx);
+        }
     }
 
     /// Move the playhead to `tick`; `play` (or an already-playing transport)
