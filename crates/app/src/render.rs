@@ -723,22 +723,51 @@ impl Render for EditorView {
             )
             .child({
                 let events = self.events.clone();
+                let refs = self.event_refs.clone();
+                let sel = self.sel_events.clone();
+                let view = cx.entity();
                 uniform_list("events", events.len(), move |range, _w, _cx| {
                     range
                         .map(|i| {
+                            let selected = refs[i]
+                                .map(|(_, _, id)| sel.contains(&id))
+                                .unwrap_or(false);
+                            let view = view.clone();
                             div()
+                                .id(("ev-row", i))
                                 .h(px(18.0))
                                 .px_2()
                                 .text_size(px(11.0))
                                 .font_family("Cascadia Mono")
-                                .text_color(rgb(0xb8b8c8))
+                                .text_color(if selected { rgb(0xffffff) } else { rgb(0xb8b8c8) })
+                                .bg(if selected {
+                                    rgba(0x4f8cff44)
+                                } else {
+                                    rgba(0x00000000)
+                                })
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgba(0xffffff12)))
                                 .child(events[i].clone())
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    move |ev, _w, cx| {
+                                        view.update(cx, |this, cx| {
+                                            this.ev_row_click(
+                                                i,
+                                                ev.modifiers.control,
+                                                ev.modifiers.shift,
+                                                cx,
+                                            );
+                                        });
+                                    },
+                                )
                         })
                         .collect()
                 })
                 .h_full()
                 .flex_1()
-            });
+            })
+            .child(self.prop_panel(cx));
 
         let body = div().flex().flex_1().min_h(px(0.0));
 
@@ -1271,6 +1300,7 @@ impl Render for EditorView {
                                 this.selection = BTreeSet::from([n.on_id]);
                             }
                             this.sel_track = n.track;
+                            this.sel_events.clear();
                             this.drag = Some(Drag {
                                 mode: if ev.modifiers.alt {
                                     DragMode::Duplicate
@@ -1395,6 +1425,7 @@ impl Render for EditorView {
                                             .filter(|n| bar_dx(n).abs() <= 6.0)
                                         {
                                             this.selection = BTreeSet::from([n.on_id]);
+                                            this.sel_events.clear();
                                             this.drag = Some(Drag {
                                                 mode: DragMode::Velocity,
                                                 on_id: n.on_id,
@@ -2711,6 +2742,7 @@ impl Render for EditorView {
                         this.help_open = false;
                         this.show_output_status = false;
                         this.selection.clear();
+                        this.sel_events.clear();
                         cx.notify();
                     }
                     (true, false, "x") => this.copy_selected(true, cx),
@@ -3111,6 +3143,83 @@ impl EditorView {
     /// Dropdown separator line.
     fn msep() -> Div {
         div().h(px(1.0)).mx_2().my_1().bg(rgb(0x2a2a35))
+    }
+
+    /// Event-properties inspector: exact numeric rows for the selected
+    /// event / note / track. Clicking an editable row loads its value into
+    /// the input; Apply commits through one transaction. Byte-level rows
+    /// (meta payload, sysex, escape) are flagged with a warning tint.
+    fn prop_panel(&self, cx: &mut Context<Self>) -> Div {
+        let (title, rows) = self.doc(|d| self.prop_rows(d));
+        let any_warn = rows.iter().any(|r| r.warn);
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .gap_y(px(2.0))
+            .border_t_1()
+            .border_color(rgb(0x2a2a35))
+            .px_2()
+            .py_1()
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(rgb(0x9a9ab0))
+                    .child(title),
+            );
+        for (ix, r) in rows.into_iter().enumerate() {
+            let mut row = div()
+                .id(("prop-row", ix))
+                .flex()
+                .gap_2()
+                .text_size(px(11.0))
+                .child(
+                    div()
+                        .w(px(86.0))
+                        .text_color(if r.warn { rgb(0xffb060) } else { rgb(0x9a9ab0) })
+                        .child(if r.warn {
+                            SharedString::from(format!("{}!", r.label))
+                        } else {
+                            r.label.clone()
+                        }),
+                )
+                .child(
+                    div()
+                        .font_family("Cascadia Mono")
+                        .text_color(rgb(0xd8d8e0))
+                        .overflow_hidden()
+                        .child(r.value.clone()),
+                );
+            if let Some(field) = r.field {
+                let value = r.value.clone();
+                row = row
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgba(0xffffff10)))
+                    .on_click(cx.listener(move |v, _e, w, cx| {
+                        v.prop_edit(field, value.clone(), w, cx)
+                    }));
+            }
+            panel = panel.child(row);
+        }
+        let mut foot = div().flex().gap_1().items_center().child(
+            div()
+                .w(px(150.0))
+                .h(px(22.0))
+                .child(Input::new(&self.prop_input)),
+        );
+        if self.prop_field.is_some() {
+            foot = foot.child(Self::chip("prop.apply", t("prop.apply"), cx, |v, _e, cx| {
+                v.prop_apply(cx)
+            }));
+        }
+        if any_warn {
+            foot = foot.child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(rgb(0xffb060))
+                    .child(t("prop.raw_warn")),
+            );
+        }
+        panel.child(foot)
     }
 }
 
