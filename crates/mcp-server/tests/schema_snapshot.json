@@ -111,7 +111,7 @@
     },
     {
       "deprecated": null,
-      "description": "Import-quality findings over the raw event layer: dangling noteOn, zero-length notes, missing End-of-Track, tempo events outside the conductor track. Each has code/track/tick/event_id + detail.",
+      "description": "Import-quality findings over the raw event layer: dangling noteOn, zero-length notes, missing End-of-Track, tempo events outside the conductor track, overlapping (retriggered) noteOns. Each has code/track/tick/event_id + detail. Note pairing is deterministic LIFO per (channel,key); overlapping-noteon marks where that choice was ambiguous.",
       "input_schema": {
         "properties": {},
         "type": "object"
@@ -287,7 +287,7 @@
     },
     {
       "deprecated": null,
-      "description": "Resolve import-quality findings as one undo step. Args: codes? (array of diagnostic codes; omitted = fix all). Returns resolved/failed counts.",
+      "description": "Resolve import-quality findings as one undo step. Args: codes? (array of diagnostic codes; omitted = fix all). Returns resolved/failed counts. overlapping-noteon is reported but never auto-resolved — ambiguous performance data is preserved.",
       "input_schema": {
         "properties": {
           "codes": {

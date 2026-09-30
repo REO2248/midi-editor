@@ -348,7 +348,9 @@ impl Document {
                 });
             }
         }
-        for n in self.notes() {
+        let (notes, mut pairing_diags) = self.paired_notes();
+        out.append(&mut pairing_diags);
+        for n in notes {
             if n.end_tick.is_none() {
                 out.push(Diagnostic {
                     code: "dangling-noteon",
@@ -988,8 +990,31 @@ impl Default for ChaseState {
 
 impl Document {
     /// Derived view over the raw event truth — O(events). Call after edits.
+    ///
+    /// Pairing policy — deterministic, channel-aware, **LIFO**: every
+    /// (channel, key) lane keeps a stack of pending note-ons. A `0x90` with
+    /// vel>0 pushes; a `0x80` or `0x90`-vel0 pops the NEWEST pending on for
+    /// that lane. Overlapping ons for the same key pair their offs
+    /// innermost-first (the conventional reading of stacked retriggers);
+    /// ons on different channels or different keys never interact. A
+    /// retrigger arriving while a previous on is still held is surfaced as
+    /// an `overlapping-noteon` diagnostic instead of being silently
+    /// interpreted. Leftover ons become `Note`s with `end_tick: None` (the
+    /// `dangling-noteon` diagnostic).
+    ///
+    /// The pairing is a pure derived view — no events are inserted,
+    /// removed, or merged — and edits always address the paired
+    /// `on_id`/`off_id` EventIds, never key/time heuristics.
     pub fn notes(&self) -> Vec<Note> {
+        self.paired_notes().0
+    }
+
+    /// `notes()` plus the pairing diagnostics discovered on the same pass
+    /// (`overlapping-noteon`) — the two never disagree about which on
+    /// paired which off.
+    fn paired_notes(&self) -> (Vec<Note>, Vec<Diagnostic>) {
         let mut out = Vec::new();
+        let mut diags = Vec::new();
         for (ti, t) in self.tracks.iter().enumerate() {
             // (channel, key) -> pending NoteOn stack
             let mut pending: [[Vec<usize>; 128]; 16] =
@@ -1004,6 +1029,22 @@ impl Document {
                 let key = data[0] as usize;
                 match (msg, data[1]) {
                     (0x90, v) if v > 0 => {
+                        // an on arriving while a previous on for this lane
+                        // is still held is ambiguous — flag it, then keep
+                        // stacking (LIFO pairing is the documented answer)
+                        if !pending[ch][key].is_empty() {
+                            diags.push(Diagnostic {
+                                code: "overlapping-noteon",
+                                track: ti,
+                                tick: e.tick,
+                                event: Some(e.id),
+                                detail: format!(
+                                    "noteOn ch{} key{} retriggered while previous on still held — paired LIFO (newest on takes the next off)",
+                                    ch + 1,
+                                    key
+                                ),
+                            });
+                        }
                         pending[ch][key].push(on_events.len());
                         on_events.push((e.tick, v, e.id));
                     }
@@ -1049,7 +1090,7 @@ impl Document {
             }
         }
         out.sort_by_key(|n| (n.start_tick, n.key));
-        out
+        (out, diags)
     }
 }
 
