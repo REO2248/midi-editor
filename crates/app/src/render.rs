@@ -2262,6 +2262,14 @@ impl Render for EditorView {
                                 .text_size(px(9.0))
                                 .text_color(rgb(0x9fd0ff))
                                 .child(lane_mode.label())
+                                // swallow the mouse_down so a chip press can't
+                                // start a lane insert-drag underneath it
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|_v, _e, _w, cx| {
+                                        cx.stop_propagation()
+                                    }),
+                                )
                                 .on_click(cx.listener(|v, _e: &ClickEvent, _w, cx| {
                                     cx.stop_propagation();
                                     v.set_lane(v.lane_mode.cycle(), cx);
@@ -2287,6 +2295,12 @@ impl Render for EditorView {
                                         Some(k) => format!("k{k}"),
                                         None => "k*".to_string(),
                                     })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|_v, _e, _w, cx| {
+                                            cx.stop_propagation()
+                                        }),
+                                    )
                                     .on_click(cx.listener(|v, e: &ClickEvent, _w, cx| {
                                         cx.stop_propagation();
                                         v.cycle_poly_key(e.modifiers().shift, cx);
