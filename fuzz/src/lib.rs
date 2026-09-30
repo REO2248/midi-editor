@@ -21,7 +21,11 @@ fn riff_unwrap(raw: &[u8]) -> Option<&[u8]> {
         if id == b"data" {
             return Some(data);
         }
-        chunks = &body[data.len()..];
+        if body.len() < len {
+            // remainder of the file becomes the chunk body -> EOF after it
+            return None;
+        }
+        chunks = &body[len..];
         if len % 2 == 1 && !chunks.is_empty() {
             chunks = &chunks[1..];
         }
@@ -29,44 +33,48 @@ fn riff_unwrap(raw: &[u8]) -> Option<&[u8]> {
     None
 }
 
-/// Model midly 0.5.3's `Chunk::read` scan over the SMF payload: skip unknown
-/// chunks (BE length, remainder fallback since `strict` is off), and on the
-/// first `MThd` chunk return the high byte of the timing division field.
-fn division_hi_byte(raw: &[u8]) -> Option<u8> {
-    let payload = match raw.get(..4) {
-        Some(b"RIFF") => riff_unwrap(raw)?,
-        Some(b"MThd") => raw,
-        _ => return None,
-    };
+/// Model midly 0.5.3's `Chunk::read` walk over the whole SMF payload: chunks
+/// are skipped by big-endian length (remainder fallback since `strict` is
+/// off), and `Header::read` runs on EVERY `MThd` chunk reached — including
+/// stray ones mid-file while `TrackIter` scans for tracks. Returns true when
+/// any reached MThd carries division high byte 0x80 (the panicking value).
+fn any_header_panics(payload: &[u8]) -> bool {
     let mut rest = payload;
-    loop {
-        if rest.len() < 8 {
-            return None;
-        }
+    while rest.len() >= 8 {
         let id = &rest[..4];
-        let len = u32::from_be_bytes(rest[4..8].try_into().ok()?) as usize;
+        let len = u32::from_be_bytes(rest[4..8].try_into().unwrap()) as usize;
         let body = &rest[8..];
         let chunk = &body[..len.min(body.len())];
-        if id == b"MThd" {
-            // format u16, ntrks u16, then timing; division hi byte is fps.
-            return chunk.get(4).copied();
+        if id == b"MThd" && chunk.get(4) == Some(&0x80) {
+            return true;
         }
-        if id == b"MTrk" || body.len() < len {
-            // MTrk isn't a header; a remainder-length chunk consumes all.
-            return None;
+        if body.len() < len {
+            // remainder consumed by this chunk -> EOF next
+            return false;
         }
         rest = &body[len..];
     }
+    false
 }
 
 /// Known upstream panic, unfixable downstream: midly 0.5.3 negates the SMPTE
 /// fps byte as i8, so a division high byte of 0x80 (-128) overflows and
-/// panics (`midly/src/primitive.rs` `Timing::read`).
+/// panics (`midly/src/primitive.rs` `Timing::read`). It fires on every MThd
+/// chunk the chunk iterator reaches, not just the file's real header.
 ///
 /// In normal builds `smf_core::parse` recovers via `catch_unwind` + the
 /// lenient path, but libFuzzer builds abort on panic, so targets that run
 /// any midly-backed code must skip inputs hitting only this bug to keep
 /// finding NEW panics.
 pub fn hits_known_midly_panic(raw: &[u8]) -> bool {
-    division_hi_byte(raw) == Some(0x80)
+    let payload = match raw.get(..4) {
+        Some(b"RIFF") => match riff_unwrap(raw) {
+            Some(p) => p,
+            None => return false,
+        },
+        Some(b"MThd") => raw,
+        // midly errors before parsing anything else
+        _ => return false,
+    };
+    any_header_panics(payload)
 }
