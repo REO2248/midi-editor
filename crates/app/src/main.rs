@@ -172,6 +172,21 @@ enum DestPick {
     Default,
 }
 
+/// How the timeline tracks the playhead while the transport runs.
+#[derive(Clone, Copy, PartialEq)]
+enum Follow {
+    /// viewport stays put
+    Off,
+    /// jump a viewport ahead when the playhead walks off the right edge
+    Page,
+    /// keep the playhead pinned ~1/3 from the left edge
+    Smooth,
+}
+
+/// Follow is suspended this long after a manual scroll so it never fights
+/// the user's own pan (any follow/nav command resumes it immediately).
+const FOLLOW_HOLD: std::time::Duration = std::time::Duration::from_secs(4);
+
 /// What the bottom lane edits for the selected track.
 #[derive(Clone, Copy, PartialEq)]
 enum LaneMode {
@@ -632,6 +647,10 @@ struct EditorView {
     /// restart at `loop_start_us` when playback reaches the end
     /// (`loop_enabled` itself lives in `shared` so MCP can toggle it)
     loop_start_us: u64,
+    /// playhead follow mode during playback (per-song pref)
+    follow: Follow,
+    /// manual scroll pauses follow until this instant
+    follow_hold: Option<std::time::Instant>,
     /// what the bottom lane edits
     lane_mode: LaneMode,
     /// live MIDI input capture while `rec` is armed
@@ -1144,6 +1163,8 @@ impl EditorView {
             playback: None,
             play_us: 0,
             loop_start_us: 0,
+            follow: Follow::Page,
+            follow_hold: None,
             lane_mode: LaneMode::Velocity,
             rec: None,
             sysex_stats: Vec::new(),
@@ -1403,6 +1424,139 @@ impl EditorView {
         self.cursor_tick = first;
         self.cursor_key = mid.unwrap_or(60);
         self.ev_sel = 0;
+    }
+
+    /// Keep the playhead on screen while playing, per `follow` mode.
+    /// Never fires while a drag is live or `follow_hold` is active.
+    fn follow_playhead(&mut self, tick: u64) {
+        let w = f32::from(self.roll_bounds.get().size.width);
+        if w <= 0.0 {
+            return;
+        }
+        let x = tick as f32 * self.zoom;
+        match self.follow {
+            Follow::Off => {}
+            Follow::Page => {
+                let m = 48.0;
+                if x < self.scroll_x + m || x > self.scroll_x + w - m {
+                    self.scroll_x = (x - w * 0.15).max(0.0);
+                }
+            }
+            Follow::Smooth => {
+                self.scroll_x = (x - w / 3.0).max(0.0);
+            }
+        }
+        self.clamp_scroll();
+    }
+
+    /// Scroll so the playhead sits at viewport center.
+    fn center_playhead(&mut self) {
+        let w = f32::from(self.roll_bounds.get().size.width);
+        if w <= 0.0 {
+            return;
+        }
+        let tick = self.doc(|d| d.tempo_map.us_to_tick(self.play_us));
+        self.scroll_x = (tick as f32 * self.zoom - w / 2.0).max(0.0);
+        self.clamp_scroll();
+    }
+
+    /// Go to playhead — also the explicit "resume follow" gesture.
+    fn go_playhead(&mut self, cx: &mut Context<Self>) {
+        self.follow_hold = None;
+        self.center_playhead();
+        cx.notify();
+    }
+
+    /// Frame the selected notes in the viewport (10% breathing room).
+    fn zoom_to_selection(&mut self, cx: &mut Context<Self>) {
+        let mut lo = u64::MAX;
+        let mut hi = 0u64;
+        for n in self
+            .notes
+            .iter()
+            .filter(|n| self.selection.contains(&n.on_id))
+        {
+            lo = lo.min(n.start_tick);
+            hi = hi.max(n.end_tick.unwrap_or(n.start_tick + 1));
+        }
+        if lo > hi {
+            self.status = t("status.nosel").into();
+            cx.notify();
+            return;
+        }
+        self.zoom_to_span(lo, hi, cx);
+    }
+
+    /// Frame the whole song.
+    fn zoom_to_song(&mut self, cx: &mut Context<Self>) {
+        self.zoom_to_span(0, self.doc_end_ticks(), cx);
+    }
+
+    fn zoom_to_span(&mut self, lo: u64, hi: u64, cx: &mut Context<Self>) {
+        let w = f32::from(self.roll_bounds.get().size.width);
+        if w <= 0.0 {
+            return;
+        }
+        let span = (hi - lo).max(1) as f32;
+        self.zoom = (w * 0.9 / span).clamp(ZOOM_MIN, ZOOM_MAX);
+        self.scroll_x = (lo as f32 * self.zoom - w * 0.05).max(0.0);
+        self.clamp_scroll();
+        self.persist();
+        cx.notify();
+    }
+
+    /// Seek the playhead to the previous/next marker in the file.
+    fn marker_step(&mut self, dir: i64, cx: &mut Context<Self>) {
+        let tick = self.doc(|d| d.tempo_map.us_to_tick(self.play_us));
+        let dst = if dir > 0 {
+            self.doc_ui.markers.iter().map(|m| m.0).find(|&m| m > tick)
+        } else {
+            self.doc_ui
+                .markers
+                .iter()
+                .rev()
+                .map(|m| m.0)
+                .find(|&m| m < tick)
+        };
+        match dst {
+            Some(t) => {
+                self.seek_to_tick(t, false, cx);
+                self.center_playhead();
+            }
+            None => {
+                self.status = t("status.no_marker").into();
+                cx.notify();
+            }
+        }
+    }
+
+    /// Seek the playhead to the previous/next event of the selected track —
+    /// the same jump whether the roll or the event list drove the command.
+    fn event_step(&mut self, dir: i64, cx: &mut Context<Self>) {
+        let tick = self.doc(|d| d.tempo_map.us_to_tick(self.play_us));
+        let tr = self.sel_track;
+        let dst = self.doc(|d| {
+            let it = d
+                .tracks
+                .get(tr)
+                .into_iter()
+                .flat_map(|t| t.events.iter().map(|e| e.tick));
+            if dir > 0 {
+                it.filter(|&x| x > tick).min()
+            } else {
+                it.filter(|&x| x < tick).max()
+            }
+        });
+        match dst {
+            Some(t) => {
+                self.seek_to_tick(t, false, cx);
+                self.center_playhead();
+            }
+            None => {
+                self.status = t("status.no_event").into();
+                cx.notify();
+            }
+        }
     }
 
     fn set_enc(&mut self, enc: Option<smf_core::TextEncoding>, cx: &mut Context<Self>) {
@@ -4915,6 +5069,8 @@ impl EditorView {
         let vw = f32::from(self.roll_bounds.get().size.width) / self.zoom;
         self.scroll_x = ((t - vw / 2.0) * self.zoom).max(0.0);
         self.clamp_scroll();
+        // minimap pan counts as a manual scroll — pause follow briefly
+        self.follow_hold = Some(std::time::Instant::now() + FOLLOW_HOLD);
     }
 
     /// Recompute the active drag's deltas from the last cursor position.
@@ -5854,6 +6010,8 @@ struct Prefs {
     drum: Option<bool>,
     scale: Option<i8>,
     scale_minor: Option<bool>,
+    /// None in old sidecars = keep the default (page)
+    follow: Option<String>,
 }
 
 impl Default for Prefs {
@@ -5882,6 +6040,7 @@ impl Default for Prefs {
             drum: None,
             scale: None,
             scale_minor: None,
+            follow: None,
         }
     }
 }
@@ -5926,6 +6085,10 @@ impl persist::json::Versioned for Prefs {
         });
         // unbounded track indexes are noise, not data — keep only plausible
         // indices (document bounds are still enforced at apply time)
+        self.follow = self
+            .follow
+            .take()
+            .filter(|f| matches!(f.as_str(), "off" | "page" | "smooth"));
         self.muted.retain(|t| *t < 1024);
         self.soloed.retain(|t| *t < 1024);
         self.track_dest.retain(|t, _| *t < 1024);
@@ -6091,6 +6254,11 @@ impl EditorView {
         if let Some(m) = p.scale_minor {
             self.scale_minor = m;
         }
+        self.follow = match p.follow.as_deref() {
+            Some("off") => Follow::Off,
+            Some("smooth") => Follow::Smooth,
+            _ => Follow::Page,
+        };
         // start warming any VST3 destinations the prefs just restored
         self.refresh_plugins();
         let plugin_dests: Vec<usize> = {
@@ -6186,6 +6354,14 @@ impl EditorView {
                 .into(),
             ),
             snap: Some(self.snap_idx),
+            follow: Some(
+                match self.follow {
+                    Follow::Off => "off",
+                    Follow::Page => "page",
+                    Follow::Smooth => "smooth",
+                }
+                .into(),
+            ),
         };
         // atomic temp+replace with a bounded .bak of the previous valid
         // version — a crash mid-write can no longer reset the sidecar

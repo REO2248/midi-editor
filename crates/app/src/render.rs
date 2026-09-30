@@ -159,6 +159,18 @@ impl Render for EditorView {
         let badge = td.badge();
         let pos = td.format_tick(playhead_tick);
 
+        // playhead follow — suspended while a drag is live or the user just
+        // scrolled manually (`follow_hold`)
+        if self.playback.is_some()
+            && self.follow != Follow::Off
+            && self.drag.is_none()
+            && !self
+                .follow_hold
+                .is_some_and(|t| t > std::time::Instant::now())
+        {
+            self.follow_playhead(playhead_tick);
+        }
+
         // --- piano roll canvas -------------------------------------------------
         let notes = self.notes.clone();
         let (scroll_x, scroll_y, zoom) = (self.scroll_x, self.scroll_y, self.zoom);
@@ -1625,6 +1637,8 @@ impl Render for EditorView {
                     } else {
                         this.scroll_x = (this.scroll_x + d.x.to_f64() as f32).max(0.0);
                         this.scroll_y = (this.scroll_y + d.y.to_f64() as f32).max(0.0);
+                        // manual pan pauses playhead-follow briefly
+                        this.follow_hold = Some(std::time::Instant::now() + FOLLOW_HOLD);
                     }
                     this.clamp_scroll();
                     cx.notify();
@@ -2546,6 +2560,23 @@ impl Render for EditorView {
                     self.mi_cmd("view.zoom_in", None, cx),
                     self.mi_cmd("view.zoom_out", None, cx),
                     self.mi_cmd("view.zoom_reset", None, cx),
+                    Self::msep(),
+                    self.mi_cmd("view.follow_off", Some(self.follow == Follow::Off), cx),
+                    self.mi_cmd("view.follow_page", Some(self.follow == Follow::Page), cx),
+                    self.mi_cmd(
+                        "view.follow_smooth",
+                        Some(self.follow == Follow::Smooth),
+                        cx,
+                    ),
+                    Self::msep(),
+                    self.mi_cmd("view.zoom_sel", None, cx),
+                    self.mi_cmd("view.zoom_song", None, cx),
+                    Self::msep(),
+                    self.mi_cmd("view.go_playhead", None, cx),
+                    self.mi_cmd("view.marker_prev", None, cx),
+                    self.mi_cmd("view.marker_next", None, cx),
+                    self.mi_cmd("view.event_prev", None, cx),
+                    self.mi_cmd("view.event_next", None, cx),
                     Self::msep(),
                     Self::mi_sub("v.rowh", t("view.row_height"), Sub::RowH, cx),
                     self.mi_cmd("view.fold", Some(self.fold), cx),
