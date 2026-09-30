@@ -582,6 +582,146 @@ fn channel_event(b: &[u8]) -> Option<vst3_host::MidiEvent> {
     }
 }
 
+/// One `IComponentHandler::restartComponent` notification, named — the
+/// audit view of `vst3_host::RestartFlags`' predicate set. Ordering is the
+/// VST3 bit order so a drain walks them deterministically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RestartNote {
+    ParamValues,
+    ReloadComponent,
+    ParamTitles,
+    Latency,
+    Io,
+    MidiCcAssignment,
+    NoteExpression,
+    IoTitles,
+    Prefetchable,
+    Routing,
+    Keyswitch,
+    ParamIdMapping,
+}
+
+impl RestartNote {
+    /// Every notification the audit knows, in VST3 bit order.
+    pub const ALL: [RestartNote; 12] = [
+        RestartNote::ReloadComponent,
+        RestartNote::Io,
+        RestartNote::ParamValues,
+        RestartNote::ParamTitles,
+        RestartNote::Latency,
+        RestartNote::MidiCcAssignment,
+        RestartNote::NoteExpression,
+        RestartNote::IoTitles,
+        RestartNote::Prefetchable,
+        RestartNote::Routing,
+        RestartNote::Keyswitch,
+        RestartNote::ParamIdMapping,
+    ];
+
+    /// The `k…Changed`/`kReloadComponent` name, for diagnostics.
+    pub fn name(self) -> &'static str {
+        match self {
+            RestartNote::ParamValues => "kParamValuesChanged",
+            RestartNote::ReloadComponent => "kReloadComponent",
+            RestartNote::ParamTitles => "kParamTitlesChanged",
+            RestartNote::Latency => "kLatencyChanged",
+            RestartNote::Io => "kIoChanged",
+            RestartNote::MidiCcAssignment => "kMidiCCAssignmentChanged",
+            RestartNote::NoteExpression => "kNoteExpressionChanged",
+            RestartNote::IoTitles => "kIoTitlesChanged",
+            RestartNote::Prefetchable => "kPrefetchableSupportChanged",
+            RestartNote::Routing => "kRoutingInfoChanged",
+            RestartNote::Keyswitch => "kKeyswitchChanged",
+            RestartNote::ParamIdMapping => "kParamIDMappingChanged",
+        }
+    }
+}
+
+/// The notifications raised since the last drain, in VST3 bit order —
+/// the only `RestartFlags`-aware shim; the policy below is pure.
+pub fn restart_notes(f: vst3_host::RestartFlags) -> Vec<RestartNote> {
+    let mut out = Vec::with_capacity(4);
+    if f.reload_component() {
+        out.push(RestartNote::ReloadComponent);
+    }
+    if f.io_changed() {
+        out.push(RestartNote::Io);
+    }
+    if f.param_values_changed() {
+        out.push(RestartNote::ParamValues);
+    }
+    if f.param_titles_changed() {
+        out.push(RestartNote::ParamTitles);
+    }
+    if f.latency_changed() {
+        out.push(RestartNote::Latency);
+    }
+    if f.midi_cc_assignment_changed() {
+        out.push(RestartNote::MidiCcAssignment);
+    }
+    if f.note_expression_changed() {
+        out.push(RestartNote::NoteExpression);
+    }
+    if f.io_titles_changed() {
+        out.push(RestartNote::IoTitles);
+    }
+    if f.prefetchable_support_changed() {
+        out.push(RestartNote::Prefetchable);
+    }
+    if f.routing_info_changed() {
+        out.push(RestartNote::Routing);
+    }
+    if f.keyswitch_changed() {
+        out.push(RestartNote::Keyswitch);
+    }
+    if f.param_id_mapping_changed() {
+        out.push(RestartNote::ParamIdMapping);
+    }
+    out
+}
+
+/// What one notification asks of this host. The audit is deliberately
+/// small: we keep no parameter/bus/title caches of our own, so most flags
+/// need only a record; the few that touch playback get a real reaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartAction {
+    /// re-read `getLatencySamples` into the shared tracker
+    RefreshLatency,
+    /// bus layout changed — `service_host_requests` already ran the
+    /// deactivate/reactivate lifecycle; re-query the arrangement for
+    /// diagnostics (nothing else in the app caches it)
+    RequeryIo,
+    /// the plugin demands a full reload — destroy and reopen the instance
+    Reload,
+    /// nothing this host caches needs rebuilding; record it once
+    LogOnly,
+}
+
+/// Notification → reaction. Pure, so the policy is fully unit-testable.
+pub fn restart_action(n: RestartNote) -> RestartAction {
+    match n {
+        RestartNote::Latency => RestartAction::RefreshLatency,
+        RestartNote::Io => RestartAction::RequeryIo,
+        RestartNote::ReloadComponent => RestartAction::Reload,
+        // parameter values/titles, note-expression, routing, keyswitch and
+        // id-mapping metadata: the app keeps no caches of these (the GUI
+        // editor reads them live), so they only need a log record
+        _ => RestartAction::LogOnly,
+    }
+}
+
+/// Per-plugin dedupe for restart notes — a notification the host doesn't
+/// act on is logged the first time it's seen per instance, not per frame.
+#[derive(Debug, Default)]
+pub struct RestartLog(std::collections::HashSet<RestartNote>);
+
+impl RestartLog {
+    /// True the first time `n` is reported for this instance.
+    pub fn first_seen(&mut self, n: RestartNote) -> bool {
+        self.0.insert(n)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,6 +781,45 @@ mod tests {
         assert_eq!(c.offset(rem), 0);
         let d = heard_delta_us(&c, rem);
         assert!(d > 0 && d <= (4096.0 / S_PER_US).ceil() as i64);
+    }
+
+    #[test]
+    fn every_restart_note_maps_to_an_action() {
+        use RestartAction::*;
+        for n in RestartNote::ALL {
+            let a = restart_action(n);
+            assert!(matches!(
+                a,
+                RefreshLatency | RequeryIo | Reload | LogOnly
+            ));
+        }
+        assert_eq!(restart_action(RestartNote::Latency), RefreshLatency);
+        assert_eq!(restart_action(RestartNote::Io), RequeryIo);
+        assert_eq!(restart_action(RestartNote::ReloadComponent), Reload);
+        assert_eq!(restart_action(RestartNote::ParamTitles), LogOnly);
+        assert_eq!(restart_action(RestartNote::Routing), LogOnly);
+        assert_eq!(restart_action(RestartNote::NoteExpression), LogOnly);
+    }
+
+    #[test]
+    fn restart_note_names_cover_vst3_flags() {
+        // names are the VST3 flag spellings so logs can be grepped against
+        // the Steinberg restartComponent docs
+        for n in RestartNote::ALL {
+            assert!(n.name().starts_with('k'), "{}", n.name());
+        }
+        assert_eq!(RestartNote::ALL.len(), 12);
+    }
+
+    #[test]
+    fn restart_log_logs_once_per_note_per_instance() {
+        let mut log = RestartLog::default();
+        assert!(log.first_seen(RestartNote::NoteExpression));
+        assert!(!log.first_seen(RestartNote::NoteExpression));
+        assert!(log.first_seen(RestartNote::Keyswitch));
+        // a fresh instance (e.g. reopened plugin) logs fresh
+        let mut next = RestartLog::default();
+        assert!(next.first_seen(RestartNote::NoteExpression));
     }
 
     #[test]

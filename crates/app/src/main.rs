@@ -369,6 +369,10 @@ struct EditorView {
     /// param edits drain into the playing slot live, and full state is
     /// transferred on open/close via save_state/load_state.
     editor_plugin: Option<(usize, std::sync::Arc<std::sync::Mutex<vst3_host::Plugin>>)>,
+    /// dest index → restart notifications already logged for the instance
+    /// there — a notification the host doesn't act on is recorded once, not
+    /// every frame (`apply_restart_flags`). Cleared with the slot.
+    restart_logged: HashMap<usize, output::RestartLog>,
     /// Manual text-encoding override for display decoding (None = auto/XF hint)
     enc_override: Option<smf_core::TextEncoding>,
     playback: Option<Playback>,
@@ -615,6 +619,7 @@ impl EditorView {
             show_output_status: false,
             plugin_window: None,
             editor_plugin: None,
+            restart_logged: HashMap::new(),
             enc_override: None,
             playback: None,
             play_us: 0,
@@ -2356,6 +2361,7 @@ impl EditorView {
         }
         // index now points at a different bundle — retire the old instance
         if self.plugin_slots.remove(&d).is_some() {
+            self.restart_logged.remove(&d);
             let _ = self.plugin_req.send(output::PluginReq::Drop(d));
         }
         self.plugin_state.insert(
@@ -2423,6 +2429,8 @@ impl EditorView {
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_default();
                     tracing::info!(dest = event.dest, plugin = %name, "plugin ready");
+                    // fresh instance → fresh notification log
+                    self.restart_logged.remove(&event.dest);
                     self.plugin_slots.insert(event.dest, slot);
                     self.plugin_state
                         .insert(event.dest, PluginState::Ready { path: event.path });
@@ -2459,30 +2467,37 @@ impl EditorView {
             }
             changed = true;
         }
-        // a plugin reporting kLatencyChanged gets its latency re-read into
-        // the shared tracker — the sink compensates on its next event, with
-        // no reload and no dropped audio. service_host_requests performs the
-        // VST3-required stop/deactivate/reactivate lifecycle for latency and
-        // I/O requests inside the isolated helper's own control thread.
-        // try_lock keeps a busy audio block from stalling a UI frame; the
-        // next frame picks the flag up.
+        // VST3 restart notifications (IComponentHandler::restartComponent):
+        // serviced per ready slot each frame. service_host_requests runs the
+        // VST3-required stop/deactivate/reactivate lifecycle on the isolated
+        // helper's control thread and returns every flag raised; the audit
+        // then reacts where the host tracks state (latency re-read, bus
+        // re-query, component reload) and logs the rest once per instance.
+        // try_lock keeps a busy audio block from stalling a UI frame — the
+        // next frame picks the flags up.
+        let mut drained: Vec<(usize, vst3_host::RestartFlags)> = Vec::new();
         for (d, slot) in &self.plugin_slots {
             if !matches!(self.plugin_state.get(d), Some(PluginState::Ready { .. })) {
                 continue;
             }
-            let latency_changed = slot
+            if let Some(flags) = slot
                 .plugin
                 .try_lock()
-                .map(|mut p| {
-                    p.service_host_requests()
-                        .map(|f| f.latency_changed())
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
-            if latency_changed {
-                slot.refresh_latency();
-                changed = true;
+                .ok()
+                .and_then(|mut p| p.service_host_requests().ok())
+            {
+                if !flags.is_empty() {
+                    drained.push((*d, flags));
+                }
             }
+        }
+        let mut reloads = Vec::new();
+        for (d, flags) in drained {
+            changed |= self.apply_restart_flags(d, flags, &mut reloads);
+        }
+        for d in reloads {
+            self.ensure_plugin(d, true);
+            changed = true;
         }
         if self.play_pending {
             let needed_loading = {
@@ -2496,6 +2511,72 @@ impl EditorView {
                 self.play_pending = false;
                 self.start_playback();
                 changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Route one plugin's drained `restartComponent` flags through the
+    /// notification audit (`output::restart_notes` → `restart_action`).
+    /// Reactions needing a `&mut self` follow-up after the drain loop
+    /// (instance reloads) are queued on `reloads` for the caller.
+    fn apply_restart_flags(
+        &mut self,
+        d: usize,
+        flags: vst3_host::RestartFlags,
+        reloads: &mut Vec<usize>,
+    ) -> bool {
+        let mut changed = false;
+        let name = self
+            .plugin_slots
+            .get(&d)
+            .and_then(|s| {
+                s.path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+            })
+            .unwrap_or_default();
+        for note in output::restart_notes(flags) {
+            match output::restart_action(note) {
+                output::RestartAction::RefreshLatency => {
+                    if let Some(slot) = self.plugin_slots.get(&d) {
+                        let n = slot.refresh_latency();
+                        tracing::info!("{name} (dest {d}): kLatencyChanged -> {n} samples");
+                    }
+                    changed = true;
+                }
+                output::RestartAction::RequeryIo => {
+                    // the lifecycle already ran inside service_host_requests;
+                    // nothing caches the layout, so re-query it for the log
+                    let ch = self
+                        .plugin_slots
+                        .get(&d)
+                        .and_then(|s| {
+                            s.plugin
+                                .try_lock()
+                                .ok()
+                                .map(|p| p.output_channel_count())
+                        });
+                    tracing::info!("{name} (dest {d}): kIoChanged -> {ch:?} output channel(s)");
+                }
+                output::RestartAction::Reload => {
+                    tracing::info!("{name} (dest {d}): kReloadComponent -> reopening");
+                    reloads.push(d);
+                    changed = true;
+                }
+                output::RestartAction::LogOnly => {
+                    if self
+                        .restart_logged
+                        .entry(d)
+                        .or_default()
+                        .first_seen(note)
+                    {
+                        tracing::info!(
+                            "{name} (dest {d}): {} noted — no host state to rebuild",
+                            note.name()
+                        );
+                    }
+                }
             }
         }
         changed
@@ -2997,6 +3078,7 @@ impl EditorView {
         self.editor_plugin = None;
         // dest indices were just remapped — every slot is stale
         self.plugin_slots.clear();
+        self.restart_logged.clear();
         self.plugin_state.clear();
         let _ = self.plugin_req.send(output::PluginReq::Clear);
         self.refresh_plugins();
@@ -3053,12 +3135,13 @@ impl EditorView {
         }
     }
 
-    /// Push the in-process editor's full state into the playing instance —
+    /// Copy the in-process editor's full state into the playing instance —
     /// covers program/bank changes parameter-edit draining can't see.
-    fn sync_editor_state_into_slot(&mut self) {
-        let Some((d, editor)) = self.editor_plugin.take() else {
-            return;
-        };
+    fn push_editor_state(
+        &self,
+        d: usize,
+        editor: &std::sync::Arc<std::sync::Mutex<vst3_host::Plugin>>,
+    ) {
         let Some(slot) = self.plugin_slots.get(&d) else {
             return;
         };
@@ -3068,6 +3151,14 @@ impl EditorView {
                 let _ = p.load_state(&data);
             }
         }
+    }
+
+    /// `push_editor_state` on editor close, then the handle is released.
+    fn sync_editor_state_into_slot(&mut self) {
+        let Some((d, editor)) = self.editor_plugin.take() else {
+            return;
+        };
+        self.push_editor_state(d, &editor);
     }
 
     /// tick,key under a window-space mouse position
@@ -4076,13 +4167,13 @@ fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
                         let _ = pw.service_platform_events();
                         // live param sync: forward the editor's edits into
                         // the playing instance (best-effort each tick)
-                        if let Some((d, editor)) = &v.editor_plugin {
+                        if let Some((d, editor)) = v.editor_plugin.clone() {
                             let edits = editor
                                 .lock()
                                 .map(|mut e| e.take_parameter_edits())
                                 .unwrap_or_default();
                             if !edits.is_empty() {
-                                if let Some(slot) = v.plugin_slots.get(d) {
+                                if let Some(slot) = v.plugin_slots.get(&d) {
                                     if let Ok(mut p) = slot.plugin.try_lock() {
                                         for ed in edits {
                                             if let Some(val) = ed.value {
@@ -4091,6 +4182,42 @@ fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
                                         }
                                     }
                                 }
+                            }
+                            // the editor instance's own restartComponent drain:
+                            // a preset/state change made inside the plugin's
+                            // GUI arrives as kParamValuesChanged, not as
+                            // parameter edits — push the editor's state into
+                            // the playing instance so they agree. (Drained
+                            // with take_restart_flags, not serviced: a
+                            // GUI-only instance has no processing lifecycle.
+                            // This is its control thread — the UI thread that
+                            // loaded it.)
+                            let flags = editor
+                                .lock()
+                                .map(|mut e| e.take_restart_flags())
+                                .unwrap_or_default();
+                            let mut resync = false;
+                            for note in output::restart_notes(flags) {
+                                match note {
+                                    output::RestartNote::ParamValues
+                                    | output::RestartNote::ParamTitles => resync = true,
+                                    _ => {
+                                        if v
+                                            .restart_logged
+                                            .entry(d)
+                                            .or_default()
+                                            .first_seen(note)
+                                        {
+                                            tracing::info!(
+                                                "editor instance (dest {d}): {} noted",
+                                                note.name()
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            if resync {
+                                v.push_editor_state(d, &editor);
                             }
                         }
                         if pw.closed_by_user() {
