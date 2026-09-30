@@ -15,7 +15,7 @@ headers + channel, tempo/time-signature editing, quantize/transpose/velocity
 ops, marker strip, MIDI-input recording, seek ruler + loop, lane editor for
 velocity/CC/pitch bend, import diagnostics with one-click normalize,
 text-encoding override, plugin GUI windows, per-file sidecar persistence, and
-a 36-tool MCP surface — all against a real .mid document.
+a 38-tool MCP surface — all against a real .mid document.
 
 ## Build (Windows)
 
@@ -106,7 +106,16 @@ tracks, notes, duration, revision, dirty flag), `list_notes`, `query_events`
 (raw events incl. raw_hex), `get_tempo_map`, `get_meta` (names/markers/lyrics
 decoded), `get_cc` (latest CC value per track/channel/cc), `diagnostics`
 (import-quality findings), `list_midi_ports`, `list_destinations`,
-`transaction_status`.
+`transaction_status`, `transaction_history` (bounded log of commits/undos/redos
+with per-transaction change summaries), `changes_since_revision` (aggregate
+diff since a revision, `truncated` when the capped history can't reach it).
+`list_notes` / `query_events` / `get_meta` / `get_cc` paginate: pass `limit`
+(≤10000) and feed each response's `next_cursor` back as `cursor`; cursors are
+keyed to the document revision, so an edit mid-walk returns a `stale_cursor`
+error with a restart hint instead of a silently wrong page. `fields` selects
+row keys to keep (e.g. omit `raw_hex`/`data_hex` on bulk scans). Every
+mutation reply carries a `summary` of what changed (counts by event kind,
+tracks touched, tick range).
 
 **Edit tools** — one call = one undoable transaction, or wrap many calls in a
 named checkpoint (`begin_transaction` / `commit_transaction` /
