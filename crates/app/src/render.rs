@@ -735,7 +735,7 @@ impl Render for EditorView {
                         let d = ev.delta.pixel_delta(px(18.0));
                         let max = this.events.len().saturating_sub(1) as i64;
                         this.ev_first = (this.ev_first as i64
-                            + (d.y.to_f64() / 18.0).round() as i64)
+                            - (d.y.to_f64() / 18.0).round() as i64)
                             .clamp(0, max) as usize;
                         cx.notify();
                     }))
@@ -768,7 +768,11 @@ impl Render for EditorView {
                                         move |_e, _w, app| {
                                             // click selects the event for
                                             // delete / value nudge (-/=)
-                                            let _ = weak.update_in(app, |v, _w, cx| {
+                                            let _ = weak.update_in(app, |v, w, cx| {
+                                                // clicking a non-focusable
+                                                // row blurs the editor —
+                                                // refocus so -/=/Del work
+                                                w.focus(&v.focus.clone(), cx);
                                                 v.sel_event = if id == 0 || v.sel_event == Some(id)
                                                 {
                                                     None
@@ -1457,6 +1461,14 @@ impl Render for EditorView {
                                 .text_size(px(9.0))
                                 .text_color(rgb(0x9fd0ff))
                                 .child(lane_mode.label())
+                                // swallow the mouse_down so it can't start
+                                // a lane insert-drag under the chip
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|_v, _e, _w, cx| {
+                                        cx.stop_propagation()
+                                    }),
+                                )
                                 .on_click(cx.listener(|v, _e: &ClickEvent, _w, cx| {
                                     cx.stop_propagation();
                                     v.set_lane(v.lane_mode.cycle(), cx);
@@ -1482,6 +1494,12 @@ impl Render for EditorView {
                                         Some(k) => format!("k{k}"),
                                         None => "k*".to_string(),
                                     })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|_v, _e, _w, cx| {
+                                            cx.stop_propagation()
+                                        }),
+                                    )
                                     .on_click(cx.listener(|v, e: &ClickEvent, _w, cx| {
                                         cx.stop_propagation();
                                         v.cycle_poly_key(e.modifiers().shift, cx);
