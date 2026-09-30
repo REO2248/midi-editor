@@ -173,6 +173,7 @@ static EN: &[(&str, &str)] = &[
     ("plugin.phase_host", "host init"),
     ("plugin.phase_load", "plugin load"),
     ("plugin.phase_audio", "audio start"),
+    ("plugin.state_restore_failed", "{name}: could not restore saved state ({e})"),
     ("status.rescan", "rescanned: {n} destination(s)"),
 ];
 
@@ -290,6 +291,7 @@ static JA: &[(&str, &str)] = &[
     ("plugin.phase_host", "ホスト初期化"),
     ("plugin.phase_load", "プラグイン読み込み"),
     ("plugin.phase_audio", "オーディオ開始"),
+    ("plugin.state_restore_failed", "{name}: 保存したステートを復元できません ({e})"),
     ("status.rescan", "再スキャン: {n} 件の出力先"),
     ("edit.legato", "レガート"),
     ("edit.set_length", "長さを統一"),

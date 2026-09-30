@@ -6,6 +6,7 @@
 mod geometry;
 mod i18n;
 mod icons;
+mod plugin_state;
 mod render;
 use geometry::{
     clamp_move_delta, clamp_span, content_view, reanchor, roll_hit, ZOOM_MAX, ZOOM_MIN,
@@ -323,6 +324,21 @@ struct EditorView {
     scan_probe_used: Option<bool>,
     host_diag: output::HostDiag,
     show_output_status: bool,
+    /// Per-song VST3 state records (the `<song>.mid.editor.state` companion
+    /// file): keyed by class uid, or bundle path while a uid is unknown.
+    plugin_states: plugin_state::PluginStateStore,
+    /// dest indexes whose live slot needs a state (re)capture — set wherever
+    /// slot parameters actually change (editor drains, editor sync, MIDI
+    /// playback), drained by `flush_plugin_states`.
+    pending_state_capture: BTreeSet<usize>,
+    /// in-memory records changed since the companion file was last written
+    state_file_dirty: bool,
+    /// last companion-file write — tick-driven flushes throttle to ~1/s so a
+    /// knob drag can't turn into a disk-write loop
+    last_state_write: std::time::Instant,
+    /// dest indexes whose slot already received its saved state — prevents a
+    /// double `load_state` on doc swaps where the instance stayed warm
+    state_restored: std::collections::HashSet<usize>,
     /// Standalone window hosting the open plugin editor (in-process
     /// instance — isolated plugins cannot host a GUI on Windows).
     plugin_window: Option<vst3_host::PluginWindow>,
@@ -509,6 +525,11 @@ impl EditorView {
             scan_probe_used: None,
             host_diag: output::host_diag(),
             show_output_status: false,
+            plugin_states: plugin_state::PluginStateStore::default(),
+            pending_state_capture: BTreeSet::new(),
+            state_file_dirty: false,
+            last_state_write: std::time::Instant::now(),
+            state_restored: std::collections::HashSet::new(),
             plugin_window: None,
             editor_plugin: None,
             enc_override: None,
@@ -549,6 +570,12 @@ impl EditorView {
         // it with a warning instead of silently losing the take
         let rec_discarded = self.rec.take().is_some();
         self.stop_playback();
+        // the outgoing song keeps its plugin state — flush before the path
+        // and the state table are dropped with the document
+        self.flush_plugin_states(true);
+        self.plugin_states = plugin_state::PluginStateStore::default();
+        self.state_file_dirty = false;
+        self.pending_state_capture.clear();
         {
             let mut sh = lock_shared(&self.shared);
             sh.doc = empty_doc();
@@ -1631,6 +1658,10 @@ impl EditorView {
                 // drop it with a warning instead of silently losing the take
                 let rec_discarded = self.rec.take().is_some();
                 self.stop_playback();
+                // flush plugin state while the outgoing song's path (and its
+                // state file) is still the active one — `apply_prefs` loads
+                // the incoming song's table after the swap
+                self.flush_plugin_states(true);
                 // swap the document in place — the MCP server holds this same Arc
                 {
                     let mut sh = lock_shared(&self.shared);
@@ -1725,8 +1756,12 @@ impl EditorView {
             Some(PluginState::Failed { path: p, .. }) if p == &path && !force => return,
             _ => {}
         }
-        // index now points at a different bundle — retire the old instance
-        if self.plugin_slots.remove(&d).is_some() {
+        // index now points at a different bundle — retire the old instance,
+        // capturing its state first so a re-point doesn't lose the patch
+        if self.plugin_slots.contains_key(&d) {
+            self.capture_plugin_state(d);
+            self.state_restored.remove(&d);
+            self.plugin_slots.remove(&d);
             let _ = self.plugin_req.send(output::PluginReq::Drop(d));
         }
         self.plugin_state.insert(
@@ -1792,7 +1827,11 @@ impl EditorView {
                         .file_stem()
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_default();
+                    self.state_restored.remove(&event.dest);
                     self.plugin_slots.insert(event.dest, slot);
+                    // saved sidecar state goes in before Ready — playback may
+                    // start as soon as this slot reports ready
+                    self.restore_plugin_state(event.dest);
                     self.plugin_state
                         .insert(event.dest, PluginState::Ready { path: event.path });
                     self.status = tf("plugin.ready", &[("name", name.as_str())]).into();
@@ -1808,6 +1847,7 @@ impl EditorView {
                         .file_stem()
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_default();
+                    self.state_restored.remove(&event.dest);
                     self.plugin_state.insert(
                         event.dest,
                         PluginState::Failed {
@@ -2010,6 +2050,10 @@ impl EditorView {
                 let _ = pl.set_playing(false);
             }
         }
+        // playback can move plugin state (CC-mapped params); queue a capture
+        for d in self.plugin_slots.keys() {
+            self.pending_state_capture.insert(*d);
+        }
         self.finish_record();
     }
 
@@ -2211,7 +2255,10 @@ impl EditorView {
             pw.close();
         }
         self.editor_plugin = None;
-        // dest indices were just remapped — every slot is stale
+        // dest indices were just remapped — every slot is stale; capture
+        // their state first so a rescan doesn't lose dialed-in patches
+        self.capture_all_plugin_states();
+        self.state_restored.clear();
         self.plugin_slots.clear();
         self.plugin_state.clear();
         let _ = self.plugin_req.send(output::PluginReq::Clear);
@@ -2283,6 +2330,129 @@ impl EditorView {
             if let Ok(mut p) = slot.plugin.lock() {
                 let _ = p.load_state(&data);
             }
+            // the playing instance's state just changed wholesale — persist it
+            self.pending_state_capture.insert(d);
+            self.flush_plugin_states(true);
+        }
+    }
+
+    /// Capture one warm slot's component+controller state into the per-song
+    /// store. The blob is keyed by the loaded plugin's own class uid so the
+    /// record follows the component when the bundle path moves; while a uid
+    /// is unknown the bundle path is the key. No-op without a readable slot.
+    fn capture_plugin_state(&mut self, d: usize) {
+        let Some(slot) = self.plugin_slots.get(&d) else {
+            return;
+        };
+        let (uid, blob) = match slot.plugin.lock() {
+            Ok(p) => match p.save_state() {
+                Ok(b) => (p.info().uid.clone(), b),
+                Err(_) => return,
+            },
+            Err(_) => return,
+        };
+        let key = slot.path.to_string_lossy().into_owned();
+        let meta = self.plugin_meta.get(&key);
+        let changed = self.plugin_states.insert(plugin_state::PluginStateRecord {
+            uid,
+            path: key.clone(),
+            vendor: meta.map(|m| m.vendor.clone()).unwrap_or_default(),
+            name: meta.map(|m| m.name.clone()).unwrap_or_else(|| {
+                slot.path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            }),
+            version: meta.map(|m| m.version.clone()).unwrap_or_default(),
+            saved_unix_ms: plugin_state::now_unix_ms(),
+            state: blob,
+        });
+        self.state_file_dirty |= changed;
+    }
+
+    /// Snapshot every warm slot — used at doc swaps and catalog rebuilds,
+    /// where the instances the state belongs to are about to be retired.
+    fn capture_all_plugin_states(&mut self) {
+        let ds: Vec<usize> = self.plugin_slots.keys().copied().collect();
+        for d in ds {
+            self.capture_plugin_state(d);
+        }
+    }
+
+    /// Drain pending captures into the store and write the companion file
+    /// when records changed. `force` bypasses the ~1 s write throttle used
+    /// by the periodic tick — teardown points (persist, doc swap, rescan,
+    /// editor close) always force so a quick exit can't strand state.
+    fn flush_plugin_states(&mut self, force: bool) {
+        let pending = std::mem::take(&mut self.pending_state_capture);
+        for d in pending {
+            self.capture_plugin_state(d);
+        }
+        if !self.state_file_dirty {
+            return;
+        }
+        let doc_path = lock_shared(&self.shared).path.clone();
+        let Some(doc_path) = doc_path else {
+            // untitled document: keep records in memory until Save As gives
+            // the song (and its sidecars) a home
+            return;
+        };
+        if !force && self.last_state_write.elapsed() < std::time::Duration::from_secs(1) {
+            return;
+        }
+        match self.plugin_states.save(&plugin_state::state_path(&doc_path)) {
+            Ok(_) => {
+                self.state_file_dirty = false;
+                self.last_state_write = std::time::Instant::now();
+            }
+            Err(e) => tracing::warn!("plugin state write failed: {e}"),
+        }
+    }
+
+    /// Push the song's saved state into a warm or just-loaded slot. Runs once
+    /// per (re)load — `state_restored` prevents a double `load_state` when a
+    /// doc is reopened over still-warm instances. A non-empty record uid that
+    /// disagrees with the loaded plugin's real uid is rejected as
+    /// incompatible; any failure is a status line note, never fatal — the
+    /// plugin still loads and plays with its defaults.
+    fn restore_plugin_state(&mut self, d: usize) {
+        if self.state_restored.contains(&d) {
+            return;
+        }
+        let Some(slot) = self.plugin_slots.get(&d) else {
+            return;
+        };
+        let plugin = slot.plugin.clone();
+        let path = slot.path.clone();
+        let uid = plugin
+            .lock()
+            .map(|p| p.info().uid.clone())
+            .unwrap_or_default();
+        let err = {
+            let Some(rec) = self.plugin_states.lookup(&uid, &path) else {
+                return;
+            };
+            if !rec.uid.is_empty() && !uid.is_empty() && rec.uid != uid {
+                Some("class id mismatch".to_string())
+            } else {
+                match plugin.lock() {
+                    Ok(mut p) => p.load_state(&rec.state).err().map(|e| e.to_string()),
+                    Err(_) => None,
+                }
+            }
+        };
+        // mark even on failure — a rejected blob should not retry every tick
+        self.state_restored.insert(d);
+        if let Some(e) = err {
+            let name = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.status = tf(
+                "plugin.state_restore_failed",
+                &[("name", name.as_str()), ("e", e.as_str())],
+            )
+            .into();
         }
     }
 
@@ -2656,8 +2826,27 @@ impl EditorView {
         if let Some(i) = p.snap {
             self.snap_idx = i.min(SNAPS.len() - 1);
         }
+        // load this song's plugin state table and push saved state into any
+        // destinations still warm from the previous document; instances that
+        // load after this point restore when their PluginEvent arrives, ahead
+        // of the Ready flag playback waits on
+        self.plugin_states =
+            plugin_state::PluginStateStore::load(&plugin_state::state_path(doc_path));
+        self.state_file_dirty = false;
+        self.state_restored.clear();
         // start warming any VST3 destinations the prefs just restored
         self.refresh_plugins();
+        let plugin_dests: Vec<usize> = {
+            let sh = lock_shared(&self.shared);
+            (0..sh.dests.len())
+                .filter(|i| {
+                    matches!(sh.dests[*i].1, output::Destination::Plugin { .. })
+                })
+                .collect()
+        };
+        for d in plugin_dests {
+            self.restore_plugin_state(d);
+        }
     }
 
     /// MRU update + persist to the app-wide prefs file.
@@ -2678,7 +2867,7 @@ impl EditorView {
         .save();
     }
 
-    fn persist(&self) {
+    fn persist(&mut self) {
         let sh = lock_shared(&self.shared);
         let Some(path) = sh.path.clone() else {
             return;
@@ -2726,6 +2915,10 @@ impl EditorView {
         if let Ok(text) = serde_json::to_string_pretty(&prefs) {
             let _ = std::fs::write(prefs_path(&path), text);
         }
+        drop(sh);
+        // persist is the routine durability point: capture any slot whose
+        // state was marked dirty and write the companion file now
+        self.flush_plugin_states(true);
     }
 }
 
@@ -2864,12 +3057,19 @@ fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
                                         }
                                     }
                                 }
+                                // the playing slot's state changed — queue a
+                                // capture; the throttled flush below bounds
+                                // the write rate while a knob is dragged
+                                v.pending_state_capture.insert(*d);
                             }
                         }
                         if pw.closed_by_user() {
                             v.plugin_window = None;
                             v.sync_editor_state_into_slot();
                         }
+                    }
+                    if !v.pending_state_capture.is_empty() {
+                        v.flush_plugin_states(false);
                     }
                     if dirty || plugin_changed || v.playback.is_some() || v.plugin_window.is_some()
                     {
