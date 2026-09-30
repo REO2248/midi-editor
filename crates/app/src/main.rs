@@ -2792,21 +2792,31 @@ fn spawn_mcp(shared: SharedDoc) {
 fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
     cx.spawn(async move |this, cx| {
         let mut last = 0u64;
+        let mut last_tx = 0u64;
         loop {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(150))
                 .await;
-            let (cur, reqs) = {
+            let (cur, reqs, mcp_tx) = {
                 let mut sh = lock_shared(&shared);
                 (
                     sh.gui_notify.load(std::sync::atomic::Ordering::Relaxed),
                     std::mem::take(&mut sh.transport_req),
+                    sh.last_mcp_tx.clone(),
                 )
             };
             let dirty = cur != last || !reqs.is_empty();
             if cur != last {
                 last = cur;
             }
+            // surface the newest agent-originated transaction in the status bar
+            let mcp_label = mcp_tx
+                .as_ref()
+                .filter(|r| r.revision > last_tx)
+                .map(|r| {
+                    last_tx = r.revision;
+                    r.label.clone()
+                });
             if let Some(this) = this.upgrade() {
                 this.update(cx, |v, cx| {
                     // MCP transport requests -> real playback actions
@@ -2840,6 +2850,9 @@ fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
                         // also warms any newly-assigned VST3 destination
                         v.persist();
                         v.refresh_plugins();
+                    }
+                    if let Some(l) = mcp_label {
+                        v.status = tf("status.mcp_edit", &[("label", &l)]).into();
                     }
                     // repaint while playing so the playhead/counter advance;
                     // also while a plugin editor is open so its native event

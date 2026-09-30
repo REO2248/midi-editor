@@ -69,6 +69,11 @@ pub struct Shared {
     /// open named transaction (begin_transaction) — staged edits live here
     /// until commit/rollback; never blocks GUI edits on the real document
     pub batch: Option<Batch>,
+    /// bounded committed-transaction log (oldest evicted past TX_HISTORY_CAP)
+    pub history: std::collections::VecDeque<TxRecord>,
+    /// last agent-originated committed transaction — the GUI watches this to
+    /// show "MCP: <label>" in the status bar
+    pub last_mcp_tx: Option<TxRecord>,
 }
 
 /// A named edit checkpoint. While open, every edit tool stages its ops on
@@ -95,11 +100,68 @@ pub const BATCH_TTL: Duration = Duration::from_secs(300);
 
 /// Result of routing an edit through `apply_or_stage`.
 pub enum StageOutcome {
-    /// committed on the real document (no batch open) — new revision
-    Committed(u64),
-    /// staged into the open batch
-    Staged { pending_ops: usize, staged_revision: u64 },
+    /// committed on the real document (no batch open)
+    Committed { revision: u64, summary: ChangeSummary },
+    /// staged into the open batch — `summary` covers this call's ops
+    Staged {
+        pending_ops: usize,
+        staged_revision: u64,
+        summary: ChangeSummary,
+    },
 }
+
+/// Who committed a transaction — recorded in `history`/`last_mcp_tx` so
+/// agent-originated edits are attributable (and surfaced in the GUI status).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxOrigin {
+    Gui,
+    Mcp,
+}
+
+/// What a history entry did to the document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxKind {
+    Commit,
+    Undo,
+    Redo,
+}
+
+/// Structured change summary derived from a transaction's committed ops —
+/// never re-scanned from the document, so it cannot drift from what apply()
+/// actually did.
+#[derive(Debug, Clone, Default)]
+pub struct ChangeSummary {
+    pub ops: usize,
+    pub inserted: usize,
+    pub removed: usize,
+    pub updated: usize,
+    pub notes_inserted: usize,
+    pub notes_removed: usize,
+    pub notes_moved: usize,
+    pub cc_changes: usize,
+    pub meta_changes: usize,
+    pub other_events: usize,
+    pub tracks_touched: Vec<usize>,
+    pub tick_range: Option<(u64, u64)>,
+}
+
+/// One entry in the bounded agent-facing transaction log.
+#[derive(Debug, Clone)]
+pub struct TxRecord {
+    /// document revision before this entry (coverage cursor for
+    /// `changes_since_revision`)
+    pub base: u64,
+    /// document revision after this entry
+    pub revision: u64,
+    pub label: String,
+    pub origin: TxOrigin,
+    pub kind: TxKind,
+    pub summary: ChangeSummary,
+}
+
+/// Bounded transaction history — `transaction_history`/`changes_since_revision`
+/// reads never grow past this.
+pub const TX_HISTORY_CAP: usize = 64;
 
 pub type SharedDoc = Arc<Mutex<Shared>>;
 
@@ -122,6 +184,8 @@ impl Shared {
             gui_attached: false,
             transport_req: Vec::new(),
             batch: None,
+            history: std::collections::VecDeque::new(),
+            last_mcp_tx: None,
         }
     }
 
@@ -144,18 +208,52 @@ impl Shared {
             .unwrap_or(self.default_dest)
     }
 
-    /// Apply a transaction and push it onto the shared undo stack.
-    /// Returns the new revision.
+    /// Apply a transaction and push it onto the shared undo stack — the
+    /// GUI's entry point (origin Gui). Returns the new revision.
     pub fn apply(&mut self, label: &str, ops: Vec<Op>) -> Result<u64, ApplyError> {
+        self.apply_origin(TxOrigin::Gui, label, ops)
+    }
+
+    /// `apply` with an explicit origin — the summary is computed from the
+    /// committed ops and recorded in `history`; MCP-originated commits also
+    /// update `last_mcp_tx` for the GUI status surface.
+    pub fn apply_origin(
+        &mut self,
+        origin: TxOrigin,
+        label: &str,
+        ops: Vec<Op>,
+    ) -> Result<u64, ApplyError> {
+        let summary = change_summary(&ops);
         let tx = Transaction {
             label: label.into(),
             base: self.doc.revision(),
             ops,
         };
+        let base = self.doc.revision();
         let rev = self.doc.apply(tx.clone())?;
         self.undo.push(tx);
+        self.record_history(TxRecord {
+            base,
+            revision: rev,
+            label: label.to_string(),
+            origin,
+            kind: TxKind::Commit,
+            summary,
+        });
         self.gui_notify.fetch_add(1, Ordering::Relaxed);
         Ok(rev)
+    }
+
+    /// Append to the bounded history; agent-originated entries also update
+    /// `last_mcp_tx` (the GUI status surface watches that field).
+    pub fn record_history(&mut self, rec: TxRecord) {
+        if rec.origin == TxOrigin::Mcp {
+            self.last_mcp_tx = Some(rec.clone());
+        }
+        if self.history.len() == TX_HISTORY_CAP {
+            self.history.pop_front();
+        }
+        self.history.push_back(rec);
     }
 
     /// The document edit tools and reads see: the staged copy while a batch
@@ -218,6 +316,7 @@ impl Shared {
         ops: Vec<Op>,
     ) -> Result<StageOutcome, ApplyError> {
         if let Some(b) = &mut self.batch {
+            let summary = change_summary(&ops);
             let tx = Transaction {
                 label: label.into(),
                 base: b.staging.revision(),
@@ -229,9 +328,14 @@ impl Shared {
             return Ok(StageOutcome::Staged {
                 pending_ops: b.ops.len(),
                 staged_revision: rev,
+                summary,
             });
         }
-        Ok(StageOutcome::Committed(self.apply(label, ops)?))
+        let summary = change_summary(&ops);
+        Ok(StageOutcome::Committed {
+            revision: self.apply_origin(TxOrigin::Mcp, label, ops)?,
+            summary,
+        })
     }
 
     /// Commit the staged ops as ONE transaction on the real document — one
@@ -243,7 +347,7 @@ impl Shared {
         let Some(b) = self.batch.take() else {
             return Err(err_json("no open transaction"));
         };
-        let (events_changed, tracks_touched) = ops_stats(&b.ops);
+        let changes = change_summary(&b.ops);
         let n_ops = b.ops.len();
         let label = b.label.clone();
         let cur = self.doc.revision();
@@ -274,20 +378,18 @@ impl Shared {
                     "valid": true,
                     "label": label,
                     "ops": n_ops,
-                    "events_changed": events_changed,
-                    "tracks_touched": tracks_touched,
+                    "summary": change_summary_json(&changes),
                     "would_be_revision": rev,
                 })),
                 Err(e) => Err(err_json(format!("dry_run failed: {e}"))),
             };
         }
-        match self.apply(&label, b.ops.clone()) {
+        match self.apply_origin(TxOrigin::Mcp, &label, b.ops.clone()) {
             Ok(rev) => Ok(serde_json::json!({
                 "committed": true,
                 "label": label,
                 "ops": n_ops,
-                "events_changed": events_changed,
-                "tracks_touched": tracks_touched,
+                "summary": change_summary_json(&changes),
                 "revision": rev,
             })),
             Err(e) => {
@@ -299,37 +401,172 @@ impl Shared {
     }
 }
 
-/// (events touched, sorted track indices) across an op list — the
-/// changed-event accounting transaction_history/commit report.
-pub fn ops_stats(ops: &[Op]) -> (usize, Vec<usize>) {
-    let mut events = 0usize;
+// note-on = status 0x9x with nonzero velocity
+fn is_note_on(e: &Event) -> bool {
+    matches!(&e.kind, EventKind::Channel { status, data, .. } if status & 0xF0 == 0x90 && data[1] > 0)
+}
+
+// 0 = note-on, 1 = controller, 2 = meta, 3 = other (note-off, pitch bend, sysex...)
+fn classify(e: &Event) -> u8 {
+    match &e.kind {
+        EventKind::Channel { status, .. } if status & 0xF0 == 0xB0 => 1,
+        EventKind::Channel { .. } if is_note_on(e) => 0,
+        EventKind::Meta { .. } => 2,
+        _ => 3,
+    }
+}
+
+fn tick_extend(s: &mut ChangeSummary, t: u64) {
+    s.tick_range = Some(match s.tick_range {
+        None => (t, t),
+        Some((lo, hi)) => (lo.min(t), hi.max(t)),
+    });
+}
+
+fn class_count(s: &mut ChangeSummary, class: u8, ins: bool) {
+    match (class, ins) {
+        (0, true) => s.notes_inserted += 1,
+        (0, false) => s.notes_removed += 1,
+        (1, _) => s.cc_changes += 1,
+        (2, _) => s.meta_changes += 1,
+        _ => s.other_events += 1,
+    }
+}
+
+/// Structured change summary of an op list — computed from the ops actually
+/// committed (or staged), so the report cannot drift from what apply() did.
+pub fn change_summary(ops: &[Op]) -> ChangeSummary {
+    let mut s = ChangeSummary::default();
     let mut tracks = std::collections::BTreeSet::new();
     for op in ops {
+        s.ops += 1;
         match op {
-            Op::InsertEvents { track, events: ev } => {
-                events += ev.len();
+            Op::InsertEvents { track, events } => {
                 tracks.insert(*track);
+                for e in events {
+                    s.inserted += 1;
+                    tick_extend(&mut s, e.tick);
+                    class_count(&mut s, classify(e), true);
+                }
             }
             Op::RemoveEvents { track, removed } => {
-                events += removed.len();
                 tracks.insert(*track);
+                for (_, e) in removed {
+                    s.removed += 1;
+                    tick_extend(&mut s, e.tick);
+                    class_count(&mut s, classify(e), false);
+                }
             }
-            Op::UpdateEvent { track, .. } => {
-                events += 1;
+            Op::UpdateEvent {
+                track,
+                before,
+                after,
+            } => {
                 tracks.insert(*track);
+                s.updated += 1;
+                tick_extend(&mut s, before.tick.min(after.tick));
+                tick_extend(&mut s, before.tick.max(after.tick));
+                // a note-on whose tick or key changed = a moved note
+                let key = |e: &Event| match &e.kind {
+                    EventKind::Channel { data, .. } => data[0],
+                    _ => 0,
+                };
+                if is_note_on(before)
+                    && (before.tick != after.tick || key(before) != key(after))
+                {
+                    s.notes_moved += 1;
+                } else {
+                    match classify(after) {
+                        1 => s.cc_changes += 1,
+                        2 => s.meta_changes += 1,
+                        _ => {}
+                    }
+                }
             }
-            Op::InsertTrack { index, track }
-            | Op::RemoveTrack { index, track } => {
-                events += track.events.len();
+            Op::InsertTrack { index, track } | Op::RemoveTrack { index, track } => {
+                let ins = matches!(op, Op::InsertTrack { .. });
                 tracks.insert(*index);
+                for e in &track.events {
+                    if ins {
+                        s.inserted += 1;
+                    } else {
+                        s.removed += 1;
+                    }
+                    tick_extend(&mut s, e.tick);
+                    class_count(&mut s, classify(e), ins);
+                }
             }
-            Op::UpdateTrack { index, after, .. } => {
-                events += after.events.len();
+            Op::UpdateTrack { index, .. } => {
                 tracks.insert(*index);
+                s.updated += 1;
+                s.meta_changes += 1; // the only UpdateTrack field is the name meta
             }
         }
     }
-    (events, tracks.into_iter().collect())
+    s.tracks_touched = tracks.into_iter().collect();
+    s
+}
+
+fn merge_summary(a: &mut ChangeSummary, b: &ChangeSummary) {
+    a.ops += b.ops;
+    a.inserted += b.inserted;
+    a.removed += b.removed;
+    a.updated += b.updated;
+    a.notes_inserted += b.notes_inserted;
+    a.notes_removed += b.notes_removed;
+    a.notes_moved += b.notes_moved;
+    a.cc_changes += b.cc_changes;
+    a.meta_changes += b.meta_changes;
+    a.other_events += b.other_events;
+    for t in &b.tracks_touched {
+        if !a.tracks_touched.contains(t) {
+            a.tracks_touched.push(*t);
+        }
+    }
+    a.tracks_touched.sort_unstable();
+    if let Some((lo, hi)) = b.tick_range {
+        a.tick_range = Some(match a.tick_range {
+            None => (lo, hi),
+            Some((l, h)) => (l.min(lo), h.max(hi)),
+        });
+    }
+}
+
+fn change_summary_json(s: &ChangeSummary) -> serde_json::Value {
+    serde_json::json!({
+        "ops": s.ops,
+        "inserted": s.inserted,
+        "removed": s.removed,
+        "updated": s.updated,
+        "notes": {
+            "inserted": s.notes_inserted,
+            "removed": s.notes_removed,
+            "moved": s.notes_moved,
+        },
+        "cc_changes": s.cc_changes,
+        "meta_changes": s.meta_changes,
+        "other_events": s.other_events,
+        "tracks_touched": s.tracks_touched,
+        "tick_range": s.tick_range.map(|(lo, hi)| vec![lo, hi]),
+    })
+}
+
+fn tx_record_json(r: &TxRecord) -> serde_json::Value {
+    serde_json::json!({
+        "base_revision": r.base,
+        "revision": r.revision,
+        "label": r.label,
+        "origin": match r.origin {
+            TxOrigin::Gui => "gui",
+            TxOrigin::Mcp => "mcp",
+        },
+        "kind": match r.kind {
+            TxKind::Commit => "commit",
+            TxKind::Undo => "undo",
+            TxKind::Redo => "redo",
+        },
+        "summary": change_summary_json(&r.summary),
+    })
 }
 
 #[derive(Clone)]
@@ -468,6 +705,7 @@ fn editor_info_json(sh: &Shared) -> serde_json::Value {
                 "base_revision": true,
                 "atomic_transactions": true,
                 "batch_transactions": true,
+                "transaction_history": true,
             },
             // these only work while the desktop app hosts the document
             "transport": sh.gui_attached,
@@ -835,6 +1073,20 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             "transaction_status",
             "Open-transaction state: label, base/staged revisions, staged op count, age and time until auto-rollback.",
             object_schema(serde_json::json!({})),
+        ),
+        spec(
+            "transaction_history",
+            "Bounded log of committed transactions (cap 64, newest first): {revision, base_revision, label, origin (gui|mcp), kind (commit|undo|redo), summary}. Args: limit? (default 20).",
+            object_schema(serde_json::json!({
+                "limit": {"type": "integer"},
+            })),
+        ),
+        spec(
+            "changes_since_revision",
+            "All transactions committed after `revision` plus their merged change summary — verify an edit's effect without re-querying the document. `truncated` when the bounded history no longer reaches that far back.",
+            object_schema(serde_json::json!({
+                "revision": {"type": "integer"},
+            })),
         ),
         spec(
             "list_notes",
@@ -1268,14 +1520,29 @@ fn dispatch(
                     "an edit transaction is open — commit_transaction or rollback_transaction first",
                 );
             }
+            let base = sh.doc.revision();
+            // summarize the tx about to be reverted before it pops off the stack
+            let pending_ops = sh.undo.peek_done().map(|t| t.ops.clone());
             let res = {
                 let Shared { doc, undo, .. } = &mut *sh;
                 undo.undo(doc)
             };
             match res {
                 Some(l) => {
+                    let rev = sh.doc.revision();
+                    let summary = change_summary(&pending_ops.unwrap_or_default());
+                    sh.record_history(TxRecord {
+                        base,
+                        revision: rev,
+                        label: l.clone(),
+                        origin: TxOrigin::Mcp,
+                        kind: TxKind::Undo,
+                        summary: summary.clone(),
+                    });
                     sh.gui_notify.fetch_add(1, Ordering::Relaxed);
-                    ok_json(serde_json::json!({"undone": l, "revision": sh.doc.revision()}))
+                    ok_json(serde_json::json!({
+                        "undone": l, "revision": rev, "summary": change_summary_json(&summary),
+                    }))
                 }
                 None => err_json("nothing to undo"),
             }
@@ -1286,17 +1553,92 @@ fn dispatch(
                     "an edit transaction is open — commit_transaction or rollback_transaction first",
                 );
             }
+            let base = sh.doc.revision();
+            let pending_ops = sh.undo.peek_undone().map(|t| t.ops.clone());
             let res = {
                 let Shared { doc, undo, .. } = &mut *sh;
                 undo.redo(doc)
             };
             match res {
                 Some(l) => {
+                    let rev = sh.doc.revision();
+                    let summary = change_summary(&pending_ops.unwrap_or_default());
+                    sh.record_history(TxRecord {
+                        base,
+                        revision: rev,
+                        label: l.clone(),
+                        origin: TxOrigin::Mcp,
+                        kind: TxKind::Redo,
+                        summary: summary.clone(),
+                    });
                     sh.gui_notify.fetch_add(1, Ordering::Relaxed);
-                    ok_json(serde_json::json!({"redone": l, "revision": sh.doc.revision()}))
+                    ok_json(serde_json::json!({
+                        "redone": l, "revision": rev, "summary": change_summary_json(&summary),
+                    }))
                 }
                 None => err_json("nothing to redo"),
             }
+        }
+        "transaction_history" => {
+            let limit = args["limit"]
+                .as_u64()
+                .unwrap_or(20)
+                .min(TX_HISTORY_CAP as u64) as usize;
+            let txs: Vec<_> = sh
+                .history
+                .iter()
+                .rev()
+                .take(limit)
+                .map(tx_record_json)
+                .collect();
+            ok_json(serde_json::json!({
+                "count": txs.len(),
+                "history_cap": TX_HISTORY_CAP,
+                "transactions": txs,
+            }))
+        }
+        "changes_since_revision" => {
+            let Some(from) = args["revision"].as_u64() else {
+                return err_json("'revision' is required");
+            };
+            let cur = sh.doc.revision();
+            if from > cur {
+                return err_json(
+                    serde_json::json!({
+                        "error": "future_revision",
+                        "current_revision": cur,
+                    })
+                    .to_string(),
+                );
+            }
+            let txs: Vec<&TxRecord> =
+                sh.history.iter().filter(|r| r.revision > from).collect();
+            // coverage is only trustworthy while the oldest retained record
+            // reaches back to `from`; older entries were evicted at the cap
+            let truncated = from < cur
+                && match sh.history.front() {
+                    Some(f) => f.base > from,
+                    None => true,
+                };
+            let mut agg = ChangeSummary::default();
+            for r in &txs {
+                merge_summary(&mut agg, &r.summary);
+            }
+            ok_json(serde_json::json!({
+                "from_revision": from,
+                "current_revision": cur,
+                "truncated": truncated,
+                "hint": if truncated {
+                    serde_json::Value::String(format!(
+                        "history is bounded at {TX_HISTORY_CAP} entries — re-query the document for full state"
+                    ))
+                } else {
+                    serde_json::Value::Null
+                },
+                "count": txs.len(),
+                "aggregate": change_summary_json(&agg),
+                "transactions": txs.iter().map(|r| tx_record_json(r)).collect::<Vec<_>>(),
+            }))
         }
         "save" => {
             let path = args["path"]
@@ -1787,21 +2129,25 @@ fn apply_ops(sh: &mut Shared, label: &str, ops: Vec<Op>) -> CallToolResponse {
     }
 }
 
-/// Uniform mutation reply: `{applied, revision}` committed, or
-/// `{staged, pending_ops, staged_revision}` inside an open transaction.
+/// Uniform mutation reply: `{applied, revision, summary}` committed, or
+/// `{staged, pending_ops, staged_revision, summary}` inside an open
+/// transaction — `summary` is the op-derived change diff (issue #14).
 fn apply_reply(outcome: StageOutcome, mut v: serde_json::Value) -> CallToolResponse {
     match outcome {
-        StageOutcome::Committed(rev) => {
+        StageOutcome::Committed { revision, summary } => {
             v["applied"] = true.into();
-            v["revision"] = rev.into();
+            v["revision"] = revision.into();
+            v["summary"] = change_summary_json(&summary);
         }
         StageOutcome::Staged {
             pending_ops,
             staged_revision,
+            summary,
         } => {
             v["staged"] = true.into();
             v["pending_ops"] = pending_ops.into();
             v["staged_revision"] = staged_revision.into();
+            v["summary"] = change_summary_json(&summary);
         }
     }
     ok_json(v)
@@ -2202,6 +2548,106 @@ mod tests {
         assert!(!err);
         assert_eq!(v["open"], false, "idle batch auto-rolled-back");
         assert_eq!(sh.lock().unwrap().doc.revision(), 0);
+    }
+
+    #[test]
+    fn mutation_replies_carry_change_summary() {
+        let sh = shared();
+        let (err, v) = call(
+            &sh,
+            "apply_patch",
+            json!({"ops": [{"op": "insert_note", "track": 1, "key": 64, "start": 480, "dur": 240}]}),
+        );
+        assert!(!err);
+        let s = &v["summary"];
+        assert_eq!(s["inserted"], 2, "on + off events");
+        assert_eq!(s["notes"]["inserted"], 1);
+        assert_eq!(s["tracks_touched"], json!([1]));
+        assert_eq!(s["tick_range"], json!([480, 720]));
+        // a move is reported as moved, not as delete+insert
+        let (_err, v) = call(&sh, "list_notes", json!({}));
+        let on_id = v["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["key"] == 64)
+            .unwrap()["on_id"]
+            .as_u64()
+            .unwrap();
+        let (err, v) = call(
+            &sh,
+            "apply_patch",
+            json!({"ops": [{"op": "move_note", "on_id": on_id, "dtick": 240, "dkey": 2}]}),
+        );
+        assert!(!err);
+        assert_eq!(v["summary"]["notes"]["moved"], 1);
+        assert_eq!(v["summary"]["notes"]["inserted"], 0);
+        assert_eq!(v["summary"]["notes"]["removed"], 0);
+    }
+
+    #[test]
+    fn history_and_changes_since_revision() {
+        let sh = shared();
+        call(
+            &sh,
+            "apply_patch",
+            json!({"ops": [{"op": "insert_note", "track": 1, "key": 64, "start": 480, "dur": 240}]}),
+        );
+        call(&sh, "set_tempo", json!({"tick": 0, "bpm": 90.0}));
+        let (err, v) = call(&sh, "transaction_history", json!({}));
+        assert!(!err);
+        assert_eq!(v["count"], 2);
+        // newest first; origin attribution
+        assert_eq!(v["transactions"][0]["label"], "set tempo");
+        assert_eq!(v["transactions"][0]["origin"], "mcp");
+        // last agent-originated tx is what the GUI status bar surfaces
+        assert_eq!(
+            sh.lock().unwrap().last_mcp_tx.as_ref().unwrap().label,
+            "set tempo"
+        );
+
+        let (err, v) = call(&sh, "changes_since_revision", json!({"revision": 1}));
+        assert!(!err);
+        assert_eq!(v["count"], 1);
+        assert_eq!(v["aggregate"]["meta_changes"], 1);
+        assert_eq!(v["truncated"], false);
+
+        // undo is recorded too — revision moves are visible both ways
+        call(&sh, "undo", json!({}));
+        let (_, v) = call(&sh, "changes_since_revision", json!({"revision": 2}));
+        assert_eq!(v["transactions"][0]["kind"], "undo");
+
+        let (err, _) = call(&sh, "changes_since_revision", json!({"revision": 999}));
+        assert!(err, "future revision is an error, not an empty diff");
+    }
+
+    #[test]
+    fn gui_apply_is_not_attributed_to_mcp() {
+        let sh = shared();
+        let ops = sh.lock().unwrap().doc.add_track_ops(Some("gui"));
+        sh.lock().unwrap().apply("gui edit", ops).unwrap();
+        let (_, v) = call(&sh, "transaction_history", json!({}));
+        assert_eq!(v["transactions"][0]["origin"], "gui");
+        assert!(sh.lock().unwrap().last_mcp_tx.is_none());
+    }
+
+    #[test]
+    fn history_is_bounded() {
+        let sh = shared();
+        for i in 0..(TX_HISTORY_CAP + 8) {
+            let (err, _) = call(
+                &sh,
+                "set_tempo",
+                json!({"tick": i as u64 * 1000, "bpm": 100.0 + i as f64}),
+            );
+            assert!(!err);
+        }
+        let (_, v) = call(&sh, "transaction_history", json!({"limit": 1000}));
+        assert_eq!(v["count"], TX_HISTORY_CAP, "history capped");
+        // coverage no longer reaches revision 0 — the flag tells the agent
+        // to fall back to a full document query instead of trusting a gap
+        let (_, v) = call(&sh, "changes_since_revision", json!({"revision": 0}));
+        assert_eq!(v["truncated"], true);
     }
 
     #[test]

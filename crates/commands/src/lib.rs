@@ -28,6 +28,17 @@ impl UndoStack {
         }
     }
 
+    /// The transaction `undo()` would revert — lets callers summarize it
+    /// (e.g. a history/changes feed) before popping.
+    pub fn peek_done(&self) -> Option<&Transaction> {
+        self.done.last()
+    }
+
+    /// The transaction `redo()` would replay.
+    pub fn peek_undone(&self) -> Option<&Transaction> {
+        self.undone.last()
+    }
+
     pub fn undo(&mut self, doc: &mut Document) -> Option<String> {
         let tx = self.done.pop()?;
         doc.revert(&tx);
