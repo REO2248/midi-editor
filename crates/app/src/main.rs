@@ -654,6 +654,48 @@ struct EditorView {
     shutdown: shutdown::Shutdown,
     /// keeps the on_app_quit subscription registered for the view's life
     _quit_sub: Option<Subscription>,
+    /// (track, event index, id) for each real event-list row — diagnostic
+    /// rows carry None. Parallel to `events`.
+    event_refs: Arc<Vec<Option<(usize, usize, EventId)>>>,
+    /// event-list selection (independent from the roll note `selection`)
+    sel_events: BTreeSet<EventId>,
+    /// anchor row index for shift-range selection in the event list
+    ev_anchor: Option<usize>,
+    /// inspector field currently being edited, if any
+    prop_field: Option<PropField>,
+    /// numeric/hex editor for the inspector's active field
+    prop_input: Entity<InputState>,
+}
+
+/// An editable/read-only property shown in the event inspector. The same
+/// key is reused across event kinds — the row label says what it means.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PropField {
+    Tick,
+    Channel,
+    D0,
+    D1,
+    /// 14-bit pitch-bend value, displayed as -8192..8191
+    PbValue,
+    /// meta event type byte — byte-level, warns
+    MetaType,
+    /// raw payload bytes as hex — byte-level, warns
+    HexData,
+    NoteStart,
+    NoteEnd,
+    NoteDur,
+    NoteVel,
+    NoteRelVel,
+    NoteChannel,
+    TrackChannel,
+}
+
+/// One row of the inspector: label + current value (+ edit/warn flags).
+struct PropRow {
+    field: Option<PropField>,
+    label: SharedString,
+    value: String,
+    warn: bool,
 }
 
 enum PluginState {
@@ -861,6 +903,7 @@ impl EditorView {
     fn new(
         path: Option<PathBuf>,
         input: Entity<InputState>,
+        prop_input: Entity<InputState>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -1033,6 +1076,11 @@ impl EditorView {
             win_active: true,
             focus: cx.focus_handle(),
             input,
+            event_refs: Arc::new(vec![]),
+            sel_events: BTreeSet::new(),
+            ev_anchor: None,
+            prop_field: None,
+            prop_input,
             status,
             file_stamp: path.as_deref().and_then(watch::stat_file),
             ext_prompted: false,
@@ -1454,7 +1502,17 @@ impl EditorView {
         };
         let vkey = (key.0, key.1, seq_sel);
         if self.ev_key != vkey {
-            self.events = Arc::new(self.build_event_rows(&sh.doc));
+            let (rows, refs) = self.build_event_rows(&sh.doc);
+            self.events = Arc::new(rows);
+            self.event_refs = Arc::new(refs);
+            // drop event-list selections that no longer exist
+            let ids: BTreeSet<EventId> = self
+                .event_refs
+                .iter()
+                .flatten()
+                .map(|&(_, _, id)| id)
+                .collect();
+            self.sel_events.retain(|id| ids.contains(id));
             self.ev_key = vkey;
         }
         if self.doc_ui_key != vkey || self.doc_ui_enc != self.enc_override {
@@ -1581,13 +1639,18 @@ impl EditorView {
         self.doc(|d| d.time_display())
     }
 
-    fn build_event_rows(&self, doc: &Document) -> Vec<SharedString> {
+    fn build_event_rows(
+        &self,
+        doc: &Document,
+    ) -> (Vec<SharedString>, Vec<Option<(usize, usize, EventId)>>) {
         let td = doc.time_display();
         let seq = doc.is_sequential();
         let hint = self.enc_override.or(doc.text_encoding_hint());
         let mut rows = Vec::new();
+        let mut refs = Vec::new();
         for d in doc.diagnose() {
             rows.push(format!("[{}] tk{} @{}", d.code, d.track + 1, d.tick).into());
+            refs.push(None);
         }
         if seq {
             // explicit mode marker: these are sequences, not one timeline
@@ -1599,12 +1662,13 @@ impl EditorView {
                 )
                 .into(),
             );
+            refs.push(None);
         }
         for (ti, tr) in doc.tracks.iter().enumerate() {
             if seq && ti != self.sel_track {
                 continue; // a format-2 event list shows one sequence
             }
-            for e in &tr.events {
+            for (ei, e) in tr.events.iter().enumerate() {
                 // bar.beat.tick for metrical, hh:mm:ss.ff timecode for
                 // SMPTE — position labels always match the file's timing
                 let pos = td.format_tick(e.tick);
@@ -1645,9 +1709,10 @@ impl EditorView {
                     EventKind::Escape(d) => format!("Escape  {}B", d.len()),
                 };
                 rows.push(SharedString::from(format!("{pos:>11}  T{ti}  {body}")));
+                refs.push(Some((ti, ei, e.id)));
             }
         }
-        rows
+        (rows, refs)
     }
 
     fn apply_tx(&mut self, label: &str, ops: Vec<Op>) {
@@ -1657,6 +1722,208 @@ impl EditorView {
             Ok(_) => self.refresh_derived_sh(&mut sh),
             Err(e) => self.status = tf("status.apply_failed", &[("e", &e.to_string())]).into(),
         }
+    }
+
+    // --- event-properties inspector -------------------------------------
+
+    /// Click on an event-list row: plain = single-select + inspect, ctrl =
+    /// toggle, shift = range from the last anchor. Diagnostic rows (no ref)
+    /// just clear the inspector selection.
+    fn ev_row_click(&mut self, row: usize, ctrl: bool, shift: bool, cx: &mut Context<Self>) {
+        let Some(&Some((_, _, id))) = self.event_refs.get(row) else {
+            self.sel_events.clear();
+            self.prop_field = None;
+            cx.notify();
+            return;
+        };
+        if shift {
+            let anchor = self.ev_anchor.unwrap_or(row).min(self.event_refs.len() - 1);
+            let (lo, hi) = (anchor.min(row), anchor.max(row));
+            for r in &self.event_refs[lo..=hi] {
+                if let Some((_, _, id)) = r {
+                    self.sel_events.insert(*id);
+                }
+            }
+        } else if ctrl {
+            if !self.sel_events.remove(&id) {
+                self.sel_events.insert(id);
+            }
+            self.ev_anchor = Some(row);
+        } else {
+            self.sel_events = BTreeSet::from([id]);
+            self.ev_anchor = Some(row);
+        }
+        self.prop_field = None;
+        cx.notify();
+    }
+
+    /// Header + rows for the inspector panel, in its current mode
+    /// (event / note / track depending on what is selected).
+    fn prop_rows(&self, d: &Document) -> (SharedString, Vec<PropRow>) {
+        let mut rows = Vec::new();
+        if !self.sel_events.is_empty() {
+            let sel: Vec<(usize, usize, EventId)> = self
+                .event_refs
+                .iter()
+                .flatten()
+                .copied()
+                .filter(|(_, _, id)| self.sel_events.contains(id))
+                .collect();
+            if sel.len() == 1 {
+                let (ti, ei, _) = sel[0];
+                let e = &d.tracks[ti].events[ei];
+                return (
+                    tf("prop.event_title", &[("t", &(ti + 1).to_string())]).into(),
+                    event_prop_rows(e),
+                );
+            }
+            for f in [
+                PropField::Tick,
+                PropField::Channel,
+                PropField::D0,
+                PropField::D1,
+            ] {
+                rows.push(PropRow {
+                    field: Some(f),
+                    label: prop_field_label(f, None),
+                    value: String::new(),
+                    warn: false,
+                });
+            }
+            return (
+                tf("prop.multi_title", &[("n", &sel.len().to_string())]).into(),
+                rows,
+            );
+        }
+        if !self.selection.is_empty() {
+            if self.selection.len() == 1 {
+                let on_id = *self.selection.iter().next().unwrap();
+                if let Some(n) = d.notes().into_iter().find(|n| n.on_id == on_id) {
+                    return (
+                        tf("prop.note_title", &[("k", &n.key.to_string())]).into(),
+                        note_prop_rows(&n, d),
+                    );
+                }
+            }
+            rows.push(PropRow {
+                field: Some(PropField::NoteChannel),
+                label: prop_field_label(PropField::NoteChannel, None),
+                value: String::new(),
+                warn: false,
+            });
+            rows.push(PropRow {
+                field: Some(PropField::NoteVel),
+                label: prop_field_label(PropField::NoteVel, None),
+                value: String::new(),
+                warn: false,
+            });
+            return (
+                tf(
+                    "prop.multi_title",
+                    &[("n", &self.selection.len().to_string())],
+                )
+                .into(),
+                rows,
+            );
+        }
+        // track mode
+        let ti = self.sel_track;
+        if let Some(tr) = d.tracks.get(ti) {
+            let name = tr
+                .name
+                .as_deref()
+                .map(|b| smf_core::decode_text(b, self.enc_override.or(d.text_encoding_hint())))
+                .unwrap_or_default();
+            rows.push(PropRow {
+                field: None,
+                label: t("prop.name").into(),
+                value: name,
+                warn: false,
+            });
+            rows.push(PropRow {
+                field: Some(PropField::TrackChannel),
+                label: t("prop.channel").into(),
+                value: (tr.out_channel + 1).to_string(),
+                warn: false,
+            });
+            rows.push(PropRow {
+                field: None,
+                label: t("prop.port").into(),
+                value: tr.out_port.to_string(),
+                warn: false,
+            });
+            rows.push(PropRow {
+                field: None,
+                label: t("prop.count").into(),
+                value: tr.events.len().to_string(),
+                warn: false,
+            });
+        }
+        (
+            tf("prop.track_title", &[("t", &(ti + 1).to_string())]).into(),
+            rows,
+        )
+    }
+
+    /// What the inspector's active edit applies to.
+    fn prop_target(&self) -> PropTarget {
+        if !self.sel_events.is_empty() {
+            return PropTarget::Events(
+                self.event_refs
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .filter(|(_, _, id)| self.sel_events.contains(id))
+                    .collect(),
+            );
+        }
+        if !self.selection.is_empty() {
+            return PropTarget::Notes(self.selection.iter().copied().collect());
+        }
+        PropTarget::Track(self.sel_track)
+    }
+
+    /// Commit the inspector's active field: parse + validate first, then a
+    /// single transaction covering every selected target. Invalid input
+    /// lands in the status line and no transaction is created.
+    fn prop_apply(&mut self, cx: &mut Context<Self>) {
+        let Some(field) = self.prop_field else { return };
+        let text = self.prop_input.read(cx).value().to_string();
+        let target = self.prop_target();
+        let result = {
+            let mut sh = lock_shared(&self.shared);
+            prop_edit_ops(&mut sh.doc, &target, field, &text)
+        };
+        match result {
+            Err(e) => {
+                self.status = e.into();
+            }
+            Ok(ops) if ops.is_empty() => {
+                self.status = t("prop.unsupported").into();
+            }
+            Ok(ops) => {
+                self.apply_tx("edit property", ops);
+                self.status = t("prop.applied").into();
+            }
+        }
+        cx.notify();
+    }
+
+    /// Load the inspector field's current value into the input and focus it.
+    fn prop_edit(
+        &mut self,
+        field: PropField,
+        value: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.prop_field = Some(field);
+        self.prop_input.update(cx, |i, cx| {
+            i.set_value(value, window, cx);
+        });
+        let fh = self.prop_input.read(cx).focus_handle(cx);
+        window.focus(&fh, cx);
+        cx.notify();
     }
 
     /// Run a semantic region transform (`Document` *_ops generator) on the
@@ -1817,6 +2084,7 @@ impl EditorView {
             }],
         );
         self.selection = BTreeSet::from([on_id]);
+        self.sel_events.clear();
         cx.notify();
     }
 
@@ -4292,6 +4560,460 @@ impl EditorView {
     }
 }
 
+/// What the inspector edits: event-list rows, roll-selected notes, or the
+/// selected track itself.
+enum PropTarget {
+    Events(Vec<(usize, usize, EventId)>),
+    Notes(Vec<EventId>),
+    Track(usize),
+}
+
+/// i18n label for a field, specialized per event kind where useful.
+fn prop_field_label(f: PropField, ev: Option<&DocEvent>) -> SharedString {
+    let key = match f {
+        PropField::Tick => "prop.tick",
+        PropField::Channel | PropField::NoteChannel | PropField::TrackChannel => "prop.channel",
+        PropField::MetaType => "prop.meta_type",
+        PropField::HexData => "prop.hex_data",
+        PropField::NoteStart => "prop.start",
+        PropField::NoteEnd => "prop.end",
+        PropField::NoteDur => "prop.duration",
+        PropField::NoteVel => "prop.velocity",
+        PropField::NoteRelVel => "prop.rel_velocity",
+        PropField::PbValue => "prop.pb_value",
+        PropField::D0 | PropField::D1 => {
+            let hi = match ev.map(|e| &e.kind) {
+                Some(EventKind::Channel { status, .. }) => status & 0xF0,
+                _ => 0,
+            };
+            match (hi, f) {
+                (0x80, PropField::D0) => "prop.key",
+                (0x80, PropField::D1) => "prop.rel_velocity",
+                (0x90, PropField::D0) => "prop.key",
+                (0x90, PropField::D1) => "prop.velocity",
+                (0xA0, PropField::D0) => "prop.key",
+                (0xA0, PropField::D1) => "prop.pressure",
+                (0xB0, PropField::D0) => "prop.controller",
+                (0xB0, PropField::D1) => "prop.value",
+                (0xC0, PropField::D0) => "prop.program",
+                (0xD0, PropField::D0) => "prop.pressure",
+                _ => {
+                    if f == PropField::D0 {
+                        "prop.d0"
+                    } else {
+                        "prop.d1"
+                    }
+                }
+            }
+        }
+    };
+    t(key).into()
+}
+
+fn hex_of(data: &[u8]) -> String {
+    data.iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Per-kind inspector rows for one event. Editable rows carry `Some(field)`;
+/// `warn` flags byte-level edits (malformed bytes can corrupt the event).
+fn event_prop_rows(e: &DocEvent) -> Vec<PropRow> {
+    let mut rows = vec![PropRow {
+        field: Some(PropField::Tick),
+        label: prop_field_label(PropField::Tick, Some(e)),
+        value: e.tick.to_string(),
+        warn: false,
+    }];
+    match &e.kind {
+        EventKind::Channel { status, data, len } => {
+            let hi = status & 0xF0;
+            rows.push(PropRow {
+                field: Some(PropField::Channel),
+                label: prop_field_label(PropField::Channel, Some(e)),
+                value: ((status & 0x0F) + 1).to_string(),
+                warn: false,
+            });
+            if hi == 0xE0 {
+                let v = (((data[1] as u16) << 7) | data[0] as u16) as i32 - 8192;
+                rows.push(PropRow {
+                    field: Some(PropField::PbValue),
+                    label: prop_field_label(PropField::PbValue, Some(e)),
+                    value: v.to_string(),
+                    warn: false,
+                });
+            } else {
+                rows.push(PropRow {
+                    field: Some(PropField::D0),
+                    label: prop_field_label(PropField::D0, Some(e)),
+                    value: data[0].to_string(),
+                    warn: false,
+                });
+                if *len >= 2 {
+                    rows.push(PropRow {
+                        field: Some(PropField::D1),
+                        label: prop_field_label(PropField::D1, Some(e)),
+                        value: data[1].to_string(),
+                        warn: false,
+                    });
+                }
+            }
+        }
+        EventKind::Meta { meta_type, data } => {
+            rows.push(PropRow {
+                field: Some(PropField::MetaType),
+                label: prop_field_label(PropField::MetaType, Some(e)),
+                value: format!("0x{meta_type:02X}"),
+                warn: true,
+            });
+            rows.push(PropRow {
+                field: Some(PropField::HexData),
+                label: prop_field_label(PropField::HexData, Some(e)),
+                value: hex_of(data),
+                warn: true,
+            });
+        }
+        EventKind::SysEx(data) | EventKind::Escape(data) => {
+            rows.push(PropRow {
+                field: Some(PropField::HexData),
+                label: prop_field_label(PropField::HexData, Some(e)),
+                value: hex_of(data),
+                warn: true,
+            });
+        }
+    }
+    rows
+}
+
+fn note_prop_rows(n: &Note, d: &Document) -> Vec<PropRow> {
+    let end = n.end_tick.map(|e| e.to_string()).unwrap_or_default();
+    let dur = n
+        .end_tick
+        .map(|e| e.saturating_sub(n.start_tick).to_string())
+        .unwrap_or_default();
+    let rel = n
+        .off_id
+        .and_then(|id| find_event(d, id))
+        .and_then(|(ti, ei)| match &d.tracks[ti].events[ei].kind {
+            EventKind::Channel { data, .. } => Some(data[1].to_string()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let mk = |field: PropField, label: SharedString, value: String| PropRow {
+        field: Some(field),
+        label,
+        value,
+        warn: false,
+    };
+    vec![
+        mk(
+            PropField::NoteStart,
+            t("prop.start").into(),
+            n.start_tick.to_string(),
+        ),
+        mk(PropField::NoteEnd, t("prop.end").into(), end),
+        mk(PropField::NoteDur, t("prop.duration").into(), dur),
+        mk(
+            PropField::NoteChannel,
+            t("prop.channel").into(),
+            (n.channel + 1).to_string(),
+        ),
+        mk(
+            PropField::NoteVel,
+            t("prop.velocity").into(),
+            n.vel.to_string(),
+        ),
+        mk(PropField::NoteRelVel, t("prop.rel_velocity").into(), rel),
+    ]
+}
+
+fn parse_num(text: &str, lo: i64, hi: i64, name: &str) -> Result<i64, String> {
+    let v: i64 = text
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid {name}: {text}"))?;
+    if v < lo || v > hi {
+        return Err(format!("{name} out of range {lo}..={hi}: {v}"));
+    }
+    Ok(v)
+}
+
+/// "80 3c 40" / "803c40" / "0x80,0x3c,0x40" / "" all parse; anything else
+/// is rejected before a transaction exists.
+fn parse_hex(text: &str) -> Result<Vec<u8>, String> {
+    let cleaned: String = text.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if cleaned.len() % 2 != 0 {
+        return Err(format!("hex data needs whole bytes: {text}"));
+    }
+    (0..cleaned.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&cleaned[i..i + 2], 16).map_err(|e| e.to_string()))
+        .collect()
+}
+
+fn find_event(d: &Document, id: EventId) -> Option<(usize, usize)> {
+    for (ti, tr) in d.tracks.iter().enumerate() {
+        for (ei, e) in tr.events.iter().enumerate() {
+            if e.id == id {
+                return Some((ti, ei));
+            }
+        }
+    }
+    None
+}
+
+/// Validate `text` for `field` against every target, producing the ops for
+/// one transaction. Err = rejected before any transaction; Ok(vec![]) =
+/// field unsupported by all targets (e.g. velocity on a meta event).
+fn prop_edit_ops(
+    d: &mut Document,
+    target: &PropTarget,
+    field: PropField,
+    text: &str,
+) -> Result<Vec<Op>, String> {
+    match target {
+        PropTarget::Track(ti) => match field {
+            PropField::TrackChannel => {
+                let ch = parse_num(text, 1, 16, "channel")? as u8 - 1;
+                Ok(d.set_track_channel_ops(*ti, ch))
+            }
+            _ => Ok(vec![]),
+        },
+        PropTarget::Events(ids) => {
+            let mut ops = Vec::new();
+            for &(ti, ei, _) in ids {
+                ops.extend(edit_event_field(d, ti, ei, field, text)?);
+            }
+            Ok(ops)
+        }
+        PropTarget::Notes(ids) => {
+            let mut ops = Vec::new();
+            for &on_id in ids {
+                ops.extend(edit_note_field(d, on_id, field, text)?);
+            }
+            Ok(ops)
+        }
+    }
+}
+
+/// Edit one field of one event. Unsupported field-for-kind returns empty
+/// ops (multi-select batch applies only where meaningful); invalid input
+/// is an Err before any transaction exists.
+fn edit_event_field(
+    d: &mut Document,
+    ti: usize,
+    ei: usize,
+    field: PropField,
+    text: &str,
+) -> Result<Vec<Op>, String> {
+    let ev = match d.tracks.get(ti).and_then(|t| t.events.get(ei)) {
+        Some(e) => e.clone(),
+        None => return Err(format!("event not found: track {ti} index {ei}")),
+    };
+    let mk = |after: DocEvent| {
+        vec![Op::UpdateEvent {
+            track: ti,
+            before: ev.clone(),
+            after,
+        }]
+    };
+    match field {
+        PropField::Tick => {
+            let mut a = ev.clone();
+            a.tick = parse_num(text, 0, i64::MAX, "tick")? as u64;
+            Ok(mk(a))
+        }
+        PropField::Channel => {
+            let ch = parse_num(text, 1, 16, "channel")? as u8 - 1;
+            if let EventKind::Channel { .. } = ev.kind {
+                let mut a = ev.clone();
+                if let EventKind::Channel { status, .. } = &mut a.kind {
+                    *status = (*status & 0xF0) | ch;
+                }
+                Ok(mk(a))
+            } else {
+                Ok(vec![])
+            }
+        }
+        PropField::D0 => {
+            let v = parse_num(text, 0, 127, "data0")? as u8;
+            if let EventKind::Channel { .. } = ev.kind {
+                let mut a = ev.clone();
+                if let EventKind::Channel { data, .. } = &mut a.kind {
+                    data[0] = v;
+                }
+                Ok(mk(a))
+            } else {
+                Ok(vec![])
+            }
+        }
+        PropField::D1 => {
+            let v = parse_num(text, 0, 127, "data1")? as u8;
+            match ev.kind {
+                EventKind::Channel { len, .. } if len >= 2 => {
+                    let mut a = ev.clone();
+                    if let EventKind::Channel { data, .. } = &mut a.kind {
+                        data[1] = v;
+                    }
+                    Ok(mk(a))
+                }
+                _ => Ok(vec![]),
+            }
+        }
+        PropField::PbValue => {
+            let v = parse_num(text, -8192, 8191, "pitch bend")?;
+            if let EventKind::Channel { status, .. } = ev.kind {
+                if status & 0xF0 != 0xE0 {
+                    return Ok(vec![]);
+                }
+                let u = (v + 8192) as u16;
+                let mut a = ev.clone();
+                if let EventKind::Channel { data, .. } = &mut a.kind {
+                    data[0] = (u & 0x7F) as u8;
+                    data[1] = ((u >> 7) & 0x7F) as u8;
+                }
+                Ok(mk(a))
+            } else {
+                Ok(vec![])
+            }
+        }
+        PropField::MetaType => {
+            let s = text.trim();
+            let mt = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                Some(h) => {
+                    u8::from_str_radix(h, 16).map_err(|_| format!("invalid meta type: {text}"))?
+                }
+                None => parse_num(s, 0, 255, "meta type")? as u8,
+            };
+            if let EventKind::Meta { .. } = ev.kind {
+                let mut a = ev.clone();
+                if let EventKind::Meta { meta_type, .. } = &mut a.kind {
+                    *meta_type = mt;
+                }
+                Ok(mk(a))
+            } else {
+                Ok(vec![])
+            }
+        }
+        PropField::HexData => {
+            let bytes = parse_hex(text)?;
+            let mut a = ev.clone();
+            match &mut a.kind {
+                EventKind::Meta { data, .. } | EventKind::SysEx(data) | EventKind::Escape(data) => {
+                    *data = bytes.into();
+                    Ok(mk(a))
+                }
+                _ => Ok(vec![]),
+            }
+        }
+        // note-shaped fields apply through the note path, not single events
+        _ => Ok(vec![]),
+    }
+}
+
+/// Edit one field of one paired note (its NoteOn / NoteOff events).
+/// Unsupported fields (e.g. duration on a dangling on) return empty ops.
+fn edit_note_field(
+    d: &mut Document,
+    on_id: EventId,
+    field: PropField,
+    text: &str,
+) -> Result<Vec<Op>, String> {
+    let Some((oti, oei)) = find_event(d, on_id) else {
+        return Ok(vec![]);
+    };
+    let note = d.notes().into_iter().find(|n| n.on_id == on_id);
+    let Some(n) = note else { return Ok(vec![]) };
+    let on = d.tracks[oti].events[oei].clone();
+    let off = n
+        .off_id
+        .and_then(|id| find_event(d, id))
+        .map(|(ti, ei)| d.tracks[ti].events[ei].clone());
+    let mut ops = Vec::new();
+    let mut upd = |pos: (usize, usize), after: DocEvent| {
+        ops.push(Op::UpdateEvent {
+            track: pos.0,
+            before: d.tracks[pos.0].events[pos.1].clone(),
+            after,
+        });
+    };
+    match field {
+        PropField::NoteStart => {
+            let v = parse_num(text, 0, i64::MAX, "start")? as u64;
+            if let Some(end) = n.end_tick {
+                if v >= end {
+                    return Err(format!("start must be before end ({end}): {v}"));
+                }
+            }
+            let mut a = on.clone();
+            a.tick = v;
+            upd((oti, oei), a);
+        }
+        PropField::NoteEnd => {
+            let v = parse_num(text, 0, i64::MAX, "end")? as u64;
+            let Some(off) = off else {
+                return Err("dangling note has no note-off to edit".into());
+            };
+            if v <= n.start_tick {
+                return Err(format!("end must be after start ({}): {v}", n.start_tick));
+            }
+            let fti = find_event(d, n.off_id.unwrap()).unwrap();
+            let mut a = off;
+            a.tick = v;
+            upd(fti, a);
+        }
+        PropField::NoteDur => {
+            let v = parse_num(text, 1, i64::MAX, "duration")? as u64;
+            let Some(off) = off else {
+                return Err("dangling note has no note-off to edit".into());
+            };
+            let fti = find_event(d, n.off_id.unwrap()).unwrap();
+            let mut a = off;
+            a.tick = n.start_tick + v;
+            upd(fti, a);
+        }
+        PropField::NoteVel => {
+            let v = parse_num(text, 1, 127, "velocity")? as u8;
+            let mut a = on.clone();
+            if let EventKind::Channel { data, .. } = &mut a.kind {
+                data[1] = v;
+            }
+            upd((oti, oei), a);
+        }
+        PropField::NoteRelVel => {
+            let v = parse_num(text, 0, 127, "release velocity")? as u8;
+            let Some(off) = off else {
+                return Err("dangling note has no note-off to edit".into());
+            };
+            let fti = find_event(d, n.off_id.unwrap()).unwrap();
+            let mut a = off;
+            if let EventKind::Channel { data, .. } = &mut a.kind {
+                data[1] = v;
+            }
+            upd(fti, a);
+        }
+        PropField::NoteChannel => {
+            let ch = parse_num(text, 1, 16, "channel")? as u8 - 1;
+            let mut a = on.clone();
+            if let EventKind::Channel { status, .. } = &mut a.kind {
+                *status = (*status & 0xF0) | ch;
+            }
+            upd((oti, oei), a);
+            if let Some(off) = off {
+                let fti = find_event(d, n.off_id.unwrap()).unwrap();
+                let mut a = off;
+                if let EventKind::Channel { status, .. } = &mut a.kind {
+                    *status = (*status & 0xF0) | ch;
+                }
+                upd(fti, a);
+            }
+        }
+        _ => return Ok(vec![]),
+    }
+    Ok(ops)
+}
+
 /// App-wide preferences: recent files + record count-in + recording source.
 /// Stored at %APPDATA%/midi-editor/prefs.json (unlike the per-song sidecar).
 /// Versioned + atomically persisted via `persist::json` — a torn write can
@@ -4809,8 +5531,10 @@ fn main() {
             cx.open_window(WindowOptions::default(), move |window, cx| {
                 let input =
                     cx.new(|cx| InputState::new(window, cx).placeholder(t("field.track_name")));
+                let prop_input =
+                    cx.new(|cx| InputState::new(window, cx).placeholder(t("prop.value")));
                 let view = cx.new(|cx| {
-                    let mut v = EditorView::new(path.clone(), input, window, cx);
+                    let mut v = EditorView::new(path.clone(), input, prop_input, window, cx);
                     v.window_handle = Some(window.window_handle());
                     let (mcp_stop, mcp_thread) = spawn_mcp(v.shared.clone());
                     v.shutdown.track_mcp(mcp_stop, mcp_thread);
@@ -5620,6 +6344,7 @@ mod tests {
             EditorView::new(
                 None,
                 cx.new(|cx| InputState::new(window, cx).placeholder(t("field.track_name"))),
+                cx.new(|cx| InputState::new(window, cx).placeholder(t("prop.value"))),
                 window,
                 cx,
             )
@@ -5672,5 +6397,220 @@ mod tests {
             assert_eq!(window.find("snap").role(), Some(Role::SpinButton));
         })
         .unwrap();
+    }
+
+    // --- event-properties inspector --------------------------------------
+
+    use super::{edit_event_field, edit_note_field, prop_edit_ops, PropField, PropTarget};
+    use document::{Document, Op};
+    use smf_core::{Division, EventKind};
+
+    fn chan(tick: u64, seq: u32, status: u8, d0: u8, d1: u8) -> smf_core::Event {
+        smf_core::Event {
+            tick,
+            seq,
+            raw_body: None,
+            kind: EventKind::Channel {
+                status,
+                data: [d0, d1],
+                len: match status & 0xF0 {
+                    0xC0 | 0xD0 => 1,
+                    _ => 2,
+                },
+            },
+        }
+    }
+
+    fn doc(tracks: Vec<Vec<smf_core::Event>>) -> Document {
+        Document::from_file(smf_core::File {
+            format: 1,
+            division: Division::Metrical(480),
+            tracks: tracks
+                .into_iter()
+                .map(|events| smf_core::Track { events })
+                .collect(),
+            warnings: vec![],
+        })
+    }
+
+    fn note_doc() -> Document {
+        doc(vec![vec![
+            chan(0, 0, 0x90, 60, 100),
+            chan(480, 1, 0x80, 60, 40),
+        ]])
+    }
+
+    fn apply(d: &mut Document, ops: Vec<Op>) {
+        d.apply(document::Transaction {
+            label: "t".into(),
+            base: d.revision(),
+            ops,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn prop_note_fields_edit_on_and_off_events() {
+        let mut d = note_doc();
+        let n = d.notes().remove(0);
+        let ops = edit_note_field(&mut d, n.on_id, PropField::NoteVel, "90").unwrap();
+        apply(&mut d, ops);
+        let ops = edit_note_field(&mut d, n.on_id, PropField::NoteRelVel, "7").unwrap();
+        apply(&mut d, ops);
+        let ops = edit_note_field(&mut d, n.on_id, PropField::NoteChannel, "3").unwrap();
+        apply(&mut d, ops);
+        let ops = edit_note_field(&mut d, n.on_id, PropField::NoteEnd, "960").unwrap();
+        apply(&mut d, ops);
+        let n = d.notes().remove(0);
+        assert_eq!(n.vel, 90);
+        assert_eq!(n.channel, 2);
+        assert_eq!(n.end_tick, Some(960));
+        let (_, ei) = super::find_event(&d, n.off_id.unwrap()).unwrap();
+        match &d.tracks[0].events[ei].kind {
+            EventKind::Channel { status, data, .. } => {
+                assert_eq!(*status, 0x82); // status high nibble kept, ch = 3-1
+                assert_eq!(data[1], 7); // release velocity
+            }
+            _ => panic!("expected channel event"),
+        }
+    }
+
+    #[test]
+    fn prop_note_rejects_bad_numbers_before_ops() {
+        let mut d = note_doc();
+        let n = d.notes().remove(0);
+        assert!(edit_note_field(&mut d, n.on_id, PropField::NoteVel, "0").is_err());
+        assert!(edit_note_field(&mut d, n.on_id, PropField::NoteVel, "128").is_err());
+        assert!(edit_note_field(&mut d, n.on_id, PropField::NoteVel, "x").is_err());
+        assert!(edit_note_field(&mut d, n.on_id, PropField::NoteChannel, "17").is_err());
+        assert!(edit_note_field(&mut d, n.on_id, PropField::NoteEnd, "0").is_err());
+        assert!(edit_note_field(&mut d, n.on_id, PropField::NoteStart, "480").is_err());
+        assert!(edit_note_field(&mut d, n.on_id, PropField::NoteDur, "0").is_err());
+    }
+
+    #[test]
+    fn prop_dangling_note_rejects_end_edits() {
+        let mut d = doc(vec![vec![chan(0, 0, 0x90, 60, 100)]]);
+        let n = d.notes().remove(0);
+        assert!(n.off_id.is_none());
+        assert!(edit_note_field(&mut d, n.on_id, PropField::NoteEnd, "960").is_err());
+        assert!(edit_note_field(&mut d, n.on_id, PropField::NoteRelVel, "7").is_err());
+        // start/velocity/channel still fine on the on event
+        assert!(!edit_note_field(&mut d, n.on_id, PropField::NoteVel, "80")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn prop_event_fields_edit_channel_meta_and_bytes() {
+        let mut d = doc(vec![vec![
+            chan(0, 0, 0x90, 60, 100),
+            chan(0, 1, 0xE0, 0x00, 0x40), // pb center
+            smf_core::Event {
+                tick: 0,
+                seq: 2,
+                raw_body: None,
+                kind: EventKind::Meta {
+                    meta_type: 0x51,
+                    data: vec![0x07, 0xA1, 0x20].into(),
+                },
+            },
+        ]]);
+        let id_note = d.tracks[0].events[0].id;
+        let id_pb = d.tracks[0].events[1].id;
+        let id_meta = d.tracks[0].events[2].id;
+        // channel: keeps the status high nibble
+        let ops = edit_event_field(&mut d, 0, 0, PropField::Channel, "5").unwrap();
+        apply(&mut d, ops);
+        match &d.tracks[0].events[0].kind {
+            EventKind::Channel { status, .. } => assert_eq!(*status, 0x94),
+            _ => panic!(),
+        }
+        // d0/d1
+        let ops = edit_event_field(&mut d, 0, 0, PropField::D0, "64").unwrap();
+        apply(&mut d, ops);
+        let ops = edit_event_field(&mut d, 0, 0, PropField::D1, "30").unwrap();
+        apply(&mut d, ops);
+        match &d.tracks[0].events[0].kind {
+            EventKind::Channel { data, .. } => assert_eq!(*data, [64, 30]),
+            _ => panic!(),
+        }
+        // tick move re-sorts the track — locate by id afterwards
+        let ops = edit_event_field(&mut d, 0, 0, PropField::Tick, "240").unwrap();
+        apply(&mut d, ops);
+        let (ti, ei) = super::find_event(&d, id_note).unwrap();
+        assert_eq!(d.tracks[ti].events[ei].tick, 240);
+        // pitch bend: -8192..8191 → 14-bit encoding
+        let (_, ei_pb) = super::find_event(&d, id_pb).unwrap();
+        let ops = edit_event_field(&mut d, 0, ei_pb, PropField::PbValue, "8191").unwrap();
+        apply(&mut d, ops);
+        match &d.tracks[0].events[ei_pb].kind {
+            EventKind::Channel { data, .. } => assert_eq!(*data, [0x7F, 0x7F]),
+            _ => panic!(),
+        }
+        // meta type accepts 0x hex
+        let (_, ei_m) = super::find_event(&d, id_meta).unwrap();
+        let ops = edit_event_field(&mut d, 0, ei_m, PropField::MetaType, "0x2F").unwrap();
+        apply(&mut d, ops);
+        match &d.tracks[0].events[ei_m].kind {
+            EventKind::Meta { meta_type, .. } => assert_eq!(*meta_type, 0x2F),
+            _ => panic!(),
+        }
+        // hex payload replaces the data bytes
+        let ops = edit_event_field(&mut d, 0, ei_m, PropField::HexData, "03 12 ff").unwrap();
+        apply(&mut d, ops);
+        match &d.tracks[0].events[ei_m].kind {
+            EventKind::Meta { data, .. } => assert_eq!(&data[..], &[0x03, 0x12, 0xff]),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn prop_event_rejects_bad_input_and_unsupported_fields() {
+        let mut d = doc(vec![vec![
+            chan(0, 0, 0x90, 60, 100),
+            chan(0, 1, 0xC0, 12, 0), // PC has no d1
+        ]]);
+        assert!(edit_event_field(&mut d, 0, 0, PropField::Tick, "-1").is_err());
+        assert!(edit_event_field(&mut d, 0, 0, PropField::Channel, "0").is_err());
+        assert!(edit_event_field(&mut d, 0, 0, PropField::D0, "128").is_err());
+        assert!(edit_event_field(&mut d, 0, 0, PropField::PbValue, "9000").is_err());
+        assert!(edit_event_field(&mut d, 0, 0, PropField::HexData, "abc").is_err());
+        // field unsupported by the kind → empty ops, not an error
+        assert!(edit_event_field(&mut d, 0, 0, PropField::MetaType, "1")
+            .unwrap()
+            .is_empty());
+        assert!(edit_event_field(&mut d, 0, 1, PropField::D1, "5")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn prop_batch_edits_every_supported_target() {
+        let mut d = doc(vec![vec![
+            chan(0, 0, 0x90, 60, 100),
+            chan(240, 1, 0xB0, 7, 100),
+            smf_core::Event {
+                tick: 0,
+                seq: 2,
+                raw_body: None,
+                kind: EventKind::Meta {
+                    meta_type: 0x06,
+                    data: b"text".to_vec().into(),
+                },
+            },
+        ]]);
+        // channel=4 applies to the two channel events, skips the meta one
+        let target = PropTarget::Events(vec![
+            (0, 0, d.tracks[0].events[0].id),
+            (0, 1, d.tracks[0].events[1].id),
+            (0, 2, d.tracks[0].events[2].id),
+        ]);
+        let ops = prop_edit_ops(&mut d, &target, PropField::Channel, "4").unwrap();
+        assert_eq!(ops.len(), 2);
+        apply(&mut d, ops);
+        // tick applies to all three
+        let ops = prop_edit_ops(&mut d, &target, PropField::Tick, "100").unwrap();
+        assert_eq!(ops.len(), 3);
     }
 }
