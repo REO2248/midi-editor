@@ -372,6 +372,7 @@ static EN: &[(&str, &str)] = &[
     ("focus.roll", "piano roll"),
     ("focus.lane", "lane"),
     ("focus.events", "event list"),
+    ("ui.scale", "display scale"),
 ];
 
 static JA: &[(&str, &str)] = &[
@@ -722,6 +723,7 @@ static JA: &[(&str, &str)] = &[
     ("focus.roll", "ピアノロール"),
     ("focus.lane", "レーン"),
     ("focus.events", "イベントリスト"),
+    ("ui.scale", "表示スケール"),
 ];
 
 fn detect_lang() -> &'static str {

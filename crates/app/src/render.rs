@@ -2430,6 +2430,18 @@ impl Render for EditorView {
                     .whitespace_nowrap()
                     .child(format!("{}: {}", t("focus.label"), t(area.key()))),
             )
+            .child(
+                // live monitor scale — proves PerMonitorV2 at runtime (a
+                // bitmap-stretched app would always report 100%)
+                div()
+                    .text_color(rgb(0x77778a))
+                    .whitespace_nowrap()
+                    .child(format!(
+                        "{}: {}%",
+                        t("ui.scale"),
+                        (window.scale_factor() * 100.0).round() as i32
+                    )),
+            )
             .child(Self::chip(
                 "st-lane",
                 lane_mode.label(),
