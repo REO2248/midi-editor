@@ -1803,13 +1803,25 @@ impl EditorView {
                 ],
             ),
         };
-        let Ok(rx) = wh.update(cx, |_, w, app| {
-            w.prompt(PromptLevel::Warning, &title, Some(&detail), &answers, app)
-        }) else {
-            return;
-        };
         self.prompt_active = true;
+        // open the prompt from a deferred task: save() is invoked inside
+        // the window's own event-handler update, and nesting a window
+        // update there is rejected — spawning moves it outside the handler
         cx.spawn(async move |this, cx| {
+            let rx = wh
+                .update(cx, |_, w, app| {
+                    w.prompt(PromptLevel::Warning, &title, Some(&detail), &answers, app)
+                })
+                .ok();
+            let Some(rx) = rx else {
+                this.update(cx, |v, cx| {
+                    v.prompt_active = false;
+                    v.status = t("watch.save_blocked").into();
+                    cx.notify();
+                })
+                .ok();
+                return;
+            };
             let idx = rx.await.unwrap_or(usize::MAX);
             this.update(cx, |v, cx| {
                 v.prompt_active = false;
