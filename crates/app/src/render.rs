@@ -1879,9 +1879,21 @@ impl Render for EditorView {
                     items.extend([
                         Self::msep().into_any_element(),
                         Self::mi("o.rescan", t("output.rescan"), "", None, cx, |v, _e, cx| {
-                            v.rescan_plugins();
+                            v.rescan_plugins(crate::ScanMode::Changed);
                             cx.notify();
                         })
+                        .into_any_element(),
+                        Self::mi(
+                            "o.rescan_all",
+                            t("output.rescan_all"),
+                            "",
+                            None,
+                            cx,
+                            |v, _e, cx| {
+                                v.rescan_plugins(crate::ScanMode::All);
+                                cx.notify();
+                            },
+                        )
                         .into_any_element(),
                         Self::mi(
                             "o.status",
@@ -2480,12 +2492,17 @@ impl Render for EditorView {
             let scan = if self.scan_rx.is_some() {
                 t("status.scanning").to_string()
             } else {
-                let n = self.plugin_meta.len();
+                let n = self.plugin_meta.len().to_string();
+                let c = self.scan_cached.to_string();
+                let to = self.probe_timeout_secs.to_string();
                 let mode = match self.scan_probe_used {
                     Some(true) => t("output.probe_used"),
                     _ => t("output.probe_unused"),
                 };
-                format!("{n} plugins, {mode}")
+                tf(
+                    "output.scan_summary",
+                    &[("n", n.as_str()), ("c", c.as_str()), ("mode", mode), ("timeout", to.as_str())],
+                )
             };
             let mut rows: Vec<AnyElement> = vec![
                 diag_row(
@@ -2582,6 +2599,49 @@ impl Render for EditorView {
                     .into_any_element(),
                 );
             }
+            // quarantine: bundles the cache recorded as crash/timeout and
+            // skipped this scan — each row force-retries that one plugin
+            if !self.quarantined.is_empty() {
+                rows.push(Self::mhead(t("output.quarantined_short")).into_any_element());
+            }
+            for (i, (path, reason)) in self.quarantined.iter().enumerate() {
+                let name = path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let path = path.clone();
+                rows.push(
+                    div()
+                        .id(("output-quarantine", i))
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .text_color(rgb(0xe0b050))
+                        .child(
+                            div()
+                                .flex()
+                                .gap_1()
+                                .items_center()
+                                .child(format!("{}  {}", name, t("plugin.state_failed")))
+                                .child(
+                                    div()
+                                        .text_color(rgb(0x888899))
+                                        .child(t("output.quarantined_short").to_string()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(rgb(0x9999aa))
+                                .child(format!("{} — {}", reason, t("output.click_rescan"))),
+                        )
+                        .on_click(cx.listener(move |v, _e, _w, cx| {
+                            v.rescan_plugins(crate::ScanMode::Retry(path.clone()));
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                );
+            }
             let panel_content_h = 24.0 + rows.len() as f32 * 26.0 + 32.0 + 32.0;
             let panel = div()
                 .id("output-status-panel")
@@ -2614,7 +2674,7 @@ impl Render for EditorView {
                             t("output.rescan"),
                             cx,
                             |v, _e, cx| {
-                                v.rescan_plugins();
+                                v.rescan_plugins(crate::ScanMode::Changed);
                                 cx.notify();
                             },
                         ))
