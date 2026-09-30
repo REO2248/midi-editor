@@ -2006,6 +2006,14 @@ impl Render for EditorView {
                             "MCP: http://127.0.0.1:7878/mcp (mcp-bridge for stdio clients)".into();
                     })
                     .into_any_element(),
+                    Self::mi("h.logs", t("help.open_logs"), "", None, cx, |v, _e, cx| {
+                        v.open_logs(cx);
+                    })
+                    .into_any_element(),
+                    Self::mi("h.diag", t("help.export_diag"), "", None, cx, |v, _e, cx| {
+                        v.export_diagnostics(cx);
+                    })
+                    .into_any_element(),
                 ],
             };
             // dropdown panel under the clicked label

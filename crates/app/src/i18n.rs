@@ -242,6 +242,12 @@ static EN: &[(&str, &str)] = &[
         "watch.save_blocked",
         "file changed on disk — answer the open prompt first",
     ),
+    ("help.open_logs", "Open Logs Folder"),
+    ("help.export_diag", "Export Diagnostics Bundle"),
+    ("status.logs_dir", "logs: {p}"),
+    ("status.logs_open_failed", "could not open logs folder"),
+    ("status.bundle_written", "diagnostics bundle: {p}"),
+    ("status.bundle_failed", "bundle export failed: {e}"),
 ];
 
 static JA: &[(&str, &str)] = &[
@@ -462,6 +468,12 @@ static JA: &[(&str, &str)] = &[
         "watch.save_blocked",
         "ファイルがディスク上で変更されています — 開いているプロンプトに先に回答してください",
     ),
+    ("help.open_logs", "ログフォルダーを開く"),
+    ("help.export_diag", "診断バンドルをエクスポート"),
+    ("status.logs_dir", "ログ: {p}"),
+    ("status.logs_open_failed", "ログフォルダーを開けませんでした"),
+    ("status.bundle_written", "診断バンドル: {p}"),
+    ("status.bundle_failed", "バンドル出力に失敗: {e}"),
 ];
 
 fn detect_lang() -> &'static str {
