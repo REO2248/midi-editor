@@ -701,7 +701,7 @@ pub static COMMANDS: &[Command] = &[
     cmd!("help.about", "help.about", &[], None, |v, _w, _cx| {
         v.status = concat!(
             "midi-editor ",
-            env!("CARGO_PKG_VERSION"),
+            env!("BUILD_IDENTITY"),
             " — pure-SMF editor"
         )
         .into();

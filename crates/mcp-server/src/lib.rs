@@ -1338,10 +1338,7 @@ fn err_json(msg: impl Into<String>) -> CallToolResponse {
 impl ServerHandler for MidiService {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new(
-                "midi-editor",
-                env!("CARGO_PKG_VERSION"),
-            ))
+            .with_server_info(Implementation::new("midi-editor", env!("BUILD_IDENTITY")))
             .with_instructions(
                 "Pure-SMF MIDI editor. All edits go through Document::apply transactions; \
                  one tool call = one undo step, or begin_transaction groups many calls into \

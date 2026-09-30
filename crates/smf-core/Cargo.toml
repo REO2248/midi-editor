@@ -1,6 +1,7 @@
 [package]
 name = "smf-core"
 edition.workspace = true
+version.workspace = true
 license.workspace = true
 description = "Standard MIDI File parsing and faithful serialization"
 

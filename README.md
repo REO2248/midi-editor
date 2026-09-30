@@ -216,6 +216,19 @@ reveals them; Help → **Export Diagnostics Bundle** writes a single
 `midi-editor-diagnostics-<ts>.txt` under `%APPDATA%\midi-editor\diagnostics\`
 containing environment facts and redacted log tails — token/secret-shaped
 values are masked, and no MIDI file content is ever included.
+## Versioning & releases
+
+All workspace crates share one semantic version (`[workspace.package]
+version` in the root `Cargo.toml`). Every build embeds an identity string
+`<semver>+<commit>[.dirty]` — `midi-editor --version`,
+`mcp-bridge --version`, Help > About, and MCP `serverInfo.version` all report
+the same value; quote it in bug reports.
+
+History lives in `CHANGELOG.md` (Keep a Changelog, grouped Added / Fixed /
+Breaking); draft sections with `scripts/changelog.ps1`. State compatibility
+and downgrade risks are in `docs/UPGRADING.md`. Releases are annotated tags
+`v<semver>`; `scripts/release.ps1` builds the payload and writes a versioned
+zip, `SHA256SUMS.txt`, and `manifest.json` with commit/dirty provenance.
 
 ## i18n
 

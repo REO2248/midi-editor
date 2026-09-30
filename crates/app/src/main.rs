@@ -7268,6 +7268,7 @@ impl EditorView {
 
     fn save_global(&self) {
         GlobalPrefs {
+            version: <GlobalPrefs as persist::json::Versioned>::VERSION,
             recent: self.recent.iter().map(|r| r.to_string()).collect(),
             count_in: self.count_in,
             midi_in: self.midi_in.to_string(),
@@ -7382,6 +7383,20 @@ impl Drop for EditorView {
 }
 
 fn main() {
+    // exact build identity for bug reports — same string as Help>About and
+    // MCP serverInfo: "<semver>+<commit>[.dirty]"
+    if std::env::args_os()
+        .skip(1)
+        .any(|a| a == "--version" || a == "-V")
+    {
+        println!(
+            "midi-editor {} ({} {})",
+            env!("BUILD_IDENTITY"),
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
+        return;
+    }
     output::init_env();
     let log_dir = diagnostics::init_logging();
     diagnostics::install_panic_hook();

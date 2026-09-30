@@ -1,6 +1,7 @@
 [package]
 name = "commands"
 edition.workspace = true
+version.workspace = true
 license.workspace = true
 description = "Edit commands and undo stack over document Transactions"
 

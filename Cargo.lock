@@ -1113,7 +1113,7 @@ dependencies = [
 
 [[package]]
 name = "commands"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bytes",
  "document",
@@ -1726,7 +1726,7 @@ dependencies = [
 
 [[package]]
 name = "document"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bytes",
  "proptest",
@@ -4264,7 +4264,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-server"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -4336,7 +4336,7 @@ dependencies = [
 
 [[package]]
 name = "midi-editor"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4359,7 +4359,7 @@ dependencies = [
 
 [[package]]
 name = "midi-io"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "midir",
  "serde",
@@ -5272,7 +5272,7 @@ dependencies = [
 
 [[package]]
 name = "output"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "cpal",
  "midi-io",
@@ -6990,7 +6990,7 @@ checksum = "f9395f0f0eee849a9b707b2f06bb92a6a422090e2123bb2ef8e87a0e61892a8e"
 
 [[package]]
 name = "smf-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bytes",
  "encoding_rs",

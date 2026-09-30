@@ -25,7 +25,7 @@ struct ForwardService {
 impl ServerHandler for ForwardService {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("mcp-bridge", env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new("mcp-bridge", env!("BUILD_IDENTITY")))
             .with_instructions(format!("stdio bridge -> {}", self.upstream_name))
     }
 
@@ -76,6 +76,10 @@ async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--version" | "-V" => {
+                println!("mcp-bridge {}", env!("BUILD_IDENTITY"));
+                return Ok(());
+            }
             "--url" => url = args.next().unwrap_or(url),
             // an empty bearer token is never valid — a missing value must
             // fail loudly, not silently send "Bearer "
