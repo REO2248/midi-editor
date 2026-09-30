@@ -697,7 +697,15 @@ impl Render for EditorView {
                     .border_color(rgb(BORDER_C))
                     .text_size(px(11.0))
                     .text_color(rgb(0x77778a))
-                    .child(format!("{} ({})", t("events.header"), self.events.len()))
+                    .child(format!(
+                        "{} ({}){}",
+                        t("events.header"),
+                        self.events.len(),
+                        self.doc_ui
+                            .mode_hint
+                            .map(|m| format!(" [{}]", m.label()))
+                            .unwrap_or_default(),
+                    ))
                     .child(div().flex_1())
                     .children((n_diags > 0).then(|| {
                         div()

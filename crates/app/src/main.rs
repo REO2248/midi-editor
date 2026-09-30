@@ -187,6 +187,8 @@ struct DocUi {
     track_chs: Vec<u8>,
     sig: String,
     tempo0: f64,
+    /// detected GM/GS/XG reset SysEx — a display hint for patch naming
+    mode_hint: Option<smf_core::ModeHint>,
     /// last tick with a note — the scrollable extent of the timeline
     song_end: u64,
 }
@@ -248,6 +250,7 @@ impl DocUi {
             track_chs,
             sig,
             tempo0,
+            mode_hint: doc.synth_mode(),
             song_end: notes
                 .iter()
                 .map(|n| n.end_tick.unwrap_or(n.start_tick))
@@ -830,6 +833,11 @@ impl EditorView {
             Division::Smpte { .. } => 480,
         };
         let hint = self.enc_override.or(doc.text_encoding_hint());
+        let pc_names: HashMap<EventId, (u8, u8, Option<String>)> = doc
+            .program_changes()
+            .iter()
+            .map(|p| (p.id, (p.bank_msb, p.bank_lsb, doc.program_name(p))))
+            .collect();
         let mut rows = Vec::new();
         for d in doc.diagnose() {
             rows.push(format!("[{}] tk{} @{}", d.code, d.track + 1, d.tick).into());
@@ -852,7 +860,25 @@ impl EditorView {
                             0xE0 => "PB     ",
                             _ => "Ch?    ",
                         };
-                        format!("{name} ch{ch:<2} {:>3} {:>3}", data[0], data[1])
+                        // channel 10 notes get GM percussion names; program
+                        // changes get bank + friendly patch name (numeric
+                        // context always shown — unknown banks stay numeric)
+                        let mut tag = String::new();
+                        if status & 0xF0 == 0x90 || status & 0xF0 == 0x80 {
+                            if (status & 0x0F) == 9 {
+                                if let Some(d) = smf_core::gm_drum_name(data[0]) {
+                                    tag = format!("  [{d}]");
+                                }
+                            }
+                        } else if status & 0xF0 == 0xC0 {
+                            if let Some((msb, lsb, name)) = pc_names.get(&e.id) {
+                                tag = match name {
+                                    Some(n) => format!("  bank {msb}.{lsb}  [{n}]"),
+                                    None => format!("  bank {msb}.{lsb}"),
+                                };
+                            }
+                        }
+                        format!("{name} ch{ch:<2} {:>3} {:>3}{tag}", data[0], data[1])
                     }
                     EventKind::Meta { meta_type, data } => match *meta_type {
                         0x03 => format!("TrkName {}", smf_core::decode_text(data, hint)),

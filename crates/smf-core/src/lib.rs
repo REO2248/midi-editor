@@ -11,6 +11,10 @@ use midly::{MetaMessage, MidiMessage, SmfBytemap, TrackEventKind};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use thiserror::Error;
 
+/// GM/GS/XG display-name tables + reset-SysEx detection (display only).
+pub mod gm;
+pub use gm::{gm_drum_name, gm_program_name, kit_name, reset_hint, ModeHint};
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("SMF parse failed: {0}")]
