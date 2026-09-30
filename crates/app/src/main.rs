@@ -10,6 +10,7 @@ mod i18n;
 mod icons;
 mod recovery;
 mod render;
+mod shutdown;
 mod watch;
 use geometry::{
     clamp_move_delta, clamp_span, content_view, reanchor, roll_hit, ZOOM_MAX, ZOOM_MIN,
@@ -401,6 +402,10 @@ struct EditorView {
     /// our window's handle — needed to open prompts from listeners and
     /// the doc-watch loop where no &mut Window is passed
     window_handle: Option<AnyWindowHandle>,
+    /// teardown coordinator — owns every worker handle (see `shutdown.rs`)
+    shutdown: shutdown::Shutdown,
+    /// keeps the on_app_quit subscription registered for the view's life
+    _quit_sub: Option<Subscription>,
 }
 
 enum PluginState {
@@ -498,7 +503,7 @@ impl EditorView {
         sh.dests = build_dest_catalog(&initial_plugins);
         let g = GlobalPrefs::load();
         let shared = Arc::new(Mutex::new(sh));
-        let (plugin_req, plugin_evt) = output::spawn_plugin_host();
+        let (plugin_req, plugin_evt, host_thread) = output::spawn_plugin_host();
         tracing::info!("plugin host worker spawned");
         let hd = output::host_diag();
         tracing::info!(
@@ -588,7 +593,16 @@ impl EditorView {
             guard_active: false,
             close_confirmed: false,
             window_handle: None,
+            shutdown: shutdown::Shutdown::default(),
+            _quit_sub: None,
         };
+        v.shutdown.track_host(host_thread);
+        // app-quit path (menu Quit / task kill minus window close) —
+        // on_window_should_close alone doesn't cover it
+        v._quit_sub = Some(cx.on_app_quit(|v, _| {
+            v.perform_shutdown();
+            async {}
+        }));
         v.sel_track = v.pick_default_track();
         v.refresh_derived();
         if let Some(p) = &path {
@@ -2643,9 +2657,19 @@ impl EditorView {
         self.status = t("status.scanning").into();
         let (tx, rx) = std::sync::mpsc::channel();
         self.scan_rx = Some(rx);
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             let _ = tx.send(output::discover_plugins());
         });
+        self.shutdown.track_scan(handle);
+    }
+
+    /// Ordered, bounded teardown of everything the app owns. Runs from
+    /// `on_window_should_close` and `on_app_quit`; the Shutdown latch
+    /// makes the second call a no-op.
+    fn perform_shutdown(&mut self) {
+        let mut sd = std::mem::take(&mut self.shutdown);
+        sd.run(self);
+        self.shutdown = sd;
     }
 
     fn apply_catalog(&mut self, report: output::ScanReport) {
@@ -3357,13 +3381,16 @@ fn main() {
                 let view = cx.new(|cx| {
                     let mut v = EditorView::new(path.clone(), input, cx);
                     v.window_handle = Some(window.window_handle());
-                    spawn_mcp(v.shared.clone());
+                    let (mcp_stop, mcp_thread) = spawn_mcp(v.shared.clone());
+                    v.shutdown.track_mcp(mcp_stop, mcp_thread);
                     spawn_doc_watch(cx, v.shared.clone());
                     window.focus(&v.focus.clone(), cx);
                     v
                 });
                 // the close button (and any quit path going through window
-                // close) runs the same discard guard as New/Open
+                // close) runs the same discard guard as New/Open; once the
+                // guard passes, the teardown coordinator runs once
+                // (idempotent with the on_app_quit hook)
                 let weak = view.downgrade();
                 window.on_window_should_close(cx, move |window, cx| {
                     let Some(view) = weak.upgrade() else {
@@ -3371,6 +3398,7 @@ fn main() {
                     };
                     view.update(cx, |v, cx| {
                         if v.close_confirmed || !v.needs_discard_guard() {
+                            v.perform_shutdown();
                             return true;
                         }
                         v.confirm_discard_or_save(PendingAction::CloseWindow, window, cx);
@@ -3389,8 +3417,11 @@ fn main() {
 /// In-app MCP server: Streamable-HTTP on 127.0.0.1:7878/mcp on its own
 /// tokio runtime thread. Bearer token = MIDI_MCP_TOKEN env (unset = open on
 /// loopback only). `mcp-bridge` is the stdio frontend for stdio-only clients.
-fn spawn_mcp(shared: SharedDoc) {
-    std::thread::spawn(move || {
+fn spawn_mcp(
+    shared: SharedDoc,
+) -> (tokio::sync::oneshot::Sender<()>, std::thread::JoinHandle<()>) {
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let handle = std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -3405,12 +3436,14 @@ fn spawn_mcp(shared: SharedDoc) {
             let token = std::env::var("MIDI_MCP_TOKEN").ok();
             // auth mode is safe to log; the token value never is
             tracing::info!(auth = token.is_some(), "mcp http listening on 127.0.0.1:7878");
-            if let Err(e) = mcp_server::serve_http(shared, "127.0.0.1:7878", token).await {
+            if let Err(e) =
+                mcp_server::serve_http(shared, "127.0.0.1:7878", token, stop_rx).await
+            {
                 tracing::error!(error = %e, "mcp http stopped");
-                eprintln!("mcp http: {e}");
             }
         });
     });
+    (stop_tx, handle)
 }
 
 /// Startup recovery. After a crash the newest snapshot that is newer than

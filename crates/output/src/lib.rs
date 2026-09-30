@@ -330,13 +330,16 @@ pub struct PluginEvent {
 /// `AudioHandle`s are not `Send`); the app talks to it through the request
 /// channel and receives `PluginSlot` handles on the returned receiver.
 /// Requests are processed in order; `Open` replies carry `(dest, result)`.
+/// Returns `(requests, events, worker handle)` — the handle joins after
+/// `PluginReq::Shutdown` once owned plugin instances have unloaded.
 pub fn spawn_plugin_host() -> (
     std::sync::mpsc::Sender<PluginReq>,
     std::sync::mpsc::Receiver<PluginEvent>,
+    std::thread::JoinHandle<()>,
 ) {
     let (req_tx, req_rx) = std::sync::mpsc::channel::<PluginReq>();
     let (evt_tx, evt_rx) = std::sync::mpsc::channel::<PluginEvent>();
-    std::thread::spawn(move || {
+    let handle = std::thread::spawn(move || {
         let mut owned: std::collections::HashMap<usize, PluginOutput> =
             std::collections::HashMap::new();
         while let Ok(req) = req_rx.recv() {
@@ -370,8 +373,10 @@ pub fn spawn_plugin_host() -> (
                 PluginReq::Shutdown => break,
             }
         }
+        // dropping `owned` unloads every instance; helper subprocesses die
+        // with their PluginOutput drops
     });
-    (req_tx, evt_rx)
+    (req_tx, evt_rx, handle)
 }
 
 #[derive(Clone)]
