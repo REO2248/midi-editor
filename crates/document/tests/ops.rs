@@ -128,6 +128,131 @@ fn scale_velocity_clamps() {
 }
 
 #[test]
+fn note_off_velocity_and_form_are_captured() {
+    // 0x80 off carrying release 42 + 0x90-vel0 off — the Note model
+    // keeps the release value AND which wire form closed the note
+    let d = doc(vec![vec![
+        chan(0, 0x90, 60, 100),
+        chan(480, 0x80, 60, 42),
+        chan(0, 0x90, 64, 90),
+        chan(480, 0x90, 64, 0),
+    ]]);
+    let ns = notes_on(&d, 0);
+    assert_eq!(ns.len(), 2);
+    assert!(!ns[0].off_via_on && ns[0].off_vel == 42, "0x80 off → release 42");
+    assert!(ns[1].off_via_on && ns[1].off_vel == 0, "0x90-vel0 off → form kept");
+    // dangling note-on reports a zero/0x80 default — nothing stored
+    let d = doc(vec![vec![chan(0, 0x90, 60, 100)]]);
+    assert!(notes_on(&d, 0)[0].off_id.is_none());
+}
+
+#[test]
+fn release_velocity_survives_serialize_roundtrip() {
+    // import → serialize → re-import: release velocity and the 0x80/0x90v0
+    // split come through byte-for-byte
+    let d = doc(vec![vec![
+        chan(0, 0x90, 60, 100),
+        chan(480, 0x80, 60, 42),
+        chan(0, 0x90, 64, 90),
+        chan(480, 0x90, 64, 0),
+    ]]);
+    let bytes = d.serialize(smf_core::WriteOptions {
+        running_status: true,
+    });
+    let d2 = Document::from_file(smf_core::parse(&bytes).unwrap());
+    let ns = notes_on(&d2, 0);
+    assert_eq!(ns.len(), 2);
+    assert!(!ns[0].off_via_on && ns[0].off_vel == 42);
+    assert!(ns[1].off_via_on && ns[1].off_vel == 0);
+}
+
+#[test]
+fn release_velocity_survives_structural_edits() {
+    // transpose rewrites the pitch byte on BOTH ends; set_length moves the
+    // off's tick — the release byte rides along untouched
+    let mut d = doc(vec![vec![chan(0, 0x90, 60, 100), chan(500, 0x80, 60, 42)]]);
+    let __ops = d.transpose_ops(0, 0, u64::MAX, 5);
+    apply(&mut d, __ops);
+    let __ops = d.set_length_ops(0, 0, u64::MAX, 960);
+    apply(&mut d, __ops);
+    let n = &notes_on(&d, 0)[0];
+    assert_eq!(n.key, 65);
+    let off = d.tracks[0]
+        .events
+        .iter()
+        .find(|e| Some(e.id) == n.off_id)
+        .unwrap();
+    match &off.kind {
+        EventKind::Channel { status, data, .. } => {
+            assert_eq!(*status & 0xF0, 0x80);
+            assert_eq!(data, &[65, 42]);
+        }
+        _ => panic!("off event lost its channel kind"),
+    }
+    assert_eq!(off.tick, 960, "off moved to start+len");
+    assert_eq!(n.off_vel, 42);
+}
+
+#[test]
+fn set_release_velocity_upgrades_0x90v0_to_0x80() {
+    // vel>0: a real note-off is required — the 0x90v0 form has no byte
+    // for release data; an existing 0x80 keeps its form
+    let mut d = doc(vec![vec![
+        chan(0, 0x90, 60, 100),
+        chan(480, 0x80, 60, 10),
+        chan(0, 0x90, 64, 90),
+        chan(480, 0x90, 64, 0),
+    ]]);
+    let __ops = d.set_release_velocity_ops(0, 0, u64::MAX, 42);
+    let tx = apply(&mut d, __ops);
+    let ns = notes_on(&d, 0);
+    for n in &ns {
+        let off = d.tracks[0]
+            .events
+            .iter()
+            .find(|e| Some(e.id) == n.off_id)
+            .unwrap();
+        match &off.kind {
+            EventKind::Channel { status, data, .. } => {
+                assert_eq!(*status, 0x80, "key {}: upgraded/kept as 0x80", n.key);
+                assert_eq!(data[1], 42);
+            }
+            _ => panic!(),
+        }
+    }
+    assert!(ns.iter().all(|n| n.off_vel == 42 && !n.off_via_on));
+    // revert restores the original forms
+    d.revert(&tx);
+    let ns = notes_on(&d, 0);
+    assert!(ns[1].off_via_on && ns[1].off_vel == 0);
+}
+
+#[test]
+fn set_release_velocity_zero_preserves_form() {
+    // vel=0 must NOT normalize 0x90v0 → 0x80 — both are valid "released"
+    let mut d = doc(vec![vec![chan(0, 0x90, 64, 90), chan(480, 0x90, 64, 0)]]);
+    let __ops = d.set_release_velocity_ops(0, 0, u64::MAX, 0);
+    apply(&mut d, __ops);
+    assert!(matches!(
+        d.tracks[0].events[1].kind,
+        EventKind::Channel { status: 0x90, .. }
+    ));
+    // and on an 0x80 it zeroes the release byte without changing form
+    let mut d = doc(vec![vec![chan(0, 0x90, 64, 90), chan(480, 0x80, 64, 42)]]);
+    let __ops = d.set_release_velocity_ops(0, 0, u64::MAX, 0);
+    apply(&mut d, __ops);
+    let off_id = notes_on(&d, 0)[0].off_id.unwrap();
+    let off = d.tracks[0].events.iter().find(|e| e.id == off_id).unwrap();
+    match &off.kind {
+        EventKind::Channel { status, data, .. } => {
+            assert_eq!(*status, 0x80);
+            assert_eq!(data[1], 0);
+        }
+        _ => panic!(),
+    }
+}
+
+#[test]
 fn set_channel_rewrites_nibble_only_on_channel_events() {
     let mut d = doc(vec![vec![
         chan(0, 0x90, 60, 100),
