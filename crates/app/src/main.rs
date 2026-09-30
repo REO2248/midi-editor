@@ -22,7 +22,7 @@ use midi_io::{EventSink, Playback, PortSink};
 use smf_core::Division;
 use smf_core::EventKind;
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -417,6 +417,54 @@ fn build_dest_catalog(plugins: &[output::PluginInfo]) -> Vec<(String, midi_io::D
 /// MCP threads.
 pub(crate) fn lock_shared(m: &Mutex<Shared>) -> std::sync::MutexGuard<'_, Shared> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Audible-track filter shared by every timeline the schedule consumes:
+/// any solo wins over all mutes; with no solos, mutes are the filter.
+fn track_audible(tr: usize, muted: &HashSet<usize>, soloed: &HashSet<usize>) -> bool {
+    if !soloed.is_empty() {
+        soloed.contains(&tr)
+    } else {
+        !muted.contains(&tr)
+    }
+}
+
+/// Filter a per-track timeline to audible tracks and remap each event's
+/// track onto its sink index; events whose destination has no open sink
+/// (failed port, unavailable plugin) are dropped.
+fn route_events(
+    timeline: Vec<(u64, usize, Vec<u8>)>,
+    audible: impl Fn(usize) -> bool,
+    dest_of: impl Fn(usize) -> usize,
+    sink_of: &HashMap<usize, usize>,
+) -> Vec<(u64, usize, Vec<u8>)> {
+    timeline
+        .into_iter()
+        .filter(|(_, tr, _)| audible(*tr))
+        .filter_map(|(us, tr, b)| sink_of.get(&dest_of(tr)).map(|&s| (us, s, b)))
+        .collect()
+}
+
+/// Merge routed events into the playback schedule. `events` is the
+/// concatenation of SysEx, channel, and metronome-click lists; the stable
+/// µs sort keeps that order at equal times, so SysEx lands before channel
+/// messages and both before clicks (setup traffic — GM/XG resets, patch
+/// dumps — must arrive before notes struck at the same instant). Channel
+/// chase splices after the last event before `start_us` so real events at
+/// the exact play position override it; chased SysEx splices ahead of it so
+/// a chased reset cannot wipe the program/CC state the channel chase
+/// restored.
+fn assemble_events(
+    mut events: Vec<(u64, usize, Vec<u8>)>,
+    chase: Vec<(u64, usize, Vec<u8>)>,
+    chase_sysex: Vec<(u64, usize, Vec<u8>)>,
+    start_us: u64,
+) -> Vec<(u64, usize, Vec<u8>)> {
+    events.sort_by_key(|e| e.0);
+    let at = events.partition_point(|e| e.0 < start_us);
+    events.splice(at..at, chase);
+    events.splice(at..at, chase_sysex);
+    events
 }
 
 fn empty_doc() -> Document {
@@ -1860,13 +1908,7 @@ impl EditorView {
             self.status = t("status.no_port").into();
             return;
         }
-        let audible = |tr: usize| {
-            if !soloed.is_empty() {
-                soloed.contains(&tr)
-            } else {
-                !muted.contains(&tr)
-            }
-        };
+        let audible = |tr: usize| track_audible(tr, &muted, &soloed);
         let tagged: Vec<(u64, usize, Vec<u8>)> = self
             .doc(|d| d.timeline_tagged())
             .into_iter()
@@ -1925,16 +1967,11 @@ impl EditorView {
         }
         // SysEx first among same-time events: setup traffic (GM/XG resets,
         // patch dumps) must land before notes struck at the same instant.
-        // The stable sort below keeps sysex < channel < click at equal µs.
-        let mut events: Vec<(u64, usize, Vec<u8>)> = self
-            .doc(|d| d.timeline_sysex())
-            .into_iter()
-            .filter(|(_, tr, _)| audible(*tr))
-            .filter_map(|(us, tr, b)| sink_of.get(&dest_of(tr)).map(|&s| (us, s, b)))
-            .collect();
-        events.extend(tagged.into_iter().filter_map(|(us, tr, b)| {
-            sink_of.get(&dest_of(tr)).map(|&s| (us, s, b))
-        }));
+        // assemble_events' stable sort keeps sysex < channel < click at
+        // equal µs.
+        let mut events: Vec<(u64, usize, Vec<u8>)> =
+            route_events(self.doc(|d| d.timeline_sysex()), &audible, &dest_of, &sink_of);
+        events.extend(route_events(tagged, &audible, &dest_of, &sink_of));
         if metronome {
             // prefer a plain MIDI port for clicks; fall back to any sink
             let click_sink = dests
@@ -1957,35 +1994,30 @@ impl EditorView {
                     events.push((us + 20_000, s, vec![0x99, note, 0]));
                     beat += 1;
                 }
-                events.sort_by_key(|e| e.0);
             }
         }
         // chase: re-establish the state the timeline had built up before the
         // play position (CC/program/bend/at, plus notes already sounding) so
-        // mid-song starts and loop wraps sound like a continuous pass. Insert
-        // at the same partition the playback thread seeks with: after every
-        // past event, before the first event at/after the position — so real
-        // events at the exact play time land after (and override) the chase.
+        // mid-song starts and loop wraps sound like a continuous pass.
         let start_us = self.play_us;
-        let chase: Vec<(u64, usize, Vec<u8>)> = self
-            .doc(|d| d.chase_events(start_us))
-            .into_iter()
-            .filter(|(_, tr, _)| audible(*tr))
-            .filter_map(|(us, tr, b)| sink_of.get(&dest_of(tr)).map(|&s| (us, s, b)))
-            .collect();
-        let at = events.partition_point(|e| e.0 < start_us);
-        events.splice(at..at, chase);
-        // opt-in SysEx chase, spliced BEFORE the channel chase so a chased
-        // reset cannot wipe the program/CC state the channel chase restores
-        if chase_sysex {
-            let sx: Vec<(u64, usize, Vec<u8>)> = self
-                .doc(|d| d.chase_sysex(start_us))
-                .into_iter()
-                .filter(|(_, tr, _)| audible(*tr))
-                .filter_map(|(us, tr, b)| sink_of.get(&dest_of(tr)).map(|&s| (us, s, b)))
-                .collect();
-            events.splice(at..at, sx);
-        }
+        let chase = route_events(
+            self.doc(|d| d.chase_events(start_us)),
+            &audible,
+            &dest_of,
+            &sink_of,
+        );
+        // opt-in SysEx chase
+        let chase_sx = if chase_sysex {
+            route_events(
+                self.doc(|d| d.chase_sysex(start_us)),
+                &audible,
+                &dest_of,
+                &sink_of,
+            )
+        } else {
+            Vec::new()
+        };
+        let events = assemble_events(events, chase, chase_sx, start_us);
         self.loop_start_us = self.play_us;
         self.playback = Some(Playback::start(
             sinks,
@@ -2886,7 +2918,8 @@ fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
 
 #[cfg(test)]
 mod tests {
-    use crate::empty_doc;
+    use crate::{assemble_events, empty_doc, route_events, track_audible};
+    use std::collections::{HashMap, HashSet};
 
     /// Every freshly parsed document reports revision 0, so the derived-view
     /// caches must not key on the revision alone: before `doc_epoch` existed,
@@ -2896,5 +2929,114 @@ mod tests {
     #[test]
     fn fresh_documents_share_revision_zero() {
         assert_eq!(empty_doc().revision(), empty_doc().revision());
+    }
+
+    fn note(key: u8) -> Vec<u8> {
+        vec![0x90, key, 100]
+    }
+
+    fn set(xs: &[usize]) -> HashSet<usize> {
+        xs.iter().copied().collect()
+    }
+
+    #[test]
+    fn track_audible_solo_wins_over_mute() {
+        let muted = set(&[1, 2]);
+        let soloed = set(&[2]);
+        assert!(track_audible(0, &muted, &soloed) == false);
+        assert!(!track_audible(1, &muted, &soloed));
+        assert!(track_audible(2, &muted, &soloed));
+    }
+
+    #[test]
+    fn track_audible_mute_filters_without_solo() {
+        let muted = set(&[1]);
+        let soloed = set(&[]);
+        assert!(track_audible(0, &muted, &soloed));
+        assert!(!track_audible(1, &muted, &soloed));
+        assert!(track_audible(2, &muted, &soloed));
+    }
+
+    #[test]
+    fn route_events_filters_and_remaps_to_sinks() {
+        // tracks → dests: t0→d0, t1→d1, t2→d0; sinks opened for d0,d2 only
+        let timeline = vec![
+            (10, 0, note(60)),
+            (20, 1, note(62)), // muted out
+            (30, 2, note(64)),
+            (40, 1, note(65)), // muted out
+        ];
+        let sink_of: HashMap<usize, usize> = HashMap::from([(0, 0), (2, 1)]);
+        let got = route_events(
+            timeline,
+            |tr| tr != 1,              // audible = "not track 1"
+            |tr| [0, 1, 0][tr],        // dest_of
+            &sink_of,
+        );
+        // t0→d0→sink0, t2→d0→sink0; a d2 event would map to sink1
+        assert_eq!(
+            got,
+            vec![(10, 0, note(60)), (30, 0, note(64))]
+        );
+        // destination with no open sink → event dropped
+        let sink_of2: HashMap<usize, usize> = HashMap::from([(2, 0)]);
+        let got2 = route_events(
+            vec![(10, 0, note(60)), (20, 3, note(62))],
+            |_| true,
+            |_| 0, // every track targets dest 0
+            &sink_of2,
+        );
+        assert!(got2.is_empty());
+    }
+
+    #[test]
+    fn assemble_keeps_sysex_before_channel_before_click_at_equal_us() {
+        // concatenated in sysex, channel, click order — stable sort must keep
+        // that order when µs tie
+        let events = vec![
+            (100, 0, vec![0xF0, 0x7E, 0xF7]),    // sysex
+            (100, 0, note(60)),                 // channel
+            (100, 0, vec![0x99, 76, 110]),      // click
+        ];
+        let got = assemble_events(events, vec![], vec![], 0);
+        assert_eq!(got[0].2, vec![0xF0, 0x7E, 0xF7]);
+        assert_eq!(got[1].2, note(60));
+        assert_eq!(got[2].2, vec![0x99, 76, 110]);
+    }
+
+    #[test]
+    fn assemble_sorts_across_lists_even_without_metronome() {
+        // regression: the merged list used to sort only under `if metronome`,
+        // so a later SysEx sent before an earlier note and the note fired
+        // late every pass
+        let events = vec![
+            (300, 0, vec![0xF0, 0x7E, 0xF7]), // sysex at 300µs
+            (100, 0, note(60)),             // channel event at 100µs
+        ];
+        let got = assemble_events(events, vec![], vec![], 0);
+        assert_eq!(got[0].2, note(60));
+        assert_eq!(got[1].2, vec![0xF0, 0x7E, 0xF7]);
+    }
+
+    #[test]
+    fn assemble_splices_chase_before_first_event_at_start() {
+        let events = vec![(50, 0, note(60)), (150, 0, note(64)), (250, 0, note(65))];
+        let chase = vec![(100, 0, vec![0xB0, 7, 90])];
+        let got = assemble_events(events, chase, vec![], 100);
+        // chase lands after the past event (50), before the first at/after (150)
+        assert_eq!(got[1].2, vec![0xB0, 7, 90]);
+        assert_eq!(got[2].2, note(64));
+    }
+
+    #[test]
+    fn assemble_splices_chase_sysex_before_channel_chase() {
+        let events = vec![(100, 0, note(60))];
+        let chase = vec![(100, 0, vec![0xB0, 7, 90])];
+        let chase_sx = vec![(100, 0, vec![0xF0, 0x7E, 0xF7])];
+        let got = assemble_events(events, chase, chase_sx, 100);
+        // chased reset first, then chased channel state, then the real event
+        assert_eq!(got[0].2, vec![0xF0, 0x7E, 0xF7]);
+        assert_eq!(got[1].2, vec![0xB0, 7, 90]);
+        assert_eq!(got[2].2, note(60));
     }
 }
