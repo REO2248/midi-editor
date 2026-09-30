@@ -1396,6 +1396,8 @@ impl EditorView {
             }
             DragMode::Move | DragMode::Duplicate => {}
             DragMode::LaneEvent => {
+                // snap before locking: snap_down -> doc() re-acquires `sh`
+                let ins_tick = self.snap_down(d.a_tick).max(0) as u64;
                 // CC/PB lane: update an existing event's value, or insert a
                 // new one when the drag started on empty lane space
                 let mut sh = lock_shared(&self.shared);
@@ -1421,7 +1423,7 @@ impl EditorView {
                         track: d.track,
                         events: vec![DocEvent {
                             id,
-                            tick: self.snap_down(d.a_tick).max(0) as u64,
+                            tick: ins_tick,
                             seq: 0,
                             raw_body: None,
                             kind: EventKind::Channel {
