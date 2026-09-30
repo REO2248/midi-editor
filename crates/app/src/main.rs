@@ -687,7 +687,12 @@ impl EditorView {
             return;
         }
         self.scroll_y = clamp_span(self.scroll_y, 128.0 * NOTE_H, h);
-        self.scroll_x = clamp_span(self.scroll_x, self.doc_end_ticks() as f32 * self.zoom, w);
+        // the edit cursor is live content too: a doc narrower than the
+        // viewport would pin scroll_x=0 and let the cursor walk off-screen
+        let end = self
+            .doc_end_ticks()
+            .max(self.cursor_tick + self.cursor_insert_len());
+        self.scroll_x = clamp_span(self.scroll_x, end as f32 * self.zoom + 32.0, w);
     }
 
     /// Point the view at the current document's content (first note with a
@@ -1510,7 +1515,7 @@ impl EditorView {
             }
             "up" => self.menu_step(-1, cx),
             "down" => self.menu_step(1, cx),
-            "enter" | " " => {
+            "enter" | " " | "space" => {
                 // nothing highlighted yet: select the first row rather than
                 // firing it — Enter activates on the next press
                 if self.menu_sel.is_none() && self.sub_sel.is_none() {
