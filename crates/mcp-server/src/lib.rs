@@ -1,11 +1,16 @@
 //! Embedded MCP server.
 //!
 //! Topology:
-//!   - the GUI app hosts Streamable-HTTP on 127.0.0.1 (optional Bearer token
-//!     via `MIDI_MCP_TOKEN`), sharing one `SharedDoc` with the editor.
+//!   - the GUI app hosts Streamable-HTTP on 127.0.0.1, sharing one `SharedDoc`
+//!     with the editor. HTTP requests are Bearer-authenticated by default:
+//!     `MIDI_MCP_TOKEN` wins, otherwise a random token is provisioned into
+//!     `%LOCALAPPDATA%\midi-editor\mcp-token` on first launch and re-read per
+//!     request (rotation/revocation need no restart). Unauthenticated mode
+//!     requires the explicit `MIDI_MCP_ALLOW_INSECURE=1` opt-out.
 //!   - `mcp-bridge` connects to that endpoint as an rmcp client and re-serves
-//!     it over stdio so stdio-only clients (Claude Desktop etc.) can reach it.
-//!     With `--file`, it can also serve a standalone document without the app.
+//!     it over stdio so stdio-only clients (Claude Desktop etc.) can reach it
+//!     (it discovers the provisioned token file automatically). With `--file`
+//!     it can also serve a standalone document without the app.
 //!
 //! Every mutation goes through `Document::apply(Transaction)` on the shared
 //! doc — the exact same path GUI edits take — so undo is unified.
@@ -58,16 +63,42 @@ pub enum TransportReq {
     Seek { tick: u64 },
 }
 
+/// MCP authentication posture of the transport serving `Shared`. Written by
+/// `serve_http` at startup; `Stdio` is the default for stdio/frontends. The
+/// status bar renders it so an unauthenticated endpoint is never invisible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpAuthMode {
+    /// process-local stdio — inherits the spawning client's trust
+    Stdio,
+    /// `Authorization: Bearer` required
+    Bearer,
+    /// serving HTTP without any credential check (explicit opt-out)
+    Open,
+}
+
+impl McpAuthMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Stdio => "stdio",
+            Self::Bearer => "bearer",
+            Self::Open => "open",
+        }
+    }
+}
+
 /// The effective MCP security posture, reported by the `diagnostics` tool and
 /// renderable by the GUI. Lives in `Shared` (not on the service) so the stdio
 /// frontend, the in-app HTTP server, and the UI all see the same facts.
-/// Never carries credential material — only the mode names.
+/// Never carries credential material — only the mode names and the
+/// credential's provenance.
 #[derive(Debug, Clone)]
 pub struct SecurityReport {
     /// e.g. "streamable-http 127.0.0.1:7878" or "stdio"
     pub transport: String,
-    /// "bearer" when a token is required, "none" when unauthenticated
-    pub auth: String,
+    /// typed auth mode — the status bar keys on this
+    pub auth_mode: McpAuthMode,
+    /// e.g. "auto-provisioned token file (…\mcp-token)" — tooltips/logs
+    pub auth_detail: String,
     /// which Host header values are accepted
     pub host_policy: String,
     /// which Origin header values are accepted
@@ -80,16 +111,18 @@ impl SecurityReport {
     pub fn stdio() -> Self {
         Self {
             transport: "stdio".into(),
-            auth: "process-local (no HTTP)".into(),
+            auth_mode: McpAuthMode::Stdio,
+            auth_detail: "process-local (no HTTP)".into(),
             host_policy: "n/a".into(),
             origin_policy: "n/a".into(),
         }
     }
 
-    pub fn http(bind: &str, authenticated: bool) -> Self {
+    pub fn http(bind: &str, auth_mode: McpAuthMode, auth_detail: String) -> Self {
         Self {
             transport: format!("streamable-http {bind}"),
-            auth: if authenticated { "bearer" } else { "none" }.into(),
+            auth_mode,
+            auth_detail,
             host_policy: "loopback only (localhost/127.0.0.1/[::1])".into(),
             origin_policy: "absent or loopback only".into(),
         }
@@ -98,7 +131,8 @@ impl SecurityReport {
     fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "transport": self.transport,
-            "auth": self.auth,
+            "auth": self.auth_mode.as_str(),
+            "auth_detail": self.auth_detail,
             "host_policy": self.host_policy,
             "origin_policy": self.origin_policy,
         })
@@ -138,7 +172,8 @@ pub struct Shared {
     /// drained by the GUI watcher
     pub transport_req: Vec<TransportReq>,
     /// effective security posture of the MCP transport serving this doc
-    /// (stdio by default; the HTTP server overwrites it at startup)
+    /// (stdio by default; the HTTP server overwrites it at startup).
+    /// Never carries the credential itself, only its provenance.
     pub mcp_security: SecurityReport,
 }
 
@@ -275,7 +310,8 @@ fn note_json(n: &document::Note) -> serde_json::Value {
     })
 }
 
-fn summary_json(d: &Document, path: &Option<PathBuf>, saved_rev: u64) -> serde_json::Value {
+fn summary_json(sh: &Shared) -> serde_json::Value {
+    let d = &sh.doc;
     let last_tick = doc_last_tick(d);
     serde_json::json!({
         "format": d.format,
@@ -290,8 +326,13 @@ fn summary_json(d: &Document, path: &Option<PathBuf>, saved_rev: u64) -> serde_j
         "last_tick": last_tick,
         "duration_us": d.tempo_map.tick_to_us(last_tick),
         "revision": d.revision(),
-        "path": path,
-        "dirty": d.revision() != saved_rev,
+        "path": sh.path,
+        "dirty": d.revision() != sh.saved_revision,
+        // auth posture only — never the credential itself
+        "mcp_auth": {
+            "mode": sh.mcp_security.auth_mode.as_str(),
+            "detail": sh.mcp_security.auth_detail
+        },
     })
 }
 
@@ -924,7 +965,7 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
     // must not take down every later request
     let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
     match name {
-        "document_summary" => ok_json(summary_json(&sh.doc, &sh.path, sh.saved_revision)),
+        "document_summary" => ok_json(summary_json(&sh)),
         "diagnostics" => {
             let diags = sh.doc.diagnose();
             ok_json(serde_json::json!({
@@ -1711,21 +1752,200 @@ async fn loopback_guard(
     next.run(req).await
 }
 
+// ---------- HTTP authentication ----------
+
+/// Where the bearer token comes from. `File` is re-read on every request so
+/// rotating or revoking the credential (rewrite/delete the file) takes effect
+/// without restarting the app.
+pub enum TokenSource {
+    /// `MIDI_MCP_TOKEN` / `--token`: fixed for the server's lifetime.
+    Fixed(String),
+    /// Auto-provisioned per-user token file.
+    File(PathBuf),
+}
+
+impl TokenSource {
+    fn token(&self) -> Option<String> {
+        match self {
+            Self::Fixed(t) => Some(t.clone()),
+            Self::File(p) => read_token_file(p),
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Self::Fixed(_) => "MIDI_MCP_TOKEN".into(),
+            Self::File(p) => format!("auto-provisioned token file ({})", p.display()),
+        }
+    }
+}
+
+/// Authentication posture for the HTTP endpoint.
+pub enum HttpAuth {
+    /// `Authorization: Bearer <token>` required.
+    Token(TokenSource),
+    /// Explicit opt-out (`MIDI_MCP_ALLOW_INSECURE`) — unauthenticated loopback.
+    Insecure,
+}
+
+/// Per-user token file: `%LOCALAPPDATA%\midi-editor\mcp-token` normally —
+/// a directory only the owning user can read, so other local accounts cannot
+/// steal the credential.
+pub fn token_file_path() -> PathBuf {
+    for var in ["LOCALAPPDATA", "APPDATA"] {
+        if let Ok(d) = std::env::var(var) {
+            if !d.is_empty() {
+                return PathBuf::from(d).join("midi-editor").join("mcp-token");
+            }
+        }
+    }
+    std::env::temp_dir().join("midi-editor-mcp-token")
+}
+
+/// Generated tokens are 64 lowercase hex; a file/env-provided token just has
+/// to be a single line of printable ASCII.
+fn token_is_valid(t: &str) -> bool {
+    !t.is_empty() && t.len() <= 256 && t.bytes().all(|b| b.is_ascii_graphic())
+}
+
+fn read_token_file(path: &std::path::Path) -> Option<String> {
+    let t = std::fs::read_to_string(path).ok()?.trim().to_string();
+    token_is_valid(&t).then_some(t)
+}
+
+/// Provision the token file on first launch; reuse it afterwards. Never
+/// overwrites a healthy file, and regenerates a corrupt/empty one.
+fn ensure_token_file(path: &std::path::Path) -> std::io::Result<()> {
+    if read_token_file(path).is_some() {
+        return Ok(());
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut raw = [0u8; 32];
+    getrandom::fill(&mut raw).map_err(std::io::Error::other)?;
+    write_atomic(path, bytes_hex(&raw).as_bytes()).map_err(std::io::Error::other)
+}
+
+/// The stored auto-provisioned token, for `mcp-bridge` to pass through when
+/// no `--token`/`MIDI_MCP_TOKEN` was given — keeps stdio clients ergonomic.
+pub fn read_stored_token() -> Option<String> {
+    read_token_file(&token_file_path())
+}
+
+/// Resolve the effective HTTP auth posture, most explicit wins:
+///   1. `MIDI_MCP_TOKEN` (non-empty)     → fixed bearer token
+///   2. `MIDI_MCP_ALLOW_INSECURE` truthy → explicit unauthenticated opt-out
+///   3. otherwise                        → auto-provisioned token file
+/// Errors instead of silently serving unauthenticated when provisioning
+/// fails — failing open would hand mutating tools to any local process.
+pub fn resolve_http_auth() -> anyhow::Result<HttpAuth> {
+    if let Ok(t) = std::env::var("MIDI_MCP_TOKEN") {
+        if token_is_valid(&t) {
+            return Ok(HttpAuth::Token(TokenSource::Fixed(t)));
+        }
+    }
+    let insecure = std::env::var("MIDI_MCP_ALLOW_INSECURE")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    if insecure {
+        return Ok(HttpAuth::Insecure);
+    }
+    let path = token_file_path();
+    ensure_token_file(&path).map_err(|e| {
+        anyhow::anyhow!("cannot provision MCP auth token at {}: {e}", path.display())
+    })?;
+    Ok(HttpAuth::Token(TokenSource::File(path)))
+}
+
+/// Constant-time string equality — the token isn't length-secret, so early
+/// exit on length is fine; the byte loop itself must not short-circuit.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.bytes()
+        .zip(b.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
+/// Throttle authentication failures per client IP. A local port scanner or
+/// hostile page gets a bounded number of guesses, then 429s — and every
+/// failure is logged by IP only, never with the presented credential.
+struct AuthLimiter {
+    fails: Mutex<std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>>,
+}
+
+const AUTH_FAIL_MAX: u32 = 10;
+const AUTH_FAIL_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+impl AuthLimiter {
+    fn new() -> Self {
+        Self {
+            fails: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// May this IP attempt another auth check right now?
+    fn allow_attempt(&self, ip: std::net::IpAddr) -> bool {
+        let mut m = self.fails.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((n, first)) = m.get(&ip) {
+            if first.elapsed() < AUTH_FAIL_WINDOW && *n >= AUTH_FAIL_MAX {
+                return false;
+            }
+        }
+        // keep the map bounded — loopback space is tiny but don't grow forever
+        if m.len() > 1024 {
+            m.clear();
+        }
+        true
+    }
+
+    fn record(&self, ip: std::net::IpAddr, ok: bool) {
+        let mut m = self.fails.lock().unwrap_or_else(|e| e.into_inner());
+        match m.get_mut(&ip) {
+            Some((n, first)) if first.elapsed() < AUTH_FAIL_WINDOW => {
+                if ok {
+                    *n = 0;
+                } else {
+                    *n += 1;
+                }
+            }
+            _ => {
+                m.insert(ip, (if ok { 0 } else { 1 }, std::time::Instant::now()));
+            }
+        }
+    }
+}
+
+fn http_error(status: axum::http::StatusCode, msg: &'static str) -> axum::response::Response {
+    axum::response::Response::builder()
+        .status(status)
+        .body(axum::body::Body::from(msg))
+        .expect("static response")
+}
+
 /// Build the `/mcp` router with the full HTTP security posture: the explicit
-/// [`loopback_guard`] (outermost layer), optional Bearer auth, and rmcp's own
-/// Host/Origin allowlists configured explicitly rather than left at library
-/// defaults. Split out of [`serve_http`] so tests can mount it on an
-/// ephemeral port.
-pub fn mcp_http_router(doc: SharedDoc, addr: &str, token: Option<String>) -> axum::Router {
+/// [`loopback_guard`] (outermost layer), Bearer auth middleware (with per-IP
+/// failure throttling), and rmcp's own Host/Origin allowlists configured
+/// explicitly rather than left at library defaults. Split out of
+/// [`serve_http`] so tests can mount it on an ephemeral port.
+pub fn mcp_http_router(doc: SharedDoc, addr: &str, auth: HttpAuth) -> axum::Router {
     use axum::middleware::Next;
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService,
     };
+    use std::net::SocketAddr;
 
+    let (auth_mode, auth_detail) = match &auth {
+        HttpAuth::Token(src) => (McpAuthMode::Bearer, src.describe()),
+        HttpAuth::Insecure => (McpAuthMode::Open, "MIDI_MCP_ALLOW_INSECURE".into()),
+    };
     doc.lock()
         .unwrap_or_else(|e| e.into_inner())
-        .mcp_security = SecurityReport::http(addr, token.is_some());
+        .mcp_security = SecurityReport::http(addr, auth_mode, auth_detail);
 
     let factory = {
         let doc = doc.clone();
@@ -1741,24 +1961,40 @@ pub fn mcp_http_router(doc: SharedDoc, addr: &str, token: Option<String>) -> axu
         StreamableHttpService::new(factory, Arc::new(LocalSessionManager::default()), config);
 
     let mut app = axum::Router::new().route_service("/mcp", service);
-    if let Some(tok) = token {
+    if let HttpAuth::Token(src) = auth {
+        let src = Arc::new(src);
+        let limiter = Arc::new(AuthLimiter::new());
         app = app.layer(axum::middleware::from_fn(
-            move |req: axum::extract::Request, next: Next| {
-                let tok = tok.clone();
+            move |axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
+                  req: axum::extract::Request,
+                  next: Next| {
+                let (src, limiter) = (src.clone(), limiter.clone());
                 async move {
-                    let ok = req
+                    let ip = peer.ip();
+                    if !limiter.allow_attempt(ip) {
+                        tracing::warn!(ip = %ip, "mcp http: auth attempts throttled");
+                        return http_error(
+                            axum::http::StatusCode::TOO_MANY_REQUESTS,
+                            "too many failed auth attempts — retry later",
+                        );
+                    }
+                    let presented = req
                         .headers()
                         .get(axum::http::header::AUTHORIZATION)
                         .and_then(|v| v.to_str().ok())
-                        .map(|v| v == format!("Bearer {tok}"))
-                        .unwrap_or(false);
+                        .and_then(|v| v.strip_prefix("Bearer "));
+                    let expected = src.token();
+                    let ok = match (presented, expected) {
+                        (Some(p), Some(e)) => constant_time_eq(p, &e),
+                        _ => false,
+                    };
+                    limiter.record(ip, ok);
                     if ok {
                         next.run(req).await
                     } else {
-                        axum::response::Response::builder()
-                            .status(401)
-                            .body(axum::body::Body::from("unauthorized"))
-                            .unwrap()
+                        // log the attempt, never the credential
+                        tracing::warn!(ip = %ip, "mcp http: auth failed");
+                        http_error(axum::http::StatusCode::UNAUTHORIZED, "unauthorized")
                     }
                 }
             },
@@ -1770,23 +2006,27 @@ pub fn mcp_http_router(doc: SharedDoc, addr: &str, token: Option<String>) -> axu
 }
 
 /// Serve Streamable-HTTP on `addr` (e.g. "127.0.0.1:7878") at path `/mcp`.
-/// When `token` is Some, requests must carry `Authorization: Bearer <token>`.
+/// `auth` comes from [`resolve_http_auth`] — Bearer by default, explicitly
+/// opted-out `Insecure` otherwise.
 /// `shutdown`: resolve to stop accepting connections and drain in-flight
 /// requests (axum graceful shutdown — open connections finish their work).
 pub async fn serve_http(
     doc: SharedDoc,
     addr: &str,
-    token: Option<String>,
+    auth: HttpAuth,
     shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
-    let app = mcp_http_router(doc, addr, token);
+    let app = mcp_http_router(doc, addr, auth);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!("mcp http listening on {addr}");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let _ = shutdown.await;
-        })
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        let _ = shutdown.await;
+    })
+    .await?;
     Ok(())
 }
 
@@ -1957,6 +2197,194 @@ mod tests {
         assert!(err);
     }
 
+    // ---------- issue #10: auth ----------
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir()
+            .join("midi-editor-mcp-tests")
+            .join(format!("{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn token_file_provisions_once_then_reuses() {
+        let p = tmpdir("tok").join("sub").join("mcp-token");
+        ensure_token_file(&p).unwrap();
+        let t1 = read_token_file(&p).unwrap();
+        assert_eq!(t1.len(), 64, "32 bytes of hex");
+        assert!(t1.bytes().all(|b| b.is_ascii_hexdigit()));
+        // second launch reuses, doesn't rotate
+        ensure_token_file(&p).unwrap();
+        assert_eq!(read_token_file(&p).unwrap(), t1);
+        // a corrupt file is regenerated rather than trusted
+        std::fs::write(&p, "not-a-token\nextra").unwrap();
+        ensure_token_file(&p).unwrap();
+        let t2 = read_token_file(&p).unwrap();
+        assert_eq!(t2.len(), 64);
+        assert_ne!(t1, t2);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn token_validation_rejects_bad_values() {
+        assert!(token_is_valid("abc123"));
+        assert!(!token_is_valid(""));
+        assert!(!token_is_valid("has space"));
+        assert!(!token_is_valid("line\nbreak"));
+        assert!(!token_is_valid(&"x".repeat(257)));
+    }
+
+    #[test]
+    fn constant_time_compares_exactly() {
+        assert!(constant_time_eq("abc", "abc"));
+        assert!(!constant_time_eq("abc", "abd"));
+        assert!(!constant_time_eq("abc", "abcd"));
+        assert!(!constant_time_eq("", "a"));
+        assert!(constant_time_eq("", ""));
+    }
+
+    /// Start the real router on an ephemeral port; returns the bound address.
+    async fn start_http(auth: HttpAuth) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().unwrap().to_string();
+        let app = mcp_http_router(shared(), &addr, auth)
+            .into_make_service_with_connect_info::<std::net::SocketAddr>();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        addr
+    }
+
+    /// Raw HTTP/1.1 POST; returns the status code.
+    async fn http_post(addr: &str, headers: &[(&str, &str)], body: &str) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut req = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        );
+        for (k, v) in headers {
+            req += &format!("{k}: {v}\r\n");
+        }
+        req += "\r\n";
+        req += body;
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), s.read_to_end(&mut buf))
+            .await
+            .expect("response timed out");
+        String::from_utf8_lossy(&buf)
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0)
+    }
+
+    const INIT: &str = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","#,
+        r#""params":{"protocolVersion":"2025-03-26","capabilities":{},"#,
+        r#""clientInfo":{"name":"t","version":"0"}}}"#,
+    );
+    fn mcp_headers(token: Option<&str>) -> Vec<(&'static str, String)> {
+        let mut h: Vec<(&'static str, String)> = vec![
+            ("Content-Type", "application/json".into()),
+            ("Accept", "application/json, text/event-stream".into()),
+        ];
+        if let Some(t) = token {
+            h.push(("Authorization", format!("Bearer {t}")));
+        }
+        h
+    }
+    async fn authed_post(addr: &str, token: Option<&str>) -> u16 {
+        let h = mcp_headers(token);
+        let pairs: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        http_post(addr, &pairs, INIT).await
+    }
+
+    #[tokio::test]
+    async fn bearer_token_required_and_checked() {
+        let addr = start_http(HttpAuth::Token(TokenSource::Fixed("s3cret".into()))).await;
+        assert_eq!(authed_post(&addr, None).await, 401, "no creds rejected");
+        assert_eq!(authed_post(&addr, Some("wrong")).await, 401);
+        assert_eq!(authed_post(&addr, Some("s3cret")).await, 200);
+    }
+
+    #[tokio::test]
+    async fn token_file_source_rotates_without_restart() {
+        let dir = tmpdir("rotate");
+        let p = dir.join("mcp-token");
+        std::fs::write(&p, "tok-a").unwrap();
+        let addr = start_http(HttpAuth::Token(TokenSource::File(p.clone()))).await;
+        assert_eq!(authed_post(&addr, Some("tok-a")).await, 200);
+        // rotate: rewrite the file — next request must require the new token
+        std::fs::write(&p, "tok-b").unwrap();
+        assert_eq!(authed_post(&addr, Some("tok-a")).await, 401, "old token revoked");
+        assert_eq!(authed_post(&addr, Some("tok-b")).await, 200, "new token live");
+        // revoke: delete the file — everything fails closed
+        std::fs::remove_file(&p).unwrap();
+        assert_eq!(authed_post(&addr, Some("tok-b")).await, 401);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn auth_failures_are_rate_limited() {
+        let addr = start_http(HttpAuth::Token(TokenSource::Fixed("s3cret".into()))).await;
+        for _ in 0..AUTH_FAIL_MAX {
+            assert_eq!(authed_post(&addr, Some("bad")).await, 401);
+        }
+        // past the limit the client is throttled — even with the right token
+        assert_eq!(authed_post(&addr, Some("bad")).await, 429);
+        assert_eq!(authed_post(&addr, Some("s3cret")).await, 429);
+    }
+
+    #[test]
+    fn resolve_prefers_env_then_opt_out_then_file() {
+        // env vars are process-global; keep every mutation inside this one
+        // test so nothing races with a sibling
+        let dir = tmpdir("resolve");
+        std::env::set_var("MIDI_MCP_TOKEN", "envtok");
+        std::env::set_var("LOCALAPPDATA", &dir);
+        std::env::remove_var("MIDI_MCP_ALLOW_INSECURE");
+        match resolve_http_auth().unwrap() {
+            HttpAuth::Token(TokenSource::Fixed(t)) => assert_eq!(t, "envtok"),
+            _ => panic!("env token must win"),
+        }
+        std::env::remove_var("MIDI_MCP_TOKEN");
+        std::env::set_var("MIDI_MCP_ALLOW_INSECURE", "1");
+        assert!(matches!(resolve_http_auth().unwrap(), HttpAuth::Insecure));
+        std::env::remove_var("MIDI_MCP_ALLOW_INSECURE");
+        match resolve_http_auth().unwrap() {
+            HttpAuth::Token(TokenSource::File(p)) => {
+                assert_eq!(p, dir.join("midi-editor").join("mcp-token"));
+                assert!(read_token_file(&p).is_some(), "provisioned on resolve");
+            }
+            _ => panic!("default must auto-provision a token file"),
+        }
+        std::env::remove_var("LOCALAPPDATA");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn summary_reports_auth_mode_not_secret() {
+        let sh = shared();
+        let (err, v) = call(&sh, "document_summary", json!({}));
+        assert!(!err);
+        assert_eq!(v["mcp_auth"]["mode"], "stdio");
+        let _router = mcp_http_router(
+            sh.clone(),
+            "127.0.0.1:0",
+            HttpAuth::Token(TokenSource::Fixed("dontleak".into())),
+        );
+        let (err, v) = call(&sh, "document_summary", json!({}));
+        assert!(!err);
+        assert_eq!(v["mcp_auth"]["mode"], "bearer");
+        assert_eq!(v["mcp_auth"]["detail"], "MIDI_MCP_TOKEN");
+        assert!(!v.to_string().contains("dontleak"), "token never surfaces");
+    }
+
     #[test]
     fn authority_parsing_accepts_only_wellformed() {
         assert_eq!(authority_host("127.0.0.1:7878").as_deref(), Some("127.0.0.1"));
@@ -2004,16 +2432,8 @@ mod tests {
     }
 
     /// Start the real router on an ephemeral port; returns the bound address.
-    async fn start_http() -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let addr = listener.local_addr().unwrap().to_string();
-        let app = mcp_http_router(shared(), &addr, None);
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("serve");
-        });
-        addr
+    async fn start_http_insecure() -> String {
+        start_http(HttpAuth::Insecure).await
     }
 
     /// Raw HTTP/1.1 POST (no client library needed); returns the status code.
@@ -2065,14 +2485,14 @@ mod tests {
 
     #[tokio::test]
     async fn legitimate_client_initialize_passes() {
-        let addr = start_http().await;
+        let addr = start_http_insecure().await;
         let status = http_post(&addr, None, MCP_HEADERS, INIT).await;
         assert_eq!(status, 200);
     }
 
     #[tokio::test]
     async fn hostile_origins_are_rejected() {
-        let addr = start_http().await;
+        let addr = start_http_insecure().await;
         for origin in [
             "https://evil.com",
             "null",
@@ -2091,7 +2511,7 @@ mod tests {
 
     #[tokio::test]
     async fn hostile_hosts_are_rejected() {
-        let addr = start_http().await;
+        let addr = start_http_insecure().await;
         for host in ["evil.com", "127.0.0.1.evil.com", "localhost.evil.com", "user@127.0.0.1"] {
             let status = http_post(&addr, Some(host), MCP_HEADERS, INIT).await;
             assert_eq!(status, 403, "Host {host:?} must be rejected");
@@ -2100,7 +2520,7 @@ mod tests {
 
     #[tokio::test]
     async fn loopback_ipv4_ipv6_and_loopback_origin_pass() {
-        let addr = start_http().await;
+        let addr = start_http_insecure().await;
         // Host variants the guard must accept (the socket is IPv4 but the
         // Host header is validated by value, not by interface)
         for host in ["localhost:7878", "127.0.0.1:7878", "[::1]:7878", "localhost"] {
@@ -2121,10 +2541,14 @@ mod tests {
 
     #[tokio::test]
     async fn diagnostics_reports_http_security_mode() {
-        let addr = start_http().await;
+        let addr = start_http_insecure().await;
         let sh = shared();
         // mounting the router is what stamps the security report
-        let _app = mcp_http_router(sh.clone(), &addr, Some("t0k3n".into()));
+        let _app = mcp_http_router(
+            sh.clone(),
+            &addr,
+            HttpAuth::Token(TokenSource::Fixed("t0k3n".into())),
+        );
         let (err, v) = call(&sh, "diagnostics", json!({}));
         assert!(!err);
         assert_eq!(v["security"]["auth"], "bearer");

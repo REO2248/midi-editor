@@ -75,7 +75,20 @@ SMF itself is never touched by editor state.
 ## MCP server
 
 The app embeds a Streamable-HTTP MCP server at `http://127.0.0.1:7878/mcp`
-while it is running. Set `MIDI_MCP_TOKEN` to require `Authorization: Bearer`.
+while it is running. **Authentication is on by default** — every request
+needs `Authorization: Bearer <token>`:
+
+- `MIDI_MCP_TOKEN` set → that token is required.
+- unset → on first launch the app generates a random 256-bit token into
+  `%LOCALAPPDATA%\midi-editor\mcp-token` (a per-user private dir) and
+  re-reads it per request — editing or deleting the file rotates/revokes
+  the credential without restarting the app.
+- `MIDI_MCP_ALLOW_INSECURE=1` → explicit opt-out: open loopback, exactly
+  like the old default. The status bar shows a red `mcp: OPEN` chip.
+- Auth failures are logged by client IP (never the credential) and
+  throttled after 10 failures per minute.
+- If the token file can't be provisioned, the MCP endpoint stays off
+  rather than serving unauthenticated.
 
 **Loopback security model.** The endpoint binds to loopback only, so remote
 machines cannot reach it; the residual risks are local. A hostile web page in
@@ -85,12 +98,11 @@ present `Host` header is not `localhost`/`127.0.0.1`/`[::1]` or a present
 `Origin` header is not `http(s)://<loopback>:<any port>` — enforced both by an
 explicit guard middleware and rmcp's own allowlists. Non-browser MCP clients
 send no `Origin` and are unaffected; browser tooling served from localhost
-(e.g. MCP Inspector) still works. When `MIDI_MCP_TOKEN` is unset the endpoint
-is unauthenticated: any local process may call mutating tools. The effective
-mode is printed on stderr at startup and reported by the `diagnostics` tool
-under `security`.
+(e.g. MCP Inspector) still works. The effective mode is printed on stderr at
+startup and reported by the `diagnostics` tool under `security`.
 
-For stdio-only clients (Claude Desktop etc.) use the bridge:
+For stdio-only clients (Claude Desktop etc.) use the bridge, which
+discovers the provisioned token file automatically:
 
 ```
 # proxy to the running app (default URL above; --url/--token to override)

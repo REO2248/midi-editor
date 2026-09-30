@@ -3418,8 +3418,9 @@ fn main() {
 }
 
 /// In-app MCP server: Streamable-HTTP on 127.0.0.1:7878/mcp on its own
-/// tokio runtime thread. Bearer token = MIDI_MCP_TOKEN env (unset = open on
-/// loopback only). `mcp-bridge` is the stdio frontend for stdio-only clients.
+/// tokio runtime thread. Auth: MIDI_MCP_TOKEN, else an auto-provisioned
+/// per-user token file; unauthenticated only via MIDI_MCP_ALLOW_INSECURE.
+/// `mcp-bridge` is the stdio frontend for stdio-only clients.
 fn spawn_mcp(
     shared: SharedDoc,
 ) -> (
@@ -3439,13 +3440,16 @@ fn spawn_mcp(
             }
         };
         rt.block_on(async move {
-            let token = std::env::var("MIDI_MCP_TOKEN").ok();
-            // auth mode is safe to log; the token value never is
-            tracing::info!(
-                auth = token.is_some(),
-                "mcp http listening on 127.0.0.1:7878"
-            );
-            if let Err(e) = mcp_server::serve_http(shared, "127.0.0.1:7878", token, stop_rx).await {
+            let auth = match mcp_server::resolve_http_auth() {
+                Ok(a) => a,
+                // never silently serve unauthenticated: no token source,
+                // no MCP endpoint
+                Err(e) => {
+                    tracing::error!(error = %e, "mcp http disabled");
+                    return;
+                }
+            };
+            if let Err(e) = mcp_server::serve_http(shared, "127.0.0.1:7878", auth, stop_rx).await {
                 tracing::error!(error = %e, "mcp http stopped");
             }
         });

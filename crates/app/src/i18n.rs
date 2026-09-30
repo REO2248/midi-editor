@@ -248,6 +248,9 @@ static EN: &[(&str, &str)] = &[
     ("status.logs_open_failed", "could not open logs folder"),
     ("status.bundle_written", "diagnostics bundle: {p}"),
     ("status.bundle_failed", "bundle export failed: {e}"),
+    ("status.mcp_auth", "mcp: auth"),
+    ("status.mcp_open", "mcp: OPEN"),
+    ("status.mcp_off", "mcp: off"),
 ];
 
 static JA: &[(&str, &str)] = &[
@@ -367,6 +370,9 @@ static JA: &[(&str, &str)] = &[
     ("plugin.phase_load", "プラグイン読み込み"),
     ("plugin.phase_audio", "オーディオ開始"),
     ("status.rescan", "再スキャン: {n} 件の出力先"),
+    ("status.mcp_auth", "mcp: 認証あり"),
+    ("status.mcp_open", "mcp: 無認証"),
+    ("status.mcp_off", "mcp: 停止"),
     ("edit.legato", "レガート"),
     ("edit.set_length", "長さを統一"),
     ("edit.set_velocity", "ベロシティを統一"),
