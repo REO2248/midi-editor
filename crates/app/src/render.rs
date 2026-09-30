@@ -2362,10 +2362,29 @@ impl Render for EditorView {
                         });
                     })
                     .into_any_element(),
-                    Self::mi("e.legato", t("edit.legato"), "", None, cx, |v, _e, _cx| {
-                        v.apply_region_op("legato", |d, t, f, to| d.legato_ops(t, f, to));
+                    Self::mi("e.split", t("edit.split"), "", None, cx, |v, _e, cx| {
+                        v.split_at_playhead(cx);
                     })
                     .into_any_element(),
+                    Self::mi("e.join", t("edit.join"), "", None, cx, |v, _e, _cx| {
+                        v.apply_region_op("join", |d, t, f, to| d.join_ops(t, f, to));
+                    })
+                    .into_any_element(),
+                    Self::mi(
+                        "e.fixov",
+                        t("edit.fix_overlaps"),
+                        "",
+                        None,
+                        cx,
+                        |v, _e, _cx| {
+                            v.apply_region_op("fix overlaps", |d, t, f, to| {
+                                d.fix_overlaps_ops(t, f, to)
+                            });
+                        },
+                    )
+                    .into_any_element(),
+                    Self::mi_sub("e.legato", t("edit.legato"), Sub::LegatoGap, cx)
+                        .into_any_element(),
                     Self::mi_sub("e.len", t("edit.set_length"), Sub::LenSet, cx).into_any_element(),
                     Self::mi_sub("e.velset", t("edit.set_velocity"), Sub::VelSet, cx)
                         .into_any_element(),
@@ -3211,6 +3230,28 @@ impl Render for EditorView {
                                 Self::mi_leaf(("len", i), label, "", None, cx, move |v, _e, _cx| {
                                     v.apply_region_op("set length", move |d, t, f, to| {
                                         d.set_length_ops(t, f, to, ticks)
+                                    });
+                                })
+                                .into_any_element()
+                            })
+                            .collect()
+                    }
+                    Sub::LegatoGap => {
+                        // gap in ticks relative to ppq: 0 touches the next
+                        // note, >0 leaves space, <0 overlaps into it
+                        let ppq = self.ppq() as i64;
+                        let opts: [(&str, i64); 4] = [
+                            ("touch (0 gap)", 0),
+                            ("gap 1/32", ppq / 8),
+                            ("gap 1/16", ppq / 4),
+                            ("overlap 1/32", -(ppq / 8)),
+                        ];
+                        opts.into_iter()
+                            .enumerate()
+                            .map(|(i, (label, gap))| {
+                                Self::mi_leaf(("leg", i), label, "", None, cx, move |v, _e, _cx| {
+                                    v.apply_region_op("legato", move |d, t, f, to| {
+                                        d.legato_ops(t, f, to, gap)
                                     });
                                 })
                                 .into_any_element()

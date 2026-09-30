@@ -1694,6 +1694,46 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "base_revision": {"type": "integer"},
             })),
         ),
+        spec(
+            "split",
+            "Split every note spanning `at` into two at that tick. Args: track?, from?, to? (scope = notes starting in range), at (tick, required). Optional base_revision.",
+            object_schema(serde_json::json!({
+                "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
+                "at": {"type": "integer"}, "base_revision": {"type": "integer"},
+            })),
+        ),
+        spec(
+            "join_notes",
+            "Merge runs of same-pitch+channel notes that overlap or touch: the earliest NoteOn survives, the NoteOff moves to the run's end, interior events are removed. Args: track?, from?, to?. Optional base_revision.",
+            object_schema(serde_json::json!({
+                "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
+                "base_revision": {"type": "integer"},
+            })),
+        ),
+        spec(
+            "fix_overlaps",
+            "Shorten notes overlapping the next same-pitch+channel note so they end at its start; event ids are preserved. Args: track?, from?, to?. Optional base_revision.",
+            object_schema(serde_json::json!({
+                "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
+                "base_revision": {"type": "integer"},
+            })),
+        ),
+        spec(
+            "legato",
+            "Extend each note's end toward the next same-pitch+channel note's start. Args: track?, from?, to?, gap? (ticks; 0 = touch, >0 leaves a gap, <0 overlaps). Optional base_revision.",
+            object_schema(serde_json::json!({
+                "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
+                "gap": {"type": "integer"}, "base_revision": {"type": "integer"},
+            })),
+        ),
+        spec(
+            "set_length",
+            "Set every note starting in range to exactly `ticks` long. Args: track?, from?, to?, ticks (required). Optional base_revision.",
+            object_schema(serde_json::json!({
+                "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
+                "ticks": {"type": "integer"}, "base_revision": {"type": "integer"},
+            })),
+        ),
     ]
 }
 
@@ -2618,6 +2658,88 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
                 .unwrap_or_else(|| doc_last_tick(sh.view()));
             let ops = sh.view_mut().duplicate_range_ops(track, from, to);
             apply_ops(&mut sh, "duplicate range", ops)
+        }
+        "split" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let (from, to) = region(args);
+            let Some(at) = args["at"].as_u64() else {
+                return err_json("split requires 'at' (tick)");
+            };
+            let tracks = match sel_tracks(&sh, args) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
+            let mut ops = Vec::new();
+            for t in tracks {
+                ops.extend(sh.doc.split_ops(t, from, to, at));
+            }
+            apply_ops(&mut sh, "split", ops)
+        }
+        "join_notes" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let (from, to) = region(args);
+            let tracks = match sel_tracks(&sh, args) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
+            let mut ops = Vec::new();
+            for t in tracks {
+                ops.extend(sh.doc.join_ops(t, from, to));
+            }
+            apply_ops(&mut sh, "join notes", ops)
+        }
+        "fix_overlaps" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let (from, to) = region(args);
+            let tracks = match sel_tracks(&sh, args) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
+            let mut ops = Vec::new();
+            for t in tracks {
+                ops.extend(sh.doc.fix_overlaps_ops(t, from, to));
+            }
+            apply_ops(&mut sh, "fix overlaps", ops)
+        }
+        "legato" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let (from, to) = region(args);
+            let gap = args["gap"].as_i64().unwrap_or(0);
+            let tracks = match sel_tracks(&sh, args) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
+            let mut ops = Vec::new();
+            for t in tracks {
+                ops.extend(sh.doc.legato_ops(t, from, to, gap));
+            }
+            apply_ops(&mut sh, "legato", ops)
+        }
+        "set_length" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let (from, to) = region(args);
+            let Some(ticks) = args["ticks"].as_u64() else {
+                return err_json("set_length requires 'ticks'");
+            };
+            let tracks = match sel_tracks(&sh, args) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
+            let mut ops = Vec::new();
+            for t in tracks {
+                ops.extend(sh.doc.set_length_ops(t, from, to, ticks));
+            }
+            apply_ops(&mut sh, "set length", ops)
         }
         _ => err_json(format!("unknown tool '{name}'")),
     }

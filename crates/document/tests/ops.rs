@@ -548,7 +548,7 @@ fn legato_extends_same_key_only() {
         chan(720, 0x90, 60, 100),
         chan(800, 0x80, 60, 0),
     ]]);
-    let ops = d.legato_ops(0, 0, u64::MAX);
+    let ops = d.legato_ops(0, 0, u64::MAX, 0);
     apply(&mut d, ops);
     let ns = notes_on(&d, 0);
     let k60: Vec<&Note> = ns.iter().filter(|n| n.key == 60).collect();
@@ -1187,4 +1187,221 @@ fn key_signature_picks_latest_before_tick_else_earliest() {
         meta(0, 0x58, vec![4, 2, 24, 8]),
     ]]);
     assert_eq!(d.key_signature(0), None);
+}
+
+#[test]
+fn split_breaks_spanning_note_keeps_both_halves() {
+    let mut d = doc(vec![vec![
+        chan(0, 0x90, 60, 100),
+        chan(480, 0x80, 60, 0),
+        chan(960, 0x90, 64, 100),
+        chan(1440, 0x80, 64, 0),
+    ]]);
+    let ops = d.split_ops(0, 0, u64::MAX, 240);
+    assert_eq!(ops.len(), 2); // off moved + new on/off pair
+    apply(&mut d, ops);
+    let ns = notes_on(&d, 0);
+    // spanning note becomes [0,240) + [240,480); the second note is untouched
+    assert!(ns
+        .iter()
+        .any(|n| n.key == 60 && n.start_tick == 0 && n.end_tick == Some(240)));
+    assert!(ns
+        .iter()
+        .any(|n| n.key == 60 && n.start_tick == 240 && n.end_tick == Some(480)));
+    assert!(ns
+        .iter()
+        .any(|n| n.key == 64 && n.start_tick == 960 && n.end_tick == Some(1440)));
+    assert_eq!(ns.len(), 3);
+}
+
+#[test]
+fn split_ids_only_touches_selected_notes() {
+    let mut d = doc(vec![vec![
+        chan(0, 0x90, 60, 100),
+        chan(480, 0x80, 60, 0),
+        chan(0, 0x90, 72, 90),
+        chan(480, 0x80, 72, 0),
+    ]]);
+    let sel: std::collections::BTreeSet<EventId> = notes_on(&d, 0)
+        .iter()
+        .filter(|n| n.key == 60)
+        .map(|n| n.on_id)
+        .collect();
+    let ops = d.split_ids_ops(&sel, 240);
+    apply(&mut d, ops);
+    let ns = notes_on(&d, 0);
+    assert!(ns.iter().any(|n| n.key == 72 && n.end_tick == Some(480)));
+    assert_eq!(ns.len(), 3); // 60 split in two, 72 untouched
+}
+
+#[test]
+fn split_at_boundary_or_dangling_does_nothing() {
+    let mut d = doc(vec![vec![
+        chan(0, 0x90, 60, 100),
+        chan(480, 0x80, 60, 0),
+        chan(720, 0x90, 64, 100), // dangling — never splits
+    ]]);
+    assert!(d.split_ops(0, 0, u64::MAX, 480).is_empty()); // starts AT split point
+    assert!(d.split_ops(0, 0, u64::MAX, 500).is_empty()); // past the end
+    assert!(d.split_ops(0, 0, u64::MAX, 800).is_empty()); // inside a dangling on
+}
+
+#[test]
+fn join_merges_contiguous_same_pitch_channel() {
+    let mut d = doc(vec![vec![
+        chan(0, 0x90, 60, 100),
+        chan(480, 0x80, 60, 0),
+        chan(480, 0x90, 60, 90), // touching start == prev end
+        chan(960, 0x80, 60, 0),
+        chan(960, 0x90, 60, 80), // touching again
+        chan(1200, 0x80, 60, 0),
+        chan(2000, 0x90, 60, 70), // separate — a gap before it
+        chan(2400, 0x80, 60, 0),
+    ]]);
+    let first_on = notes_on(&d, 0)[0].on_id;
+    let ops = d.join_ops(0, 0, u64::MAX);
+    apply(&mut d, ops);
+    let ns = notes_on(&d, 0);
+    assert_eq!(ns.len(), 2);
+    assert_eq!(ns[0].start_tick, 0);
+    assert_eq!(ns[0].end_tick, Some(1200));
+    assert_eq!(ns[0].on_id, first_on); // earliest event id preserved
+    assert_eq!(ns[1].start_tick, 2000);
+}
+
+#[test]
+fn join_never_crosses_channel_boundary() {
+    // same pitch, different channels must stay two notes — the ambiguous case
+    let mut d = doc(vec![vec![
+        chan(0, 0x90, 60, 100),
+        chan(0, 0x91, 60, 90),
+        chan(480, 0x80, 60, 0),
+        chan(480, 0x81, 60, 0),
+    ]]);
+    let ops = d.join_ops(0, 0, u64::MAX);
+    apply(&mut d, ops);
+    let ns = notes_on(&d, 0);
+    assert_eq!(ns.len(), 2);
+    assert!(ns.iter().any(|n| n.channel == 0));
+    assert!(ns.iter().any(|n| n.channel == 1));
+}
+
+#[test]
+fn join_is_deterministic_on_polyphony() {
+    let mut d = doc(vec![vec![
+        chan(0, 0x90, 60, 100),  // ch0 key60 on — pairs off@300 → [0,300)
+        chan(0, 0x90, 64, 80),   // ch0 key64 [0,480)
+        chan(120, 0x90, 60, 70), // ch0 key60 second on — LIFO pairs off@240
+        chan(240, 0x80, 60, 0),
+        chan(300, 0x80, 60, 0),
+        chan(480, 0x80, 64, 0),
+        chan(720, 0x91, 60, 60), // ch1 same key, dangling — never joins
+    ]]);
+    let ops = d.join_ops(0, 0, u64::MAX);
+    apply(&mut d, ops);
+    let ns = notes_on(&d, 0);
+    // the two overlapping ch0 key60 notes merge to [0,300)
+    assert_eq!(
+        ns.iter().filter(|n| n.key == 60 && n.channel == 0).count(),
+        1
+    );
+    assert!(ns
+        .iter()
+        .any(|n| n.key == 60 && n.channel == 0 && n.start_tick == 0 && n.end_tick == Some(300)));
+    assert!(ns.iter().any(|n| n.key == 64 && n.end_tick == Some(480)));
+    assert!(ns.iter().any(|n| n.channel == 1 && n.end_tick.is_none()));
+}
+
+#[test]
+fn fix_overlaps_shortens_only_the_off_tick() {
+    // distinct seqs like a real file — ordering at the clamp tick matters
+    let mut evs = vec![
+        chan(0, 0x90, 60, 100),
+        chan(240, 0x90, 60, 90), // overlapping second on
+        chan(480, 0x80, 60, 0),
+        chan(960, 0x80, 60, 0),
+    ];
+    for (i, e) in evs.iter_mut().enumerate() {
+        e.seq = i as u32;
+    }
+    let mut d = doc(vec![evs]);
+    let ids_before: Vec<_> = notes_on(&d, 0)
+        .iter()
+        .map(|n| (n.on_id, n.off_id))
+        .collect();
+    let ops = d.fix_overlaps_ops(0, 0, u64::MAX);
+    apply(&mut d, ops);
+    let ns = notes_on(&d, 0);
+    // LIFO pairing: off@480 closes the 240-on → [240,480); off@960 closes
+    // the 0-on → [0,960) — the fix clamps the second note's end to 240
+    assert_eq!(ns.len(), 2);
+    assert!(ns
+        .iter()
+        .any(|n| n.start_tick == 0 && n.end_tick == Some(240)));
+    assert!(ns
+        .iter()
+        .any(|n| n.start_tick == 240 && n.end_tick == Some(480)));
+    // event ids preserved
+    let ids_after: Vec<_> = ns.iter().map(|n| (n.on_id, n.off_id)).collect();
+    assert_eq!(ids_before, ids_after);
+}
+
+#[test]
+fn fix_overlaps_ignores_other_channels() {
+    let mut d = doc(vec![vec![
+        chan(0, 0x90, 60, 100),
+        chan(240, 0x91, 60, 90), // same key, channel 1 — not an overlap
+        chan(480, 0x80, 60, 0),
+        chan(960, 0x81, 60, 0),
+    ]]);
+    assert!(d.fix_overlaps_ops(0, 0, u64::MAX).is_empty());
+}
+
+#[test]
+fn legato_gap_leaves_space_and_negative_overlaps() {
+    let mk = || {
+        doc(vec![vec![
+            chan(0, 0x90, 60, 100),
+            chan(480, 0x80, 60, 0),
+            chan(960, 0x90, 60, 90),
+            chan(1440, 0x80, 60, 0),
+        ]])
+    };
+    let mut d = mk();
+    let ops = d.legato_ops(0, 0, u64::MAX, 120);
+    apply(&mut d, ops); // 1/4 of a 480 quarter
+    assert_eq!(notes_on(&d, 0)[0].end_tick, Some(840));
+    // negative gap: off lands past the next on (on-wire overlap). The op is
+    // what the spec asks for; same-key+channel overlap re-pairs LIFO, so
+    // assert on the emitted op rather than the re-read notes.
+    let mut d = mk();
+    let ops = d.legato_ops(0, 0, u64::MAX, -120);
+    match &ops[0] {
+        Op::UpdateEvent { after, .. } => assert_eq!(after.tick, 1080),
+        other => panic!("expected UpdateEvent, got {:?}", other),
+    }
+}
+
+#[test]
+fn legato_stays_within_channel() {
+    // same key on two channels: the ch0 note must stretch to the next CH0
+    // start (500), not be fooled by the overlapping ch1 note at 120
+    let mut d = doc(vec![vec![
+        chan(0, 0x90, 60, 100),  // ch0 key60 [0,200)
+        chan(120, 0x91, 60, 90), // ch1 key60 [120,960)
+        chan(200, 0x80, 60, 0),
+        chan(500, 0x90, 60, 80), // ch0 key60 second [500,700)
+        chan(700, 0x80, 60, 0),
+        chan(960, 0x81, 60, 0),
+    ]]);
+    let ops = d.legato_ops(0, 0, u64::MAX, 0);
+    apply(&mut d, ops);
+    let ns = notes_on(&d, 0);
+    let ch0_first = ns
+        .iter()
+        .find(|n| n.channel == 0 && n.start_tick == 0)
+        .unwrap();
+    assert_eq!(ch0_first.end_tick, Some(500));
+    let ch1 = ns.iter().find(|n| n.channel == 1).unwrap();
+    assert_eq!(ch1.end_tick, Some(960)); // no ch1 successor — untouched
 }
