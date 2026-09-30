@@ -39,9 +39,10 @@ gpui-kit = "0.6"
 
 # MCP server
 rmcp = { version = "3.4", features = ["client", "server", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "macros", "schemars"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "io-util"] }
 axum = "0.8"
 http = "1"
+getrandom = "0.4"
 
 [profile.dev]
 # faster link times during spike work

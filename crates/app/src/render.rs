@@ -61,6 +61,8 @@ impl Render for EditorView {
             muted_set,
             soloed_set,
             has_track_dest,
+            mcp_auth_mode,
+            mcp_auth_detail,
         ) = {
             let sh = crate::lock_shared(&self.shared);
             (
@@ -79,6 +81,8 @@ impl Render for EditorView {
                 sh.muted.clone(),
                 sh.soloed.clone(),
                 sh.track_dest.contains_key(&self.sel_track),
+                sh.mcp_auth_mode,
+                sh.mcp_auth_detail.clone(),
             )
         };
         // revision-cached document chrome (markers, names, diagnostics, …) —
@@ -1550,6 +1554,23 @@ impl Render for EditorView {
                     .child(format!("{}", self.status)),
             )
             .children(plugin_chip)
+            // MCP auth posture — an unauthenticated endpoint must be visible
+            .child({
+                let (label, color) = match mcp_auth_mode {
+                    mcp_server::McpAuthMode::Bearer => (t("status.mcp_auth"), 0x8fd0a0),
+                    mcp_server::McpAuthMode::Open => (t("status.mcp_open"), 0xe06060),
+                    mcp_server::McpAuthMode::Stdio => (t("status.mcp_off"), 0x77778a),
+                };
+                div()
+                    .id("mcp-auth-chip")
+                    .px_1()
+                    .text_color(rgb(color))
+                    .child(label)
+                    .tooltip(move |_w, cx| {
+                        let tip = mcp_auth_detail.clone();
+                        cx.new(|_| Tip(tip.into())).into()
+                    })
+            })
             .child(Self::chip("st-lane", lane_mode.label(), cx, |v, _e, cx| {
                 v.set_lane(v.lane_mode.cycle(), cx);
             }))

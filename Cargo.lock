@@ -4234,6 +4234,7 @@ dependencies = [
  "bytes",
  "commands",
  "document",
+ "getrandom 0.4.3",
  "http",
  "midi-io",
  "rmcp",

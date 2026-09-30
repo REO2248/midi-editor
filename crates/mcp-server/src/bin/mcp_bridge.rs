@@ -91,6 +91,13 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // discover the app's auto-provisioned token file so spawned stdio
+    // clients need no configuration — the file lives in the same user's
+    // private config dir, so only same-user processes can read it anyway
+    if token.is_none() {
+        token = mcp_server::read_stored_token();
+    }
+
     if let Some(f) = file {
         let doc = load_file(&f)?;
         return mcp_server::serve_stdio(doc).await;
