@@ -27,6 +27,10 @@ fn blend(c: u32, to: u32, f: f32) -> u32 {
 }
 
 const ACCENT: u32 = 0x9fd0ff;
+/// Per-key-group tint for the all-keys poly-AT lane (key/16 → index).
+const LANE_KEY_COLORS: [u32; 8] = [
+    0x4fd0ff, 0x8fd0a0, 0xe0b050, 0xd070e0, 0x70d0d0, 0xe0e070, 0xa090ff, 0xff9090,
+];
 
 impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -723,16 +727,39 @@ impl Render for EditorView {
             )
             .child({
                 let events = self.events.clone();
-                uniform_list("events", events.len(), move |range, _w, _cx| {
+                let sel_event = self.sel_event;
+                let view_weak = cx.weak_entity();
+                uniform_list("events", events.len(), move |range, _w, _app| {
                     range
                         .map(|i| {
+                            let (id, text) = events[i].clone();
+                            let sel = id != 0 && sel_event == Some(id);
+                            let weak = view_weak.clone();
                             div()
+                                .id(("ev", i))
                                 .h(px(18.0))
                                 .px_2()
                                 .text_size(px(11.0))
                                 .font_family("Cascadia Mono")
+                                .bg(if sel { rgb(0x2b3d4f) } else { rgb(0x000000) })
                                 .text_color(rgb(0xb8b8c8))
-                                .child(events[i].clone())
+                                .cursor_pointer()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    move |_e, _w, app| {
+                                        // click selects the event for
+                                        // delete / value nudge (-/=)
+                                        let _ = weak.update_in(app, |v, _w, cx| {
+                                            v.sel_event = if id == 0 || v.sel_event == Some(id) {
+                                                None
+                                            } else {
+                                                Some(id)
+                                            };
+                                            cx.notify();
+                                        });
+                                    },
+                                )
+                                .child(text)
                         })
                         .collect()
                 })
@@ -906,15 +933,17 @@ impl Render for EditorView {
             {
                 let lane_notes = self.notes.clone();
                 let lane_selection = self.selection.clone();
+                let lane_sel = self.lane_sel.clone();
                 let lane_events = lane_events.clone();
                 let drag_v = drag;
+                let lane_drag = self.drag.as_ref().and_then(|d| {
+                    matches!(d.mode, DragMode::LaneEvent | DragMode::LaneMarquee)
+                        .then_some((d.mode, d.on_id, d.a_tick, d.a_key, d.b_tick, d.b_key, d.dkey))
+                });
+                let poly_key = self.poly_key;
                 move |bounds, _state, window, _cx| {
                     let h: f32 = bounds.size.height.into();
-                    let vrange = if lane_mode == LaneMode::PitchBend {
-                        16383.0
-                    } else {
-                        127.0
-                    };
+                    let vrange = lane_mode.vrange();
                     match lane_mode {
                         LaneMode::Velocity => {
                             for n in lane_notes.iter().filter(|n| n.track == lane_sel_track) {
@@ -943,8 +972,18 @@ impl Render for EditorView {
                         }
                         _ => {
                             // stepped automation line: dot + run to next point
+                            // (all-keys poly-AT draws dots only — a stepped line
+                            // across keys would be meaningless)
+                            let stepped =
+                                !(lane_mode == LaneMode::PolyAT && poly_key.is_none());
+                            // cull to the visible tick window — dense controller
+                            // data must stay cheap to paint
+                            let t_lo = (scroll_x / zoom).max(0.0) as i64;
+                            let t_hi = t_lo + (f32::from(bounds.size.width) / zoom) as i64 + 1;
+                            let lo = lane_events.partition_point(|e| (e.1 as i64) < t_lo);
+                            let hi = lane_events.partition_point(|e| (e.1 as i64) <= t_hi);
                             let mut prev: Option<(Pixels, Pixels)> = None;
-                            for (id, tick, val) in lane_events.iter() {
+                            for (id, tick, val, key) in lane_events[lo..hi].iter() {
                                 let mut v = *val;
                                 if let Some((DragMode::LaneEvent, d_on, _, dkey)) = drag_v {
                                     if d_on == *id {
@@ -954,32 +993,47 @@ impl Render for EditorView {
                                 let x = bounds.origin.x + px(*tick as f32 * zoom - scroll_x);
                                 let y = bounds.origin.y
                                     + px((h - 4.0) * (1.0 - v as f32 / vrange) + 2.0);
-                                if let Some((px_, py_)) = prev {
-                                    // horizontal run at previous level, then
-                                    // a vertical connector at this event's x
-                                    window.paint_quad(fill(
-                                        Bounds::new(point(px_, py_), size(x - px_, px(1.0))),
-                                        rgba(0x4fd0ff88),
-                                    ));
-                                    window.paint_quad(fill(
-                                        Bounds::new(
-                                            point(x, y.min(py_)),
-                                            size(px(1.0), (y - py_).abs().max(px(1.0))),
-                                        ),
-                                        rgba(0x4fd0ff88),
-                                    ));
+                                if stepped {
+                                    if let Some((px_, py_)) = prev {
+                                        // horizontal run at previous level, then
+                                        // a vertical connector at this event's x
+                                        window.paint_quad(fill(
+                                            Bounds::new(point(px_, py_), size(x - px_, px(1.0))),
+                                            rgba(0x4fd0ff88),
+                                        ));
+                                        window.paint_quad(fill(
+                                            Bounds::new(
+                                                point(x, y.min(py_)),
+                                                size(px(1.0), (y - py_).abs().max(px(1.0))),
+                                            ),
+                                            rgba(0x4fd0ff88),
+                                        ));
+                                    }
+                                    prev = Some((x, y));
                                 }
+                                let c = if lane_sel.contains(id) {
+                                    SEL_COLOR
+                                } else if lane_mode == LaneMode::PolyAT
+                                    && poly_key.is_none()
+                                    && *key >= 0
+                                {
+                                    // key-aware tint: hue family per key group
+                                    LANE_KEY_COLORS[(*key as usize / 16) % LANE_KEY_COLORS.len()]
+                                } else {
+                                    0x4fd0ff
+                                };
                                 window.paint_quad(fill(
                                     Bounds::new(
                                         point(x - px(2.0), y - px(2.0)),
                                         size(px(4.0), px(4.0)),
                                     ),
-                                    rgb(0x4fd0ff),
+                                    rgb(c),
                                 ));
-                                prev = Some((x, y));
                             }
                             // drag insert ghost
-                            if let Some((DragMode::LaneEvent, 0, a_tick, dkey)) = drag_v {
+                            if let Some((DragMode::LaneEvent, 0, a_tick, _, _, _, dkey)) =
+                                lane_drag
+                            {
                                 let x = bounds.origin.x + px(a_tick as f32 * zoom - scroll_x);
                                 let y = bounds.origin.y
                                     + px((h - 4.0)
@@ -994,6 +1048,32 @@ impl Render for EditorView {
                                 ));
                             }
                         }
+                    }
+                    // lane rubber band (tick × value box)
+                    if let Some((DragMode::LaneMarquee, _, a_t, a_v, b_t, b_v, _)) = lane_drag {
+                        let (t0, t1) = (a_t.min(b_t), a_t.max(b_t));
+                        let (v0, v1) = (a_v.min(b_v), a_v.max(b_v));
+                        let x0 = bounds.origin.x + px(t0 as f32 * zoom - scroll_x);
+                        let x1 = bounds.origin.x + px(t1 as f32 * zoom - scroll_x);
+                        let y0 = bounds.origin.y
+                            + px((h - 4.0) * (1.0 - v1 as f32 / vrange) + 2.0);
+                        let y1 = bounds.origin.y
+                            + px((h - 4.0) * (1.0 - v0 as f32 / vrange) + 2.0);
+                        window.paint_quad(fill(
+                            Bounds::new(point(x0, y0), size(x1 - x0, (y1 - y0).max(px(1.0)))),
+                            rgba(0x4f8cff33),
+                        ));
+                    }
+                    // playhead (shared time cursor with the roll)
+                    let pxx = bounds.origin.x + px(play_x_tick as f32 * zoom - scroll_x);
+                    if pxx >= bounds.origin.x && pxx <= bounds.origin.x + bounds.size.width {
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                point(pxx, bounds.origin.y),
+                                size(px(1.0), bounds.size.height),
+                            ),
+                            rgb(0x50ff9f),
+                        ));
                     }
                 }
             },
@@ -1345,7 +1425,7 @@ impl Render for EditorView {
                         .child(lane.size_full())
                         .child(
                             // lane-mode chip: Vel -> CC1 -> CC7 -> CC10 ->
-                            // CC11 -> CC64 -> PB -> Vel
+                            // CC11 -> CC64 -> PB -> CAT -> PAT -> Vel
                             div()
                                 .id("lane-mode")
                                 .absolute()
@@ -1361,10 +1441,35 @@ impl Render for EditorView {
                                 .child(lane_mode.label())
                                 .on_click(cx.listener(|v, _e: &ClickEvent, _w, cx| {
                                     cx.stop_propagation();
-                                    v.lane_mode = v.lane_mode.cycle();
-                                    v.persist();
-                                    cx.notify();
+                                    v.set_lane(v.lane_mode.cycle(), cx);
                                 })),
+                        )
+                        .children(
+                            // poly-AT key filter chip — only visible in PAT
+                            // mode; cycles all -> keys present -> all
+                            (self.lane_mode == LaneMode::PolyAT).then(|| {
+                                div()
+                                    .id("lane-key")
+                                    .absolute()
+                                    .top(px(2.0))
+                                    .right(px(30.0))
+                                    .px_1()
+                                    .rounded_sm()
+                                    .bg(rgb(0x2a2a35))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(0x3a3a48)))
+                                    .text_size(px(9.0))
+                                    .text_color(rgb(0x9fd0ff))
+                                    .child(match self.poly_key {
+                                        Some(k) => format!("k{k}"),
+                                        None => "k*".to_string(),
+                                    })
+                                    .on_click(cx.listener(|v, e: &ClickEvent, _w, cx| {
+                                        cx.stop_propagation();
+                                        v.cycle_poly_key(e.modifiers().shift, cx);
+                                    }))
+                                    .into_any_element()
+                            }),
                         )
                         .on_mouse_down(
                             MouseButton::Left,
@@ -1375,10 +1480,31 @@ impl Render for EditorView {
                                 let y = f32::from(ev.position.y) - f32::from(b.origin.y);
                                 let tick = ((x + this.scroll_x) / this.zoom).max(0.0) as u64;
                                 let h = f32::from(b.size.height);
-                                match this.lane_mode {
+                                let mode = this.lane_mode;
+                                let vrange = mode.vrange();
+                                let val = ((1.0 - y / h) * vrange) as i32;
+                                // shift+drag = rubber-band select inside the lane
+                                if ev.modifiers.shift {
+                                    this.drag = Some(Drag {
+                                        mode: DragMode::LaneMarquee,
+                                        on_id: 0,
+                                        off_id: None,
+                                        track: this.sel_track,
+                                        orig_start: 0,
+                                        orig_end: None,
+                                        orig_key: 0,
+                                        dtick: 0,
+                                        dkey: 0,
+                                        a_tick: tick as i64,
+                                        a_key: val,
+                                        b_tick: tick as i64,
+                                        b_key: val,
+                                    });
+                                    cx.notify();
+                                    return;
+                                }
+                                match mode {
                                     LaneMode::Velocity => {
-                                        let vel =
-                                            ((1.0 - y / h) * 127.0) as i32;
                                         // the note bar under the cursor (within
                                         // ~6px) — a click on empty lane space
                                         // must not edit some distant note
@@ -1404,7 +1530,7 @@ impl Render for EditorView {
                                                 orig_end: n.end_tick,
                                                 orig_key: n.key,
                                                 dtick: 0,
-                                                dkey: vel.clamp(1, 127),
+                                                dkey: val.clamp(1, 127),
                                                 a_tick: 0,
                                                 a_key: 0,
                                                 b_tick: 0,
@@ -1412,17 +1538,11 @@ impl Render for EditorView {
                                             });
                                         }
                                     }
-                                    mode => {
-                                        // CC/PB: grab the nearest lane event
+                                    _ => {
+                                        // CC/PB/AT: grab the nearest lane event
                                         // within ~10px, else insert a new one
                                         // at the click and drag it
-                                        let vrange = if mode == LaneMode::PitchBend {
-                                            16383.0
-                                        } else {
-                                            127.0
-                                        };
-                                        let val =
-                                            ((1.0 - y / h) * vrange) as i32;
+                                        let pkey = this.poly_key;
                                         let tr = this.sel_track;
                                         let found = {
                                             let sh = crate::lock_shared(&this.shared);
@@ -1435,6 +1555,8 @@ impl Render for EditorView {
                                                             if match mode {
                                                                 LaneMode::CC(cc) => status & 0xF0 == 0xB0 && data[0] == cc,
                                                                 LaneMode::PitchBend => status & 0xF0 == 0xE0,
+                                                                LaneMode::ChanAT => status & 0xF0 == 0xD0,
+                                                                LaneMode::PolyAT => status & 0xF0 == 0xA0 && (pkey.is_none() || pkey == Some(data[0])),
                                                                 LaneMode::Velocity => false,
                                                             })
                                                     })
@@ -1465,6 +1587,35 @@ impl Render for EditorView {
                                             b_key: 0,
                                         });
                                     }
+                                }
+                                cx.notify();
+                            }),
+                        )
+                        // right-click a lane point deletes it
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
+                                if !this.lane_mode.is_event_lane() {
+                                    return;
+                                }
+                                let b = this.lane_bounds.get();
+                                let x = f32::from(ev.position.x) - f32::from(b.origin.x);
+                                let tick = ((x + this.scroll_x) / this.zoom).max(0.0) as u64;
+                                let found = this
+                                    .lane_events_cached()
+                                    .iter()
+                                    .min_by_key(|e| (e.1 as i64 - tick as i64).abs())
+                                    .filter(|e| {
+                                        ((e.1 as f32 - tick as f32) * this.zoom).abs() <= 10.0
+                                    })
+                                    .map(|e| e.0);
+                                if let Some(id) = found {
+                                    let ops = {
+                                        let mut sh = crate::lock_shared(&this.shared);
+                                        sh.doc.remove_events_ops(&[id])
+                                    };
+                                    this.lane_sel.remove(&id);
+                                    this.apply_tx("delete lane event", ops);
                                 }
                                 cx.notify();
                             }),
@@ -2119,7 +2270,7 @@ impl Render for EditorView {
                         rows
                     }
                     Sub::Lane => {
-                        const LANES: [LaneMode; 7] = [
+                        const LANES: [LaneMode; 9] = [
                             LaneMode::Velocity,
                             LaneMode::CC(1),
                             LaneMode::CC(7),
@@ -2127,6 +2278,8 @@ impl Render for EditorView {
                             LaneMode::CC(11),
                             LaneMode::CC(64),
                             LaneMode::PitchBend,
+                            LaneMode::ChanAT,
+                            LaneMode::PolyAT,
                         ];
                         LANES
                             .iter()
@@ -2375,7 +2528,7 @@ impl Render for EditorView {
 
         // shortcuts overlay (F1 / Help > Keyboard Shortcuts)
         let help_layer = self.help_open.then(|| {
-            const ROWS: [(&str, &str); 21] = [
+            const ROWS: [(&str, &str); 25] = [
                 ("Space", "Play / stop"),
                 ("F1", "This panel"),
                 ("Esc", "Close menus / clear selection"),
@@ -2390,6 +2543,10 @@ impl Render for EditorView {
                 ("Shift+← →", "Nudge by 1 tick"),
                 ("↑ ↓", "Transpose by semitone"),
                 ("Shift+↑ ↓", "Transpose by octave"),
+                ("- / =", "Edit event-list value"),
+                ("Lane click", "Insert / drag point"),
+                ("Lane right-click", "Delete point"),
+                ("Shift+drag lane", "Box-select points"),
                 ("Alt+drag note", "Duplicate note(s)"),
                 ("Right-edge drag", "Resize note"),
                 ("Click ruler", "Seek playhead"),
@@ -2711,8 +2868,13 @@ impl Render for EditorView {
                         this.help_open = false;
                         this.show_output_status = false;
                         this.selection.clear();
+                        this.lane_sel.clear();
+                        this.sel_event = None;
                         cx.notify();
                     }
+                    // exact value editing for the event-list selection
+                    (false, false, "-") | (false, true, "_") => this.nudge_sel_event(-1, cx),
+                    (false, false, "=") | (false, true, "+") => this.nudge_sel_event(1, cx),
                     (true, false, "x") => this.copy_selected(true, cx),
                     (true, false, "c") => this.copy_selected(false, cx),
                     (true, false, "v") => this.paste(cx),
