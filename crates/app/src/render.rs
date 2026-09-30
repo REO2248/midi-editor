@@ -1261,6 +1261,10 @@ impl Render for EditorView {
                 .child(
                     div()
                         .flex_1()
+                        // a bare div is display:block — flex_row alone
+                        // leaves children stacked vertically (rolled the
+                        // canvas below the fold); display:flex is required
+                        .flex()
                         .flex_row()
                         .relative()
                         .overflow_hidden()
@@ -1339,17 +1343,19 @@ impl Render for EditorView {
                                 ))
                                 .on_mouse_up(
                                     MouseButton::Left,
-                                    cx.listener(|this, _ev: &MouseUpEvent, _w, _cx| {
+                                    cx.listener(|this, _ev: &MouseUpEvent, _w, cx| {
                                         if this.scrub_key.is_some() {
                                             this.audition_off();
+                                            cx.notify();
                                         }
                                     }),
                                 )
                                 .on_mouse_up_out(
                                     MouseButton::Left,
-                                    cx.listener(|this, _ev: &MouseUpEvent, _w, _cx| {
+                                    cx.listener(|this, _ev: &MouseUpEvent, _w, cx| {
                                         if this.scrub_key.is_some() {
                                             this.audition_off();
+                                            cx.notify();
                                         }
                                     }),
                                 ),
@@ -1357,6 +1363,7 @@ impl Render for EditorView {
                         .child(
                             div()
                                 .flex_1()
+                                .h_full()
                                 .relative()
                                 .overflow_hidden()
                                 .child(roll.size_full()),
