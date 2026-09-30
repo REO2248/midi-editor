@@ -28,6 +28,17 @@ fn blend(c: u32, to: u32, f: f32) -> u32 {
 
 const ACCENT: u32 = 0x9fd0ff;
 
+/// Snap-menu label: metrical files subdivide a whole note, SMPTE files a
+/// second — "1/16" vs "1/16s" makes the redefined grid explicit instead
+/// of silently suggesting beats that don't exist. "off" stays bare.
+fn snap_label(label: &'static str, td: TimeDisplay) -> String {
+    if td.is_smpte() && label != "off" {
+        format!("{label}s")
+    } else {
+        label.to_string()
+    }
+}
+
 impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // the plugin editor lives in the helper subprocess's own window —
@@ -90,12 +101,13 @@ impl Render for EditorView {
         let track_names = doc_ui.track_names.clone();
         let track_chs = doc_ui.track_chs.clone();
         let markers = &doc_ui.markers;
-        let ppq = self.ppq();
-        let pos = {
-            let bar = playhead_tick / (ppq * 4) + 1;
-            let beat = (playhead_tick % (ppq * 4)) / ppq + 1;
-            format!("{bar}.{beat}.{:>3}", playhead_tick % ppq)
-        };
+        // explicit UI timing mode — metrical bar/beat or SMPTE timecode,
+        // drawn straight from the SMF division (never a pretend PPQ)
+        let td = self.td();
+        let (grid_minor, grid_major) = td.grid_ticks(self.zoom);
+        let note_min = td.min_grid_ticks();
+        let badge = td.badge();
+        let pos = td.format_tick(playhead_tick);
 
         // --- piano roll canvas -------------------------------------------------
         let notes = self.notes.clone();
@@ -141,18 +153,19 @@ impl Render for EditorView {
                         rgb(if k % 12 == 0 { 0x2e2e3a } else { 0x232329 }),
                     ));
                 }
-                // beat/bar lines
+                // beat/bar lines — quarter/bar for metrical, frame/second
+                // for SMPTE (minor lines collapse when < ~4px apart)
                 let tick0 = (scroll_x / zoom).max(0.0) as u64;
-                let tick1 = tick0 + (f32::from(w) / zoom) as u64 + ppq;
-                let mut t = tick0 / ppq * ppq;
+                let tick1 = tick0 + (f32::from(w) / zoom) as u64 + grid_minor;
+                let mut t = tick0 / grid_minor * grid_minor;
                 while t <= tick1 {
                     let x = bounds.origin.x + px(t as f32 * zoom - scroll_x);
-                    let bar = t.is_multiple_of(ppq * 4);
+                    let strong = t.is_multiple_of(grid_major);
                     window.paint_quad(fill(
                         Bounds::new(point(x, bounds.origin.y), size(px(1.0), h)),
-                        rgb(if bar { 0x3d3d52 } else { 0x2a2a35 }),
+                        rgb(if strong { 0x3d3d52 } else { 0x2a2a35 }),
                     ));
-                    t += ppq;
+                    t += grid_minor;
                 }
                 // notes — enter the sorted list by binary search. While a
                 // Move/Duplicate drag shifts notes, widen the window toward
@@ -170,7 +183,7 @@ impl Render for EditorView {
                         break;
                     }
                     let mut st = n.start_tick as i64;
-                    let mut en = n.end_tick.unwrap_or(n.start_tick + ppq / 4) as i64;
+                    let mut en = n.end_tick.unwrap_or(n.start_tick + note_min) as i64;
                     let mut key = n.key as i32;
                     let mut ghost_orig = false;
                     if let Some((mode, d_on, dtick, dkey)) = drag {
@@ -481,6 +494,25 @@ impl Render for EditorView {
                     .whitespace_nowrap()
                     .child(pos.clone()),
             )
+            // explicit timing-mode badge: ppq for metrical, fps for SMPTE
+            // — amber for SMPTE so a timecode file never masquerades as a
+            // musical grid
+            .child(
+                div()
+                    .px_2()
+                    .h(px(24.0))
+                    .flex()
+                    .items_center()
+                    .bg(rgb(0x0b0b11))
+                    .border_1()
+                    .border_color(rgb(BORDER_C))
+                    .rounded_sm()
+                    .text_color(rgb(if td.is_smpte() { 0xffb46a } else { 0x9fd0ff }))
+                    .text_size(px(11.0))
+                    .font_family("Cascadia Mono")
+                    .whitespace_nowrap()
+                    .child(badge.clone()),
+            )
             .child(
                 div()
                     .id("bpm")
@@ -545,7 +577,8 @@ impl Render for EditorView {
                 |v, _e, cx| v.set_tool(Tool::Erase, cx),
             ))
             .child(Self::vsep())
-            // snap grid cycle: off / 1 / 1/2 / 1/4 / 1/8 / 1/16 / 1/32
+            // snap grid cycle: off / 1 / 1/2 / 1/4 / 1/8 / 1/16 / 1/32 —
+            // for SMPTE files the fractions are seconds ("1/16s" ≈ 62ms)
             .child(
                 div()
                     .id("snap")
@@ -589,7 +622,7 @@ impl Render for EditorView {
                                 0x55556a
                             }))
                             .whitespace_nowrap()
-                            .child(SNAPS[self.snap_idx].2),
+                            .child(snap_label(SNAPS[self.snap_idx].2, td)),
                     )
                     .on_click(cx.listener(|v, _e, _w, cx| v.cycle_snap(cx))),
             )
@@ -598,11 +631,15 @@ impl Render for EditorView {
             .child(Self::ibtn(
                 "i.quant",
                 "compress",
-                t("tip.quantize"),
+                t(if td.is_smpte() {
+                    "tip.quantize_smpte"
+                } else {
+                    "tip.quantize"
+                }),
                 false,
                 cx,
                 |v, _e, cx| {
-                    let g = v.snap_ticks().max(v.ppq() as i64 / 4) as u64;
+                    let g = v.snap_ticks().max(v.td().min_grid_ticks() as i64) as u64;
                     v.apply_region_op("quantize", move |d, tr, f, to| {
                         d.quantize_ops(tr, f, to, g, 100)
                     });
@@ -1005,7 +1042,7 @@ impl Render for EditorView {
         let mini_notes = self.notes.clone();
         let mini_active = self.sel_track;
         let roll_bounds_cell = self.roll_bounds.clone();
-        let song_end = doc_ui.song_end.max(ppq * 16);
+        let song_end = self.doc_end_ticks();
         let mini_play = play_x_tick;
         let minimap = canvas(
             move |b, _w, _cx| mini_bounds_cell.set(b),
@@ -1071,16 +1108,17 @@ impl Render for EditorView {
             },
             move |bounds, _state, window, _cx| {
                 let w = bounds.size.width;
+                // coarse ticks: one bar for metrical, one second for SMPTE
                 let tick0 = (scroll_x / zoom).max(0.0) as u64;
-                let tick1 = tick0 + (f32::from(w) / zoom) as u64 + ppq * 4;
-                let mut t = tick0 / (ppq * 4) * (ppq * 4);
+                let tick1 = tick0 + (f32::from(w) / zoom) as u64 + grid_major;
+                let mut t = tick0 / grid_major * grid_major;
                 while t <= tick1 {
                     let x = bounds.origin.x + px(t as f32 * zoom - scroll_x);
                     window.paint_quad(fill(
                         Bounds::new(point(x, bounds.origin.y + px(12.0)), size(px(1.0), px(8.0))),
                         rgb(0x55556a),
                     ));
-                    t += ppq * 4;
+                    t += grid_major;
                 }
                 // playhead marker
                 let hx = bounds.origin.x + px(ruler_play_tick as f32 * zoom - scroll_x);
@@ -2171,7 +2209,7 @@ impl Render for EditorView {
                         .map(|(i, (_div, _trip, label))| {
                             Self::mi_leaf(
                                 ("snap", i),
-                                *label,
+                                snap_label(label, td),
                                 "",
                                 Some(self.snap_idx == i),
                                 cx,
@@ -2218,7 +2256,7 @@ impl Render for EditorView {
                         }
                     }
                     Sub::Quant => {
-                        let g = self.snap_ticks().max(self.ppq() as i64 / 4) as u64;
+                        let g = self.snap_ticks().max(self.td().min_grid_ticks() as i64) as u64;
                         [("100%", 100u32), ("75%", 75), ("50%", 50)]
                             .into_iter()
                             .enumerate()
@@ -2254,14 +2292,28 @@ impl Render for EditorView {
                             .collect()
                     }
                     Sub::LenSet => {
-                        let ppq = self.ppq();
-                        let opts: [(&str, u64); 5] = [
-                            ("1/32", ppq / 8),
-                            ("1/16", ppq / 4),
-                            ("1/8", ppq / 2),
-                            ("1/4", ppq),
-                            ("1 bar", ppq * 4),
-                        ];
+                        // metrical: note fractions; SMPTE: frame/second
+                        // spans — never a fake-PPQ musical grid
+                        let opts: Vec<(String, u64)> = match td {
+                            TimeDisplay::Metrical { ppq } => vec![
+                                ("1/32".into(), ppq / 8),
+                                ("1/16".into(), ppq / 4),
+                                ("1/8".into(), ppq / 2),
+                                ("1/4".into(), ppq),
+                                ("1 bar".into(), ppq * 4),
+                            ],
+                            TimeDisplay::Smpte { .. } => {
+                                let f = td.cell_ticks();
+                                let s = td.bar_ticks();
+                                vec![
+                                    ("1 frame".into(), f),
+                                    ("5 frames".into(), f * 5),
+                                    ("10 frames".into(), f * 10),
+                                    ("1 s".into(), s),
+                                    ("5 s".into(), s * 5),
+                                ]
+                            }
+                        };
                         opts.into_iter()
                             .enumerate()
                             .map(|(i, (label, ticks))| {
@@ -2692,7 +2744,7 @@ impl Render for EditorView {
                     if s > 0 {
                         s
                     } else {
-                        this.ppq() as i64 / 8
+                        this.td().nudge_ticks() as i64
                     }
                 };
                 match (ctrl, shift, k) {

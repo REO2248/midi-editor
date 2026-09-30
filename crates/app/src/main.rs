@@ -13,7 +13,7 @@ use geometry::{
 use i18n::{t, tf};
 
 use commands::UndoStack;
-use document::{Document, Event as DocEvent, EventId, Note, Op};
+use document::{Document, Event as DocEvent, EventId, Note, Op, TimeDisplay};
 use gpui_kit::component::input::InputState;
 use gpui_kit::component::Root;
 use gpui_kit::*;
@@ -659,7 +659,7 @@ impl EditorView {
         if div == 0 {
             return 0;
         }
-        let base = (self.ppq() as i64 * 4) / div as i64;
+        let base = self.td().snap_base_ticks() as i64 / div as i64;
         if trip {
             base * 2 / 3
         } else {
@@ -812,23 +812,21 @@ impl EditorView {
         self.lane_cache.clone()
     }
 
-    /// Tick position of the song end (scroll extent, minimap scale).
+    /// Tick position of the song end (scroll extent, minimap scale) —
+    /// at least four coarse cells (bars / seconds) past the content.
     fn doc_end_ticks(&self) -> u64 {
-        self.doc_ui.song_end.max(self.ppq() * 16)
+        self.doc_ui.song_end.max(self.td().bar_ticks() * 4)
     }
 
-    fn ppq(&self) -> u64 {
-        match self.doc(|d| d.division) {
-            Division::Metrical(p) => (p as u64).max(1),
-            Division::Smpte { .. } => 480,
-        }
+    /// UI timing mode for the loaded document — the explicit answer to
+    /// "what does a tick mean here": metrical bar/beat or SMPTE timecode,
+    /// never a synthesized 480 PPQ.
+    fn td(&self) -> TimeDisplay {
+        self.doc(|d| d.time_display())
     }
 
     fn build_event_rows(&self, doc: &Document) -> Vec<SharedString> {
-        let ppq = match doc.division {
-            Division::Metrical(p) => (p as u64).max(1),
-            Division::Smpte { .. } => 480,
-        };
+        let td = doc.time_display();
         let hint = self.enc_override.or(doc.text_encoding_hint());
         let mut rows = Vec::new();
         for d in doc.diagnose() {
@@ -836,9 +834,9 @@ impl EditorView {
         }
         for (ti, tr) in doc.tracks.iter().enumerate() {
             for e in &tr.events {
-                let bar = e.tick / (ppq * 4) + 1;
-                let beat = (e.tick % (ppq * 4)) / ppq + 1;
-                let tk = e.tick % ppq;
+                // bar.beat.tick for metrical, hh:mm:ss.ff timecode for
+                // SMPTE — position labels always match the file's timing
+                let pos = td.format_tick(e.tick);
                 let body = match &e.kind {
                     EventKind::Channel { status, data, .. } => {
                         let ch = (status & 0x0F) + 1;
@@ -876,7 +874,7 @@ impl EditorView {
                     EventKind::Escape(d) => format!("Escape  {}B", d.len()),
                 };
                 rows.push(SharedString::from(format!(
-                    "{bar:>4}.{beat}.{tk:>3}  T{ti}  {body}"
+                    "{pos:>11}  T{ti}  {body}"
                 )));
             }
         }
@@ -973,7 +971,9 @@ impl EditorView {
 
     #[allow(dead_code)]
     fn insert_note(&mut self, tick: u64, key: u8, cx: &mut Context<Self>) {
-        let len = self.snap_ticks().max(self.ppq() as i64 / 4) as u64;
+        let len = self
+            .snap_ticks()
+            .max(self.td().min_grid_ticks() as i64) as u64;
         self.insert_note_len(tick, key, len, cx);
     }
 
@@ -1071,7 +1071,7 @@ impl EditorView {
 
     /// Copy the selection into the note clipboard (`cut` also deletes it).
     fn copy_selected(&mut self, cut: bool, cx: &mut Context<Self>) {
-        let ppq = self.ppq();
+        let min_len = self.td().min_grid_ticks();
         let sel: Vec<Note> = self
             .notes
             .iter()
@@ -1091,7 +1091,7 @@ impl EditorView {
                 key: n.key,
                 len: n
                     .end_tick
-                    .unwrap_or(n.start_tick + ppq / 4)
+                    .unwrap_or(n.start_tick + min_len)
                     .saturating_sub(n.start_tick)
                     .max(1),
                 vel: n.vel,
@@ -1181,7 +1181,7 @@ impl EditorView {
 
     /// Duplicate the selection, tiled immediately after it (Ctrl+D).
     fn duplicate_selected(&mut self, cx: &mut Context<Self>) {
-        let ppq = self.ppq();
+        let min_len = self.td().min_grid_ticks();
         let sel: Vec<Note> = self
             .notes
             .iter()
@@ -1206,7 +1206,7 @@ impl EditorView {
                 key: n.key,
                 len: n
                     .end_tick
-                    .unwrap_or(n.start_tick + ppq / 4)
+                    .unwrap_or(n.start_tick + min_len)
                     .saturating_sub(n.start_tick)
                     .max(1),
                 vel: n.vel,
@@ -1944,11 +1944,12 @@ impl EditorView {
                 .and_then(|(d, _)| sink_of.get(&d).copied())
                 .or_else(|| sink_of.values().next().copied());
             if let Some(s) = click_sink {
-                let ppq = self.ppq();
+                // one click per beat / per second — never a fake-PPQ beat
+                let click = self.td().click_ticks();
                 let end_us = events.iter().map(|e| e.0).max().unwrap_or(0);
                 let mut beat = 0u64;
                 loop {
-                    let us = self.doc(|d| d.tempo_map.tick_to_us(beat * ppq));
+                    let us = self.doc(|d| d.tempo_map.tick_to_us(beat * click));
                     if us > end_us {
                         break;
                     }
@@ -2052,9 +2053,9 @@ impl EditorView {
         }
         let buf = std::sync::Arc::new(Mutex::new(Vec::new()));
         let buf2 = buf.clone();
-        // optional one-bar count-in: capture starts after it elapses
+        // optional count-in: one bar for metrical, one second for SMPTE
         let cin_us = if self.count_in {
-            self.doc(|d| d.tempo_map.tick_to_us(self.ppq() * 4))
+            self.doc(|d| d.tempo_map.tick_to_us(self.td().bar_ticks()))
         } else {
             0
         };
@@ -2428,7 +2429,10 @@ impl EditorView {
             .find(|n| {
                 n.key as i32 == key
                     && tick >= n.start_tick as i64
-                    && tick <= n.end_tick.unwrap_or(n.start_tick + self.ppq() / 4) as i64
+                    && tick
+                        <= n.end_tick
+                            .unwrap_or(n.start_tick + self.td().min_grid_ticks())
+                            as i64
             })
             .cloned()
     }

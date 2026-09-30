@@ -566,3 +566,90 @@ fn smpte_tempo_map_uses_frames_not_ppq() {
     assert_eq!(d.tempo_map.tick_to_us(1500), 500_000);
     assert_eq!(d.tempo_map.us_to_tick(1_000_000), 3000);
 }
+
+// ---- SMPTE UI timing: every frame rate the SMF spec defines ----
+
+/// A real SMPTE-division SMF file as parsed bytes — fixture coverage for
+/// 24/25/29.97(-29)/30 fps, all representable in the format.
+fn smpte_doc(fps: u8, tpf: u8) -> Document {
+    let track = smf_core::Track {
+        // write() appends End-of-Track itself
+        events: vec![chan(0, 0x90, 60, 100), chan(10_000, 0x80, 60, 40)],
+    };
+    let bytes = smf_core::write(
+        1,
+        Division::Smpte {
+            fps,
+            ticks_per_frame: tpf,
+        },
+        &[track],
+        smf_core::WriteOptions::default(),
+    );
+    let f = smf_core::parse(&bytes).unwrap();
+    assert_eq!(
+        f.division,
+        Division::Smpte {
+            fps,
+            ticks_per_frame: tpf
+        },
+        "fixture must actually carry the SMPTE division"
+    );
+    Document::from_file(f)
+}
+
+#[test]
+fn smpte_files_report_timecode_positions_not_fake_bars() {
+    for (fps, tpf) in [(24u8, 100u8), (25, 40), (29, 100), (30, 100)] {
+        let d = smpte_doc(fps, tpf);
+        let td = d.time_display();
+        assert!(td.is_smpte(), "fps {fps} must be a SMPTE UI timing mode");
+        assert_eq!(d.tempo_map.ppq(), None, "SMPTE has no quarter note");
+        // the coarse grid is one *displayed* second (nominal frames for
+        // the -29 drop division), never 4*480 invented beats — and the
+        // position label at that boundary is a round timecode second
+        let sec = td.bar_ticks();
+        assert_eq!(sec, td.snap_base_ticks(), "fps {fps}");
+        assert_eq!(td.format_tick(sec), "00:00:01.00", "fps {fps}");
+        // round trip keeps the division and event ticks byte-exact
+        let bytes = d.serialize(smf_core::WriteOptions::default());
+        let re = smf_core::parse(&bytes).unwrap();
+        assert_eq!(
+            re.division,
+            Division::Smpte {
+                fps,
+                ticks_per_frame: tpf
+            },
+            "fps {fps} division must round-trip"
+        );
+        assert_eq!(re.tracks[0].events.len(), 3);
+    }
+}
+
+#[test]
+fn smpte_time_and_positions_round_trip() {
+    // 25fps * 40tpf = 1000 ticks/s — the classic PAL fixture
+    let d = smpte_doc(25, 40);
+    assert_eq!(d.tempo_map.tick_to_us(1000), 1_000_000);
+    assert_eq!(d.tempo_map.us_to_tick(1_500_000), 1500);
+    let td = d.time_display();
+    assert_eq!(td.format_tick(0), "00:00:00.00");
+    assert_eq!(td.format_tick(1000), "00:00:01.00");
+    // 308 frames = 12s + 8 frames; +20 ticks of sub-frame remainder
+    assert_eq!(td.format_tick(12_320), "00:00:12.08");
+    assert_eq!(td.format_tick(12_340), "00:00:12.08+20");
+    // quantize/small-step quanta are the frame, not a 16th of 480
+    assert_eq!(td.min_grid_ticks(), 40);
+    assert_eq!(td.nudge_ticks(), 40);
+}
+
+#[test]
+fn smpte_drop_frame_boundary_from_file() {
+    // -29 division = 29.97 drop-frame; numbering verified against the
+    // file-level TimeDisplay the UI renders
+    let d = smpte_doc(29, 100);
+    let td = d.time_display();
+    assert_eq!(td.badge(), "29.97df");
+    assert_eq!(td.format_tick(179_900), "00:00:59.29");
+    assert_eq!(td.format_tick(180_000), "00:01:00.02");
+    assert_eq!(td.format_tick(1_798_200), "00:10:00.00");
+}
