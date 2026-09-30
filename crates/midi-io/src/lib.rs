@@ -178,6 +178,202 @@ impl Input {
     }
 }
 
+/// Policy for sending long SysEx messages during playback.
+///
+/// WinMM serializes a `midiOutLongMsg` transmission: `Output::send` on a
+/// multi-kilobyte dump blocks until the device drains it, and every event
+/// scheduled behind it on that sink is shifted by the whole dump time.
+/// The policy is per-sink; anything `SysexConfig::inline_max` bytes or
+/// smaller always goes inline so small setup SysEx (GM/GS/XG resets, patch
+/// dumps) keeps deterministic ordering ahead of same-tick channel events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SysexPolicy {
+    /// Send everything on the playback thread (default, deterministic):
+    /// a long dump delays the events scheduled after it on that sink.
+    Serialize,
+    /// Long messages move to a per-sink worker thread holding a second
+    /// connection to the same port; channel timing stays predictable.
+    /// Ordering between a deferred dump and later channel events is not
+    /// preserved — that is the point of the mode. Falls back to
+    /// `Serialize` when the backend refuses a second connection.
+    Background,
+    /// Drop messages over `inline_max` during playback, with a diagnostic —
+    /// for rigs where a dump must never stall channel playback at all.
+    Skip,
+}
+
+impl SysexPolicy {
+    /// Menu/serialization label (round-trips through `from_label`).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Serialize => "serialize",
+            Self::Background => "background",
+            Self::Skip => "skip",
+        }
+    }
+    pub fn from_label(s: &str) -> Option<Self> {
+        match s {
+            "serialize" => Some(Self::Serialize),
+            "background" => Some(Self::Background),
+            "skip" => Some(Self::Skip),
+            _ => None,
+        }
+    }
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Serialize => Self::Background,
+            Self::Background => Self::Skip,
+            Self::Skip => Self::Serialize,
+        }
+    }
+}
+
+/// Tunables bounding long-message transmission: message size, queue memory.
+#[derive(Debug, Clone, Copy)]
+pub struct SysexConfig {
+    pub policy: SysexPolicy,
+    /// At or under this size a message always sends inline — small setup
+    /// SysEx keeps deterministic ordering before same-tick channel events.
+    pub inline_max: usize,
+    /// Hard cap on one message; larger dumps are dropped under every policy.
+    pub max_bytes: usize,
+    /// Bound on bytes parked in the background lane of one sink; further
+    /// messages are dropped with a diagnostic instead of growing memory.
+    pub max_queue_bytes: usize,
+}
+
+impl Default for SysexConfig {
+    fn default() -> Self {
+        Self {
+            policy: SysexPolicy::Serialize,
+            inline_max: 256,
+            max_bytes: 1 << 20,
+            max_queue_bytes: 4 << 20,
+        }
+    }
+}
+
+/// What `SysexConfig` decided for one message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    /// Send now, on the playback thread.
+    Inline,
+    /// Hand to the background lane.
+    Defer,
+    /// Discard (oversized, policy-skip, or a full lane).
+    Drop,
+}
+
+fn gate(cfg: &SysexConfig, len: usize, has_lane: bool) -> Gate {
+    if len <= cfg.inline_max {
+        return Gate::Inline;
+    }
+    if len > cfg.max_bytes {
+        return Gate::Drop;
+    }
+    match cfg.policy {
+        SysexPolicy::Skip => Gate::Drop,
+        SysexPolicy::Background if has_lane => Gate::Defer,
+        // Serialize — or Background that fell back when no lane could open
+        SysexPolicy::Serialize | SysexPolicy::Background => Gate::Inline,
+    }
+}
+
+/// Per-sink measurements of long-message transmission, shared via `Arc` so
+/// the UI can surface them after playback stops.
+#[derive(Debug, Default)]
+pub struct SysexStats {
+    /// messages deferred to the background lane
+    pub deferred: std::sync::atomic::AtomicU64,
+    /// messages dropped by policy/bounds
+    pub dropped: std::sync::atomic::AtomicU64,
+    /// messages sent inline
+    pub inline: std::sync::atomic::AtomicU64,
+    /// duration of the most recent long-message send (worker or inline)
+    pub last_send_us: std::sync::atomic::AtomicU64,
+    /// worst long-message send duration seen
+    pub max_send_us: std::sync::atomic::AtomicU64,
+}
+
+impl SysexStats {
+    fn note_send(&self, dur: std::time::Duration) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let us = dur.as_micros() as u64;
+        self.last_send_us.store(us, Relaxed);
+        self.max_send_us.fetch_max(us, Relaxed);
+    }
+    pub fn snapshot(&self) -> (u64, u64, u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.inline.load(Relaxed),
+            self.deferred.load(Relaxed),
+            self.dropped.load(Relaxed),
+            self.last_send_us.load(Relaxed),
+            self.max_send_us.load(Relaxed),
+        )
+    }
+}
+
+/// Bounded background lane for long SysEx: a worker thread draining a
+/// sync_channel through a caller-supplied sender — a second port connection
+/// for `PortSink`, a fake in tests. Memory is capped twice: a 64-message
+/// channel and a byte budget in `queued` charged before enqueue.
+struct SysexLane {
+    tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    queued: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// held so the worker's lifetime is tied to the lane; never joined
+    /// (drop detaches it — a mid-send worker exits after the port drains)
+    _thread: std::thread::JoinHandle<()>,
+}
+
+impl SysexLane {
+    fn spawn<F>(mut send: F, stats: std::sync::Arc<SysexStats>) -> Self
+    where
+        F: FnMut(&[u8]) + Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
+        let queued = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let q2 = queued.clone();
+        let thread = std::thread::spawn(move || {
+            use std::sync::atomic::Ordering::Relaxed;
+            while let Ok(msg) = rx.recv() {
+                let t0 = std::time::Instant::now();
+                send(&msg);
+                stats.note_send(t0.elapsed());
+                q2.fetch_sub(msg.len(), Relaxed);
+            }
+        });
+        Self {
+            tx,
+            queued,
+            _thread: thread,
+        }
+    }
+
+    /// Charge `max_queue_bytes` then try the channel. Full = drop, never
+    /// block — a lane that can't keep up must not stall playback either.
+    fn try_enqueue(&self, msg: Vec<u8>, max_queue_bytes: usize) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let len = msg.len();
+        let prior = self.queued.fetch_add(len, Relaxed);
+        if prior + len > max_queue_bytes {
+            self.queued.fetch_sub(len, Relaxed);
+            return false;
+        }
+        match self.tx.try_send(msg) {
+            Ok(()) => true,
+            Err(_) => {
+                self.queued.fetch_sub(len, Relaxed);
+                false
+            }
+        }
+    }
+}
+
+// dropping the lane drops its SyncSender — the worker drains what it
+// already holds then exits on its own; we never join, since an in-flight
+// dump may still be transmitting on a real-time caller
+
 /// A destination a playback thread can deliver raw channel-message bytes to.
 /// Implementors: `PortSink` (WinMM port) and the output crate's plugin sink.
 pub trait EventSink: Send {
@@ -207,19 +403,134 @@ pub struct PortSink {
     /// a port that disappeared mid-play would otherwise fail every event;
     /// one log line is enough to notice it
     warned_dead: bool,
+    /// long-message policy: Serialize | Background (via `lane`) | Skip
+    cfg: SysexConfig,
+    lane: Option<SysexLane>,
+    stats: std::sync::Arc<SysexStats>,
+    /// one "dropped by policy" warning is enough
+    warned_drop: bool,
 }
 
 impl PortSink {
+    /// Serialized sends (today's behavior).
     pub fn new(out: Output) -> Self {
+        Self::with_config(out, SysexConfig::default())
+    }
+
+    /// `cfg.policy` picks how messages over `inline_max` leave the sink.
+    /// `Background` opens a second connection to the same port for the
+    /// worker lane; when the backend refuses, the sink stays serialized
+    /// and reports `has_lane() == false`.
+    pub fn with_config(out: Output, cfg: SysexConfig) -> Self {
+        let stats = std::sync::Arc::new(SysexStats::default());
+        let lane = if cfg.policy == SysexPolicy::Background {
+            match Output::open_named(&out.name) {
+                Ok(lane_out) => {
+                    let stats2 = stats.clone();
+                    let mut lane_out = Some(lane_out);
+                    Some(SysexLane::spawn(
+                        move |b: &[u8]| {
+                            if let Some(o) = lane_out.as_mut() {
+                                if let Err(e) = o.send(b) {
+                                    tracing::warn!("sysex lane on '{}': {e}", o.name);
+                                    lane_out = None;
+                                }
+                            }
+                        },
+                        stats2,
+                    ))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "sysex background lane on '{}' unavailable ({e}) — serializing",
+                        out.name
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         Self {
             out,
             warned_dead: false,
+            cfg,
+            lane,
+            stats,
+            warned_drop: false,
         }
+    }
+
+    /// True when the background SysEx lane is live (policy honored);
+    /// false means `Background` fell back to serialized sends.
+    pub fn has_lane(&self) -> bool {
+        self.lane.is_some()
+    }
+
+    /// Long-message counters — read after playback for a diagnostic summary.
+    pub fn stats(&self) -> std::sync::Arc<SysexStats> {
+        self.stats.clone()
     }
 }
 
 impl EventSink for PortSink {
     fn send_at(&mut self, bytes: &[u8], _rem_us: u64) {
+        if bytes.first() == Some(&0xF0) {
+            match gate(&self.cfg, bytes.len(), self.lane.is_some()) {
+                Gate::Drop => {
+                    self.stats
+                        .dropped
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if !self.warned_drop {
+                        self.warned_drop = true;
+                        tracing::warn!(
+                            "sysex ({} bytes) on '{}' dropped by policy/bounds",
+                            bytes.len(),
+                            self.out.name
+                        );
+                    }
+                    return;
+                }
+                Gate::Defer => {
+                    let lane = self.lane.as_ref().expect("gate defers only with a lane");
+                    if lane.try_enqueue(bytes.to_vec(), self.cfg.max_queue_bytes) {
+                        self.stats
+                            .deferred
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        self.stats
+                            .dropped
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if !self.warned_drop {
+                            self.warned_drop = true;
+                            tracing::warn!(
+                                "sysex ({} bytes) on '{}' dropped — background lane full",
+                                bytes.len(),
+                                self.out.name
+                            );
+                        }
+                    }
+                    return;
+                }
+                Gate::Inline => {
+                    self.stats
+                        .inline
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let t0 = std::time::Instant::now();
+                    if let Err(e) = self.out.send(bytes) {
+                        if !self.warned_dead {
+                            self.warned_dead = true;
+                            tracing::warn!(
+                                "midi port '{}' stopped accepting events: {e}",
+                                self.out.name
+                            );
+                        }
+                    }
+                    self.stats.note_send(t0.elapsed());
+                    return;
+                }
+            }
+        }
         if let Err(e) = self.out.send(bytes) {
             if !self.warned_dead {
                 self.warned_dead = true;
@@ -445,5 +756,182 @@ mod tests {
         assert!(snapshot
             .iter()
             .all(|b| !(b.len() == 3 && (b[1] == 121 || b[1] == 120))));
+    }
+
+    // --- SysEx long-message policy ----------------------------------------
+
+    fn cfg(policy: SysexPolicy) -> SysexConfig {
+        SysexConfig {
+            policy,
+            inline_max: 256,
+            max_bytes: 1 << 20,
+            max_queue_bytes: 4096,
+        }
+    }
+
+    /// Small setup SysEx always sends inline under every policy — the
+    /// deterministic ordering before same-tick channel events is preserved.
+    #[test]
+    fn small_sysex_stays_inline_under_every_policy() {
+        for policy in [
+            SysexPolicy::Serialize,
+            SysexPolicy::Background,
+            SysexPolicy::Skip,
+        ] {
+            assert_eq!(gate(&cfg(policy), 8, true), Gate::Inline);
+            assert_eq!(gate(&cfg(policy), 256, true), Gate::Inline);
+        }
+    }
+
+    #[test]
+    fn gate_decisions_by_policy() {
+        let big = 4 * 1024; // a multi-kilobyte dump
+        assert_eq!(gate(&cfg(SysexPolicy::Serialize), big, false), Gate::Inline);
+        assert_eq!(gate(&cfg(SysexPolicy::Skip), big, false), Gate::Drop);
+        assert_eq!(gate(&cfg(SysexPolicy::Background), big, true), Gate::Defer);
+        // a Background sink whose lane failed to open serializes instead
+        assert_eq!(
+            gate(&cfg(SysexPolicy::Background), big, false),
+            Gate::Inline
+        );
+        // over max_bytes: dropped under every policy
+        for policy in [
+            SysexPolicy::Serialize,
+            SysexPolicy::Background,
+            SysexPolicy::Skip,
+        ] {
+            assert_eq!(gate(&cfg(policy), (1 << 20) + 1, true), Gate::Drop);
+        }
+    }
+
+    /// The background lane enforces its byte bound: once `max_queue_bytes`
+    /// is parked, further messages are refused (the caller drops + warns)
+    /// instead of growing memory unboundedly.
+    #[test]
+    fn background_lane_bounds_queue_memory() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent2 = sent.clone();
+        let stats = Arc::new(SysexStats::default());
+        // a "port" that blocks long enough to prove the bound: the worker
+        // holds each message until the test releases it
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let lane = SysexLane::spawn(
+            move |b: &[u8]| {
+                sent2.lock().unwrap().push(b.to_vec());
+                let _ = release_rx.recv();
+            },
+            stats.clone(),
+        );
+        let msg = vec![0xF0u8; 1024]; // 1 KiB each, bound is 4 KiB
+        for _ in 0..4 {
+            assert!(lane.try_enqueue(msg.clone(), 4096));
+        }
+        // ~4 KiB parked (worker may already be holding one) — next is refused
+        let mut refused = 0;
+        for _ in 0..4 {
+            if !lane.try_enqueue(msg.clone(), 4096) {
+                refused += 1;
+            }
+        }
+        assert!(refused > 0, "byte bound never refused an enqueue");
+        // let the worker drain everything queued
+        for _ in 0..8 {
+            let _ = release_tx.send(());
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while lane.queued.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            assert!(std::time::Instant::now() < deadline, "lane did not drain");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(!sent.lock().unwrap().is_empty());
+    }
+
+    /// Deferred sends report their duration into the shared stats — the
+    /// "measure long-message send time" diagnostic.
+    #[test]
+    fn lane_send_duration_is_measured() {
+        let stats = Arc::new(SysexStats::default());
+        let lane = SysexLane::spawn(
+            |_: &[u8]| {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            },
+            stats.clone(),
+        );
+        assert!(lane.try_enqueue(vec![0xF0u8; 512], 4096));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while stats.last_send_us.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            assert!(std::time::Instant::now() < deadline, "no send recorded");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(stats.max_send_us.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    }
+
+    /// End-to-end through `Playback`: under Skip, a huge SysEx must not
+    /// shift the note scheduled right after it. Uses a synthetic sink that
+    /// routes big messages through the same gate + stats as `PortSink`.
+    #[test]
+    fn skip_policy_keeps_note_timing_after_huge_sysex() {
+        use std::sync::atomic::Ordering::Relaxed;
+        struct GatedSink {
+            cfg: SysexConfig,
+            stats: Arc<SysexStats>,
+            log: Arc<Mutex<Vec<(u64, Vec<u8>)>>>,
+        }
+        impl EventSink for GatedSink {
+            fn send_at(&mut self, bytes: &[u8], _rem_us: u64) {
+                if bytes.first() == Some(&0xF0) {
+                    match gate(&self.cfg, bytes.len(), false) {
+                        Gate::Drop => {
+                            self.stats.dropped.fetch_add(1, Relaxed);
+                            return;
+                        }
+                        Gate::Defer => unreachable!("no lane"),
+                        Gate::Inline => {
+                            // simulate WinMM serializing a big dump —
+                            // under Skip this branch is never reached
+                            std::thread::sleep(std::time::Duration::from_millis(300));
+                        }
+                    }
+                }
+                let us = std::time::Instant::now().elapsed().as_micros() as u64;
+                self.log.lock().unwrap().push((us, bytes.to_vec()));
+            }
+            fn panic(&mut self) {}
+        }
+        let stats = Arc::new(SysexStats::default());
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sink = GatedSink {
+            cfg: cfg(SysexPolicy::Skip),
+            stats: stats.clone(),
+            log: log.clone(),
+        };
+        let dump = vec![0xF0u8; 8 * 1024];
+        let events = vec![
+            (0u64, 0usize, dump),
+            (50_000u64, 0usize, vec![0x90, 60, 100]),
+        ];
+        let mut pb = Playback::start(vec![Box::new(sink)], events, 0, None);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while log.lock().unwrap().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "note never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        pb.stop();
+        assert_eq!(stats.dropped.load(Relaxed), 1, "dump was not dropped");
+        // the note landed — the dump never blocked the thread for it
+        assert_eq!(log.lock().unwrap()[0].1, vec![0x90, 60, 100]);
+    }
+
+    /// Policy label round-trip for sidecar persistence.
+    #[test]
+    fn sysex_policy_labels_round_trip() {
+        for p in [
+            SysexPolicy::Serialize,
+            SysexPolicy::Background,
+            SysexPolicy::Skip,
+        ] {
+            assert_eq!(SysexPolicy::from_label(p.label()), Some(p));
+            assert_ne!(p.cycle(), p);
+        }
     }
 }

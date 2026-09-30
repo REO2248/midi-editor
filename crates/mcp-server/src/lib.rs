@@ -173,6 +173,9 @@ pub struct Shared {
     /// the GUI drains `transport_req` and repaints on `gui_notify`; false in
     /// standalone `mcp-bridge --file` mode (feature-detected via editor_info)
     pub gui_attached: bool,
+    /// how long SysEx dumps leave a MIDI port sink during playback
+    /// (serialize / background lane / skip) — `midi_io::SysexPolicy`
+    pub sysex_policy: midi_io::SysexPolicy,
     /// drained by the GUI watcher
     pub transport_req: Vec<TransportReq>,
     /// effective security posture of the MCP transport serving this doc
@@ -305,6 +308,7 @@ impl Shared {
             loop_enabled: false,
             chase_sysex: false,
             gui_attached: false,
+            sysex_policy: midi_io::SysexPolicy::Serialize,
             transport_req: Vec::new(),
             mcp_security: SecurityReport::stdio(),
             batch: None,
