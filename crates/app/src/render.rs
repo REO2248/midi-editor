@@ -742,7 +742,6 @@ impl Render for EditorView {
                     .children({
                         let events = self.events.clone();
                         let sel_event = self.sel_event;
-                        let view_weak = cx.weak_entity();
                         let start = self.ev_first.min(events.len());
                         // fixed 18px rows: a 120-row window covers any panel
                         // height; uniform_list children can't receive input in
@@ -753,7 +752,6 @@ impl Render for EditorView {
                             .map(|(ri, (id, text))| {
                                 let (id, text) = (*id, text.clone());
                                 let sel = id != 0 && sel_event == Some(id);
-                                let weak = view_weak.clone();
                                 div()
                                     .id(("ev", start + ri))
                                     .h(px(18.0))
@@ -765,23 +763,21 @@ impl Render for EditorView {
                                     .cursor_pointer()
                                     .on_mouse_down(
                                         MouseButton::Left,
-                                        move |_e, _w, app| {
+                                        cx.listener(move |v, _e, w, cx| {
                                             // click selects the event for
-                                            // delete / value nudge (-/=)
-                                            let _ = weak.update_in(app, |v, w, cx| {
-                                                // clicking a non-focusable
-                                                // row blurs the editor —
-                                                // refocus so -/=/Del work
-                                                w.focus(&v.focus.clone(), cx);
-                                                v.sel_event = if id == 0 || v.sel_event == Some(id)
-                                                {
-                                                    None
-                                                } else {
-                                                    Some(id)
-                                                };
-                                                cx.notify();
-                                            });
-                                        },
+                                            // delete / value nudge (-/=);
+                                            // clicking a non-focusable row
+                                            // blurs the editor — refocus so
+                                            // the keys still reach it
+                                            w.focus(&v.focus.clone(), cx);
+                                            v.sel_event = if id == 0 || v.sel_event == Some(id)
+                                            {
+                                                None
+                                            } else {
+                                                Some(id)
+                                            };
+                                            cx.notify();
+                                        }),
                                     )
                                     .child(text)
                             })
@@ -2909,8 +2905,9 @@ impl Render for EditorView {
                         cx.notify();
                     }
                     // exact value editing for the event-list selection
-                    (false, false, "-") | (false, true, "_") => this.nudge_sel_event(-1, cx),
-                    (false, false, "=") | (false, true, "+") => this.nudge_sel_event(1, cx),
+                    // shifted -/= arrive as _/+ with shift consumed
+                    (false, false, "-") | (false, false, "_") => this.nudge_sel_event(-1, cx),
+                    (false, false, "=") | (false, false, "+") => this.nudge_sel_event(1, cx),
                     (true, false, "x") => this.copy_selected(true, cx),
                     (true, false, "c") => this.copy_selected(false, cx),
                     (true, false, "v") => this.paste(cx),
@@ -2933,7 +2930,7 @@ impl Render for EditorView {
                     (false, false, "1") => this.set_tool(Tool::Select, cx),
                     (false, false, "2") => this.set_tool(Tool::Draw, cx),
                     (false, false, "3") => this.set_tool(Tool::Erase, cx),
-                    (false, false, " ") => this.toggle_play(cx),
+                    (false, false, " ") | (false, false, "space") => this.toggle_play(cx),
                     _ => {}
                 }
             }))
