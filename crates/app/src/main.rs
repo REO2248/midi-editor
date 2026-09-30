@@ -2197,6 +2197,36 @@ impl EditorView {
         self.doc(|d| d.time_display())
     }
 
+    /// Event id → semantic tag for events that participate in an RPN/NRPN
+    /// write (selector or data entry) or look like stray data entry CCs.
+    fn rpn_row_tags(doc: &Document) -> HashMap<EventId, String> {
+        let mut tags = HashMap::new();
+        for e in doc.rpn_entries() {
+            let label = if e.is_null() {
+                format!("{} null", if e.nrpn { "NRPN" } else { "RPN" })
+            } else if let Some(name) = e.param_name() {
+                format!(
+                    "{} {}.{} {}",
+                    if e.nrpn { "NRPN" } else { "RPN" },
+                    e.param_msb,
+                    e.param_lsb,
+                    name
+                )
+            } else {
+                format!(
+                    "{} {}.{}",
+                    if e.nrpn { "NRPN" } else { "RPN" },
+                    e.param_msb,
+                    e.param_lsb
+                )
+            };
+            for id in e.ids() {
+                tags.insert(id, label.clone());
+            }
+        }
+        tags
+    }
+
     fn build_event_rows(
         &self,
         doc: &Document,
@@ -2204,6 +2234,7 @@ impl EditorView {
         let td = doc.time_display();
         let seq = doc.is_sequential();
         let hint = self.enc_override.or(doc.text_encoding_hint());
+        let rpn_tags = Self::rpn_row_tags(doc);
         let mut rows = Vec::new();
         let mut refs = Vec::new();
         for d in doc.diagnose() {
@@ -2247,7 +2278,29 @@ impl EditorView {
                             0xE0 => "PB     ",
                             _ => "Ch?    ",
                         };
-                        format!("{name} ch{ch:<2} {:>3} {:>3}", data[0], data[1])
+                        let tag = if status & 0xF0 == 0xB0 {
+                            match data[0] {
+                                6 | 38 | 98..=101 => {
+                                    let part = match data[0] {
+                                        6 => "data-msb",
+                                        38 => "data-lsb",
+                                        99 | 101 => "sel-msb",
+                                        _ => "sel-lsb",
+                                    };
+                                    match rpn_tags.get(&e.id) {
+                                        Some(label) => format!("  [{label} {part}]"),
+                                        None if data[0] == 6 || data[0] == 38 => {
+                                            "  [unbound data-entry]".into()
+                                        }
+                                        None => "  [unbound selector]".into(),
+                                    }
+                                }
+                                _ => String::new(),
+                            }
+                        } else {
+                            String::new()
+                        };
+                        format!("{name} ch{ch:<2} {:>3} {:>3}{tag}", data[0], data[1])
                     }
                     EventKind::Meta { meta_type, data } => match *meta_type {
                         0x03 => format!("TrkName {}", smf_core::decode_text(data, hint)),
@@ -2682,6 +2735,43 @@ impl EditorView {
         Some(Op::RemoveEvents { track, removed })
     }
 
+    /// Exact edit on the selected event-list row when it belongs to an
+    /// RPN/NRPN entry: data events nudge the entered value (7-bit MSB step,
+    /// 14-bit LSB step); selector events nudge the parameter number. The
+    /// whole write stays in valid selector→data order because only the
+    /// targeted bytes are rewritten.
+    /// Semantic nudge for one event that belongs to an RPN/NRPN write:
+    /// on a selector CC it moves the parameter number; on a data-entry CC
+    /// it moves the written value. `None` when the event isn't in an entry.
+    fn nudge_rpn_ops(sh: &mut Shared, id: EventId, delta: i32) -> Option<(Vec<Op>, String)> {
+        let e = sh.doc.rpn_entry_containing(id)?;
+        if e.sel_ids.contains(&id) {
+            let param = (e.param14() as i32 + delta).clamp(0, 16383) as u16;
+            Some((
+                sh.doc
+                    .update_rpn_param_ops(&e, (param >> 7) as u8, (param & 0x7F) as u8),
+                format!("RPN {}.{}", param >> 7, param & 0x7F),
+            ))
+        } else if e.data_msb_id.is_some() || e.data_lsb_id.is_some() {
+            let v = e.value()?;
+            // 7-bit entries carry the value in data[1] itself; 14-bit
+            // entries split it across CC6 (msb) + CC38 (lsb)
+            let cap = if e.is_14bit() { 16383 } else { 127 };
+            let nv = (v as i32 + delta).clamp(0, cap) as u16;
+            let (msb, lsb) = if e.is_14bit() {
+                ((nv >> 7) as u8, Some((nv & 0x7F) as u8))
+            } else {
+                (nv as u8, None)
+            };
+            Some((
+                sh.doc.update_rpn_value_ops(&e, msb, lsb),
+                format!("RPN = {nv}"),
+            ))
+        } else {
+            Some((Vec::new(), String::new()))
+        }
+    }
+
     fn delete_selected(&mut self, cx: &mut Context<Self>) {
         let mut sh = lock_shared(&self.shared);
         let mut ops = Vec::new();
@@ -2711,6 +2801,28 @@ impl EditorView {
             .chain(self.sel_events.iter().copied())
             .filter(|id| !queued.contains(id))
             .collect();
+        // an event that is part of an RPN/NRPN write deletes the whole
+        // parameter entry — removing a lone selector/data CC would leave
+        // a corrupt half-write in the file
+        let mut entries: Vec<document::RpnEntry> = Vec::new();
+        let mut entry_ids: BTreeSet<EventId> = BTreeSet::new();
+        for id in &extra {
+            if entry_ids.contains(id) {
+                continue;
+            }
+            if let Some(e) = sh.doc.rpn_entry_containing(*id) {
+                entry_ids.extend(e.ids());
+                entries.push(e);
+            }
+        }
+        for e in &entries {
+            ops.extend(sh.doc.remove_rpn_entry_ops(e));
+        }
+        queued.extend(entry_ids.iter().copied());
+        let extra: Vec<EventId> = extra
+            .into_iter()
+            .filter(|id| !queued.contains(id))
+            .collect();
         ops.extend(sh.doc.remove_events_ops(&extra));
         drop(sh);
         if !ops.is_empty() {
@@ -2730,11 +2842,26 @@ impl EditorView {
             return;
         }
         let wanted: BTreeSet<EventId> = self.sel_events.clone();
-        let sh = lock_shared(&self.shared);
+        let mut sh = lock_shared(&self.shared);
         let mut ops = Vec::new();
+        // events inside an RPN/NRPN write take the semantic path: nudging
+        // a selector moves the parameter number, nudging a data-entry CC
+        // rewrites the whole entry coherently. Everything else gets the
+        // plain data-byte nudge.
+        let mut labels = Vec::new();
+        let mut raw: BTreeSet<EventId> = wanted.clone();
+        for id in &wanted {
+            if let Some((eops, lbl)) = Self::nudge_rpn_ops(&mut sh, *id, delta) {
+                ops.extend(eops);
+                if !lbl.is_empty() {
+                    labels.push(lbl);
+                }
+                raw.remove(id);
+            }
+        }
         for (ti, t) in sh.doc.tracks.iter().enumerate() {
             for e in &t.events {
-                if !wanted.contains(&e.id) {
+                if !raw.contains(&e.id) {
                     continue;
                 }
                 let EventKind::Channel { status, .. } = &e.kind else {
@@ -2769,6 +2896,9 @@ impl EditorView {
         drop(sh);
         if !ops.is_empty() {
             self.apply_tx("edit event", ops);
+            if let Some(l) = labels.first() {
+                self.status = l.clone().into();
+            }
         }
         cx.notify();
     }

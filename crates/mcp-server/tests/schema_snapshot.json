@@ -271,6 +271,32 @@
     },
     {
       "deprecated": null,
+      "description": "Semantic view of RPN/NRPN writes: [{track, channel, kind, param_msb, param_lsb, param14, name, tick, data_msb, data_lsb, value, ids}] — raw CC events are unchanged. Args: track?, channel?, kind? (\"rpn\"|\"nrpn\"), param_msb?, param_lsb?.",
+      "input_schema": {
+        "properties": {
+          "channel": {
+            "type": "integer"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "param_lsb": {
+            "type": "integer"
+          },
+          "param_msb": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "get_rpn",
+      "version": 1
+    },
+    {
+      "deprecated": null,
       "description": "Tempo breakpoints: [{tick, us_per_quarter, bpm, cumulative_us}] + ppq (null for SMPTE — fps/ticks_per_frame are reported instead). Format-2 files report per-sequence maps (each track is an independent timeline). Read before editing tempo or converting ticks<->time.",
       "input_schema": {
         "properties": {},
@@ -833,6 +859,44 @@
     },
     {
       "deprecated": null,
+      "description": "Write a full RPN/NRPN sequence in valid order (selector MSB, selector LSB, data MSB, optional data LSB). Args: track, tick, kind? (\"rpn\"|\"nrpn\", default rpn), param_msb, param_lsb (0x7F/0x7F = null reset, no data written), data_msb, data_lsb?, channel?. Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "channel": {
+            "type": "integer"
+          },
+          "data_lsb": {
+            "type": "integer"
+          },
+          "data_msb": {
+            "type": "integer"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "param_lsb": {
+            "type": "integer"
+          },
+          "param_msb": {
+            "type": "integer"
+          },
+          "tick": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "set_rpn",
+      "version": 1
+    },
+    {
+      "deprecated": null,
       "description": "Set/replace tempo at a tick. Args: tick, bpm, track? (default 0 = conductor; for format-2 files pass the sequence's track). Optional base_revision.",
       "input_schema": {
         "properties": {
@@ -1068,6 +1132,52 @@
         "type": "object"
       },
       "name": "undo",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Retarget an existing RPN/NRPN entry to a new parameter number (selectors rewritten, data preserved). Args: id, param_msb, param_lsb. Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "param_lsb": {
+            "type": "integer"
+          },
+          "param_msb": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "update_rpn_param",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Rewrite the data-entry of an existing RPN/NRPN entry (selector order preserved). Args: id (any event id from get_rpn ids), data_msb, data_lsb? (omit = 7-bit, drops the LSB event). Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "data_lsb": {
+            "type": "integer"
+          },
+          "data_msb": {
+            "type": "integer"
+          },
+          "id": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "update_rpn_value",
       "version": 1
     }
   ]
