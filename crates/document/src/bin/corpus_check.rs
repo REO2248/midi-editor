@@ -32,7 +32,8 @@ fn main() {
                 continue;
             }
         };
-        match smf_core::parse(&bytes) {
+        // trusted corpus input: bypass the hostile-input safety limits
+        match smf_core::parse_with_limits(&bytes, &smf_core::Limits::unlimited()) {
             Ok(file) => {
                 let opts = smf_core::WriteOptions::default();
                 let out = smf_core::write(file.format, file.division, &file.tracks, opts);
@@ -53,7 +54,7 @@ fn main() {
                 } else {
                     // non-clean input is allowed to normalize — but it must be
                     // a fixpoint: writing the written file must be stable.
-                    let out2 = match smf_core::parse(&out) {
+                    let out2 = match smf_core::parse_with_limits(&out, &smf_core::Limits::unlimited()) {
                         Ok(f2) => smf_core::write(f2.format, f2.division, &f2.tracks, opts),
                         Err(e) => {
                             failed += 1;

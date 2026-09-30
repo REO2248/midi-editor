@@ -2492,7 +2492,8 @@ impl EditorView {
 
 fn load_document(path: &std::path::Path) -> Result<(Document, Vec<String>), String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    let file = smf_core::parse(&bytes).map_err(|e| e.to_string())?;
+    let file = smf_core::parse_with_limits(&bytes, &smf_core::Limits::from_env())
+        .map_err(|e| e.to_string())?;
     let warnings = file.warnings.clone();
     Ok((Document::from_file(file), warnings))
 }

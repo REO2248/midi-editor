@@ -60,7 +60,8 @@ impl ServerHandler for ForwardService {
 
 fn load_file(path: &std::path::Path) -> anyhow::Result<SharedDoc> {
     let bytes = std::fs::read(path)?;
-    let file = smf_core::parse(&bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let file = smf_core::parse_with_limits(&bytes, &smf_core::Limits::from_env())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut sh = Shared::new(document::Document::from_file(file));
     sh.path = Some(path.to_path_buf());
     Ok(Arc::new(Mutex::new(sh)))
