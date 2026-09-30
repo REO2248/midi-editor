@@ -1717,7 +1717,6 @@ async fn loopback_guard(
 /// defaults. Split out of [`serve_http`] so tests can mount it on an
 /// ephemeral port.
 pub fn mcp_http_router(doc: SharedDoc, addr: &str, token: Option<String>) -> axum::Router {
->>>>>>> ab22ef2 (mcp: validate Host/Origin on HTTP endpoint + report security mode in diagnostics)
     use axum::middleware::Next;
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::{
