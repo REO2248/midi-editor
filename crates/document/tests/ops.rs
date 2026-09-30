@@ -137,8 +137,14 @@ fn note_off_velocity_and_form_are_captured() {
     ]]);
     let ns = notes_on(&d, 0);
     assert_eq!(ns.len(), 2);
-    assert!(!ns[0].off_via_on && ns[0].off_vel == 42, "0x80 off → release 42");
-    assert!(ns[1].off_via_on && ns[1].off_vel == 0, "0x90-vel0 off → form kept");
+    assert!(
+        !ns[0].off_via_on && ns[0].off_vel == 42,
+        "0x80 off → release 42"
+    );
+    assert!(
+        ns[1].off_via_on && ns[1].off_vel == 0,
+        "0x90-vel0 off → form kept"
+    );
     // dangling note-on reports a zero/0x80 default — nothing stored
     let d = doc(vec![vec![chan(0, 0x90, 60, 100)]]);
     assert!(notes_on(&d, 0)[0].off_id.is_none());
@@ -860,8 +866,16 @@ fn smpte_drop_frame_boundary_from_file() {
 #[test]
 fn format2_is_detected_and_roundtrips() {
     let d = seq_doc(vec![
-        vec![tempo(0, 500_000), chan(0, 0x90, 60, 100), chan(480, 0x80, 60, 0)],
-        vec![tempo(0, 250_000), chan(0, 0x90, 64, 100), chan(960, 0x80, 64, 0)],
+        vec![
+            tempo(0, 500_000),
+            chan(0, 0x90, 60, 100),
+            chan(480, 0x80, 60, 0),
+        ],
+        vec![
+            tempo(0, 250_000),
+            chan(0, 0x90, 64, 100),
+            chan(960, 0x80, 64, 0),
+        ],
     ]);
     assert!(d.is_sequential());
     assert_eq!(d.tracks.len(), 2);
@@ -871,7 +885,11 @@ fn format2_is_detected_and_roundtrips() {
     assert_eq!(re.format, 2);
     assert_eq!(re.tracks.len(), 2);
     let t0_ticks: Vec<u64> = re.tracks[0].events.iter().map(|e| e.tick).collect();
-    assert_eq!(t0_ticks, vec![0, 0, 480, 480], "sequence A: tempo,on,off,eot");
+    assert_eq!(
+        t0_ticks,
+        vec![0, 0, 480, 480],
+        "sequence A: tempo,on,off,eot"
+    );
 }
 
 #[test]
@@ -901,10 +919,7 @@ fn format2_tempo_maps_are_per_sequence() {
     assert_eq!(d.tempo_map_for(0).tick_to_us(480), 500_000);
     assert_eq!(d.tempo_map_for(1).tick_to_us(480), 250_000);
     // non-sequential docs keep the shared conductor map for every track
-    let flat = doc(vec![
-        vec![tempo(0, 500_000)],
-        vec![chan(0, 0x90, 60, 100)],
-    ]);
+    let flat = doc(vec![vec![tempo(0, 500_000)], vec![chan(0, 0x90, 60, 100)]]);
     assert!(!flat.is_sequential());
     assert_eq!(flat.tempo_map_for(1).tick_to_us(480), 500_000);
 }
@@ -993,16 +1008,14 @@ fn overlaps_are_scoped_per_channel_and_key() {
     // channel — neither lane overlaps
     let d = doc(vec![vec![
         chan(0, 0x90, 60, 100),
-        chan(50, 0x91, 60, 90),  // ch1 key60 — different channel
-        chan(60, 0x90, 64, 90),  // ch0 key64 — different key
+        chan(50, 0x91, 60, 90), // ch1 key60 — different channel
+        chan(60, 0x90, 64, 90), // ch0 key64 — different key
         chan(200, 0x80, 60, 0),
         chan(200, 0x81, 60, 0),
         chan(200, 0x80, 64, 0),
     ]]);
     assert!(
-        d.diagnose()
-            .iter()
-            .all(|d| d.code != "overlapping-noteon"),
+        d.diagnose().iter().all(|d| d.code != "overlapping-noteon"),
         "cross-channel/cross-key ons must not be flagged"
     );
     assert_eq!(notes_on(&d, 0).len(), 3);
@@ -1021,7 +1034,10 @@ fn stacked_duplicates_diagnose_each_extra_on() {
     ]]);
     let diags = d.diagnose();
     assert_eq!(
-        diags.iter().filter(|d| d.code == "overlapping-noteon").count(),
+        diags
+            .iter()
+            .filter(|d| d.code == "overlapping-noteon")
+            .count(),
         2,
         "2nd and 3rd stacked ons each flag"
     );
@@ -1086,9 +1102,7 @@ fn overlapping_ons_are_preserved_not_normalized() {
     let ops = d.fix_ops(&[]);
     apply(&mut d, ops);
     assert!(
-        d.diagnose()
-            .iter()
-            .any(|d| d.code == "overlapping-noteon"),
+        d.diagnose().iter().any(|d| d.code == "overlapping-noteon"),
         "overlap diag survives normalize"
     );
     assert_eq!(
@@ -1106,8 +1120,5 @@ fn overlapping_ons_are_preserved_not_normalized() {
     });
     let d2 = Document::from_file(smf_core::parse(&bytes).unwrap());
     assert_eq!(notes_on(&d2, 0).len(), 2);
-    assert!(d2
-        .diagnose()
-        .iter()
-        .any(|d| d.code == "overlapping-noteon"));
+    assert!(d2.diagnose().iter().any(|d| d.code == "overlapping-noteon"));
 }
