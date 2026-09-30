@@ -732,6 +732,57 @@ fn tool_defs() -> Vec<(&'static str, Tool)> {
             ),
         ),
         (
+            "get_rpn",
+            tool(
+                "get_rpn",
+                "Semantic view of RPN/NRPN writes: [{track, channel, kind, param_msb, param_lsb, param14, name, tick, data_msb, data_lsb, value, ids}] — raw CC events are unchanged. Args: track?, channel?, kind? (\"rpn\"|\"nrpn\"), param_msb?, param_lsb?.",
+                object_schema(serde_json::json!({
+                    "track": {"type": "integer"}, "channel": {"type": "integer"},
+                    "kind": {"type": "string"},
+                    "param_msb": {"type": "integer"}, "param_lsb": {"type": "integer"},
+                })),
+            ),
+        ),
+        (
+            "set_rpn",
+            tool(
+                "set_rpn",
+                "Write a full RPN/NRPN sequence in valid order (selector MSB, selector LSB, data MSB, optional data LSB). Args: track, tick, kind? (\"rpn\"|\"nrpn\", default rpn), param_msb, param_lsb (0x7F/0x7F = null reset, no data written), data_msb, data_lsb?, channel?. Optional base_revision.",
+                object_schema(serde_json::json!({
+                    "track": {"type": "integer"}, "tick": {"type": "integer"},
+                    "kind": {"type": "string"},
+                    "param_msb": {"type": "integer"}, "param_lsb": {"type": "integer"},
+                    "data_msb": {"type": "integer"}, "data_lsb": {"type": "integer"},
+                    "channel": {"type": "integer"},
+                    "base_revision": {"type": "integer"},
+                })),
+            ),
+        ),
+        (
+            "update_rpn_value",
+            tool(
+                "update_rpn_value",
+                "Rewrite the data-entry of an existing RPN/NRPN entry (selector order preserved). Args: id (any event id from get_rpn ids), data_msb, data_lsb? (omit = 7-bit, drops the LSB event). Optional base_revision.",
+                object_schema(serde_json::json!({
+                    "id": {"type": "integer"},
+                    "data_msb": {"type": "integer"}, "data_lsb": {"type": "integer"},
+                    "base_revision": {"type": "integer"},
+                })),
+            ),
+        ),
+        (
+            "update_rpn_param",
+            tool(
+                "update_rpn_param",
+                "Retarget an existing RPN/NRPN entry to a new parameter number (selectors rewritten, data preserved). Args: id, param_msb, param_lsb. Optional base_revision.",
+                object_schema(serde_json::json!({
+                    "id": {"type": "integer"},
+                    "param_msb": {"type": "integer"}, "param_lsb": {"type": "integer"},
+                    "base_revision": {"type": "integer"},
+                })),
+            ),
+        ),
+        (
             "set_tempo",
             tool(
                 "set_tempo",
@@ -1291,6 +1342,109 @@ fn dispatch(
             );
             apply_ops(&mut sh, "pitch bend", ops)
         }
+        "get_rpn" => {
+            let track = args["track"].as_u64().map(|v| v as usize);
+            let chan = args["channel"].as_u64().map(|v| (v.clamp(1, 16) - 1) as u8);
+            let kind = args["kind"].as_str();
+            let pm = args["param_msb"].as_u64().map(|v| v as u8);
+            let pl = args["param_lsb"].as_u64().map(|v| v as u8);
+            let entries: Vec<_> = sh
+                .doc
+                .rpn_entries()
+                .into_iter()
+                .filter(|e| {
+                    track.is_none_or(|t| t == e.track)
+                        && chan.is_none_or(|c| c == e.channel)
+                        && kind.is_none_or(|k| (k == "nrpn") == e.nrpn)
+                        && pm.is_none_or(|v| v == e.param_msb)
+                        && pl.is_none_or(|v| v == e.param_lsb)
+                })
+                .collect();
+            ok_json(serde_json::json!({
+                "count": entries.len(),
+                "entries": entries.iter().map(|e| serde_json::json!({
+                    "track": e.track, "channel": e.channel + 1,
+                    "kind": if e.nrpn { "nrpn" } else { "rpn" },
+                    "param_msb": e.param_msb, "param_lsb": e.param_lsb,
+                    "param14": e.param14(),
+                    "name": e.param_name(),
+                    "null": e.is_null(),
+                    "tick": e.tick,
+                    "data_msb": e.data_msb, "data_lsb": e.data_lsb,
+                    "value": e.value(), "ids": e.ids(),
+                })).collect::<Vec<_>>(),
+            }))
+        }
+        "set_rpn" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let track = match req_track(&sh, args) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
+            let ch = args["channel"]
+                .as_u64()
+                .map(|c| (c.clamp(1, 16) - 1) as u8)
+                .unwrap_or_else(|| sh.doc.tracks.get(track).map(|t| t.out_channel).unwrap_or(0));
+            let (Some(pm), Some(pl), Some(dm)) = (
+                args["param_msb"].as_u64(),
+                args["param_lsb"].as_u64(),
+                args["data_msb"].as_u64(),
+            ) else {
+                return err_json("param_msb, param_lsb, data_msb required");
+            };
+            let ops = sh.doc.set_rpn_ops(
+                track,
+                args["tick"].as_u64().unwrap_or(0),
+                ch,
+                args["kind"].as_str() == Some("nrpn"),
+                pm as u8,
+                pl as u8,
+                dm as u8,
+                args["data_lsb"].as_u64().map(|v| v as u8),
+            );
+            apply_ops(&mut sh, "set rpn", ops)
+        }
+        "update_rpn_value" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let id = match args["id"].as_u64() {
+                Some(i) => i,
+                None => return err_json("id required"),
+            };
+            let Some(dm) = args["data_msb"].as_u64() else {
+                return err_json("data_msb required");
+            };
+            let Some(entry) = sh.doc.rpn_entry_containing(id) else {
+                return err_json(format!("no RPN/NRPN entry contains event {id}"));
+            };
+            let ops = sh.doc.update_rpn_value_ops(
+                &entry,
+                dm as u8,
+                args["data_lsb"].as_u64().map(|v| v as u8),
+            );
+            apply_ops(&mut sh, "update rpn value", ops)
+        }
+        "update_rpn_param" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let id = match args["id"].as_u64() {
+                Some(i) => i,
+                None => return err_json("id required"),
+            };
+            let (Some(pm), Some(pl)) = (args["param_msb"].as_u64(), args["param_lsb"].as_u64())
+            else {
+                return err_json("param_msb, param_lsb required");
+            };
+            let Some(entry) = sh.doc.rpn_entry_containing(id) else {
+                return err_json(format!("no RPN/NRPN entry contains event {id}"));
+            };
+            let ops = sh.doc.update_rpn_param_ops(&entry, pm as u8, pl as u8);
+            apply_ops(&mut sh, "update rpn param", ops)
+        }
         "set_tempo" => {
             if let Some(r) = check_base(&sh, args) {
                 return r;
@@ -1737,6 +1891,54 @@ mod tests {
             ]}]}),
         );
         assert!(err);
+    }
+
+    #[test]
+    fn rpn_tools_round_trip() {
+        let sh = shared();
+        // canonical write: selector msb, lsb, data msb, data lsb
+        let (err, _) = call(&sh, "set_rpn", json!({
+            "track": 1, "tick": 960, "param_msb": 0, "param_lsb": 0,
+            "data_msb": 12, "data_lsb": 30}));
+        assert!(!err);
+        let (err, v) = call(&sh, "get_rpn", json!({}));
+        assert!(!err && v["count"] == 1);
+        let e = &v["entries"][0];
+        assert_eq!(e["name"], "Pitch Bend Range");
+        assert_eq!(e["value"], (12 << 7) | 30);
+        let id = e["ids"][0].as_u64().unwrap();
+
+        // value rewrite keeps selector order; 7-bit drops the LSB event
+        let (err, _) = call(&sh, "update_rpn_value", json!({"id": id, "data_msb": 5}));
+        assert!(!err);
+        let (err, v) = call(&sh, "get_rpn", json!({}));
+        assert!(!err);
+        assert_eq!(v["entries"][0]["value"], 5);
+        assert!(v["entries"][0]["data_lsb"].is_null());
+
+        // retarget to coarse tuning; then nrpn + null-selector + bad id paths
+        let (err, _) = call(&sh, "update_rpn_param", json!({"id": id, "param_msb": 0, "param_lsb": 2}));
+        assert!(!err);
+        let (err, v) = call(&sh, "get_rpn", json!({"kind": "rpn"}));
+        assert!(!err && v["entries"][0]["name"] == "Coarse Tuning");
+        let (err, _) = call(&sh, "set_rpn", json!({
+            "track": 1, "tick": 1000, "kind": "nrpn",
+            "param_msb": 1, "param_lsb": 2, "data_msb": 9}));
+        assert!(!err);
+        let (err, v) = call(&sh, "get_rpn", json!({"kind": "nrpn"}));
+        assert!(!err && v["count"] == 1 && v["entries"][0]["param14"] == (1 << 7) + 2);
+        let (err, _) = call(&sh, "set_rpn", json!({
+            "track": 1, "tick": 1100, "param_msb": 127, "param_lsb": 127, "data_msb": 0}));
+        assert!(!err);
+        let (err, v) = call(&sh, "get_rpn", json!({}));
+        assert!(!err && v["count"] == 3 && v["entries"][2]["null"] == true);
+        let (err, _) = call(&sh, "update_rpn_value", json!({"id": 9999, "data_msb": 1}));
+        assert!(err);
+        // undo restores prior state
+        let (err, _) = call(&sh, "undo", json!({}));
+        assert!(!err);
+        let (err, v) = call(&sh, "get_rpn", json!({}));
+        assert!(!err && v["count"] == 2);
     }
 
     #[test]

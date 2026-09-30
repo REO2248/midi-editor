@@ -9,7 +9,7 @@
 
 use bytes::Bytes;
 use smf_core::{Division, EventKind};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use thiserror::Error;
 
 pub type EventId = u64;
@@ -814,6 +814,83 @@ pub struct Note {
     pub off_id: Option<EventId>,
 }
 
+/// One RPN/NRPN parameter-write derived by scanning a track's event list.
+/// Purely a view over raw events — selectors (CC 100/101 or 98/99) and data
+/// entry (CC 6/38) keep their original order and bytes; `ids` point back to
+/// the underlying events so edits can target them precisely.
+#[derive(Debug, Clone)]
+pub struct RpnEntry {
+    pub track: usize,
+    pub channel: u8,
+    /// true = NRPN (CC 98/99), false = RPN (CC 100/101)
+    pub nrpn: bool,
+    /// selector bytes as stored (null selector is 0x7F/0x7F)
+    pub param_msb: u8,
+    pub param_lsb: u8,
+    /// tick of the first selector event
+    pub tick: u64,
+    /// selector event ids in event order (usually 2)
+    pub sel_ids: Vec<EventId>,
+    pub data_msb: Option<u8>,
+    pub data_lsb: Option<u8>,
+    pub data_msb_id: Option<EventId>,
+    pub data_lsb_id: Option<EventId>,
+    /// further data-entry events after the first 6/38 pair
+    pub extra_data_ids: Vec<EventId>,
+}
+
+impl RpnEntry {
+    /// Null selector (0x7F/0x7F) — the spec's "end parameter" reset.
+    pub fn is_null(&self) -> bool {
+        self.param_msb == 0x7F && self.param_lsb == 0x7F
+    }
+
+    /// 14-bit parameter number (msb<<7 | lsb).
+    pub fn param14(&self) -> u16 {
+        ((self.param_msb as u16) << 7) | self.param_lsb as u16
+    }
+
+    /// Entered value: 14-bit when an LSB was written, else 7-bit MSB only.
+    pub fn value(&self) -> Option<u16> {
+        match (self.data_msb, self.data_lsb) {
+            (Some(m), Some(l)) => Some(((m as u16) << 7) | l as u16),
+            (Some(m), None) => Some(m as u16),
+            _ => None,
+        }
+    }
+
+    /// True when the value used 14-bit entry (CC6 + CC38).
+    pub fn is_14bit(&self) -> bool {
+        self.data_lsb.is_some()
+    }
+
+    /// Well-known RPN mnemonics; NRPN and unassigned RPN numbers are unnamed.
+    pub fn param_name(&self) -> Option<&'static str> {
+        if self.nrpn || self.is_null() {
+            return None;
+        }
+        match (self.param_msb, self.param_lsb) {
+            (0, 0) => Some("Pitch Bend Range"),
+            (0, 1) => Some("Fine Tuning"),
+            (0, 2) => Some("Coarse Tuning"),
+            (0, 3) => Some("Tuning Program"),
+            (0, 4) => Some("Tuning Bank"),
+            (0, 5) => Some("Mod Depth Range"),
+            (0x7F, _) => None,
+            _ => None,
+        }
+    }
+
+    /// Every event id belonging to this entry (selectors first, then data).
+    pub fn ids(&self) -> Vec<EventId> {
+        let mut v = self.sel_ids.clone();
+        v.extend(self.data_msb_id);
+        v.extend(self.data_lsb_id);
+        v.extend_from_slice(&self.extra_data_ids);
+        v
+    }
+}
+
 /// Per-(track, channel) state reconstructed by `Document::chase_events` while
 /// scanning the prefix before the play position. `None` = never set (or reset
 /// by CC121) → nothing is emitted for that slot.
@@ -1334,6 +1411,235 @@ impl Document {
                 kind: Self::chan_event(0xE0, channel, (v & 0x7F) as u8, (v >> 7) as u8),
             }],
         }]
+    }
+
+    /// Derive the RPN/NRPN write sequence for every track: each completed
+    /// selector pair opens an entry at that tick and following CC6/CC38 events
+    /// on the same channel attach to it until the next selector pair (or null
+    /// selector) opens a new entry. Read-only — raw ordering is untouched.
+    pub fn rpn_entries(&self) -> Vec<RpnEntry> {
+        let mut out = Vec::new();
+        for (ti, t) in self.tracks.iter().enumerate() {
+            // per channel: pending half-selectors (cc-98 slot → (tick,id,val))
+            // and the index of the open entry receiving data entry CCs
+            let mut pend: [[Option<(u64, EventId, u8)>; 4]; 16] = [[None; 4]; 16];
+            let mut open: [Option<usize>; 16] = [None; 16];
+            for e in &t.events {
+                let (ch, cc, val) = match e.kind {
+                    EventKind::Channel { status, data, len } if status & 0xF0 == 0xB0 && len == 2 => {
+                        (status & 0x0F, data[0], data[1])
+                    }
+                    _ => continue,
+                };
+                if (98..=101).contains(&cc) {
+                    let slot = (cc - 98) as usize;
+                    let nrpn = slot < 2;
+                    // a selector event for the other group doesn't reset this
+                    // one: hardware writes the two halves however it likes
+                    pend[ch as usize][slot] = Some((e.tick, e.id, val));
+                    let (msb_slot, lsb_slot) = if nrpn { (1, 0) } else { (3, 2) };
+                    let (m, l) = (pend[ch as usize][msb_slot], pend[ch as usize][lsb_slot]);
+                    if let (Some((mt, mid, mv)), Some((lt, lid, lv))) = (m, l) {
+                        let mut sel_ids = Vec::new();
+                        if mt <= lt {
+                            sel_ids.push(mid);
+                            sel_ids.push(lid);
+                        } else {
+                            sel_ids.push(lid);
+                            sel_ids.push(mid);
+                        }
+                        pend[ch as usize][msb_slot] = None;
+                        pend[ch as usize][lsb_slot] = None;
+                        out.push(RpnEntry {
+                            track: ti,
+                            channel: ch,
+                            nrpn,
+                            param_msb: mv,
+                            param_lsb: lv,
+                            tick: mt.min(lt),
+                            sel_ids,
+                            data_msb: None,
+                            data_lsb: None,
+                            data_msb_id: None,
+                            data_lsb_id: None,
+                            extra_data_ids: Vec::new(),
+                        });
+                        let idx = out.len() - 1;
+                        open[ch as usize] = if out[idx].is_null() { None } else { Some(idx) };
+                    }
+                } else if cc == 6 || cc == 38 {
+                    if let Some(i) = open[ch as usize] {
+                        let ent = &mut out[i];
+                        if cc == 6 && ent.data_msb_id.is_none() {
+                            ent.data_msb = Some(val);
+                            ent.data_msb_id = Some(e.id);
+                        } else if cc == 38 && ent.data_lsb_id.is_none() {
+                            ent.data_lsb = Some(val);
+                            ent.data_lsb_id = Some(e.id);
+                        } else {
+                            ent.extra_data_ids.push(e.id);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Find the RPN/NRPN entry containing `id` (selector or data event).
+    pub fn rpn_entry_containing(&self, id: EventId) -> Option<RpnEntry> {
+        self.rpn_entries()
+            .into_iter()
+            .find(|e| e.ids().contains(&id))
+    }
+
+    /// Canonical RPN/NRPN write: selector MSB, selector LSB, data entry MSB,
+    /// optional data entry LSB — inserted at `tick` with consecutive seqs.
+    /// `param_msb`/`param_lsb` 0x7F/0x7F writes the null selector reset.
+    pub fn set_rpn_ops(
+        &mut self,
+        track: usize,
+        tick: u64,
+        channel: u8,
+        nrpn: bool,
+        param_msb: u8,
+        param_lsb: u8,
+        data_msb: u8,
+        data_lsb: Option<u8>,
+    ) -> Vec<Op> {
+        let seq = self.next_seq(track, tick);
+        let (sel_msb, sel_lsb) = if nrpn { (99u8, 98u8) } else { (101u8, 100u8) };
+        let mut events = Vec::new();
+        let mut push = |i: u32, cc: u8, v: u8, events: &mut Vec<Event>| {
+            events.push(Event {
+                id: self.alloc_event_id(),
+                tick,
+                seq: seq + i,
+                raw_body: None,
+                kind: Self::chan_event(0xB0, channel, cc, v & 0x7F),
+            });
+        };
+        push(0, sel_msb, param_msb, &mut events);
+        push(1, sel_lsb, param_lsb, &mut events);
+        // null selector is a pure reset — no data entry follows it
+        let null = param_msb == 0x7F && param_lsb == 0x7F;
+        if !null {
+            push(2, 6, data_msb, &mut events);
+            if let Some(l) = data_lsb {
+                push(3, 38, l, &mut events);
+            }
+        }
+        vec![Op::InsertEvents { track, events }]
+    }
+
+    /// Rewrite the data-entry bytes of a parsed entry. Missing data events are
+    /// inserted right after the selector pair; passing `data_lsb: None` with
+    /// an existing LSB removes it (7-bit entry). Selectors are untouched.
+    pub fn update_rpn_value_ops(
+        &mut self,
+        entry: &RpnEntry,
+        data_msb: u8,
+        data_lsb: Option<u8>,
+    ) -> Vec<Op> {
+        let mut ops = Vec::new();
+        let track = entry.track;
+        let ch = entry.channel;
+        // inserts for missing data events go at the selector tick, after every
+        // event already there (i.e. behind the selector pair)
+        let mut ins: Vec<(u8, u8)> = Vec::new();
+        match entry.data_msb_id {
+            Some(id) => {
+                if let Some(&(ti, ei)) = self.by_id.get(&id) {
+                    let mut after = self.tracks[ti].events[ei].clone();
+                    if let EventKind::Channel { ref mut data, .. } = after.kind {
+                        data[1] = data_msb & 0x7F;
+                    }
+                    ops.push(Op::UpdateEvent { track: ti, before: self.tracks[ti].events[ei].clone(), after });
+                }
+            }
+            None => ins.push((6, data_msb)),
+        }
+        match (entry.data_lsb_id, data_lsb) {
+            (Some(id), Some(l)) => {
+                if let Some(&(ti, ei)) = self.by_id.get(&id) {
+                    let mut after = self.tracks[ti].events[ei].clone();
+                    if let EventKind::Channel { ref mut data, .. } = after.kind {
+                        data[1] = l & 0x7F;
+                    }
+                    ops.push(Op::UpdateEvent { track: ti, before: self.tracks[ti].events[ei].clone(), after });
+                }
+            }
+            (Some(id), None) => {
+                if let Some(&(ti, ei)) = self.by_id.get(&id) {
+                    let before = self.tracks[ti].events[ei].clone();
+                    ops.push(Op::RemoveEvents { track: ti, removed: vec![(ei, before)] });
+                }
+            }
+            (None, Some(l)) => ins.push((38, l)),
+            (None, None) => {}
+        }
+        if !ins.is_empty() {
+            let seq = self.next_seq(track, entry.tick);
+            let events = ins
+                .into_iter()
+                .enumerate()
+                .map(|(i, (cc, v))| Event {
+                    id: self.alloc_event_id(),
+                    tick: entry.tick,
+                    seq: seq + i as u32,
+                    raw_body: None,
+                    kind: Self::chan_event(0xB0, ch, cc, v & 0x7F),
+                })
+                .collect();
+            ops.push(Op::InsertEvents { track, events });
+        }
+        ops
+    }
+
+    /// Rewrite the selector bytes of a parsed entry (new parameter number).
+    /// Selector order and grouping are preserved; data events untouched.
+    pub fn update_rpn_param_ops(
+        &mut self,
+        entry: &RpnEntry,
+        param_msb: u8,
+        param_lsb: u8,
+    ) -> Vec<Op> {
+        let mut ops = Vec::new();
+        // each selector event keeps its own CC number; the msb-numbered one
+        // (101/99) takes param_msb, the lsb-numbered one (100/98) param_lsb
+        let msb_cc = if entry.nrpn { 99 } else { 101 };
+        for &id in &entry.sel_ids {
+            let Some(&(ti, ei)) = self.by_id.get(&id) else { continue };
+            let Some(e) = self.tracks[ti].events.get(ei) else { continue };
+            let val = match e.kind {
+                EventKind::Channel { data, .. } if data[0] == msb_cc => param_msb,
+                _ => param_lsb,
+            };
+            let mut after = e.clone();
+            if let EventKind::Channel { ref mut data, .. } = after.kind {
+                data[1] = val & 0x7F;
+            }
+            ops.push(Op::UpdateEvent { track: ti, before: e.clone(), after });
+        }
+        ops
+    }
+
+    /// Remove an entire parsed entry (selectors + every data event) so the
+    /// whole parameter write is deleted as one semantic unit.
+    pub fn remove_rpn_entry_ops(&mut self, entry: &RpnEntry) -> Vec<Op> {
+        let mut by_track: BTreeMap<usize, Vec<(usize, Event)>> = BTreeMap::new();
+        for &id in &entry.ids() {
+            if let Some(&(ti, ei)) = self.by_id.get(&id) {
+                by_track
+                    .entry(ti)
+                    .or_default()
+                    .push((ei, self.tracks[ti].events[ei].clone()));
+            }
+        }
+        by_track
+            .into_iter()
+            .map(|(track, removed)| Op::RemoveEvents { track, removed })
+            .collect()
     }
 
     /// Set/replace the tempo at `tick` on the conductor track (track 0).
@@ -2113,5 +2419,132 @@ mod tests {
         );
         // before any message: nothing
         assert!(d.chase_sysex(d.tempo_map.tick_to_us(0)).is_empty());
+    }
+
+    // ---- RPN/NRPN ----
+
+    fn apply_ops(d: &mut Document, label: &str, ops: Vec<Op>) {
+        let tx = Transaction { label: label.into(), base: d.revision(), ops };
+        d.apply(tx).unwrap();
+    }
+
+    fn cc_bytes(d: &Document, ti: usize) -> Vec<(u8, u8, u8)> {
+        d.tracks[ti]
+            .events
+            .iter()
+            .filter_map(|e| match e.kind {
+                EventKind::Channel { status, data, .. } if status & 0xF0 == 0xB0 => {
+                    Some((status, data[0], data[1]))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rpn_entries_parse_and_unusual_untouched() {
+        // RPN pitch bend range 14-bit, an unrelated CC between selector and
+        // data (still attaches — stateful), a null selector, then an NRPN.
+        let d = chase_doc(vec![
+            ev(0, 0xB0, 101, 0),
+            ev(10, 0xB0, 100, 0),
+            ev(20, 0xB0, 7, 100), // unrelated CC: not part of the entry
+            ev(30, 0xB0, 6, 4),
+            ev(40, 0xB0, 38, 1),
+            ev(50, 0xB0, 101, 0x7F),
+            ev(60, 0xB0, 100, 0x7F),
+            ev(70, 0xB0, 99, 1),
+            ev(80, 0xB0, 98, 2),
+            ev(90, 0xB0, 6, 9),
+        ]);
+        let entries = d.rpn_entries();
+        assert_eq!(entries.len(), 3);
+        let e0 = &entries[0];
+        assert!(!e0.nrpn && !e0.is_null());
+        assert_eq!(e0.param14(), 0);
+        assert_eq!(e0.param_name(), Some("Pitch Bend Range"));
+        assert_eq!(e0.value(), Some((4 << 7) | 1));
+        assert!(e0.is_14bit());
+        assert_eq!(e0.ids().len(), 4);
+        assert!(entries[1].is_null());
+        assert_eq!(entries[1].value(), None);
+        assert!(entries[2].nrpn);
+        assert_eq!(entries[2].param14(), (1 << 7) | 2);
+        assert_eq!(entries[2].value(), Some(9));
+        // unrelated CC stayed a plain event: id list covers only sel+data
+        assert_eq!(cc_bytes(&d, 0).len(), 10);
+
+        // LSB-first ordering also parses (unusual hardware)
+        let d2 = chase_doc(vec![
+            ev(0, 0xB0, 100, 2),
+            ev(10, 0xB0, 101, 0),
+            ev(20, 0xB0, 6, 12),
+        ]);
+        let e = &d2.rpn_entries()[0];
+        assert_eq!(e.param14(), 2);
+        assert_eq!(e.value(), Some(12));
+        assert_eq!(d2.tracks[0].events[0].id, e.sel_ids[0]); // order preserved
+
+        // data entry with no active selector: not in the view, still raw
+        let d3 = chase_doc(vec![ev(0, 0xB0, 6, 5)]);
+        assert!(d3.rpn_entries().is_empty());
+        assert_eq!(cc_bytes(&d3, 0).len(), 1);
+
+        // viewing never mutates: event count and bytes are unchanged after
+        let n = d.tracks[0].events.len();
+        d.rpn_entries();
+        assert_eq!(d.tracks[0].events.len(), n);
+    }
+
+    #[test]
+    fn rpn_ops_emit_valid_order_and_edit() {
+        let mut d = chase_doc(vec![]);
+        // RPN 0.0 = 14-bit (2 semitones + cents) → 101,100,6,38 in order
+        let ops = d.set_rpn_ops(0, 480, 0, false, 0, 0, 12, Some(30));
+        apply_ops(&mut d, "rpn", ops);
+        let ccs = cc_bytes(&d, 0);
+        assert_eq!(
+            ccs,
+            vec![
+                (0xB0, 101, 0),
+                (0xB0, 100, 0),
+                (0xB0, 6, 12),
+                (0xB0, 38, 30),
+            ]
+        );
+        // null selector: no data attached
+        let ops = d.set_rpn_ops(0, 960, 0, false, 0x7F, 0x7F, 0, None);
+        apply_ops(&mut d, "null", ops);
+        let entries = d.rpn_entries();
+        assert_eq!(entries.len(), 2);
+        assert!(entries[1].is_null());
+
+        // NRPN order is 99,98; null selector emitted no data event
+        let ops = d.set_rpn_ops(0, 1200, 0, true, 1, 2, 64, None);
+        apply_ops(&mut d, "nrpn", ops);
+        let ccs = cc_bytes(&d, 0);
+        assert_eq!(&ccs[4..6], &[(0xB0, 101, 0x7F), (0xB0, 100, 0x7F)]);
+        assert_eq!(&ccs[6..], &[(0xB0, 99, 1), (0xB0, 98, 2), (0xB0, 6, 64)]);
+
+        // value edit: 14-bit → new bytes; then → 7-bit removes the LSB event
+        let e = d.rpn_entries().remove(0);
+        let ops = d.update_rpn_value_ops(&e, 5, Some(3));
+        apply_ops(&mut d, "v", ops);
+        let ccs = cc_bytes(&d, 0);
+        assert_eq!(&ccs[2..4], &[(0xB0, 6, 5), (0xB0, 38, 3)]);
+        let e = d.rpn_entries().remove(0);
+        let ops = d.update_rpn_value_ops(&e, 5, None);
+        apply_ops(&mut d, "v7", ops);
+        let ccs = cc_bytes(&d, 0);
+        assert_eq!(&ccs[2], &(0xB0, 6, 5));
+        assert_eq!(ccs.len(), 8);
+
+        // param edit rewrites only selector bytes
+        let e = d.rpn_entries().remove(0);
+        let ops = d.update_rpn_param_ops(&e, 0, 2);
+        apply_ops(&mut d, "p", ops);
+        let e = d.rpn_entries().remove(0);
+        assert_eq!(e.param_name(), Some("Coarse Tuning"));
+        assert_eq!(e.value(), Some(5));
     }
 }

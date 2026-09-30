@@ -723,16 +723,40 @@ impl Render for EditorView {
             )
             .child({
                 let events = self.events.clone();
-                uniform_list("events", events.len(), move |range, _w, _cx| {
+                let sel_event = self.sel_event;
+                let view_weak = cx.weak_entity();
+                uniform_list("events", events.len(), move |range, _w, _app| {
                     range
                         .map(|i| {
+                            let (id, text) = events[i].clone();
+                            let sel = id != 0 && sel_event == Some(id);
+                            let weak = view_weak.clone();
                             div()
+                                .id(("ev", i))
                                 .h(px(18.0))
                                 .px_2()
                                 .text_size(px(11.0))
                                 .font_family("Cascadia Mono")
+                                .bg(if sel { rgb(0x2b3d4f) } else { rgb(0x000000) })
                                 .text_color(rgb(0xb8b8c8))
-                                .child(events[i].clone())
+                                .cursor_pointer()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    move |_e, _w, app| {
+                                        // click selects the event for
+                                        // delete / value nudge (-/=)
+                                        let _ = weak.update_in(app, |v, _w, cx| {
+                                            // id 0 = diagnostics header rows
+                                            v.sel_event = if id == 0 || v.sel_event == Some(id) {
+                                                None
+                                            } else {
+                                                Some(id)
+                                            };
+                                            cx.notify();
+                                        });
+                                    },
+                                )
+                                .child(text)
                         })
                         .collect()
                 })
@@ -2375,7 +2399,7 @@ impl Render for EditorView {
 
         // shortcuts overlay (F1 / Help > Keyboard Shortcuts)
         let help_layer = self.help_open.then(|| {
-            const ROWS: [(&str, &str); 21] = [
+            const ROWS: [(&str, &str); 23] = [
                 ("Space", "Play / stop"),
                 ("F1", "This panel"),
                 ("Esc", "Close menus / clear selection"),
@@ -2384,7 +2408,7 @@ impl Render for EditorView {
                 ("Ctrl+A", "Select all notes"),
                 ("Ctrl+X / C / V", "Cut / copy / paste"),
                 ("Ctrl+D", "Duplicate selection"),
-                ("Del", "Delete selection"),
+                ("Del", "Delete selection / RPN entry"),
                 ("1 / 2 / 3", "Select / draw / erase tool"),
                 ("← →", "Nudge by grid step"),
                 ("Shift+← →", "Nudge by 1 tick"),
@@ -2397,6 +2421,8 @@ impl Render for EditorView {
                 ("Click minimap", "Jump to position"),
                 ("Ctrl+wheel", "Zoom timeline"),
                 ("Drag .mid file", "Drop to open"),
+                ("Event click", "Select event-list row"),
+                ("- / =", "Nudge RPN param / value"),
             ];
             let panel = div()
                 .id("help-panel")
@@ -2711,8 +2737,11 @@ impl Render for EditorView {
                         this.help_open = false;
                         this.show_output_status = false;
                         this.selection.clear();
+                        this.sel_event = None;
                         cx.notify();
                     }
+                    (false, false, "-") | (false, true, "_") => this.nudge_sel_event(-1, cx),
+                    (false, false, "=") | (false, true, "+") => this.nudge_sel_event(1, cx),
                     (true, false, "x") => this.copy_selected(true, cx),
                     (true, false, "c") => this.copy_selected(false, cx),
                     (true, false, "v") => this.paste(cx),

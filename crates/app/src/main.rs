@@ -268,7 +268,9 @@ struct EditorView {
     notes_key: (u64, u64),
     notes: Arc<Vec<Note>>,
     ev_key: (u64, u64),
-    events: Arc<Vec<SharedString>>,
+    events: Arc<Vec<(EventId, SharedString)>>,
+    /// event-list row selection for exact editing (RPN/NRPN semantic edits)
+    sel_event: Option<EventId>,
     /// Document-derived UI data (markers, track names, diagnostics count…).
     /// Rebuilt only when the document key or encoding hint changes — render
     /// runs at animation-frame rate during playback and must not rescan
@@ -461,6 +463,7 @@ impl EditorView {
             notes: Arc::new(vec![]),
             ev_key: (u64::MAX, u64::MAX),
             events: Arc::new(vec![]),
+            sel_event: None,
             doc_ui: Arc::new(DocUi::default()),
             doc_ui_key: (u64::MAX, u64::MAX),
             doc_ui_enc: None,
@@ -824,15 +827,35 @@ impl EditorView {
         }
     }
 
-    fn build_event_rows(&self, doc: &Document) -> Vec<SharedString> {
+    /// Event id → semantic tag for events that participate in an RPN/NRPN
+    /// write (selector or data entry) or look like stray data entry CCs.
+    fn rpn_row_tags(doc: &Document) -> HashMap<EventId, String> {
+        let mut tags = HashMap::new();
+        for e in doc.rpn_entries() {
+            let label = if e.is_null() {
+                format!("{} null", if e.nrpn { "NRPN" } else { "RPN" })
+            } else if let Some(name) = e.param_name() {
+                format!("{} {}.{} {}", if e.nrpn { "NRPN" } else { "RPN" }, e.param_msb, e.param_lsb, name)
+            } else {
+                format!("{} {}.{}", if e.nrpn { "NRPN" } else { "RPN" }, e.param_msb, e.param_lsb)
+            };
+            for id in e.ids() {
+                tags.insert(id, label.clone());
+            }
+        }
+        tags
+    }
+
+    fn build_event_rows(&self, doc: &Document) -> Vec<(EventId, SharedString)> {
         let ppq = match doc.division {
             Division::Metrical(p) => (p as u64).max(1),
             Division::Smpte { .. } => 480,
         };
         let hint = self.enc_override.or(doc.text_encoding_hint());
+        let rpn_tags = Self::rpn_row_tags(doc);
         let mut rows = Vec::new();
         for d in doc.diagnose() {
-            rows.push(format!("[{}] tk{} @{}", d.code, d.track + 1, d.tick).into());
+            rows.push((0, format!("[{}] tk{} @{}", d.code, d.track + 1, d.tick).into()));
         }
         for (ti, tr) in doc.tracks.iter().enumerate() {
             for e in &tr.events {
@@ -852,7 +875,29 @@ impl EditorView {
                             0xE0 => "PB     ",
                             _ => "Ch?    ",
                         };
-                        format!("{name} ch{ch:<2} {:>3} {:>3}", data[0], data[1])
+                        let tag = if status & 0xF0 == 0xB0 {
+                            match data[0] {
+                                6 | 38 | 98..=101 => {
+                                    let part = match data[0] {
+                                        6 => "data-msb",
+                                        38 => "data-lsb",
+                                        99 | 101 => "sel-msb",
+                                        _ => "sel-lsb",
+                                    };
+                                    match rpn_tags.get(&e.id) {
+                                        Some(label) => format!("  [{label} {part}]"),
+                                        None if data[0] == 6 || data[0] == 38 => {
+                                            "  [unbound data-entry]".into()
+                                        }
+                                        None => "  [unbound selector]".into(),
+                                    }
+                                }
+                                _ => String::new(),
+                            }
+                        } else {
+                            String::new()
+                        };
+                        format!("{name} ch{ch:<2} {:>3} {:>3}{tag}", data[0], data[1])
                     }
                     EventKind::Meta { meta_type, data } => match *meta_type {
                         0x03 => format!("TrkName {}", smf_core::decode_text(data, hint)),
@@ -875,9 +920,10 @@ impl EditorView {
                     EventKind::SysEx(d) => format!("SysEx   {}B", d.len()),
                     EventKind::Escape(d) => format!("Escape  {}B", d.len()),
                 };
-                rows.push(SharedString::from(format!(
-                    "{bar:>4}.{beat}.{tk:>3}  T{ti}  {body}"
-                )));
+                rows.push((
+                    e.id,
+                    SharedString::from(format!("{bar:>4}.{beat}.{tk:>3}  T{ti}  {body}")),
+                ));
             }
         }
         rows
@@ -1045,7 +1091,83 @@ impl EditorView {
         Some(Op::RemoveEvents { track, removed })
     }
 
+    /// Exact edit on the selected event-list row when it belongs to an
+    /// RPN/NRPN entry: data events nudge the entered value (7-bit MSB step,
+    /// 14-bit LSB step); selector events nudge the parameter number. The
+    /// whole write stays in valid selector→data order because only the
+    /// targeted bytes are rewritten.
+    fn nudge_sel_event(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let Some(id) = self.sel_event else { return };
+        let mut sh = lock_shared(&self.shared);
+        let entry = sh.doc.rpn_entry_containing(id);
+        let (ops, label) = match entry {
+            None => {
+                self.status = t("status.rpn_none").into();
+                cx.notify();
+                return;
+            }
+            Some(e) if e.sel_ids.contains(&id) => {
+                let param = (e.param14() as i32 + delta).clamp(0, 16383) as u16;
+                (
+                    sh.doc.update_rpn_param_ops(&e, (param >> 7) as u8, (param & 0x7F) as u8),
+                    format!("RPN {}.{}", param >> 7, param & 0x7F),
+                )
+            }
+            Some(e) if e.data_msb_id.is_some() || e.data_lsb_id.is_some() => {
+                if let Some(v) = e.value() {
+                    // 7-bit entries carry the value in data[1] itself; 14-bit
+                    // entries split it across CC6 (msb) + CC38 (lsb)
+                    let cap = if e.is_14bit() { 16383 } else { 127 };
+                    let nv = (v as i32 + delta).clamp(0, cap) as u16;
+                    let (msb, lsb) = if e.is_14bit() {
+                        ((nv >> 7) as u8, Some((nv & 0x7F) as u8))
+                    } else {
+                        (nv as u8, None)
+                    };
+                    (
+                        sh.doc.update_rpn_value_ops(&e, msb, lsb),
+                        format!("RPN = {nv}"),
+                    )
+                } else {
+                    self.status = t("status.rpn_none").into();
+                    cx.notify();
+                    return;
+                }
+            }
+            Some(_) => {
+                self.status = t("status.rpn_none").into();
+                cx.notify();
+                return;
+            }
+        };
+        drop(sh);
+        if !ops.is_empty() {
+            self.apply_tx(&label, ops);
+            self.status = label.into();
+        }
+        cx.notify();
+    }
+
     fn delete_selected(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.sel_event {
+            // a selected event row that belongs to an RPN/NRPN entry deletes
+            // the whole parameter write as one unit
+            let ops = {
+                let mut sh = lock_shared(&self.shared);
+                sh.doc
+                    .rpn_entry_containing(id)
+                    .map(|e| sh.doc.remove_rpn_entry_ops(&e))
+                    .unwrap_or_default()
+            };
+            if !ops.is_empty() {
+                self.apply_tx("delete RPN entry", ops);
+            }
+            self.sel_event = None;
+            cx.notify();
+            if self.selection.is_empty() {
+                return;
+            }
+        }
         if self.selection.is_empty() {
             return;
         }
