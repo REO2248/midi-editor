@@ -724,46 +724,61 @@ impl Render for EditorView {
                             }))
                     })),
             )
-            .child({
-                let events = self.events.clone();
-                let ev_ids = self.ev_ids.clone();
-                let meta_sel = self.meta_sel;
-                let view_weak = cx.weak_entity();
-                uniform_list("events", events.len(), move |range, _w, _app| {
-                    range
-                        .map(|i| {
-                            // meta rows are clickable: selects + opens the
-                            // edit dialog — no raw-hex workflow needed
-                            let meta = ev_ids.get(i).copied().flatten();
-                            let sel =
-                                meta.is_some_and(|(tr, id, _, _)| meta_sel == Some((tr, id)));
-                            let mut row = div()
-                                .id(("ev", i))
-                                .h(px(18.0))
-                                .px_2()
-                                .text_size(px(11.0))
-                                .font_family("Cascadia Mono")
-                                .bg(if sel { rgb(0x2b3d4f) } else { rgb(0x000000) })
-                                .text_color(rgb(0xb8b8c8));
-                            if let Some((tr, id, tick, mt)) = meta {
-                                let weak = view_weak.clone();
-                                row = row.cursor_pointer().on_mouse_down(
-                                    MouseButton::Left,
-                                    move |_e, _w, app| {
-                                        let _ = weak.update_in(app, |v, w, cx| {
-                                            v.meta_sel = Some((tr, id));
-                                            v.open_meta_edit(tr, tick, mt, id, w, cx);
-                                        });
-                                    },
-                                );
-                            }
-                            row.child(events[i].clone())
-                        })
-                        .collect()
-                })
-                .h_full()
-                .flex_1()
-            });
+            .child(
+                div()
+                    .id("ev-list")
+                    .flex_1()
+                    .h_full()
+                    .overflow_hidden()
+                    .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _w, cx| {
+                        let d = ev.delta.pixel_delta(px(18.0));
+                        let max = this.events.len().saturating_sub(1) as i64;
+                        this.ev_first = (this.ev_first as i64
+                            + (d.y.to_f64() / 18.0).round() as i64)
+                            .clamp(0, max) as usize;
+                        cx.notify();
+                    }))
+                    .children({
+                        let events = self.events.clone();
+                        let ev_ids = self.ev_ids.clone();
+                        let meta_sel = self.meta_sel;
+                        let view_weak = cx.weak_entity();
+                        let start = self.ev_first.min(events.len());
+                        // fixed 18px rows: a 120-row window covers any panel
+                        // height; uniform_list children can't receive input in
+                        // this gpui version, so virtualize manually
+                        (start..(start + 120).min(events.len()))
+                            .map(|i| {
+                                // meta rows are clickable: selects + opens the
+                                // edit dialog — no raw-hex workflow needed
+                                let meta = ev_ids.get(i).copied().flatten();
+                                let sel =
+                                    meta.is_some_and(|(tr, id, _, _)| meta_sel == Some((tr, id)));
+                                let mut row = div()
+                                    .id(("ev", i))
+                                    .h(px(18.0))
+                                    .px_2()
+                                    .text_size(px(11.0))
+                                    .font_family("Cascadia Mono")
+                                    .bg(if sel { rgb(0x2b3d4f) } else { rgb(0x000000) })
+                                    .text_color(rgb(0xb8b8c8));
+                                if let Some((tr, id, tick, mt)) = meta {
+                                    let weak = view_weak.clone();
+                                    row = row.cursor_pointer().on_mouse_down(
+                                        MouseButton::Left,
+                                        move |_e, _w, app| {
+                                            let _ = weak.update_in(app, |v, w, cx| {
+                                                v.meta_sel = Some((tr, id));
+                                                v.open_meta_edit(tr, tick, mt, id, w, cx);
+                                            });
+                                        },
+                                    );
+                                }
+                                row.child(events[i].clone())
+                            })
+                            .collect::<Vec<_>>()
+                    }),
+            );
 
         let body = div().flex().flex_1().min_h(px(0.0));
 

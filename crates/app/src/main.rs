@@ -377,6 +377,9 @@ struct EditorView {
     /// set by menu clicks (which lack a Window) — render picks it up, opens
     /// the dialog, and focuses the input
     meta_pending: Option<(usize, u64, u8, EventId)>,
+    /// first visible row of the events list (manual virtualization; the
+    /// pre-0.3.6 uniform_list does not dispatch input to item children)
+    ev_first: usize,
     /// one-bar count-in before MIDI recording starts (global pref)
     count_in: bool,
     /// recently opened files (global pref, newest first)
@@ -610,6 +613,7 @@ impl EditorView {
             meta_edit: None,
             meta_sel: None,
             meta_pending: None,
+            ev_first: 0,
             count_in: g.count_in,
             recent: g.recent.iter().map(|p| p.as_str().into()).collect(),
             midi_in: g.midi_in.clone().into(),
@@ -1623,6 +1627,8 @@ impl EditorView {
             DragMode::LaneEvent => {
                 // CC/PB lane: update an existing event's value, or insert a
                 // new one when the drag started on empty lane space
+                // snap before locking: snap_down -> doc() re-acquires `sh`
+                let ins_tick = self.snap_down(d.a_tick).max(0) as u64;
                 let mut sh = lock_shared(&self.shared);
                 let mut ops = Vec::new();
                 // the track may be gone (MCP remove/undo during the drag)
@@ -1646,7 +1652,7 @@ impl EditorView {
                         track: d.track,
                         events: vec![DocEvent {
                             id,
-                            tick: self.snap_down(d.a_tick).max(0) as u64,
+                            tick: ins_tick,
                             seq: 0,
                             raw_body: None,
                             kind: EventKind::Channel {
