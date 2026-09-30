@@ -479,3 +479,107 @@ fn channel_event(b: &[u8]) -> Option<vst3_host::MidiEvent> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vst3_host::MidiEvent;
+
+    /// SMF channel bytes → host events, verbatim: a zero-velocity Note On is
+    /// a Note Off (running-status convention), pitch bend packs 14 bits, and
+    /// anything the plugin queue can't carry (SysEx, realtime, truncated)
+    /// maps to None instead of a garbled event.
+    #[test]
+    fn channel_event_maps_every_message_kind() {
+        match channel_event(&[0x90, 60, 100]) {
+            Some(MidiEvent::NoteOn {
+                channel,
+                note,
+                velocity,
+            }) => {
+                assert_eq!(channel.as_index(), 0);
+                assert_eq!((note, velocity), (60, 100));
+            }
+            other => panic!("note on: {other:?}"),
+        }
+        // vel-0 note on must arrive as note off
+        assert!(matches!(
+            channel_event(&[0x9F, 60, 0]),
+            Some(MidiEvent::NoteOff { note: 60, .. })
+        ));
+        assert!(matches!(
+            channel_event(&[0x80, 64, 40]),
+            Some(MidiEvent::NoteOff {
+                note: 64,
+                velocity: 40,
+                ..
+            })
+        ));
+        assert!(matches!(
+            channel_event(&[0xB1, 7, 100]),
+            Some(MidiEvent::ControlChange {
+                controller: 7,
+                value: 100,
+                ..
+            })
+        ));
+        assert!(matches!(
+            channel_event(&[0xC2, 12]),
+            Some(MidiEvent::ProgramChange { program: 12, .. })
+        ));
+        assert!(matches!(
+            channel_event(&[0xA3, 60, 90]),
+            Some(MidiEvent::PolyAftertouch {
+                note: 60,
+                pressure: 90,
+                ..
+            })
+        ));
+        assert!(matches!(
+            channel_event(&[0xD4, 55]),
+            Some(MidiEvent::ChannelAftertouch { pressure: 55, .. })
+        ));
+        match channel_event(&[0xE5, 0x00, 0x40]) {
+            Some(MidiEvent::PitchBend { channel, value }) => {
+                assert_eq!(channel.as_index(), 5);
+                assert_eq!(value, 0x2000); // center
+            }
+            other => panic!("pitch bend: {other:?}"),
+        }
+        // non-channel messages never enter the plugin event queue
+        assert!(channel_event(&[0xF0, 0x7E]).is_none());
+        assert!(channel_event(&[0xF8]).is_none());
+        assert!(channel_event(&[0x90]).is_none());
+        assert!(channel_event(&[]).is_none());
+    }
+
+    /// The host worker drains requests in order and unloads with it: Open
+    /// replies arrive FIFO (errors included), Drop/Clear are absorbed, and
+    /// Shutdown closes the event channel — all without needing a real plugin.
+    #[test]
+    fn host_worker_request_ordering_and_exit() {
+        let (tx, rx) = spawn_plugin_host();
+        let bogus = std::path::PathBuf::from(r"C:\no\such\bundle.vst3");
+        tx.send(PluginReq::Open(7, bogus.clone())).unwrap();
+        tx.send(PluginReq::Drop(3)).unwrap();
+        tx.send(PluginReq::Open(2, bogus.clone())).unwrap();
+        tx.send(PluginReq::Clear).unwrap();
+        tx.send(PluginReq::Shutdown).unwrap();
+
+        let first = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("first reply");
+        assert_eq!(first.dest, 7);
+        assert_eq!(first.path, bogus);
+        assert!(first.result.is_err(), "bogus bundle must fail to open");
+        let second = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("second reply");
+        assert_eq!(second.dest, 2);
+        assert!(second.result.is_err());
+        // after Shutdown the worker exits and the event channel closes
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .is_err());
+    }
+}

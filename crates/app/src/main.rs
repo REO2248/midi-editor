@@ -23,7 +23,7 @@ use smf_core::Division;
 use smf_core::EventKind;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -373,6 +373,47 @@ enum PluginState {
         phase: &'static str,
         msg: String,
     },
+}
+
+/// What `ensure_plugin` should do for a destination — the load/unload
+/// decision lifted out of the UI so the ordering rules are unit-testable
+/// without a plugin (or a window).
+#[derive(Debug, PartialEq, Eq)]
+enum PluginPlan {
+    /// the wanted bundle is already resident in the slot — nothing to do
+    Satisfied,
+    /// same bundle still loading, or a failed load we may not retry yet
+    Wait,
+    /// a load must be issued; `retire` when a warm slot is evicted first
+    Open { retire: bool },
+}
+
+/// `state` is the tracked lifecycle state for the index, `warm` the bundle
+/// currently resident in its slot (if any), `target` the bundle the
+/// destination now points at. Order of checks matters: a Ready+resident
+/// match short-circuits before the wait guards, and any other mismatch
+/// reloads — retiring the stale slot first so the host never holds two
+/// instances for one index.
+fn plugin_plan(
+    state: Option<&PluginState>,
+    warm: Option<&Path>,
+    target: &Path,
+    force: bool,
+) -> PluginPlan {
+    if let Some(PluginState::Ready { path }) = state {
+        if path == target && warm == Some(target) {
+            return PluginPlan::Satisfied;
+        }
+    } else if warm == Some(target) {
+        return PluginPlan::Satisfied;
+    }
+    match state {
+        Some(PluginState::Loading { path, .. }) if path == target => PluginPlan::Wait,
+        Some(PluginState::Failed { path, .. }) if path == target && !force => PluginPlan::Wait,
+        _ => PluginPlan::Open {
+            retire: warm.is_some(),
+        },
+    }
 }
 
 /// Captured (µs, raw channel bytes) pairs from the input callback.
@@ -1702,31 +1743,16 @@ impl EditorView {
                 _ => return,
             }
         };
-        if let Some(PluginState::Ready { path: ready_path }) = self.plugin_state.get(&d) {
-            if ready_path == &path
-                && self
-                    .plugin_slots
-                    .get(&d)
-                    .map(|s| s.path == path)
-                    .unwrap_or(false)
-            {
-                return;
-            }
-        } else if self
-            .plugin_slots
-            .get(&d)
-            .map(|s| s.path == path)
-            .unwrap_or(false)
-        {
+        let PluginPlan::Open { retire } = plugin_plan(
+            self.plugin_state.get(&d),
+            self.plugin_slots.get(&d).map(|s| s.path.as_path()),
+            &path,
+            force,
+        ) else {
             return;
-        }
-        match self.plugin_state.get(&d) {
-            Some(PluginState::Loading { path: p, .. }) if p == &path => return,
-            Some(PluginState::Failed { path: p, .. }) if p == &path && !force => return,
-            _ => {}
-        }
+        };
         // index now points at a different bundle — retire the old instance
-        if self.plugin_slots.remove(&d).is_some() {
+        if retire && self.plugin_slots.remove(&d).is_some() {
             let _ = self.plugin_req.send(output::PluginReq::Drop(d));
         }
         self.plugin_state.insert(
@@ -2886,7 +2912,9 @@ fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
 
 #[cfg(test)]
 mod tests {
-    use crate::empty_doc;
+    use crate::{empty_doc, plugin_plan, PluginPlan, PluginState};
+    use std::path::{Path, PathBuf};
+    use std::time::Instant;
 
     /// Every freshly parsed document reports revision 0, so the derived-view
     /// caches must not key on the revision alone: before `doc_epoch` existed,
@@ -2896,5 +2924,87 @@ mod tests {
     #[test]
     fn fresh_documents_share_revision_zero() {
         assert_eq!(empty_doc().revision(), empty_doc().revision());
+    }
+
+    fn loading(path: &Path) -> PluginState {
+        PluginState::Loading {
+            path: path.to_path_buf(),
+            since: Instant::now(),
+        }
+    }
+
+    fn failed(path: &Path) -> PluginState {
+        PluginState::Failed {
+            path: path.to_path_buf(),
+            phase: "load",
+            msg: String::new(),
+        }
+    }
+
+    fn ready(path: &Path) -> PluginState {
+        PluginState::Ready {
+            path: path.to_path_buf(),
+        }
+    }
+
+    /// Host lifecycle ordering for one destination index: the wanted bundle
+    /// stays resident, duplicate loads are suppressed while one is in flight,
+    /// and a re-pointed index retires its stale instance before opening the
+    /// next — the slot never holds two plugins at once.
+    #[test]
+    fn plugin_plan_lifecycle_ordering() {
+        let a = PathBuf::from(r"C:\VST3\A.vst3");
+        let b = PathBuf::from(r"C:\VST3\B.vst3");
+
+        // fresh index, nothing resident → load
+        assert_eq!(
+            plugin_plan(None, None, &a, false),
+            PluginPlan::Open { retire: false }
+        );
+
+        // already loaded + resident → untouched
+        assert_eq!(
+            plugin_plan(Some(&ready(&a)), Some(&a), &a, false),
+            PluginPlan::Satisfied
+        );
+
+        // state says Ready but the slot is empty (lost instance) → reload
+        assert_eq!(
+            plugin_plan(Some(&ready(&a)), None, &a, false),
+            PluginPlan::Open { retire: false }
+        );
+
+        // resident but state lost its Ready marker → leave alone
+        assert_eq!(
+            plugin_plan(Some(&failed(&a)), Some(&a), &a, false),
+            PluginPlan::Satisfied
+        );
+
+        // same bundle already loading → don't double-load
+        assert_eq!(
+            plugin_plan(Some(&loading(&a)), None, &a, false),
+            PluginPlan::Wait
+        );
+
+        // failed load of the same bundle is sticky until a forced retry
+        assert_eq!(
+            plugin_plan(Some(&failed(&a)), None, &a, false),
+            PluginPlan::Wait
+        );
+        assert_eq!(
+            plugin_plan(Some(&failed(&a)), None, &a, true),
+            PluginPlan::Open { retire: false }
+        );
+
+        // destination re-pointed while something else is resident → the old
+        // instance is retired before the new one opens
+        assert_eq!(
+            plugin_plan(Some(&ready(&b)), Some(&b), &a, false),
+            PluginPlan::Open { retire: true }
+        );
+        assert_eq!(
+            plugin_plan(Some(&loading(&b)), Some(&b), &a, false),
+            PluginPlan::Open { retire: true }
+        );
     }
 }
