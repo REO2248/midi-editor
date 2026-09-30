@@ -289,9 +289,9 @@ impl Render for EditorView {
                     window.paint_quad(fill(
                         Bounds::new(point(bounds.origin.x, y), size(w, px(1.0))),
                         rgb(if key.is_multiple_of(12) {
-                            0x2e2e3a
+                            theme::current().grid_oct
                         } else {
-                            0x232329
+                            theme::current().grid_row
                         }),
                     ));
                 }
@@ -305,7 +305,11 @@ impl Render for EditorView {
                     let strong = t.is_multiple_of(grid_major);
                     window.paint_quad(fill(
                         Bounds::new(point(x, bounds.origin.y), size(px(1.0), h)),
-                        rgb(if strong { 0x3d3d52 } else { 0x2a2a35 }),
+                        rgb(if strong {
+                            theme::current().grid_bar
+                        } else {
+                            theme::current().border
+                        }),
                     ));
                     t += grid_minor;
                 }
@@ -380,7 +384,7 @@ impl Render for EditorView {
                         continue;
                     }
                     let c = if selection.contains(&n.on_id) {
-                        SEL_COLOR
+                        theme::current().sel
                     } else if n.end_tick.is_none() {
                         DANGLING_COLOR
                     } else {
@@ -552,9 +556,9 @@ impl Render for EditorView {
                         rgb(theme::current().bg_bar)
                     })
                     .text_color(rgb(if is_open || bar_sel {
-                        0xffffff
+                        theme::current().text_bright
                     } else {
-                        0x9a9ab0
+                        theme::current().icon_off
                     }))
                     .hover(|s| s.bg(rgb(theme::current().bg_menu_hover)))
                     .child(t(key))
@@ -669,7 +673,7 @@ impl Render for EditorView {
                 },
                 t("tip.play"),
                 self.playback.is_some(),
-                0x4fd08c,
+                theme::current().ok,
                 cx,
                 |v, _e, cx| v.toggle_play(cx),
             ))
@@ -690,7 +694,7 @@ impl Render for EditorView {
                 "fiber_manual_record",
                 t("tip.rec"),
                 self.rec.is_some(),
-                0xff6a5a,
+                theme::current().danger,
                 cx,
                 |v, _e, _cx| v.toggle_record(),
             ))
@@ -699,7 +703,7 @@ impl Render for EditorView {
                 "loop",
                 t("tip.loop"),
                 loop_en,
-                0x9fd0ff,
+                theme::current().accent,
                 cx,
                 |v, _e, _cx| {
                     {
@@ -714,7 +718,7 @@ impl Render for EditorView {
                 "timer",
                 t("tip.met"),
                 met_en,
-                0x9fd0ff,
+                theme::current().accent,
                 cx,
                 |v, _e, _cx| {
                     {
@@ -759,7 +763,11 @@ impl Render for EditorView {
                     .border_1()
                     .border_color(rgb(theme::current().border))
                     .rounded_sm()
-                    .text_color(rgb(if td.is_smpte() { 0xffb46a } else { 0x9fd0ff }))
+                    .text_color(rgb(if td.is_smpte() {
+                        theme::current().warn_alt
+                    } else {
+                        theme::current().accent
+                    }))
                     .text_size(px(11.0))
                     .font_family("Cascadia Mono")
                     .whitespace_nowrap()
@@ -912,11 +920,11 @@ impl Render for EditorView {
                     .bg(rgb(if SNAPS[self.snap_idx].0 > 0 {
                         theme::current().bg_raised
                     } else {
-                        0x141419
+                        theme::current().bg_off
                     }))
                     .border_1()
                     .border_color(rgb(if SNAPS[self.snap_idx].0 > 0 {
-                        0x3d5a75
+                        theme::current().accent_edge
                     } else {
                         theme::current().border
                     }))
@@ -929,7 +937,7 @@ impl Render for EditorView {
                         if SNAPS[self.snap_idx].0 > 0 {
                             theme::current().accent
                         } else {
-                            0x55556a
+                            theme::current().state_off
                         },
                     ))
                     .child(
@@ -938,9 +946,9 @@ impl Render for EditorView {
                             .text_size(px(metrics::TEXT_MD))
                             .font_family("Cascadia Mono")
                             .text_color(rgb(if SNAPS[self.snap_idx].0 > 0 {
-                                0xd8d8e0
+                                theme::current().text
                             } else {
-                                0x55556a
+                                theme::current().state_off
                             }))
                             .whitespace_nowrap()
                             .child(snap_label(SNAPS[self.snap_idx].2, td)),
@@ -1319,7 +1327,7 @@ impl Render for EditorView {
                                 w.focus(&v.tracks_fh, cx);
                             }))
                             .child(div().w(px(10.0)).h(px(10.0)).rounded_sm().bg(rgb(if muted {
-                                0x555560
+                                theme::current().swatch_off
                             } else {
                                 color
                             })))
@@ -1350,7 +1358,11 @@ impl Render for EditorView {
                                     })
                                     .px_1()
                                     .text_size(px(9.0))
-                                    .text_color(rgb(if muted { 0xffb454 } else { 0x707080 }))
+                                    .text_color(rgb(if muted {
+                                        theme::current().warn_alt
+                                    } else {
+                                        theme::current().text_muted_name
+                                    }))
                                     .on_click(cx.listener(move |v, _e: &ClickEvent, w, cx| {
                                         cx.stop_propagation();
                                         v.toggle_mute(i);
@@ -1372,7 +1384,11 @@ impl Render for EditorView {
                                     })
                                     .px_1()
                                     .text_size(px(9.0))
-                                    .text_color(rgb(if soloed { 0xffd24f } else { 0x707080 }))
+                                    .text_color(rgb(if soloed {
+                                        theme::current().warn
+                                    } else {
+                                        theme::current().text_muted_name
+                                    }))
                                     .on_click(cx.listener(move |v, _e: &ClickEvent, w, cx| {
                                         cx.stop_propagation();
                                         v.toggle_solo(i);
@@ -1478,7 +1494,7 @@ impl Render for EditorView {
             .border_color(rgb(if area == FocusArea::Lane {
                 theme::current().accent
             } else {
-                0x2a2a35
+                theme::current().border
             }))
             .track_focus(&self.lane_fh)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| {
@@ -3494,7 +3510,11 @@ impl Render for EditorView {
                 let mut row = div().flex().flex_col().gap_1().child(
                     div().flex().gap_1().child(format!("{label}:")).child(
                         div()
-                            .text_color(rgb(if path.is_some() { 0xd8d8e0 } else { 0xe06060 }))
+                            .text_color(rgb(if path.is_some() {
+                                theme::current().text
+                            } else {
+                                theme::current().danger
+                            }))
                             .child(value),
                     ),
                 );
@@ -3582,7 +3602,11 @@ impl Render for EditorView {
                         .px_1()
                         .cursor_pointer()
                         .hover(|s| s.bg(rgb(theme::current().border)))
-                        .text_color(rgb(if current { 0x9fd0ff } else { 0xd8d8e0 }))
+                        .text_color(rgb(if current {
+                            theme::current().accent
+                        } else {
+                            theme::current().text
+                        }))
                         .child(format!(
                             "{}: {}{}",
                             t("audio.device"),
@@ -3615,9 +3639,17 @@ impl Render for EditorView {
                         .py_1()
                         .rounded_sm()
                         .cursor_pointer()
-                        .bg(rgb(if o == cur_sr { 0x2f4f6f } else { 0x2a2a35 }))
+                        .bg(rgb(if o == cur_sr {
+                            theme::current().accent_bg
+                        } else {
+                            theme::current().bg_chip
+                        }))
                         .hover(|s| s.bg(rgb(theme::current().bg_chip_hover)))
-                        .text_color(rgb(if o == cur_sr { 0xd8f0ff } else { 0x9fd0ff }))
+                        .text_color(rgb(if o == cur_sr {
+                            theme::current().text_bright
+                        } else {
+                            theme::current().accent
+                        }))
                         .text_size(px(11.0))
                         .child(o.to_string())
                         .on_click(cx.listener(move |v, _e, _w, cx| {
@@ -3643,9 +3675,17 @@ impl Render for EditorView {
                         .py_1()
                         .rounded_sm()
                         .cursor_pointer()
-                        .bg(rgb(if o == cur_bs { 0x2f4f6f } else { 0x2a2a35 }))
+                        .bg(rgb(if o == cur_bs {
+                            theme::current().accent_bg
+                        } else {
+                            theme::current().bg_chip
+                        }))
                         .hover(|s| s.bg(rgb(theme::current().bg_chip_hover)))
-                        .text_color(rgb(if o == cur_bs { 0xd8f0ff } else { 0x9fd0ff }))
+                        .text_color(rgb(if o == cur_bs {
+                            theme::current().text_bright
+                        } else {
+                            theme::current().accent
+                        }))
                         .text_size(px(11.0))
                         .child(format!("{} smp", o))
                         .on_click(cx.listener(move |v, _e, _w, cx| {
@@ -3743,7 +3783,7 @@ impl Render for EditorView {
                         };
                         (
                             t("plugin.state_failed"),
-                            0xe06060,
+                            theme::current().danger,
                             true,
                             Some(format!("{phase}: {msg}")),
                             None,
@@ -3792,7 +3832,11 @@ impl Render for EditorView {
                     row = row.child(
                         div()
                             .text_size(px(11.0))
-                            .text_color(rgb(if ok { 0x9999aa } else { 0xe06060 }))
+                            .text_color(rgb(if ok {
+                                theme::current().text_dim
+                            } else {
+                                theme::current().danger
+                            }))
                             .child(line),
                     );
                 }
@@ -3968,7 +4012,11 @@ impl Render for EditorView {
                             .rounded_sm()
                             .when(sel, |d| d.bg(rgb(theme::current().accent_bg)))
                             .text_size(px(12.0))
-                            .text_color(rgb(if sel { 0xffffff } else { 0xd8d8e0 }))
+                            .text_color(rgb(if sel {
+                                theme::current().text_bright
+                            } else {
+                                theme::current().text
+                            }))
                             .child(div().flex_1().whitespace_nowrap().child(cmd::label(c)))
                             .when(overridden, |d| {
                                 d.child(div().text_color(rgb(theme::current().warn)).child("●"))
@@ -3978,7 +4026,11 @@ impl Render for EditorView {
                                     .pl_2()
                                     .font_family("Cascadia Mono")
                                     .text_size(px(10.0))
-                                    .text_color(rgb(if sel { 0xcfe0f0 } else { 0x666677 }))
+                                    .text_color(rgb(if sel {
+                                        theme::current().text_bright
+                                    } else {
+                                        theme::current().text_faint
+                                    }))
                                     .child(right),
                             )
                             .on_mouse_move(cx.listener(move |v, _e: &MouseMoveEvent, _w, cx| {

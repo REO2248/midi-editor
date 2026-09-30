@@ -72,7 +72,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 const NOTE_H: f32 = 13.0;
-const SEL_COLOR: u32 = 0xffffff;
 const DANGLING_COLOR: u32 = 0xff4f4f;
 
 /// What a left-drag on the piano roll is doing.

@@ -169,7 +169,7 @@ impl EditorView {
                 let (badge, color) = match self.plugin_state.get(&i) {
                     Some(PluginState::Ready { .. }) => ("●", Some(0x8fd0a0)),
                     Some(PluginState::Loading { .. }) => ("◌ …", Some(0xe0b050)),
-                    Some(PluginState::Failed { .. }) => ("✕", Some(0xe06060)),
+                    Some(PluginState::Failed { .. }) => ("✕", Some(theme::current().danger)),
                     _ => ("", None),
                 };
                 let detail = match self.plugin_state.get(&i) {
@@ -295,7 +295,7 @@ impl EditorView {
                                 let bh = px((h - 6.0) * vel);
                                 let y = bounds.origin.y + px(h) - bh - px(3.0);
                                 let c = if lane_selection.contains(&n.on_id) {
-                                    SEL_COLOR
+                                    theme::current().sel
                                 } else {
                                     th.track_colors[n.track % th.track_colors.len()]
                                 };
@@ -345,12 +345,12 @@ impl EditorView {
                                     prev = Some((x, y));
                                 }
                                 let c = if lane_sel.contains(id) {
-                                    SEL_COLOR
+                                    theme::current().sel
                                 } else if mode == LaneMode::PolyAT && pkey.is_none() && *key >= 0 {
                                     // key-aware tint: hue family per key group
                                     LANE_KEY_COLORS[(*key as usize / 16) % LANE_KEY_COLORS.len()]
                                 } else {
-                                    0x4fd0ff
+                                    theme::current().lane
                                 };
                                 window.paint_quad(fill(
                                     Bounds::new(
@@ -373,7 +373,7 @@ impl EditorView {
                                         point(x - px(2.0), y - px(2.0)),
                                         size(px(4.0), px(4.0)),
                                     ),
-                                    rgb(SEL_COLOR),
+                                    rgb(theme::current().sel),
                                 ));
                             }
                         }
