@@ -5,6 +5,7 @@
 
 use crate::geometry::{drag_window, tick_window, ZOOM_MAX, ZOOM_MIN};
 use crate::i18n::t;
+use crate::theme::metrics;
 use crate::icons::icon;
 use crate::*;
 use gpui_kit::component::input::Input;
@@ -301,7 +302,7 @@ impl Render for EditorView {
             .bg(rgb(th.bg_bar))
             .border_b_1()
             .border_color(rgb(th.border))
-            .text_size(px(12.0))
+            .text_size(px(metrics::TEXT_LG))
             .child(
                 div()
                     .w(px(96.0))
@@ -345,7 +346,7 @@ impl Render for EditorView {
         }
         menu_bar = menu_bar.child(div().flex_1()).child(
             div()
-                .text_size(px(12.0))
+                .text_size(px(metrics::TEXT_LG))
                 .text_color(rgb(if dirty { th.warn } else { th.icon_off }))
                 .whitespace_nowrap()
                 .child(format!("{title}{}", if dirty { " •" } else { "" })),
@@ -493,7 +494,7 @@ impl Render for EditorView {
                     .border_color(rgb(th.border))
                     .rounded_sm()
                     .text_color(rgb(th.lcd))
-                    .text_size(px(12.0))
+                    .text_size(px(metrics::TEXT_LG))
                     .font_family("Cascadia Mono")
                     .whitespace_nowrap()
                     .child(pos.clone()),
@@ -511,7 +512,7 @@ impl Render for EditorView {
                     .rounded_sm()
                     .cursor_pointer()
                     .text_color(rgb(th.lcd))
-                    .text_size(px(12.0))
+                    .text_size(px(metrics::TEXT_LG))
                     .font_family("Cascadia Mono")
                     .whitespace_nowrap()
                     .tooltip(move |_w, cx| cx.new(|_| Tip(t("tip.tempo").into())).into())
@@ -598,7 +599,7 @@ impl Render for EditorView {
                     .child(
                         div()
                             .pl_1()
-                            .text_size(px(11.0))
+                            .text_size(px(metrics::TEXT_MD))
                             .font_family("Cascadia Mono")
                             .text_color(rgb(if SNAPS[self.snap_idx].0 > 0 {
                                 th.text
@@ -712,7 +713,7 @@ impl Render for EditorView {
                     .h(px(26.0))
                     .border_b_1()
                     .border_color(rgb(th.border))
-                    .text_size(px(11.0))
+                    .text_size(px(metrics::TEXT_MD))
                     .text_color(rgb(th.text_muted))
                     .child(format!("{} ({})", t("events.header"), self.events.len()))
                     .child(div().flex_1())
@@ -721,7 +722,7 @@ impl Render for EditorView {
                             .id("fix-diags")
                             .ml_2()
                             .px_1()
-                            .text_size(px(10.0))
+                            .text_size(px(metrics::TEXT_SM))
                             .text_color(rgb(th.warn_alt))
                             .cursor_pointer()
                             .child(format!("{} {} [fix]", n_diags, t("events.issues")))
@@ -746,7 +747,7 @@ impl Render for EditorView {
                             div()
                                 .h(px(18.0))
                                 .px_2()
-                                .text_size(px(11.0))
+                                .text_size(px(metrics::TEXT_MD))
                                 .font_family("Cascadia Mono")
                                 .text_color(rgb(th.events_text))
                                 .child(events[i].clone())
@@ -776,7 +777,7 @@ impl Render for EditorView {
                     .items_center()
                     .border_b_1()
                     .border_color(rgb(th.border))
-                    .text_size(px(11.0))
+                    .text_size(px(metrics::TEXT_MD))
                     .text_color(rgb(th.text_muted))
                     .child(t("tracks.header")),
             )
@@ -831,7 +832,7 @@ impl Render for EditorView {
                                 div()
                                     .flex_1()
                                     .px_1()
-                                    .text_size(px(11.0))
+                                    .text_size(px(metrics::TEXT_MD))
                                     .text_color(rgb(if muted {
                                         th.text_muted_name
                                     } else {
@@ -1597,11 +1598,11 @@ impl Render for EditorView {
             .items_center()
             .gap_2()
             .px_2()
-            .h(px(24.0))
+            .h(px(metrics::MENU_ROW))
             .bg(rgb(th.bg_bar))
             .border_t_1()
             .border_color(rgb(th.border))
-            .text_size(px(11.0))
+            .text_size(px(metrics::TEXT_MD))
             .child(
                 div()
                     .flex_1()
@@ -1800,6 +1801,7 @@ impl Render for EditorView {
                         },
                     )
                     .into_any_element(),
+                    Self::mi_sub("v.theme", t("view.theme"), Sub::Theme, cx).into_any_element(),
                     Self::mi(
                         "v.hc",
                         t("view.hc"),
@@ -2083,7 +2085,8 @@ impl Render for EditorView {
             };
             // dropdown panel under the clicked label
             let popup_max_h = (f32::from(window.viewport_size().height) - 40.0).max(120.0);
-            let popup_h = (items.len() as f32 * 24.0 + 16.0).min(popup_max_h);
+            let popup_h =
+                (items.len() as f32 * metrics::MENU_ROW + 16.0).min(popup_max_h);
             let popup = div()
                 .id("menu-popup")
                 .absolute()
@@ -2373,6 +2376,27 @@ impl Render for EditorView {
                             })
                             .collect()
                     }
+                    Sub::Theme => {
+                        let opts = [
+                            ("theme.system", theme::ThemeMode::System),
+                            ("theme.dark", theme::ThemeMode::Dark),
+                            ("theme.light", theme::ThemeMode::Light),
+                        ];
+                        opts.into_iter()
+                            .enumerate()
+                            .map(|(i, (key, mode))| {
+                                Self::mi_leaf(
+                                    ("theme", i),
+                                    t(key),
+                                    "",
+                                    Some(self.theme_mode == mode),
+                                    cx,
+                                    move |v, _e, cx| v.set_theme_mode(mode, cx),
+                                )
+                                .into_any_element()
+                            })
+                            .collect()
+                    }
                     Sub::Enc => {
                         let opts: [(Option<smf_core::TextEncoding>, &str); 4] = [
                             (None, "auto"),
@@ -2397,7 +2421,7 @@ impl Render for EditorView {
                     }
                 };
                 let vh = f32::from(window.viewport_size().height);
-                let desired = rows.len() as f32 * 24.0 + 16.0;
+                let desired = rows.len() as f32 * metrics::MENU_ROW + 16.0;
                 let max_h = (vh - 40.0).max(120.0);
                 let h = desired.min(max_h);
                 let top = (y - 30.0).clamp(0.0, (vh - h - 8.0).max(0.0));
@@ -2483,7 +2507,7 @@ impl Render for EditorView {
                 .border_color(rgb(th.border_strong))
                 .rounded_lg()
                 .shadow_lg()
-                .text_size(px(12.0))
+                .text_size(px(metrics::TEXT_LG))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|_v, _e, _w, cx| cx.stop_propagation()),
@@ -2543,7 +2567,7 @@ impl Render for EditorView {
                 if path.is_none() {
                     row = row.child(
                         div()
-                            .text_size(px(11.0))
+                            .text_size(px(metrics::TEXT_MD))
                             .text_color(rgb(th.text_dim))
                             .child(hint),
                     );
@@ -2640,7 +2664,7 @@ impl Render for EditorView {
                 if let Some(detail) = detail {
                     row = row.child(
                         div()
-                            .text_size(px(11.0))
+                            .text_size(px(metrics::TEXT_MD))
                             .text_color(rgb(th.text_dim))
                             .child(detail),
                     );
@@ -2668,7 +2692,7 @@ impl Render for EditorView {
                 .border_color(rgb(th.border_strong))
                 .rounded_lg()
                 .shadow_lg()
-                .text_size(px(12.0))
+                .text_size(px(metrics::TEXT_LG))
                 .child(
                     div()
                         .text_size(px(14.0))
@@ -2840,10 +2864,10 @@ impl Render for EditorView {
 impl EditorView {
     fn mhead(label: impl Into<SharedString>) -> Div {
         div()
-            .h(px(18.0))
+            .h(px(metrics::MENU_HEAD))
             .px_2()
             .mx_1()
-            .text_size(px(9.5))
+            .text_size(px(metrics::TEXT_XS))
             .text_color(rgb(theme::current().text_head))
             .child(label.into())
     }
@@ -3071,19 +3095,19 @@ impl EditorView {
             .id(id)
             .flex()
             .items_center()
-            .h(px(24.0))
+            .h(px(metrics::MENU_ROW))
             .px_2()
             .mx_1()
             .rounded_sm()
             .cursor_pointer()
             .hover(move |s| s.bg(rgb(th.bg_hover)))
-            .text_size(px(12.0))
+            .text_size(px(metrics::TEXT_LG))
             .text_color(rgb(th.text))
             .whitespace_nowrap()
             .child(
                 div()
-                    .w(px(14.0))
-                    .text_size(px(10.0))
+                    .w(px(metrics::CHECK_W))
+                    .text_size(px(metrics::TEXT_SM))
                     .text_color(rgb(th.lcd))
                     .child(if check == Some(true) { "✓" } else { "" }),
             )
@@ -3092,7 +3116,7 @@ impl EditorView {
                 div()
                     .pl_2()
                     .text_color(rgb(badge_color.unwrap_or(th.text_faint)))
-                    .text_size(px(10.0))
+                    .text_size(px(metrics::TEXT_SM))
                     .child(shortcut.into()),
             )
             .on_mouse_move(cx.listener(move |v, _e: &MouseMoveEvent, _w, cx| {
@@ -3148,22 +3172,22 @@ impl EditorView {
             .id(id)
             .flex()
             .items_center()
-            .h(px(24.0))
+            .h(px(metrics::MENU_ROW))
             .px_2()
             .mx_1()
             .rounded_sm()
             .cursor_pointer()
             .hover(move |s| s.bg(rgb(th.bg_hover)))
-            .text_size(px(12.0))
+            .text_size(px(metrics::TEXT_LG))
             .text_color(rgb(th.text))
             .whitespace_nowrap()
-            .child(div().w(px(14.0)))
+            .child(div().w(px(metrics::CHECK_W)))
             .child(div().flex_1().child(label))
             .child(
                 div()
                     .pl_2()
                     .text_color(rgb(th.text_faint))
-                    .text_size(px(10.0))
+                    .text_size(px(metrics::TEXT_SM))
                     .child("▸"),
             )
             .on_mouse_move(cx.listener(move |v, e: &MouseMoveEvent, _w, cx| {
@@ -3210,7 +3234,7 @@ impl Render for Tip {
             .border_color(rgb(th.border_strong))
             .rounded_md()
             .shadow_lg()
-            .text_size(px(11.0))
+            .text_size(px(metrics::TEXT_MD))
             .text_color(rgb(th.text))
             .whitespace_nowrap()
             .child(self.0.clone())
@@ -3222,7 +3246,7 @@ impl EditorView {
     fn vsep() -> Div {
         div()
             .w(px(1.0))
-            .h(px(20.0))
+            .h(px(metrics::VSEP_H))
             .mx_1()
             .bg(rgb(theme::current().border))
     }
@@ -3239,8 +3263,8 @@ impl EditorView {
         let th = theme::current();
         div()
             .id(id)
-            .w(px(26.0))
-            .h(px(26.0))
+            .w(px(metrics::ICON_BTN))
+            .h(px(metrics::ICON_BTN))
             .flex()
             .items_center()
             .justify_center()
@@ -3271,8 +3295,8 @@ impl EditorView {
         let th = theme::current();
         div()
             .id(id)
-            .w(px(26.0))
-            .h(px(26.0))
+            .w(px(metrics::ICON_BTN))
+            .h(px(metrics::ICON_BTN))
             .flex()
             .items_center()
             .justify_center()

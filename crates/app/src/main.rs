@@ -78,6 +78,7 @@ enum Sub {
     LenSet,
     VelSet,
     Oct,
+    Theme,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -351,10 +352,16 @@ struct EditorView {
     recent: Vec<SharedString>,
     /// recording source — MIDI input port name; empty = first available
     midi_in: SharedString,
-    /// active color palette — dark or the high-contrast accessible palette
+    /// active color palette — dark, light, or high-contrast accessible
     theme: theme::Theme,
     /// user's stored HC override (None = follow the OS high-contrast flag)
     hc_pref: Option<bool>,
+    /// appearance preference (System follows the OS light/dark flag)
+    theme_mode: theme::ThemeMode,
+    /// last OS appearance seen — from `window.appearance()` updates
+    sys_dark: bool,
+    /// keeps the OS appearance-change observer alive
+    _appearance: Option<Subscription>,
     focus: FocusHandle,
     input: Entity<InputState>,
     status: SharedString,
@@ -430,7 +437,12 @@ fn empty_doc() -> Document {
 }
 
 impl EditorView {
-    fn new(path: Option<PathBuf>, input: Entity<InputState>, cx: &mut Context<Self>) -> Self {
+    fn new(
+        path: Option<PathBuf>,
+        input: Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let loaded = path.as_deref().map(load_document);
         // the warning(s) belong in the status line, not swallowed
         let (doc, status): (Document, SharedString) = match loaded {
@@ -522,14 +534,26 @@ impl EditorView {
             count_in: g.count_in,
             recent: g.recent.iter().map(|p| p.as_str().into()).collect(),
             midi_in: g.midi_in.clone().into(),
-            theme: theme::Theme::pick(g.hc),
+            theme_mode: theme::ThemeMode::from_pref(g.theme.as_deref()),
+            sys_dark: matches!(
+                window.appearance(),
+                WindowAppearance::Dark | WindowAppearance::VibrantDark
+            ),
+            theme: theme::Theme::dark(), // replaced by apply_theme below
             hc_pref: g.hc,
+            _appearance: None,
             open_sub: None,
             show_events: true,
             focus: cx.focus_handle(),
             input,
             status,
         };
+        // the OS flips light/dark under a running app — follow it while
+        // the preference is System
+        v._appearance = Some(cx.observe_window_appearance(window, |v, w, cx| {
+            v.on_sys_appearance(w, cx)
+        }));
+        v.apply_theme(cx);
         v.sel_track = v.pick_default_track();
         v.refresh_derived();
         if let Some(p) = &path {
@@ -538,6 +562,38 @@ impl EditorView {
         }
         v.rescan_plugins();
         v
+    }
+
+    /// Recompute the active palette from prefs + OS flags and push the
+    /// matching mode onto gpui-component so text inputs stay legible.
+    fn apply_theme(&mut self, cx: &mut Context<Self>) {
+        self.theme = theme::Theme::resolve(self.hc_pref, self.theme_mode, self.sys_dark);
+        let mode = if self.theme == theme::Theme::light() {
+            gpui_kit::component::theme::ThemeMode::Light
+        } else {
+            gpui_kit::component::theme::ThemeMode::Dark
+        };
+        gpui_kit::component::theme::Theme::change(mode, None, cx);
+        cx.notify();
+    }
+
+    fn set_theme_mode(&mut self, mode: theme::ThemeMode, cx: &mut Context<Self>) {
+        self.theme_mode = mode;
+        self.apply_theme(cx);
+        self.save_global();
+    }
+
+    fn on_sys_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dark = matches!(
+            window.appearance(),
+            WindowAppearance::Dark | WindowAppearance::VibrantDark
+        );
+        if dark != self.sys_dark {
+            self.sys_dark = dark;
+            if self.theme_mode == theme::ThemeMode::System {
+                self.apply_theme(cx);
+            }
+        }
     }
 
     fn doc<R>(&self, f: impl FnOnce(&Document) -> R) -> R {
@@ -2476,9 +2532,8 @@ impl EditorView {
     fn toggle_hc(&mut self, cx: &mut Context<Self>) {
         let on = self.theme == theme::Theme::high_contrast();
         self.hc_pref = Some(!on);
-        self.theme = theme::Theme::pick(self.hc_pref);
+        self.apply_theme(cx);
         self.save_global();
-        cx.notify();
     }
 
     /// Small chip with a literal label (symbols/numbers need no i18n key).
@@ -2522,6 +2577,8 @@ struct GlobalPrefs {
     midi_in: String,
     /// high-contrast override: Some(force on/off), None = follow the OS flag
     hc: Option<bool>,
+    /// appearance mode: "system" | "dark" | "light" (None = system)
+    theme: Option<String>,
 }
 
 impl GlobalPrefs {
@@ -2692,6 +2749,7 @@ impl EditorView {
             count_in: self.count_in,
             midi_in: self.midi_in.to_string(),
             hc: self.hc_pref,
+            theme: Some(self.theme_mode.name().to_string()),
         }
         .save();
     }
@@ -2753,20 +2811,15 @@ fn main() {
     let path = std::env::args().nth(1).map(PathBuf::from);
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
-        // dark UI — gpui-component's default theme follows the OS and renders
-        // the text input's selection overlay white; pin dark explicitly
-        gpui_kit::component::theme::Theme::change(
-            gpui_kit::component::theme::ThemeMode::Dark,
-            None,
-            cx,
-        );
+        // the component theme (text inputs etc.) is applied in
+        // EditorView::apply_theme once prefs resolve the effective palette
         let path = path.clone();
         cx.spawn(async move |cx| {
             cx.open_window(WindowOptions::default(), move |window, cx| {
                 let input =
                     cx.new(|cx| InputState::new(window, cx).placeholder(t("field.track_name")));
                 let view = cx.new(|cx| {
-                    let v = EditorView::new(path.clone(), input, cx);
+                    let v = EditorView::new(path.clone(), input, window, cx);
                     spawn_mcp(v.shared.clone());
                     spawn_doc_watch(cx, v.shared.clone());
                     window.focus(&v.focus.clone(), cx);

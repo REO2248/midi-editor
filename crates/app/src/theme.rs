@@ -254,23 +254,139 @@ impl Theme {
         }
     }
 
-    /// Resolved theme: `hc_pref` is the user's stored override —
-    /// `Some(bool)` forces a theme, `None` follows the OS high-contrast flag.
-    pub(crate) fn pick(hc_pref: Option<bool>) -> Self {
-        match hc_pref {
-            Some(true) => Self::high_contrast(),
-            Some(false) => Self::dark(),
-            None => Self::detect(),
+    /// Light palette — same token slots as `dark`, re-balanced for light
+    /// surfaces (accents darkened to keep WCAG AA on white).
+    pub(crate) const fn light() -> Self {
+        Self {
+            bg_bar: 0xefeff3,
+            bg_panel: 0xf7f7fa,
+            bg_raised: 0xffffff,
+            bg_canvas: 0xe9e9ef,
+            bg_lane: 0xececf2,
+            bg_key: 0xf4f4f8,
+            grid_row: 0xcfcfda,
+            grid_oct: 0xbfbfcf,
+            grid_bar: 0x9898b0,
+            bg_root: 0xefeff4,
+            bg_row: 0xefeff4,
+            bg_row_sel: 0xd2d2e4,
+            bg_row_hover: 0xe2e2ec,
+            bg_input: 0xffffff,
+            bg_chip: 0xe0e0e8,
+            bg_chip_hover: 0xceceda,
+            bg_hover: 0xdadae6,
+            bg_menu_hover: 0xe9e9f0,
+            bg_tooltip: 0xffffff,
+            bg_off: 0xf0f0f4,
+            border: 0xc8c8d2,
+            border_strong: 0xa8a8b8,
+            accent: 0x1a5fb0,
+            accent_dim: 0x4a70a8,
+            accent_bg: 0xd0e0f5,
+            accent_edge: 0x1a5fb0,
+            accent_drop: 0xc8dcf0,
+            text: 0x1b1b22,
+            text_dim: 0x4a4a5e,
+            text_muted: 0x5f5f75,
+            text_faint: 0x8585a0,
+            text_head: 0x66667d,
+            text_link: 0x1a5fb0,
+            icon_off: 0x565670,
+            state_off: 0xa8a8ba,
+            text_muted_name: 0x7c7c98,
+            swatch_off: 0xb8b8c8,
+            text_bright: 0x000000,
+            ch_text: 0x7a7aa0,
+            events_text: 0x2a2a35,
+            lcd: 0x1a7a40,
+            ok: 0x0a7a35,
+            warn: 0x8a5a00,
+            warn_alt: 0x945200,
+            danger: 0xc02020,
+            lane: 0x087090,
+            lane_fill: 0x08709055,
+            sel: 0x1a5fb0,
+            sel_fill: 0x1a5fb033,
+            ghost_fill: 0x50505044,
+            viewport_fill: 0x1a5fb01c,
+            scrim: 0x00000040,
+            dim_target: 0xe9e9ef,
+            mini_dim: 0xe9e9ef,
+            track_colors: [
+                0x2f6fdf, 0xc05a10, 0x1a9050, 0x9030c0, 0x9a7800, 0x1090a8, 0xd02060, 0x60a010,
+            ],
         }
     }
 
-    fn detect() -> Self {
-        if high_contrast_on() {
-            Self::high_contrast()
-        } else {
-            Self::dark()
+    /// Resolved theme: the `hc_pref` override wins; otherwise `mode`
+    /// decides, with `System` following the OS light/dark flag the caller
+    /// read from `window.appearance()`.
+    pub(crate) fn resolve(hc_pref: Option<bool>, mode: ThemeMode, sys_dark: bool) -> Self {
+        match hc_pref {
+            Some(true) => return Self::high_contrast(),
+            Some(false) => {}
+            None if high_contrast_on() => return Self::high_contrast(),
+            None => {}
+        }
+        match mode {
+            ThemeMode::Dark => Self::dark(),
+            ThemeMode::Light => Self::light(),
+            ThemeMode::System => {
+                if sys_dark {
+                    Self::dark()
+                } else {
+                    Self::light()
+                }
+            }
         }
     }
+}
+
+/// Appearance preference — persisted in prefs.json under `theme`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ThemeMode {
+    /// Follow the OS light/dark setting (default).
+    System,
+    Dark,
+    Light,
+}
+
+impl ThemeMode {
+    pub(crate) fn from_pref(s: Option<&str>) -> Self {
+        match s {
+            Some("dark") => Self::Dark,
+            Some("light") => Self::Light,
+            _ => Self::System,
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Dark => "dark",
+            Self::Light => "light",
+        }
+    }
+}
+
+/// Shared layout metrics for the chrome (toolbars, menus, popups) — the
+/// fixed sizes and the type ramp live here instead of ad-hoc px literals
+/// scattered through render code.
+pub(crate) mod metrics {
+    /// 26px square toolbar icon buttons
+    pub const ICON_BTN: f32 = 26.0;
+    /// 24px dropdown rows, 18px section headers
+    pub const MENU_ROW: f32 = 24.0;
+    pub const MENU_HEAD: f32 = 18.0;
+    /// check-column width inside a menu row
+    pub const CHECK_W: f32 = 14.0;
+    /// toolbar separator height
+    pub const VSEP_H: f32 = 20.0;
+    /// chrome type ramp (px): tiny labels → body
+    pub const TEXT_XS: f32 = 9.5;
+    pub const TEXT_SM: f32 = 10.0;
+    pub const TEXT_MD: f32 = 11.0;
+    pub const TEXT_LG: f32 = 12.0;
 }
 
 /// Windows "high contrast" accessibility flag (SystemParametersInfoW /
@@ -451,6 +567,14 @@ mod tests {
     }
 
     #[test]
+    fn light_theme_text_clears_aa() {
+        let t = Theme::light();
+        check(&t, TEXT_PAIRS, 4.5, "light text");
+        check(&t, SECONDARY_PAIRS, 3.0, "light secondary");
+        check(&t, CUE_PAIRS, 3.0, "light cue");
+    }
+
+    #[test]
     fn hc_theme_beats_dark_floor() {
         // The accessible palette must read *at least* as well as default.
         for pairs in [
@@ -471,8 +595,44 @@ mod tests {
     }
 
     #[test]
-    fn pick_prefers_explicit_override() {
-        assert_eq!(Theme::pick(Some(true)), Theme::high_contrast());
-        assert_eq!(Theme::pick(Some(false)), Theme::dark());
+    fn resolve_prefers_explicit_hc_override() {
+        assert_eq!(
+            Theme::resolve(Some(true), ThemeMode::Dark, true),
+            Theme::high_contrast()
+        );
+        assert_eq!(
+            Theme::resolve(Some(true), ThemeMode::Light, false),
+            Theme::high_contrast()
+        );
+    }
+
+    #[test]
+    fn resolve_maps_modes() {
+        // Some(false) pins HC off so mode selection is deterministic.
+        assert_eq!(
+            Theme::resolve(Some(false), ThemeMode::Dark, false),
+            Theme::dark()
+        );
+        assert_eq!(
+            Theme::resolve(Some(false), ThemeMode::Light, true),
+            Theme::light()
+        );
+        assert_eq!(
+            Theme::resolve(Some(false), ThemeMode::System, true),
+            Theme::dark()
+        );
+        assert_eq!(
+            Theme::resolve(Some(false), ThemeMode::System, false),
+            Theme::light()
+        );
+    }
+
+    #[test]
+    fn theme_mode_pref_roundtrips() {
+        for m in [ThemeMode::System, ThemeMode::Dark, ThemeMode::Light] {
+            assert_eq!(ThemeMode::from_pref(Some(m.name())), m);
+        }
+        assert_eq!(ThemeMode::from_pref(None), ThemeMode::System);
+        assert_eq!(ThemeMode::from_pref(Some("junk")), ThemeMode::System);
     }
 }
