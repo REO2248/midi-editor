@@ -24,6 +24,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+pub mod service;
+pub use persist::write_atomic;
+
 /// A transport action the MCP side requests and the GUI poller drains —
 /// playback itself lives in the app process (owns sinks/audio), MCP just asks.
 #[derive(Debug, Clone, PartialEq)]
@@ -45,6 +48,9 @@ pub struct Shared {
     pub undo: UndoStack,
     pub path: Option<PathBuf>,
     pub saved_revision: u64,
+    /// bumped on every `service::swap_document` — a save that serialized the
+    /// old document must not mark the swapped-in one saved
+    pub generation: u64,
     pub gui_notify: Arc<AtomicU64>,
     /// destination catalog: (display label, stable identity). Index into this
     /// vec is what `default_dest`/`track_dest` reference — identities, never
@@ -68,11 +74,15 @@ pub type SharedDoc = Arc<Mutex<Shared>>;
 
 impl Shared {
     pub fn new(doc: Document) -> Self {
+        // a freshly opened document is saved at whatever revision it
+        // starts on — identical bookkeeping for GUI, MCP, and stdio opens
+        let saved_revision = doc.revision();
         Self {
             doc,
             undo: UndoStack::new(512),
             path: None,
-            saved_revision: 0,
+            saved_revision,
+            generation: 0,
             gui_notify: Arc::new(AtomicU64::new(0)),
             dests: Vec::new(),
             default_dest: 0,
@@ -986,26 +996,24 @@ fn dispatch(
             }
         }
         "save" => {
-            let path = args["path"]
-                .as_str()
-                .map(PathBuf::from)
-                .or_else(|| sh.path.clone());
-            let Some(p) = path else {
-                return err_json("no path — pass one or open a file in the editor");
-            };
-            let (bytes, rev) = (
-                sh.doc.serialize(smf_core::WriteOptions {
-                    running_status: false,
-                }),
-                sh.doc.revision(),
-            );
+            let path = args["path"].as_str().map(PathBuf::from);
+            let expect_revision = args["base_revision"].as_u64();
             drop(sh); // never hold the editor lock across disk I/O
-            match write_atomic(&p, &bytes) {
-                Ok(()) => {
-                    let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
-                    sh.saved_revision = rev;
-                    ok_json(serde_json::json!({"saved": p.to_string_lossy(), "revision": rev}))
-                }
+            match service::save_document(
+                &shared,
+                service::SaveRequest {
+                    path: path.as_deref(),
+                    expect_revision,
+                },
+            ) {
+                Ok(out) => ok_json(serde_json::json!({
+                    "saved": out.path.to_string_lossy(),
+                    "revision": out.revision,
+                    "committed": out.committed,
+                    "leftover_temps": out.leftovers.iter()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>(),
+                })),
                 Err(e) => err_json(e.to_string()),
             }
         }
@@ -1418,28 +1426,6 @@ fn doc_last_tick(d: &Document) -> u64 {
         .flat_map(|t| t.events.iter().map(|e| e.tick))
         .max()
         .unwrap_or(0)
-}
-
-/// Write via temp file + rename so a crash mid-save can't truncate the
-/// target (std::fs::rename replaces an existing destination on Windows).
-pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    let dir = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(std::path::Path::new("."));
-    let stem = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let tmp = dir.join(format!(".{stem}.sav{}", std::process::id()));
-    std::fs::write(&tmp, bytes)?;
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
 }
 
 fn region(args: &serde_json::Value) -> (u64, u64) {

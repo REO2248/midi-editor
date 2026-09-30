@@ -12,7 +12,6 @@ use geometry::{
 };
 use i18n::{t, tf};
 
-use commands::UndoStack;
 use document::{Document, Event as DocEvent, EventId, Note, Op};
 use gpui_kit::component::input::InputState;
 use gpui_kit::component::Root;
@@ -431,7 +430,7 @@ fn empty_doc() -> Document {
 
 impl EditorView {
     fn new(path: Option<PathBuf>, input: Entity<InputState>, cx: &mut Context<Self>) -> Self {
-        let loaded = path.as_deref().map(load_document);
+        let loaded = path.as_deref().map(mcp_server::service::load_document);
         // the warning(s) belong in the status line, not swallowed
         let (doc, status): (Document, SharedString) = match loaded {
             Some(Ok((d, w))) if !w.is_empty() => (
@@ -443,12 +442,14 @@ impl EditorView {
                 .into(),
             ),
             Some(Ok((d, _))) => (d, t("status.loaded").into()),
-            Some(Err(e)) => (empty_doc(), tf("status.load_failed", &[("e", &e)]).into()),
+            Some(Err(e)) => (
+                empty_doc(),
+                tf("status.load_failed", &[("e", &e.to_string())]).into(),
+            ),
             None => (empty_doc(), t("status.new_doc").into()),
         };
         let mut sh = Shared::new(doc);
         sh.path = path.clone();
-        sh.saved_revision = sh.doc.revision();
         let initial_plugins = output::discover_plugin_paths();
         sh.dests = build_dest_catalog(&initial_plugins);
         let g = GlobalPrefs::load();
@@ -549,16 +550,7 @@ impl EditorView {
         // it with a warning instead of silently losing the take
         let rec_discarded = self.rec.take().is_some();
         self.stop_playback();
-        {
-            let mut sh = lock_shared(&self.shared);
-            sh.doc = empty_doc();
-            sh.undo = UndoStack::new(512);
-            sh.path = None;
-            sh.saved_revision = sh.doc.revision();
-            sh.muted.clear();
-            sh.soloed.clear();
-            sh.track_dest.clear();
-        }
+        mcp_server::service::swap_document(&self.shared, empty_doc(), None);
         self.doc_epoch += 1; // the fresh document reports revision 0 again
         self.selection.clear();
         self.drag = None;
@@ -1555,32 +1547,16 @@ impl EditorView {
     }
 
     fn save(&mut self, cx: &mut Context<Self>) {
-        let path = {
-            let sh = lock_shared(&self.shared);
-            sh.path.clone()
-        };
-        let Some(p) = path else {
-            self.save_as(cx);
-            return;
-        };
-        // serialize under the lock, write outside it — and remember the
-        // revision the bytes were taken at so concurrent edits stay dirty
-        let (bytes, rev) = {
-            let sh = lock_shared(&self.shared);
-            (
-                sh.doc.serialize(smf_core::WriteOptions {
-                    running_status: false,
-                }),
-                sh.doc.revision(),
-            )
-        };
-        match mcp_server::write_atomic(&p, &bytes) {
-            Ok(()) => {
-                let mut sh = lock_shared(&self.shared);
-                sh.saved_revision = rev;
-                drop(sh);
+        // the same persistence core MCP save uses — serialize under the
+        // lock, write outside it, mark saved only after the replace lands
+        match mcp_server::service::save_document(&self.shared, Default::default()) {
+            Ok(_) => {
                 self.status = t("status.saved").into();
                 self.persist();
+            }
+            Err(mcp_server::service::SaveError::NoPath) => {
+                self.save_as(cx);
+                return;
             }
             Err(e) => self.status = format!("{e}").into(),
         }
@@ -1625,20 +1601,14 @@ impl EditorView {
     }
 
     fn open(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        match load_document(&path) {
+        match mcp_server::service::load_document(&path) {
             Ok((d, load_warnings)) => {
                 // an armed recording belongs to the previous document —
                 // drop it with a warning instead of silently losing the take
                 let rec_discarded = self.rec.take().is_some();
                 self.stop_playback();
                 // swap the document in place — the MCP server holds this same Arc
-                {
-                    let mut sh = lock_shared(&self.shared);
-                    sh.doc = d;
-                    sh.undo = UndoStack::new(512);
-                    sh.path = Some(path.clone());
-                    sh.saved_revision = sh.doc.revision();
-                }
+                mcp_server::service::swap_document(&self.shared, d, Some(path.clone()));
                 // the new document also reports revision 0 — bump the epoch
                 // so revision-keyed derived views cannot stay stale
                 self.doc_epoch += 1;
@@ -1649,12 +1619,6 @@ impl EditorView {
                 self.mouse_pos = None;
                 self.enc_override = None;
                 self.play_us = 0;
-                {
-                    let mut sh = lock_shared(&self.shared);
-                    sh.muted.clear();
-                    sh.soloed.clear();
-                    sh.track_dest.clear();
-                }
                 // rebuild the derived views, then land the view on the new
                 // content — a saved per-file sidecar (applied next) overrides
                 self.refresh_derived();
@@ -2488,13 +2452,6 @@ impl EditorView {
             .child(label.into())
             .on_click(cx.listener(move |this, ev, _w, cx| on(this, ev, cx)))
     }
-}
-
-fn load_document(path: &std::path::Path) -> Result<(Document, Vec<String>), String> {
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    let file = smf_core::parse(&bytes).map_err(|e| e.to_string())?;
-    let warnings = file.warnings.clone();
-    Ok((Document::from_file(file), warnings))
 }
 
 /// App-wide preferences: recent files + record count-in + recording source.

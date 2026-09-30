@@ -9,13 +9,12 @@
 //! and serves it directly over stdio — no app needed. Edits stay in memory;
 //! `save` writes the file.
 
-use mcp_server::{Shared, SharedDoc};
+use mcp_server::SharedDoc;
 use rmcp::model::*;
 use rmcp::service::{Peer, RequestContext, RoleClient, ServiceExt};
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
 struct ForwardService {
@@ -58,12 +57,10 @@ impl ServerHandler for ForwardService {
     }
 }
 
+/// Standalone `--file` mode uses the same persistence core as the app:
+/// parse via `service::load_document`, save via `service::save_document`.
 fn load_file(path: &std::path::Path) -> anyhow::Result<SharedDoc> {
-    let bytes = std::fs::read(path)?;
-    let file = smf_core::parse(&bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut sh = Shared::new(document::Document::from_file(file));
-    sh.path = Some(path.to_path_buf());
-    Ok(Arc::new(Mutex::new(sh)))
+    Ok(mcp_server::service::open_shared(path)?)
 }
 
 #[tokio::main]
