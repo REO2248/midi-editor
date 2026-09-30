@@ -247,8 +247,11 @@ impl Document {
                     }
                 }
                 Op::InsertTrack { index, .. } => {
-                    if *index < self.tracks.len() {
-                        self.tracks.remove(*index);
+                    // mirror apply's `min(len)` clamp: the track landed at the
+                    // clamped position, so remove it from there
+                    if !self.tracks.is_empty() {
+                        self.tracks
+                            .remove((*index).min(self.tracks.len() - 1));
                     }
                 }
                 Op::RemoveTrack { index, track } => {
@@ -948,9 +951,10 @@ fn apply_op(tracks: &mut Vec<Track>, op: &Op) -> Result<(), ApplyError> {
             tracks.insert((*index).min(tracks.len()), track.clone());
         }
         Op::RemoveTrack { index, .. } => {
-            if *index < tracks.len() {
-                tracks.remove(*index);
+            if *index >= tracks.len() {
+                return Err(ApplyError::UnknownTrack(*index));
             }
+            tracks.remove(*index);
         }
         Op::UpdateTrack { index, after, .. } => {
             if let Some(t) = tracks.get_mut(*index) {

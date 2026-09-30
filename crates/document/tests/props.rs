@@ -4,7 +4,7 @@
 //! revisions are rejected. Extreme tick values are exercised throughout.
 
 use bytes::Bytes;
-use document::{Document, Event as DocEvent, Note, Op, Transaction};
+use document::{Document, Event as DocEvent, Note, Op, Track as DocTrack, Transaction};
 use proptest::prelude::*;
 use smf_core::{Division, Event as SmfEvent, EventKind, File, Track as SmfTrack, WriteOptions};
 
@@ -204,15 +204,34 @@ pub fn build_ops(doc: &mut Document, spec: &OpSpec) -> Vec<Op> {
     }
 }
 
-/// Semantic snapshot: serialized bytes plus the derived note list (ids
-/// excluded — they can legitimately differ after redo cycles).
-fn snapshot(doc: &Document) -> (Vec<u8>, Vec<(usize, u8, u8, u8, u64, Option<u64>)>) {
+/// Semantic snapshot: serialized bytes, the derived note list, cached track
+/// names, and the encoding hint (ids excluded — they can legitimately differ
+/// after redo cycles).
+#[allow(clippy::type_complexity)]
+fn snapshot(
+    doc: &Document,
+) -> (
+    Vec<u8>,
+    Vec<(usize, u8, u8, u8, u64, Option<u64>)>,
+    Vec<Option<Vec<u8>>>,
+    Option<smf_core::TextEncoding>,
+) {
     let notes: Vec<_> = doc
         .notes()
         .into_iter()
         .map(|n: Note| (n.track, n.channel, n.key, n.vel, n.start_tick, n.end_tick))
         .collect();
-    (doc.serialize(WriteOptions::default()), notes)
+    let names: Vec<_> = doc
+        .tracks
+        .iter()
+        .map(|t| t.name.as_ref().map(|b| b.to_vec()))
+        .collect();
+    (
+        doc.serialize(WriteOptions::default()),
+        notes,
+        names,
+        doc.text_encoding_hint(),
+    )
 }
 
 fn mint_event(doc: &mut Document) -> DocEvent {
@@ -237,7 +256,7 @@ proptest! {
     fn apply_revert_restores_state(file in arb_file(), specs in prop::collection::vec(arb_opspec(), 1..=6)) {
         let mut doc = Document::from_file(file);
         for (i, spec) in specs.iter().enumerate() {
-            let (pre_bytes, pre_notes) = snapshot(&doc);
+            let pre = snapshot(&doc);
             let pre_rev = doc.revision();
             let ops = build_ops(&mut doc, spec);
             let tx = Transaction {
@@ -250,10 +269,30 @@ proptest! {
             // serialized output must always re-parse — writers never emit
             // something our own reader rejects
             prop_assert!(smf_core::parse(&doc.serialize(WriteOptions::default())).is_ok());
+            // event ids stay unique — the by_id index depends on it
+            let mut ids = std::collections::HashSet::new();
+            prop_assert!(
+                doc.tracks
+                    .iter()
+                    .flat_map(|t| t.events.iter().map(|e| e.id))
+                    .all(|id| ids.insert(id)),
+                "duplicate event ids after apply"
+            );
+            // the playback timeline covers every channel event, sorted by µs
+            let channel_events: usize = doc
+                .tracks
+                .iter()
+                .flat_map(|t| t.events.iter())
+                .filter(|e| matches!(e.kind, EventKind::Channel { .. }))
+                .count();
+            let tagged = doc.timeline_tagged();
+            prop_assert_eq!(tagged.len(), channel_events);
+            prop_assert_eq!(doc.timeline().len(), channel_events);
+            prop_assert!(tagged.windows(2).all(|w| w[0].0 <= w[1].0));
             doc.revert(&tx);
-            let (post_bytes, post_notes) = snapshot(&doc);
-            prop_assert_eq!(post_bytes, pre_bytes, "revert must restore serialized bytes");
-            prop_assert_eq!(post_notes, pre_notes, "revert must restore derived notes");
+            // revert is itself a state change — revision stays monotonic
+            prop_assert_eq!(doc.revision(), pre_rev + 2);
+            prop_assert_eq!(snapshot(&doc), pre, "revert must restore the full snapshot");
         }
     }
 
@@ -262,7 +301,7 @@ proptest! {
     #[test]
     fn sequence_reverts_to_origin(file in arb_file(), specs in prop::collection::vec(arb_opspec(), 1..=10)) {
         let mut doc = Document::from_file(file);
-        let (origin_bytes, origin_notes) = snapshot(&doc);
+        let origin = snapshot(&doc);
         let mut applied = Vec::new();
         for (i, spec) in specs.iter().enumerate() {
             let ops = build_ops(&mut doc, spec);
@@ -277,9 +316,7 @@ proptest! {
         for tx in applied.iter().rev() {
             doc.revert(tx);
         }
-        let (bytes, notes) = snapshot(&doc);
-        prop_assert_eq!(bytes, origin_bytes);
-        prop_assert_eq!(notes, origin_notes);
+        prop_assert_eq!(snapshot(&doc), origin);
     }
 
     /// A transaction that fails mid-way leaves the document byte-identical —
@@ -291,7 +328,7 @@ proptest! {
         bad_track_delta in 1usize..=8,
     ) {
         let mut doc = Document::from_file(file);
-        let (pre_bytes, pre_notes) = snapshot(&doc);
+        let pre = snapshot(&doc);
         let pre_rev = doc.revision();
 
         // interleave real (valid) ops with an op targeting a missing track —
@@ -316,9 +353,7 @@ proptest! {
             ops,
         };
         prop_assert!(doc.apply(tx).is_err());
-        let (post_bytes, post_notes) = snapshot(&doc);
-        prop_assert_eq!(post_bytes, pre_bytes, "failed apply must not change bytes");
-        prop_assert_eq!(post_notes, pre_notes, "failed apply must not change notes");
+        prop_assert_eq!(snapshot(&doc), pre, "failed apply must not change the snapshot");
         prop_assert_eq!(doc.revision(), pre_rev, "failed apply must not bump revision");
     }
 
@@ -327,7 +362,7 @@ proptest! {
     #[test]
     fn stale_revision_is_rejected(file in arb_file(), delta in 1u64..=4) {
         let mut doc = Document::from_file(file);
-        let (pre_bytes, _) = snapshot(&doc);
+        let (pre_bytes, ..) = snapshot(&doc);
         let tx = Transaction {
             label: "stale".into(),
             base: doc.revision() + delta,
@@ -353,5 +388,491 @@ proptest! {
         };
         let unknown = matches!(doc.apply(tx), Err(document::ApplyError::UnknownTrack(_)));
         prop_assert!(unknown, "expected UnknownTrack");
+    }
+
+    /// Track-index ops at or past the end of the track list are in-range for
+    /// clamping (InsertTrack) or silent skips (RemoveTrack) — never a panic.
+    /// This pins the bounds checks so a `<`/`<=` slip is caught.
+    #[test]
+    fn out_of_range_track_ops_do_not_panic(file in arb_file(), over in 0usize..=16) {
+        let mut doc = Document::from_file(file);
+        let n = doc.tracks.len();
+        let over_idx = n + over;
+
+        // RemoveTrack past the end: rejected as UnknownTrack, doc untouched.
+        let tx = Transaction {
+            label: "oob-remove".into(),
+            base: doc.revision(),
+            ops: vec![Op::RemoveTrack {
+                index: over_idx,
+                track: DocTrack {
+                    name: None,
+                    out_port: 0,
+                    out_channel: 0,
+                    events: vec![],
+                },
+            }],
+        };
+        let unknown = matches!(doc.apply(tx), Err(document::ApplyError::UnknownTrack(_)));
+        prop_assert!(unknown, "expected UnknownTrack for RemoveTrack past end");
+        prop_assert_eq!(doc.tracks.len(), n, "rejected apply must not change tracks");
+
+        // InsertTrack past the end: clamps to the end of the list.
+        let tx = Transaction {
+            label: "oob-insert".into(),
+            base: doc.revision(),
+            ops: vec![Op::InsertTrack {
+                index: over_idx,
+                track: DocTrack {
+                    name: Some(Bytes::from_static(b"appended")),
+                    out_port: 0,
+                    out_channel: 0,
+                    events: vec![],
+                },
+            }],
+        };
+        doc.apply(tx.clone()).expect("InsertTrack past end must clamp");
+        prop_assert_eq!(doc.tracks.len(), n + 1);
+        doc.revert(&tx);
+        prop_assert_eq!(doc.tracks.len(), n, "revert of clamped insert must remove it");
+    }
+}
+
+/// Corrupt channel data (data byte with the top bit set) can arrive via
+/// UpdateEvent even though the parser never emits it — the key-range guards
+/// in notes()/chase_events must skip it, not index a 128-entry table.
+#[test]
+fn corrupt_channel_data_is_filtered() {
+    let file = File {
+        format: 0,
+        division: Division::Metrical(480),
+        warnings: vec![],
+        tracks: vec![SmfTrack {
+            events: vec![mk_ev(
+                EventKind::Channel {
+                    status: 0x90,
+                    data: [60, 100],
+                    len: 2,
+                },
+                0,
+            )],
+        }],
+    };
+    let mut doc = Document::from_file(file);
+    let before = doc.tracks[0].events[0].clone();
+    let mut after = before.clone();
+    if let EventKind::Channel { data, .. } = &mut after.kind {
+        data[0] = 0xFF;
+    }
+    let tx = Transaction {
+        label: "corrupt".into(),
+        base: doc.revision(),
+        ops: vec![Op::UpdateEvent {
+            track: 0,
+            before,
+            after,
+        }],
+    };
+    doc.apply(tx).unwrap();
+    // must not panic and must not report the corrupt key as a note
+    assert!(doc.notes().iter().all(|n| n.key < 0x80));
+    let _ = doc.chase_events(0);
+    let _ = doc.chase_events(u64::MAX);
+}
+
+/// Conventional metas (FF 03 name / FF 21 port / FF 20 channel / FF 09
+/// charset) are picked up into the cached track fields — the guards decide
+/// what sticks: first name wins, port/channel need non-empty payloads, and
+/// "JP" in the charset marker selects Shift-JIS.
+#[test]
+fn conventional_metas_are_cached() {
+    let file = File {
+        format: 1,
+        division: Division::Metrical(480),
+        warnings: vec![],
+        tracks: vec![
+            SmfTrack {
+                events: vec![
+                    mk_ev(
+                        EventKind::Meta {
+                            meta_type: 0x03,
+                            data: Bytes::from_static(b"Piano"),
+                        },
+                        0,
+                    ),
+                    mk_ev(
+                        EventKind::Meta {
+                            meta_type: 0x03,
+                            data: Bytes::from_static(b"Ignored"),
+                        },
+                        0,
+                    ),
+                    mk_ev(
+                        EventKind::Meta {
+                            meta_type: 0x21,
+                            data: Bytes::from_static(&[3]),
+                        },
+                        0,
+                    ),
+                    mk_ev(
+                        EventKind::Meta {
+                            meta_type: 0x20,
+                            data: Bytes::from_static(&[9]),
+                        },
+                        0,
+                    ),
+                    mk_ev(
+                        EventKind::Meta {
+                            meta_type: 0x09,
+                            data: Bytes::from_static(b"JP"),
+                        },
+                        0,
+                    ),
+                ],
+            },
+            SmfTrack {
+                events: vec![mk_ev(
+                    EventKind::Meta {
+                        meta_type: 0x21,
+                        data: Bytes::new(), // empty payload — must be ignored
+                    },
+                    0,
+                )],
+            },
+        ],
+    };
+    let doc = Document::from_file(file);
+    assert_eq!(doc.tracks[0].name.as_deref(), Some(b"Piano".as_slice()));
+    assert_eq!(doc.tracks[0].out_port, 3);
+    assert_eq!(doc.tracks[0].out_channel, 9);
+    assert!(matches!(
+        doc.text_encoding_hint(),
+        Some(smf_core::TextEncoding::ShiftJis)
+    ));
+    assert_eq!(doc.tracks[1].out_port, 0, "empty FF 21 payload must be ignored");
+}
+
+/// `diagnose` must find each documented class of import problem, and
+/// `fix_ops` must emit ops that actually clear them — this pins the codes,
+/// the per-arm match structure, and the event bookkeeping.
+fn mk_ev(kind: EventKind, tick: u64) -> SmfEvent {
+    SmfEvent {
+        tick,
+        seq: 0,
+        raw_body: None,
+        kind,
+    }
+}
+
+#[test]
+fn diagnose_and_fix_ops_cover_each_finding() {
+    let file = File {
+        format: 1,
+        division: Division::Metrical(480),
+        warnings: vec![],
+        tracks: vec![
+            // conductor track: a clean note pair + EOT
+            SmfTrack {
+                events: vec![
+                    mk_ev(
+                        EventKind::Channel {
+                            status: 0x90,
+                            data: [60, 100],
+                            len: 2,
+                        },
+                        0,
+                    ),
+                    mk_ev(
+                        EventKind::Channel {
+                            status: 0x80,
+                            data: [60, 0],
+                            len: 2,
+                        },
+                        480,
+                    ),
+                    mk_ev(
+                        EventKind::Meta {
+                            meta_type: 0x2F,
+                            data: Bytes::new(),
+                        },
+                        480,
+                    ),
+                ],
+            },
+            // problem track: tempo in the wrong place, a dangling note-on,
+            // a zero-length note, and no End-of-Track
+            SmfTrack {
+                events: vec![
+                    mk_ev(
+                        EventKind::Meta {
+                            meta_type: 0x51,
+                            data: Bytes::from_static(&[0x07, 0xA1, 0x20]),
+                        },
+                        0,
+                    ),
+                    mk_ev(
+                        EventKind::Channel {
+                            status: 0x91,
+                            data: [64, 90],
+                            len: 2,
+                        },
+                        0,
+                    ),
+                    mk_ev(
+                        EventKind::Channel {
+                            status: 0x91,
+                            data: [66, 90],
+                            len: 2,
+                        },
+                        240,
+                    ),
+                    mk_ev(
+                        EventKind::Channel {
+                            status: 0x81,
+                            data: [66, 0],
+                            len: 2,
+                        },
+                        240,
+                    ),
+                ],
+            },
+        ],
+    };
+    let mut doc = Document::from_file(file);
+
+    let codes: Vec<&str> = doc.diagnose().iter().map(|d| d.code).collect();
+    for want in [
+        "tempo-outside-conductor",
+        "dangling-noteon",
+        "zero-length-note",
+        "missing-eot",
+    ] {
+        assert!(codes.contains(&want), "missing diagnostic {want}: {codes:?}");
+    }
+
+    // filtered fix_ops only emits ops for the selected codes
+    let only_eot = doc.fix_ops(&["missing-eot"]);
+    assert!(!only_eot.is_empty());
+    assert!(matches!(only_eot[0], Op::InsertEvents { track: 1, .. }));
+
+    // fixing everything clears every finding
+    let ops = doc.fix_ops(&[]);
+    assert!(ops.len() >= 4, "expected >=4 fix ops, got {}", ops.len());
+    let tx = Transaction {
+        label: "fix".into(),
+        base: doc.revision(),
+        ops,
+    };
+    doc.apply(tx).unwrap();
+    assert!(
+        doc.diagnose().is_empty(),
+        "fix_ops must clear all findings: {:?}",
+        doc.diagnose().iter().map(|d| d.code).collect::<Vec<_>>()
+    );
+}
+
+fn mk_note_pair(key: u8, vel: u8, start: u64, end: u64) -> Vec<SmfEvent> {
+    vec![
+        mk_ev(
+            EventKind::Channel {
+                status: 0x90,
+                data: [key, vel],
+                len: 2,
+            },
+            start,
+        ),
+        mk_ev(
+            EventKind::Channel {
+                status: 0x80,
+                data: [key, 0],
+                len: 2,
+            },
+            end,
+        ),
+    ]
+}
+
+/// The note transforms only touch notes that START inside [from,to) — the
+/// boundary comparisons are the contract, and this test pins them plus the
+/// grid arithmetic and the out-of-range-key skip.
+#[test]
+fn transforms_respect_range_boundaries() {
+    let mut events = Vec::new();
+    events.extend(mk_note_pair(60, 30, 60, 200)); // start 60: off-grid, in range
+    events.extend(mk_note_pair(62, 30, 480, 700)); // start 480: in range
+    events.extend(mk_note_pair(62, 30, 960, 1200)); // start 960: in range, same key as the 480 note
+    events.extend(mk_note_pair(66, 30, 1440, 1600)); // start 1440: == to, out
+    events.extend(mk_note_pair(127, 30, 1000, 1200)); // key 127: transpose must skip
+    events.push(mk_ev(
+        EventKind::Meta {
+            meta_type: 0x2F,
+            data: Bytes::new(),
+        },
+        1600,
+    ));
+    let file = File {
+        format: 0,
+        division: Division::Metrical(480),
+        warnings: vec![],
+        tracks: vec![SmfTrack { events }],
+    };
+    let mut doc = Document::from_file(file);
+
+    // quantize [0,960) grid=240 @100%: only the 60→0 note moves (2 events);
+    // 480 is on-grid (delta 0 → skipped), 960/1440 are out of range.
+    let ops = doc.quantize_ops(0, 0, 960, 240, 100);
+    assert_eq!(ops.len(), 2, "quantize must move exactly the off-grid note");
+    for op in &ops {
+        let Op::UpdateEvent { before, after, .. } = op else {
+            panic!("quantize must emit UpdateEvent ops");
+        };
+        // the whole note shifts by its snap delta (-60): on 60→0, off 200→140
+        assert_eq!(after.tick as i64 - before.tick as i64, -60);
+    }
+
+    // transpose [480,1440) +12: notes at 480/960 move, the 1440/60/127-key
+    // notes don't. 2 notes × (on+off) = 4 ops.
+    let ops = doc.transpose_ops(0, 480, 1440, 12);
+    assert_eq!(ops.len(), 4, "transpose must hit exactly 2 in-range movable notes");
+    for op in &ops {
+        let Op::UpdateEvent { before, after, .. } = op else {
+            panic!("transpose must emit UpdateEvent ops");
+        };
+        let (
+            EventKind::Channel { data: bd, .. },
+            EventKind::Channel { data: ad, .. },
+        ) = (&before.kind, &after.kind)
+        else {
+            panic!("channel events only");
+        };
+        assert!(ad[0] <= 127, "transposed key must stay in range");
+        assert_eq!(ad[0], bd[0] + 12);
+    }
+
+    // scale_velocity [480,1440) ×2: the three in-range on-events (incl. the
+    // key-127 note — velocity scaling has no key limit) = 3 ops.
+    let ops = doc.scale_velocity_ops(0, 480, 1440, 2.0);
+    assert_eq!(ops.len(), 3, "scale_velocity edits noteOn events only");
+    for op in &ops {
+        let Op::UpdateEvent { before, after, .. } = op else {
+            panic!("scale_velocity must emit UpdateEvent ops");
+        };
+        let (
+            EventKind::Channel { data: bd, .. },
+            EventKind::Channel { data: ad, .. },
+        ) = (&before.kind, &after.kind)
+        else {
+            panic!("channel events only");
+        };
+        assert_eq!(ad[1], (bd[1] * 2).clamp(1, 127));
+    }
+
+    // set_velocity [480,1440) →42: the three in-range on-events only.
+    let ops = doc.set_velocity_ops(0, 480, 1440, 42);
+    assert_eq!(ops.len(), 3);
+    for op in &ops {
+        let Op::UpdateEvent { after, .. } = op else {
+            panic!()
+        };
+        let EventKind::Channel { data, .. } = &after.kind else {
+            panic!()
+        };
+        assert_eq!(data[1], 42);
+    }
+
+    // set_length [480,1440) →120: the three in-range off-events move to
+    // start+120.
+    let ops = doc.set_length_ops(0, 480, 1440, 120);
+    assert_eq!(ops.len(), 3);
+    for op in &ops {
+        let Op::UpdateEvent { before, after, .. } = op else {
+            panic!()
+        };
+        assert!(matches!(before.kind, EventKind::Channel { status, .. } if status & 0xF0 == 0x80));
+        assert!(matches!(before.tick, 700 | 1200));
+        let _ = after;
+    }
+
+    // legato [480,1440): the key-62 pair (480→960) is the only adjacent
+    // same-key pair — its off moves to the next start.
+    let ops = doc.legato_ops(0, 480, 1440);
+    assert_eq!(ops.len(), 1);
+    let Op::UpdateEvent { before, after, .. } = &ops[0] else {
+        panic!()
+    };
+    assert_eq!(before.tick, 700);
+    assert_eq!(after.tick, 960);
+
+    // set_channel [480,1440) →ch5: every in-range channel event's status
+    // low-nibble becomes 5, high nibble preserved.
+    let ops = doc.set_channel_ops(0, 480, 1440, 5);
+    assert_eq!(ops.len(), 6, "set_channel covers every in-range channel event");
+    for op in &ops {
+        let Op::UpdateEvent { before, after, .. } = op else {
+            panic!()
+        };
+        let (
+            EventKind::Channel { status: bs, .. },
+            EventKind::Channel { status: a_s, .. },
+        ) = (&before.kind, &after.kind)
+        else {
+            panic!()
+        };
+        assert_eq!(*a_s, (*bs & 0xF0) | 0x05);
+        assert!(before.tick >= 480 && before.tick < 1440);
+    }
+
+    // set_program ch9 prog7: one program-change event, status 0xC9.
+    let ops = doc.set_program_ops(0, 0, 9, 7, None, None);
+    let Op::InsertEvents { events, .. } = &ops[0] else {
+        panic!()
+    };
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        events[0].kind,
+        EventKind::Channel {
+            status: 0xC9,
+            data: [7, 0],
+            len: 1
+        }
+    ));
+
+    // set_track_channel →ch9: inserts an FF 20 meta holding the channel
+    // nibble.
+    let ops = doc.set_track_channel_ops(0, 9);
+    let Op::InsertEvents { events, .. } = &ops[0] else {
+        panic!()
+    };
+    assert!(matches!(
+        &events[0].kind,
+        EventKind::Meta {
+            meta_type: 0x20,
+            data
+        } if data[..] == [9]
+    ));
+
+    // delete_range [480,1440): one RemoveEvents op per event — on+off for
+    // the three notes = 6 removals; meta events and the notes at 60/1440
+    // survive.
+    let ops = doc.delete_range_ops(0, 480, 1440);
+    assert_eq!(ops.len(), 6);
+    for op in &ops {
+        let Op::RemoveEvents { removed, .. } = op else {
+            panic!()
+        };
+        assert_eq!(removed.len(), 1);
+        assert!(matches!(removed[0].1.kind, EventKind::Channel { .. }));
+    }
+
+    // duplicate_range [480,1440): clones the 6 in-range channel events, all
+    // shifted to [1440, 2400) — notes keep their offs.
+    let ops = doc.duplicate_range_ops(0, 480, 1440);
+    assert_eq!(ops.len(), 1);
+    let Op::InsertEvents { events, .. } = &ops[0] else {
+        panic!()
+    };
+    assert_eq!(events.len(), 6);
+    for e in events {
+        assert!(e.tick >= 1440 && e.tick < 2400, "dup tick {} out of range", e.tick);
     }
 }
