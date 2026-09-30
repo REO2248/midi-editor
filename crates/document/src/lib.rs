@@ -662,8 +662,12 @@ impl Document {
                 let ch = status & 0x0F;
                 let st = chans.entry(ch).or_default();
                 match (status & 0xF0, data[0], data[1]) {
-                    (0x90, key, v) if v > 0 => st.pending[key as usize].push(v),
-                    (0x80, key, _) | (0x90, key, _) => {
+                    // corrupt input can carry data bytes with the top bit
+                    // set; those can't index the 128-entry key tables
+                    (0x90, key, v) if v > 0 && key < 0x80 => {
+                        st.pending[key as usize].push(v)
+                    }
+                    (0x80, key, _) | (0x90, key, _) if key < 0x80 => {
                         // LIFO pairing, same as the notes() view
                         if let Some(vel) = st.pending[key as usize].pop() {
                             if st.pedal_down {
@@ -729,7 +733,9 @@ impl Document {
                     (0xC0, prog, _) => st.prog = Some(prog),
                     (0xD0, press, _) => st.pressure = Some(press),
                     (0xE0, lsb, msb) => st.bend = Some([lsb, msb]),
-                    (0xA0, key, v) => st.poly[key as usize] = Some(v),
+                    (0xA0, key, v) if key < 0x80 => {
+                        st.poly[key as usize] = Some(v)
+                    }
                     _ => {}
                 }
             }
@@ -1189,7 +1195,7 @@ impl Document {
                 let msg = status & 0xF0;
                 let key = data[0] as usize;
                 match (msg, data[1]) {
-                    (0x90, v) if v > 0 => {
+                    (0x90, v) if v > 0 && key < 0x80 => {
                         // an on arriving while a previous on for this lane
                         // is still held is ambiguous — flag it, then keep
                         // stacking (LIFO pairing is the documented answer)
@@ -1209,7 +1215,7 @@ impl Document {
                         pending[ch][key].push(on_events.len());
                         on_events.push((e.tick, v, e.id));
                     }
-                    (0x80, off_vel) | (0x90, off_vel) => {
+                    (0x80, off_vel) | (0x90, off_vel) if key < 0x80 => {
                         if let Some(idx) = pending[ch][key].pop() {
                             let (start, vel, on_id) = on_events[idx];
                             out.push(Note {
@@ -2799,7 +2805,11 @@ impl TempoMap {
         for (tick, mpq) in tempos {
             if let Division::Metrical(ppq) = division {
                 if ppq > 0 {
-                    cum += (tick - prev_tick) * prev_mpq as u64 / ppq as u64;
+                    // ticks can reach u64-scale via hostile VLQ deltas;
+                    // saturate at "far future" instead of overflowing
+                    cum = cum.saturating_add(
+                        (tick - prev_tick).saturating_mul(prev_mpq as u64) / ppq as u64,
+                    );
                 }
             }
             points.push((tick, mpq, cum));
@@ -2839,7 +2849,8 @@ impl TempoMap {
 
     pub fn tick_to_us(&self, tick: u64) -> u64 {
         if let Division::Smpte { .. } = self.division {
-            return ((tick as u128 * 1_000_000) / self.smpte_tps() as u128) as u64;
+            return (((tick as u128) * 1_000_000) / self.smpte_tps() as u128)
+                .min(u64::MAX as u128) as u64;
         }
         let ppq = match self.division {
             Division::Metrical(p) => p.max(1) as u64,
@@ -2850,13 +2861,14 @@ impl TempoMap {
             Err(0) => (0, 500_000, 0),
             Err(i) => self.points[i - 1],
         };
-        cum + (tick - t0) * mpq as u64 / ppq
+        cum.saturating_add((tick - t0).saturating_mul(mpq as u64) / ppq)
     }
 
     /// Inverse of `tick_to_us` — for playhead positioning.
     pub fn us_to_tick(&self, us: u64) -> u64 {
         if let Division::Smpte { .. } = self.division {
-            return ((us as u128 * self.smpte_tps() as u128) / 1_000_000) as u64;
+            return (((us as u128) * self.smpte_tps() as u128) / 1_000_000)
+                .min(u64::MAX as u128) as u64;
         }
         let ppq = match self.division {
             Division::Metrical(p) => p.max(1) as u64,
@@ -2865,11 +2877,11 @@ impl TempoMap {
         // last breakpoint whose cumulative time is <= us
         let i = match self.points.binary_search_by(|p| p.2.cmp(&us)) {
             Ok(i) => i,
-            Err(0) => return us * ppq / 500_000,
+            Err(0) => return us.saturating_mul(ppq) / 500_000,
             Err(i) => i - 1,
         };
         let (t0, mpq, cum) = self.points[i];
-        t0 + (us - cum) * ppq / mpq.max(1) as u64
+        t0.saturating_add((us - cum).saturating_mul(ppq) / mpq.max(1) as u64)
     }
 }
 
