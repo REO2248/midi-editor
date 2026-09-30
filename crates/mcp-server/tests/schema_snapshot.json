@@ -60,6 +60,20 @@
     },
     {
       "deprecated": null,
+      "description": "All transactions committed after `revision` plus their merged change summary — verify an edit's effect without re-querying the document. `truncated` when the bounded history no longer reaches that far back.",
+      "input_schema": {
+        "properties": {
+          "revision": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "changes_since_revision",
+      "version": 1
+    },
+    {
+      "deprecated": null,
       "description": "Fold the open transaction's staged ops into a single undo step labelled with the checkpoint name. dry_run:true validates the merged ops against the committed document without applying and keeps the transaction open. Errors with stale_base when the document changed since begin (concurrent edit) — the batch stays open for rollback/re-plan.",
       "input_schema": {
         "properties": {
@@ -602,6 +616,20 @@
         "type": "object"
       },
       "name": "set_track_name",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Bounded log of committed transactions (cap 64, newest first): {revision, base_revision, label, origin (gui|mcp), kind (commit|undo|redo), summary}. Args: limit? (default 20).",
+      "input_schema": {
+        "properties": {
+          "limit": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "transaction_history",
       "version": 1
     },
     {
