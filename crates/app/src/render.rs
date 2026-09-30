@@ -1905,7 +1905,7 @@ impl Render for EditorView {
                     })
                     .into_any_element(),
                     Self::mi_sub("f.recent", t("menu.recent"), Sub::Recent, cx).into_any_element(),
-                    Self::msep().into_any_element(),
+                    Self::msep("ms1").into_any_element(),
                     Self::mi("f.save", t("menu.save"), "Ctrl+S", None, cx, |v, _e, cx| {
                         v.save(cx);
                     })
@@ -1924,7 +1924,7 @@ impl Render for EditorView {
                         v.redo(cx);
                     })
                     .into_any_element(),
-                    Self::msep().into_any_element(),
+                    Self::msep("ms2").into_any_element(),
                     Self::mi(
                         "e.selall",
                         t("menu.select_all"),
@@ -1936,7 +1936,7 @@ impl Render for EditorView {
                         },
                     )
                     .into_any_element(),
-                    Self::msep().into_any_element(),
+                    Self::msep("ms3").into_any_element(),
                     Self::mi("e.cut", t("edit.cut"), "Ctrl+X", None, cx, |v, _e, cx| {
                         v.copy_selected(true, cx);
                     })
@@ -1971,10 +1971,10 @@ impl Render for EditorView {
                         v.delete_selected(cx);
                     })
                     .into_any_element(),
-                    Self::msep().into_any_element(),
+                    Self::msep("ms4").into_any_element(),
                     Self::mi_sub("e.tool", t("edit.tool"), Sub::Tool, cx).into_any_element(),
                     Self::mi_sub("e.snap", t("edit.snap"), Sub::Snap, cx).into_any_element(),
-                    Self::msep().into_any_element(),
+                    Self::msep("ms5").into_any_element(),
                     Self::mi_sub("e.quant", t("edit.quantize"), Sub::Quant, cx).into_any_element(),
                     Self::mi(
                         "e.trup",
@@ -2003,7 +2003,7 @@ impl Render for EditorView {
                     )
                     .into_any_element(),
                     Self::mi_sub("e.oct", t("edit.octave"), Sub::Oct, cx).into_any_element(),
-                    Self::msep().into_any_element(),
+                    Self::msep("ms6").into_any_element(),
                     Self::mi("e.human", t("edit.humanize"), "", None, cx, |v, _e, _cx| {
                         v.apply_region_op("humanize", |d, t, f, to| {
                             d.humanize_ops(t, f, to, 12, 8)
@@ -2017,7 +2017,7 @@ impl Render for EditorView {
                     Self::mi_sub("e.len", t("edit.set_length"), Sub::LenSet, cx).into_any_element(),
                     Self::mi_sub("e.velset", t("edit.set_velocity"), Sub::VelSet, cx)
                         .into_any_element(),
-                    Self::msep().into_any_element(),
+                    Self::msep("ms7").into_any_element(),
                     Self::mi("e.velup", t("edit.vel_up"), "", None, cx, |v, _e, _cx| {
                         v.apply_region_op("vel ×1.25", |d, t, f, to| {
                             d.scale_velocity_ops(t, f, to, 1.25)
@@ -2044,7 +2044,7 @@ impl Render for EditorView {
                         },
                     )
                     .into_any_element(),
-                    Self::msep().into_any_element(),
+                    Self::msep("ms8").into_any_element(),
                     Self::mi(
                         "v.zin",
                         t("view.zoom_in"),
@@ -2078,7 +2078,7 @@ impl Render for EditorView {
                         },
                     )
                     .into_any_element(),
-                    Self::msep().into_any_element(),
+                    Self::msep("ms9").into_any_element(),
                     Self::mi_sub("v.lane", t("view.lane"), Sub::Lane, cx).into_any_element(),
                     Self::mi_sub("v.enc", t("view.encoding"), Sub::Enc, cx).into_any_element(),
                 ],
@@ -2088,7 +2088,7 @@ impl Render for EditorView {
                             v.focus_rename(w, cx);
                         })
                         .into_any_element(),
-                        Self::msep().into_any_element(),
+                        Self::msep("ms10").into_any_element(),
                         Self::mi(
                             "t.mute",
                             t("track.mute"),
@@ -2125,13 +2125,13 @@ impl Render for EditorView {
                             },
                         )
                         .into_any_element(),
-                        Self::msep().into_any_element(),
+                        Self::msep("ms11").into_any_element(),
                         Self::mi_sub("t.chan", t("track.channel"), Sub::Chan, cx)
                             .into_any_element(),
                         Self::mi_sub("t.dest", t("track.dest"), Sub::Dest, cx).into_any_element(),
                     ];
                     if sel_is_plugin {
-                        items.push(Self::msep().into_any_element());
+                        items.push(Self::msep("ms12").into_any_element());
                         items.push(
                             Self::mi(
                                 "t.gui",
@@ -2154,7 +2154,7 @@ impl Render for EditorView {
                             .into_any_element(),
                         Self::mi_sub("o.in", t("output.midi_in"), Sub::InPort, cx)
                             .into_any_element(),
-                        Self::msep().into_any_element(),
+                        Self::msep("ms13").into_any_element(),
                     ];
                     if sel_is_plugin {
                         items.push(
@@ -2183,7 +2183,7 @@ impl Render for EditorView {
                         );
                     }
                     items.extend([
-                        Self::msep().into_any_element(),
+                        Self::msep("ms14").into_any_element(),
                         Self::mi("o.rescan", t("output.rescan"), "", None, cx, |v, _e, cx| {
                             v.rescan_plugins();
                             cx.notify();
@@ -2832,8 +2832,8 @@ impl Render for EditorView {
                         .into_any_element(),
                 );
             }
-            rows.push(Self::msep().into_any_element());
-            rows.push(Self::mhead(t("output.cat_vst3")).into_any_element());
+            rows.push(Self::msep("ms15").into_any_element());
+            rows.push(Self::mhead("mh.panel", t("output.cat_vst3")).into_any_element());
             for (i, (name, dest)) in dests.iter().enumerate() {
                 let output::Destination::Plugin { plugin_path } = dest else {
                     continue;
@@ -3092,8 +3092,10 @@ impl Render for EditorView {
 // --- menubar helpers -----------------------------------------------------------
 
 impl EditorView {
-    fn mhead(label: impl Into<SharedString>) -> Div {
+    fn mhead(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stateful<Div> {
         div()
+            .id(id)
+            .role(Role::Label)
             .h(px(18.0))
             .px_2()
             .mx_1()
@@ -3129,9 +3131,9 @@ impl EditorView {
                 )
                 .into_any_element(),
             );
-            rows.push(Self::msep().into_any_element());
+            rows.push(Self::msep("ms16").into_any_element());
         }
-        rows.push(Self::mhead(t("output.cat_midi")).into_any_element());
+        rows.push(Self::mhead("mh.midi", t("output.cat_midi")).into_any_element());
         let midi: Vec<(usize, String)> = dests
             .iter()
             .enumerate()
@@ -3180,7 +3182,7 @@ impl EditorView {
                 );
             }
         }
-        rows.push(Self::msep().into_any_element());
+        rows.push(Self::msep("ms17").into_any_element());
         let plugins: Vec<(usize, String, String, String)> = dests
             .iter()
             .enumerate()
@@ -3203,7 +3205,11 @@ impl EditorView {
             }
         }
         rows.push(
-            Self::mhead(format!("{} ({})", t("output.cat_vst3"), plugins.len())).into_any_element(),
+            Self::mhead(
+                "mh.vst",
+                format!("{} ({})", t("output.cat_vst3"), plugins.len()),
+            )
+            .into_any_element(),
         );
         if plugins.is_empty() {
             if self.scan_rx.is_some() {
@@ -3244,7 +3250,10 @@ impl EditorView {
             for (i, label, path, vendor) in plugins {
                 if vendors.len() >= 2 && vendor != last_vendor {
                     last_vendor = vendor.clone();
-                    rows.push(Self::mhead(format!("  {vendor}")).into_any_element());
+                    rows.push(
+                        Self::mhead(("mh.vendor", i), format!("  {vendor}"))
+                            .into_any_element(),
+                    );
                 }
                 let (badge, color) = match self.plugin_state.get(&i) {
                     Some(PluginState::Ready { .. }) => ("●", Some(0x8fd0a0)),
@@ -3458,8 +3467,14 @@ impl EditorView {
     }
 
     /// Dropdown separator line.
-    fn msep() -> Div {
-        div().h(px(1.0)).mx_2().my_1().bg(rgb(0x2a2a35))
+    fn msep(id: impl Into<ElementId>) -> Stateful<Div> {
+        div()
+            .id(id)
+            .role(Role::Splitter)
+            .h(px(1.0))
+            .mx_2()
+            .my_1()
+            .bg(rgb(0x2a2a35))
     }
 }
 
