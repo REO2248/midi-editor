@@ -1864,7 +1864,10 @@ pub fn tool_specs() -> Vec<ToolSpec> {
     ]
 }
 
-fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallToolResponse {
+/// Dispatch one MCP tool call by name, the same path `call_tool` takes.
+/// `#[doc(hidden)]`: exposed for the workspace bench crate, not public API.
+#[doc(hidden)]
+pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallToolResponse {
     // recover from a poisoned lock: a panic in an earlier critical section
     // must not take down every later request
     let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());

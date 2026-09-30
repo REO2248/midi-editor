@@ -117,3 +117,28 @@ jobs:
         run: cargo run -p document --bin corpus_check --locked -- --matrix fixtures/corpus docs/interop-matrix.md
       - name: Matrix is in sync
         run: git diff --exit-code docs/interop-matrix.md
+  bench:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Build bench harness (release)
+        run: cargo build --release -p bench --locked
+      # --check fails the job on >3x machine-normalized regressions against
+      # crates/bench/baseline.json (see crates/bench/src/main.rs header).
+      - name: Run benchmarks
+        run: ./target/release/midi-bench.exe --check --out target/bench/results.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-results
+          path: target/bench/results.json
