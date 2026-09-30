@@ -4,7 +4,7 @@
 //! key dispatcher all read this table, so a command's binding and label
 //! can never disagree between surfaces.
 
-use crate::{i18n::t, EditorView, PaletteMode, PendingAction, ScanMode, Tool};
+use crate::{i18n::t, EditorView, Follow, PaletteMode, PendingAction, ScanMode, Tool};
 use gpui_kit::{Context, Keystroke, SharedString, Window};
 use std::collections::HashMap;
 
@@ -192,6 +192,10 @@ impl KeyMap {
     pub fn is_default(&self, id: &str) -> bool {
         !self.overrides.contains_key(id)
     }
+}
+
+fn has_ev_sel(v: &EditorView) -> bool {
+    !v.sel_events.is_empty()
 }
 
 fn has_sel(v: &EditorView) -> bool {
@@ -422,6 +426,102 @@ pub static COMMANDS: &[Command] = &[
         &["ctrl+-"],
         None,
         |v, _w, cx| v.zoom_by(1.0 / 1.3, cx)
+    ),
+    cmd!(
+        "view.follow_off",
+        "view.follow_off",
+        &[],
+        None,
+        |v, _w, _cx| {
+            v.follow = Follow::Off;
+            v.follow_hold = None;
+            v.persist();
+        }
+    ),
+    cmd!(
+        "view.follow_page",
+        "view.follow_page",
+        &[],
+        None,
+        |v, _w, _cx| {
+            v.follow = Follow::Page;
+            v.follow_hold = None;
+            v.persist();
+        }
+    ),
+    cmd!(
+        "view.follow_smooth",
+        "view.follow_smooth",
+        &[],
+        None,
+        |v, _w, _cx| {
+            v.follow = Follow::Smooth;
+            v.follow_hold = None;
+            v.persist();
+        }
+    ),
+    cmd!(
+        "view.zoom_sel",
+        "view.zoom_sel",
+        &["z"],
+        Some(has_sel),
+        |v, _w, cx| v.zoom_to_selection(cx)
+    ),
+    cmd!(
+        "view.zoom_song",
+        "view.zoom_song",
+        &["shift+z"],
+        None,
+        |v, _w, cx| v.zoom_to_song(cx)
+    ),
+    cmd!(
+        "view.go_playhead",
+        "view.go_playhead",
+        &["g"],
+        None,
+        |v, _w, cx| v.go_playhead(cx)
+    ),
+    cmd!(
+        "view.marker_prev",
+        "view.marker_prev",
+        &[","],
+        None,
+        |v, _w, cx| v.marker_step(-1, cx)
+    ),
+    cmd!(
+        "view.marker_next",
+        "view.marker_next",
+        &["."],
+        None,
+        |v, _w, cx| v.marker_step(1, cx)
+    ),
+    cmd!(
+        "view.event_prev",
+        "view.event_prev",
+        &["shift+,"],
+        None,
+        |v, _w, cx| v.event_step(-1, cx)
+    ),
+    cmd!(
+        "view.event_next",
+        "view.event_next",
+        &["shift+."],
+        None,
+        |v, _w, cx| v.event_step(1, cx)
+    ),
+    cmd!(
+        "events.nudge_dn",
+        "events.nudge_dn",
+        &["-", "_"],
+        Some(has_ev_sel),
+        |v, _w, cx| v.nudge_sel_events(-1, cx)
+    ),
+    cmd!(
+        "events.nudge_up",
+        "events.nudge_up",
+        &["=", "plus"],
+        Some(has_ev_sel),
+        |v, _w, cx| v.nudge_sel_events(1, cx)
     ),
     cmd!(
         "view.zoom_reset",
