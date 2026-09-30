@@ -2,9 +2,7 @@ use midi_io::EventSink;
 use std::time::Duration;
 
 fn main() {
-    let path = std::path::Path::new(
-        r"C:\Program Files\Common Files\VST3\Dexed.vst3",
-    );
+    let path = std::path::Path::new(r"C:\Program Files\Common Files\VST3\Dexed.vst3");
     println!("opening plugin output (cpal + live audio)...");
     let out = match output::PluginOutput::open(path) {
         Ok(p) => p,
@@ -30,5 +28,8 @@ fn main() {
     }
     sink.send_at(&[0x80, 60, 0], 0);
     sink.send_at(&[0x80, 67, 0], 0);
-    println!("RESULT: peak={peak:.4} {}", if peak > 0.001 { "AUDIO OK" } else { "silent" });
+    println!(
+        "RESULT: peak={peak:.4} {}",
+        if peak > 0.001 { "AUDIO OK" } else { "silent" }
+    );
 }

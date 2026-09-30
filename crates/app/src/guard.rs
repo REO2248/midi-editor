@@ -181,7 +181,11 @@ impl EditorView {
     /// `close_confirmed` first: removing the window re-enters
     /// `on_window_should_close`, which must now see a clean pass instead of
     /// re-prompting.
-    async fn run_pending(this: WeakEntity<Self>, action: &PendingAction, cx: &mut AsyncWindowContext) {
+    async fn run_pending(
+        this: WeakEntity<Self>,
+        action: &PendingAction,
+        cx: &mut AsyncWindowContext,
+    ) {
         if let PendingAction::CloseWindow = action {
             this.update(cx, |v, _cx| v.close_confirmed = true).ok();
             cx.update(|w, _app| w.remove_window()).ok();
@@ -271,16 +275,14 @@ mod tests {
         let sh = shared();
         dirty(&sh);
         let file = tmpdir("ok").join("a.mid");
-        assert!(
-            mcp_server::service::save_document(
-                &sh,
-                mcp_server::service::SaveRequest {
-                    path: Some(&file),
-                    ..Default::default()
-                },
-            )
-            .is_ok()
-        );
+        assert!(mcp_server::service::save_document(
+            &sh,
+            mcp_server::service::SaveRequest {
+                path: Some(&file),
+                ..Default::default()
+            },
+        )
+        .is_ok());
         assert!(file.exists());
         let g = lock_shared(&sh);
         assert_eq!(g.doc.revision(), g.saved_revision);
@@ -296,16 +298,14 @@ mod tests {
         // a path inside a directory that does not exist makes write_atomic fail
         let file = tmpdir("fail").join("no-such-dir").join("a.mid");
         let rev = lock_shared(&sh).doc.revision();
-        assert!(
-            mcp_server::service::save_document(
-                &sh,
-                mcp_server::service::SaveRequest {
-                    path: Some(&file),
-                    ..Default::default()
-                },
-            )
-            .is_err()
-        );
+        assert!(mcp_server::service::save_document(
+            &sh,
+            mcp_server::service::SaveRequest {
+                path: Some(&file),
+                ..Default::default()
+            },
+        )
+        .is_err());
         let g = lock_shared(&sh);
         assert_eq!(g.doc.revision(), rev);
         assert_ne!(g.doc.revision(), g.saved_revision);

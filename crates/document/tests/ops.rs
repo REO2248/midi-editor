@@ -49,10 +49,7 @@ fn apply(d: &mut Document, ops: Vec<Op>) -> Transaction {
 #[test]
 fn quantize_moves_on_and_off_together() {
     // note 490..970 → grid 480: start snaps to 480, off to 960 (shift -10/-10)
-    let mut d = doc(vec![vec![
-        chan(490, 0x90, 60, 100),
-        chan(970, 0x80, 60, 0),
-    ]]);
+    let mut d = doc(vec![vec![chan(490, 0x90, 60, 100), chan(970, 0x80, 60, 0)]]);
     let ops = d.quantize_ops(0, 0, u64::MAX, 480, 100);
     apply(&mut d, ops);
     let n = &notes_on(&d, 0)[0];
@@ -106,16 +103,16 @@ fn transpose_skips_out_of_range_and_meta() {
     // meta untouched
     assert!(matches!(
         d.tracks[0].events[0].kind,
-        EventKind::Meta { meta_type: 0x03, .. }
+        EventKind::Meta {
+            meta_type: 0x03,
+            ..
+        }
     ));
 }
 
 #[test]
 fn scale_velocity_clamps() {
-    let mut d = doc(vec![vec![
-        chan(0, 0x90, 60, 100),
-        chan(100, 0x90, 62, 10),
-    ]]);
+    let mut d = doc(vec![vec![chan(0, 0x90, 60, 100), chan(100, 0x90, 62, 10)]]);
     let __ops = d.scale_velocity_ops(0, 0, u64::MAX, 2.0);
     apply(&mut d, __ops);
     assert_eq!(notes_on(&d, 0)[0].vel, 127, "100*2 clamps to 127");
@@ -154,7 +151,10 @@ fn set_channel_rewrites_nibble_only_on_channel_events() {
     ));
     assert!(matches!(
         d.tracks[0].events[2].kind,
-        EventKind::Meta { meta_type: 0x05, .. }
+        EventKind::Meta {
+            meta_type: 0x05,
+            ..
+        }
     ));
 }
 
@@ -189,7 +189,15 @@ fn set_tempo_replaces_same_tick_inserts_elsewhere() {
         d.tracks[0]
             .events
             .iter()
-            .filter(|e| matches!(e.kind, EventKind::Meta { meta_type: 0x51, .. }))
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    EventKind::Meta {
+                        meta_type: 0x51,
+                        ..
+                    }
+                )
+            })
             .count()
     };
     assert_eq!(n_tempos(&d), 1);
@@ -213,7 +221,10 @@ fn set_time_sig_encodes_denominator_log2() {
     let __ops = d.set_time_sig_ops(0, 6, 8);
     apply(&mut d, __ops);
     match &d.tracks[0].events[0].kind {
-        EventKind::Meta { meta_type: 0x58, data } => {
+        EventKind::Meta {
+            meta_type: 0x58,
+            data,
+        } => {
             assert_eq!(&data[..], &[6, 3, 24, 8], "6/8 → dd=3");
         }
         other => panic!("{other:?}"),
@@ -345,7 +356,14 @@ fn update_revert_restores_raw_body() {
     assert!(ev.raw_body.is_some());
     let mut after = ev.clone();
     after.tick = 999;
-    let tx = apply(&mut d, vec![Op::UpdateEvent { track: 0, before: ev, after }]);
+    let tx = apply(
+        &mut d,
+        vec![Op::UpdateEvent {
+            track: 0,
+            before: ev,
+            after,
+        }],
+    );
     d.revert(&tx);
     let back = &d.tracks[0].events[0];
     assert_eq!(back.tick, 0);
@@ -379,7 +397,10 @@ fn humanize_is_deterministic_and_bounded() {
     assert_eq!(ticks_a, ticks_b);
     apply(&mut d, ops_a);
     for n in notes_on(&d, 0) {
-        assert!(n.end_tick.unwrap() - n.start_tick == 480, "length preserved");
+        assert!(
+            n.end_tick.unwrap() - n.start_tick == 480,
+            "length preserved"
+        );
     }
 }
 
@@ -405,10 +426,7 @@ fn legato_extends_same_key_only() {
 
 #[test]
 fn set_length_and_velocity() {
-    let mut d = doc(vec![vec![
-        chan(0, 0x90, 60, 100),
-        chan(480, 0x80, 60, 0),
-    ]]);
+    let mut d = doc(vec![vec![chan(0, 0x90, 60, 100), chan(480, 0x80, 60, 0)]]);
     let ops = d.set_length_ops(0, 0, u64::MAX, 120);
     apply(&mut d, ops);
     let ops = d.set_velocity_ops(0, 0, u64::MAX, 64);
@@ -435,10 +453,9 @@ fn parsed_doc() -> Document {
     let t1 = [
         0x00, 0xFF, 0x03, 0x04, b'L', b'e', b'a', b'd', // track name
         0x00, 0x90, 0x3C, 0x64, // note on C4 vel 100
-        0x60, 0x3C, 0x00,       // running-status note off
+        0x60, 0x3C, 0x00, // running-status note off
         0x00, 0x90, 0x40, 0x40, // note on E4 vel 64
-        0x60, 0x40, 0x00,
-        0x00, 0xFF, 0x2F, 0x00,
+        0x60, 0x40, 0x00, 0x00, 0xFF, 0x2F, 0x00,
     ];
     for t in [&t0[..], &t1[..]] {
         f.extend_from_slice(b"MTrk");
@@ -469,7 +486,11 @@ fn kind_edits_survive_save_reload() {
     let re = save_reload(&d);
     let mut keys: Vec<u8> = notes_on(&re, 1).iter().map(|n| n.key).collect();
     keys.sort();
-    assert_eq!(keys, vec![72, 76], "transposed keys must survive save+reload");
+    assert_eq!(
+        keys,
+        vec![72, 76],
+        "transposed keys must survive save+reload"
+    );
     for n in notes_on(&re, 1) {
         assert_eq!(n.vel, 33, "edited velocity must survive save+reload");
         assert_eq!(n.channel, 5, "edited channel must survive save+reload");
@@ -486,9 +507,10 @@ fn tempo_and_name_replace_survive_save_reload() {
 
     let re = save_reload(&d);
     let mpq = re.tracks[0].events.iter().find_map(|e| match &e.kind {
-        EventKind::Meta { meta_type: 0x51, data } => {
-            Some(u32::from_be_bytes([0, data[0], data[1], data[2]]))
-        }
+        EventKind::Meta {
+            meta_type: 0x51,
+            data,
+        } => Some(u32::from_be_bytes([0, data[0], data[1], data[2]])),
         _ => None,
     });
     assert_eq!(mpq, Some(250_000), "240bpm tempo must survive save+reload");
@@ -504,7 +526,14 @@ fn tick_only_edit_preserves_raw_body() {
     assert!(ev.raw_body.as_deref() == Some(&[0x90, 0x3C, 0x64][..]));
     let mut after = ev.clone();
     after.tick = 960;
-    apply(&mut d, vec![Op::UpdateEvent { track: 1, before: ev, after }]);
+    apply(
+        &mut d,
+        vec![Op::UpdateEvent {
+            track: 1,
+            before: ev,
+            after,
+        }],
+    );
     let re = save_reload(&d);
     let moved = re.tracks[1].events.iter().find(|e| e.tick == 960).unwrap();
     assert_eq!(moved.raw_body.as_deref(), Some(&[0x90, 0x3C, 0x64][..]));
@@ -519,14 +548,24 @@ fn apply_is_atomic_on_unknown_track() {
         tick: 100,
         seq: 0,
         raw_body: None,
-        kind: EventKind::Channel { status: 0x90, data: [64, 90], len: 2 },
+        kind: EventKind::Channel {
+            status: 0x90,
+            data: [64, 90],
+            len: 2,
+        },
     };
     let tx = Transaction {
         label: "bad".into(),
         base: rev,
         ops: vec![
-            Op::InsertEvents { track: 0, events: vec![new_ev.clone()] },
-            Op::InsertEvents { track: 9, events: vec![new_ev.clone()] },
+            Op::InsertEvents {
+                track: 0,
+                events: vec![new_ev.clone()],
+            },
+            Op::InsertEvents {
+                track: 9,
+                events: vec![new_ev.clone()],
+            },
         ],
     };
     match d.apply(tx) {
@@ -536,7 +575,13 @@ fn apply_is_atomic_on_unknown_track() {
     assert_eq!(d.revision(), rev, "failed apply must not bump the revision");
     assert_eq!(d.tracks[0].events.len(), 1, "op 1 must not be half-applied");
     // the id index stays consistent: a follow-up edit at the same base works
-    apply(&mut d, vec![Op::InsertEvents { track: 0, events: vec![new_ev] }]);
+    apply(
+        &mut d,
+        vec![Op::InsertEvents {
+            track: 0,
+            events: vec![new_ev],
+        }],
+    );
     assert_eq!(d.tracks[0].events.len(), 2);
 }
 
@@ -560,7 +605,10 @@ fn set_length_huge_ticks_saturates() {
 fn smpte_tempo_map_uses_frames_not_ppq() {
     // 30fps * 100 tpf = 3000 ticks/s → 3000 ticks = 1s
     let mut d = doc(vec![vec![]]);
-    d.division = Division::Smpte { fps: 30, ticks_per_frame: 100 };
+    d.division = Division::Smpte {
+        fps: 30,
+        ticks_per_frame: 100,
+    };
     d.tempo_map = TempoMap::build(&d.tracks, d.division);
     assert_eq!(d.tempo_map.tick_to_us(3000), 1_000_000);
     assert_eq!(d.tempo_map.tick_to_us(1500), 500_000);

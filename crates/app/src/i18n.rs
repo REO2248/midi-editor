@@ -485,7 +485,11 @@ fn detect_lang() -> &'static str {
     }
     // OS UI language — coarse prefix match is enough for shipped locales
     let lang = std::env::var("LANG").unwrap_or_default();
-    if lang.starts_with("ja") { "ja" } else { "en" }
+    if lang.starts_with("ja") {
+        "ja"
+    } else {
+        "en"
+    }
 }
 
 fn table() -> &'static HashMap<&'static str, &'static str> {
@@ -503,7 +507,10 @@ pub fn t(key: &'static str) -> &'static str {
     if let Some(v) = table().get(key) {
         return v;
     }
-    EN.iter().find(|(k, _)| *k == key).map(|(_, v)| *v).unwrap_or(key)
+    EN.iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| *v)
+        .unwrap_or(key)
 }
 
 #[allow(dead_code)]
@@ -515,7 +522,6 @@ pub fn tf(key: &'static str, args: &[(&str, &str)]) -> String {
     }
     s
 }
-
 
 #[allow(dead_code)]
 /// Current locale id ("en", "ja").
@@ -559,4 +565,3 @@ mod tests {
         assert!(s.contains("42"), "placeholder substituted: {s}");
     }
 }
-

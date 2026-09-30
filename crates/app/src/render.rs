@@ -2010,9 +2010,16 @@ impl Render for EditorView {
                         v.open_logs(cx);
                     })
                     .into_any_element(),
-                    Self::mi("h.diag", t("help.export_diag"), "", None, cx, |v, _e, cx| {
-                        v.export_diagnostics(cx);
-                    })
+                    Self::mi(
+                        "h.diag",
+                        t("help.export_diag"),
+                        "",
+                        None,
+                        cx,
+                        |v, _e, cx| {
+                            v.export_diagnostics(cx);
+                        },
+                    )
                     .into_any_element(),
                 ],
             };

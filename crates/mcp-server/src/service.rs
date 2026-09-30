@@ -34,9 +34,7 @@ pub enum SaveError {
     #[error("no path — pass one or open a file in the editor")]
     NoPath,
     /// the live document moved past the revision the caller meant to save
-    #[error(
-        "document changed since revision {expected} (now {actual}) — save again to overwrite"
-    )]
+    #[error("document changed since revision {expected} (now {actual}) — save again to overwrite")]
     Conflict {
         /// revision the caller expected to still be current
         expected: u64,
@@ -244,7 +242,9 @@ mod tests {
     }
 
     fn testdir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("midi-editor-service-tests").join(name);
+        let dir = std::env::temp_dir()
+            .join("midi-editor-service-tests")
+            .join(name);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -261,7 +261,13 @@ mod tests {
         assert_eq!(out.revision, rev);
         assert_eq!(lock(&sh).saved_revision, rev);
         // valid SMF round-trip
-        assert_eq!(smf_core::parse(&std::fs::read(&p).unwrap()).unwrap().tracks.len(), 1);
+        assert_eq!(
+            smf_core::parse(&std::fs::read(&p).unwrap())
+                .unwrap()
+                .tracks
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -277,7 +283,14 @@ mod tests {
         let dir = testdir("save_document_explicit_path_overrides_shared_path");
         lock(&sh).path = Some(dir.join("ignored.mid"));
         let p = dir.join("chosen.mid");
-        save_document(&sh, SaveRequest { path: Some(&p), expect_revision: None }).unwrap();
+        save_document(
+            &sh,
+            SaveRequest {
+                path: Some(&p),
+                expect_revision: None,
+            },
+        )
+        .unwrap();
         assert!(p.exists());
     }
 
@@ -289,13 +302,23 @@ mod tests {
         let rev = lock(&sh).doc.revision();
         let err = save_document(
             &sh,
-            SaveRequest { path: None, expect_revision: Some(rev + 1) },
+            SaveRequest {
+                path: None,
+                expect_revision: Some(rev + 1),
+            },
         )
         .unwrap_err();
         assert!(matches!(err, SaveError::Conflict { .. }));
         assert!(!p.exists(), "conflict must not write");
         // matching expectation saves fine
-        save_document(&sh, SaveRequest { path: None, expect_revision: Some(rev) }).unwrap();
+        save_document(
+            &sh,
+            SaveRequest {
+                path: None,
+                expect_revision: Some(rev),
+            },
+        )
+        .unwrap();
     }
 
     #[test]
@@ -385,12 +408,16 @@ mod tests {
         lock(&sh).path = Some(p.clone());
         // emulate a stale save completing after an open: swap bumps
         // generation, and the new doc must keep its own saved_revision
-        swap_document(&sh, Document::from_file(smf_core::File {
-            format: 1,
-            division: smf_core::Division::Metrical(480),
-            tracks: vec![smf_core::Track { events: vec![] }],
-            warnings: vec![],
-        }), Some(dir.join("b.mid")));
+        swap_document(
+            &sh,
+            Document::from_file(smf_core::File {
+                format: 1,
+                division: smf_core::Division::Metrical(480),
+                tracks: vec![smf_core::Track { events: vec![] }],
+                warnings: vec![],
+            }),
+            Some(dir.join("b.mid")),
+        );
         let rev = lock(&sh).doc.revision();
         assert_eq!(lock(&sh).saved_revision, rev);
         assert_eq!(lock(&sh).generation, 1);
@@ -413,12 +440,16 @@ mod tests {
                 ops: vec![],
             });
         }
-        swap_document(&sh, Document::from_file(smf_core::File {
-            format: 1,
-            division: smf_core::Division::Metrical(480),
-            tracks: vec![smf_core::Track { events: vec![] }],
-            warnings: vec![],
-        }), None);
+        swap_document(
+            &sh,
+            Document::from_file(smf_core::File {
+                format: 1,
+                division: smf_core::Division::Metrical(480),
+                tracks: vec![smf_core::Track { events: vec![] }],
+                warnings: vec![],
+            }),
+            None,
+        );
         let g = lock(&sh);
         assert!(g.muted.is_empty() && g.soloed.is_empty() && g.track_dest.is_empty());
         assert!(g.undo.is_empty());
@@ -433,7 +464,11 @@ mod tests {
         std::fs::write(dir.join("other.mid"), b"x").unwrap();
         let sibs = persist::temp_siblings(&p);
         assert_eq!(sibs.len(), 1);
-        assert!(sibs[0].file_name().unwrap().to_string_lossy().starts_with(".song.mid.sav"));
+        assert!(sibs[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(".song.mid.sav"));
     }
 
     #[test]
@@ -452,7 +487,9 @@ mod tests {
                 f.format,
                 f.division,
                 &f.tracks,
-                smf_core::WriteOptions { running_status: false },
+                smf_core::WriteOptions {
+                    running_status: false,
+                },
             ),
         )
         .unwrap();

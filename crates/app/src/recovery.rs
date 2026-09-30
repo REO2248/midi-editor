@@ -63,7 +63,9 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 }
 
 fn unix_secs(t: SystemTime) -> u64 {
-    t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// %APPDATA%/midi-editor/recovery (temp dir fallback when APPDATA is unset —
@@ -352,7 +354,10 @@ mod tests {
             let _ = filetime_set(&p, past);
         }
         // artificially age s0 far beyond retention
-        let _ = filetime_set(&dir.join("s0.snap"), now - MAX_AGE - Duration::from_secs(10));
+        let _ = filetime_set(
+            &dir.join("s0.snap"),
+            now - MAX_AGE - Duration::from_secs(10),
+        );
         cleanup_stale(&dir, 3, MAX_AGE, now);
         let remaining = list_snapshots(&dir);
         assert_eq!(remaining.len(), 3);

@@ -125,10 +125,17 @@ fn redact_line(line: &str) -> String {
     while i < line.len() {
         // find the next keyword among several secret shapes
         let rest = &lower[i..];
-        let hit = ["token", "bearer", "authorization", "api_key", "apikey", "secret"]
-            .iter()
-            .filter_map(|k| rest.find(k).map(|p| (p + i, k.len())))
-            .min_by_key(|(p, _)| *p);
+        let hit = [
+            "token",
+            "bearer",
+            "authorization",
+            "api_key",
+            "apikey",
+            "secret",
+        ]
+        .iter()
+        .filter_map(|k| rest.find(k).map(|p| (p + i, k.len())))
+        .min_by_key(|(p, _)| *p);
         match hit {
             None => {
                 out.push_str(&line[i..]);
@@ -204,23 +211,23 @@ pub(crate) fn export_bundle(dir: &Path, host_lines: &str) -> io::Result<PathBuf>
         .map(|rd| {
             rd.filter_map(|e| e.ok())
                 .filter(|e| {
-                    e.file_type().map(|t| t.is_file()).unwrap_or(false)
-                        && {
-                            let n = e.file_name().to_string_lossy().into_owned();
-                            n.starts_with("midi-editor.") && n.ends_with(".log")
-                        }
+                    e.file_type().map(|t| t.is_file()).unwrap_or(false) && {
+                        let n = e.file_name().to_string_lossy().into_owned();
+                        n.starts_with("midi-editor.") && n.ends_with(".log")
+                    }
                 })
                 .map(|e| e.path())
                 .collect()
         })
         .unwrap_or_default();
     // newest first by mtime
-    logs.sort_by_key(|p| {
-        std::fs::metadata(p).and_then(|m| m.modified()).ok()
-    });
+    logs.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
     logs.reverse();
     for lf in logs.iter().take(LOG_KEEP) {
-        out.push_str(&format!("\n--- {} ---\n", lf.file_name().unwrap_or_default().to_string_lossy()));
+        out.push_str(&format!(
+            "\n--- {} ---\n",
+            lf.file_name().unwrap_or_default().to_string_lossy()
+        ));
         match file_tail(lf, BUNDLE_TAIL_BYTES) {
             Ok(tail) => {
                 for line in tail.lines() {

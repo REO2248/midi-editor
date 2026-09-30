@@ -14,9 +14,7 @@ pub trait Versioned {
     const VERSION: u32;
     /// version recorded in an on-disk document (absent `version` = 0)
     fn version_of(doc: &serde_json::Value) -> u32 {
-        doc.get("version")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32
+        doc.get("version").and_then(|v| v.as_u64()).unwrap_or(0) as u32
     }
     /// rewrite an older document into the current shape — called only when
     /// `0 <= version_of(doc) < VERSION`; should set `doc["version"]`
@@ -210,7 +208,9 @@ mod tests {
     }
 
     fn testdir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("midi-editor-json-tests").join(name);
+        let dir = std::env::temp_dir()
+            .join("midi-editor-json-tests")
+            .join(name);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -230,8 +230,24 @@ mod tests {
         let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let dir = testdir("roundtrip_writes_version_and_recovers_backup");
         let p = dir.join("x.json");
-        save_json(&p, &TestPrefs { version: 2, name: "a".into(), level: 3 }).unwrap();
-        save_json(&p, &TestPrefs { version: 2, name: "b".into(), level: 4 }).unwrap();
+        save_json(
+            &p,
+            &TestPrefs {
+                version: 2,
+                name: "a".into(),
+                level: 3,
+            },
+        )
+        .unwrap();
+        save_json(
+            &p,
+            &TestPrefs {
+                version: 2,
+                name: "b".into(),
+                level: 4,
+            },
+        )
+        .unwrap();
         // the second save backed up the first — previous valid version
         let bak: TestPrefs =
             serde_json::from_slice(&std::fs::read(backup_path(&p)).unwrap()).unwrap();
@@ -290,7 +306,15 @@ mod tests {
         // still holds the last good version
         let dir = testdir("interrupted_write_recovers_previous_valid");
         let p = dir.join("x.json");
-        save_json(&p, &TestPrefs { version: 2, name: "good".into(), level: 1 }).unwrap();
+        save_json(
+            &p,
+            &TestPrefs {
+                version: 2,
+                name: "good".into(),
+                level: 1,
+            },
+        )
+        .unwrap();
         std::fs::copy(&p, backup_path(&p)).unwrap();
         let mut bytes = std::fs::read(&p).unwrap();
         bytes.truncate(bytes.len() / 2);

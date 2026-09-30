@@ -62,13 +62,21 @@ impl PersistError {
         Self {
             phase,
             recoverable: None,
-            msg: format!("save {}: {} failed: {source}", path.display(), phase.label()),
+            msg: format!(
+                "save {}: {} failed: {source}",
+                path.display(),
+                phase.label()
+            ),
             source,
         }
     }
 
     fn replace(path: &Path, source: std::io::Error, recoverable: Option<PathBuf>) -> Self {
-        let mut msg = format!("save {}: {} failed: {source}", path.display(), Phase::Replace.label());
+        let mut msg = format!(
+            "save {}: {} failed: {source}",
+            path.display(),
+            Phase::Replace.label()
+        );
         if let Some(t) = &recoverable {
             msg.push_str(&format!(" — new contents kept at {}", t.display()));
         }
@@ -141,8 +149,8 @@ pub fn write_atomic_opts(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
 
-    let (mut file, tmp) = create_temp(dir, &stem)
-        .map_err(|e| PersistError::new(Phase::TempCreate, path, e))?;
+    let (mut file, tmp) =
+        create_temp(dir, &stem).map_err(|e| PersistError::new(Phase::TempCreate, path, e))?;
     // write + fsync in one stage-tracked block so failures carry the right
     // phase; on error the weakly-durable temp is removed so nothing later
     // can mistake it for a recoverable artifact
@@ -234,7 +242,10 @@ fn replace(path: &Path, tmp: &Path, backup: Option<&Path>) -> std::io::Result<()
     };
 
     fn wide(p: &Path) -> Vec<u16> {
-        p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+        p.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
     }
 
     let try_once = || -> std::io::Result<()> {
@@ -343,10 +354,8 @@ fn retry_transient(mut f: impl FnMut() -> std::io::Result<()>) -> std::io::Resul
 fn preserve_permissions(path: &Path, tmp: &Path) {
     use std::os::unix::fs::PermissionsExt;
     if let Ok(m) = path.metadata() {
-        let _ = std::fs::set_permissions(
-            tmp,
-            std::fs::Permissions::from_mode(m.permissions().mode()),
-        );
+        let _ =
+            std::fs::set_permissions(tmp, std::fs::Permissions::from_mode(m.permissions().mode()));
     }
 }
 
@@ -390,7 +399,9 @@ mod tests {
     use std::io::ErrorKind;
 
     fn testdir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("midi-editor-persist-tests").join(name);
+        let dir = std::env::temp_dir()
+            .join("midi-editor-persist-tests")
+            .join(name);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -424,7 +435,10 @@ mod tests {
         let final_bytes = std::fs::read(&p).unwrap();
         // the winner is a complete payload — never a torn mix of two
         assert!(payloads.iter().any(|pl| *pl == final_bytes));
-        assert!(leftover_temps(&dir).is_empty(), "no temp litter after success");
+        assert!(
+            leftover_temps(&dir).is_empty(),
+            "no temp litter after success"
+        );
     }
 
     #[test]

@@ -52,7 +52,10 @@ pub struct Track {
 pub enum Division {
     Metrical(u16),
     /// semantic fps (24/25/29/30) + ticks per frame
-    Smpte { fps: u8, ticks_per_frame: u8 },
+    Smpte {
+        fps: u8,
+        ticks_per_frame: u8,
+    },
 }
 
 impl Default for Division {
@@ -170,7 +173,10 @@ fn detect_extra_chunks(raw: &[u8], warnings: &mut Vec<String>) {
         pos += 8 + len;
     }
     if pos < raw.len() {
-        warnings.push(format!("{} trailing bytes after last chunk", raw.len() - pos));
+        warnings.push(format!(
+            "{} trailing bytes after last chunk",
+            raw.len() - pos
+        ));
     }
 }
 
@@ -207,7 +213,11 @@ fn parse_lenient(raw: &[u8]) -> Result<File, Error> {
         let len = u32::from_be_bytes(raw[pos + 4..pos + 8].try_into().unwrap()) as usize;
         let body_end = pos.saturating_add(8).saturating_add(len).min(raw.len());
         if id == b"MTrk" {
-            tracks.push(track_lenient(&raw[pos + 8..body_end], tracks.len(), &mut warnings));
+            tracks.push(track_lenient(
+                &raw[pos + 8..body_end],
+                tracks.len(),
+                &mut warnings,
+            ));
         }
         let next = pos.saturating_add(8).saturating_add(len);
         if next <= pos {
@@ -270,11 +280,7 @@ fn track_lenient(data: &[u8], tno: usize, warnings: &mut Vec<String>) -> Track {
             // u64 math: a corrupt VLQ length can exceed usize and must not
             // overflow the pointer arithmetic
             let overruns = l > (data.len() - p) as u64;
-            let end = if overruns {
-                data.len()
-            } else {
-                p + l as usize
-            };
+            let end = if overruns { data.len() } else { p + l as usize };
             if overruns {
                 warnings.push(format!(
                     "track {tno}: meta 0x{mt:02x} payload overruns chunk (clamped)"
@@ -387,9 +393,7 @@ fn midi_data(m: &MidiMessage) -> (u8, u8, u8) {
             (key.as_int(), vel.as_int(), 2)
         }
         MidiMessage::Aftertouch { key, vel } => (key.as_int(), vel.as_int(), 2),
-        MidiMessage::Controller { controller, value } => {
-            (controller.as_int(), value.as_int(), 2)
-        }
+        MidiMessage::Controller { controller, value } => (controller.as_int(), value.as_int(), 2),
         MidiMessage::ProgramChange { program } => (program.as_int(), 0, 1),
         MidiMessage::ChannelAftertouch { vel } => (vel.as_int(), 0, 1),
         MidiMessage::PitchBend { bend } => {
@@ -603,7 +607,15 @@ fn sorted_last_is_eot(track: &Track) -> bool {
         .events
         .iter()
         .max_by_key(|e| (e.tick, e.seq))
-        .map(|e| matches!(e.kind, EventKind::Meta { meta_type: 0x2F, .. }))
+        .map(|e| {
+            matches!(
+                e.kind,
+                EventKind::Meta {
+                    meta_type: 0x2F,
+                    ..
+                }
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -634,13 +646,8 @@ pub fn decode_text(data: &[u8], hint: Option<TextEncoding>) -> String {
     let enc = hint.unwrap_or_else(|| guess_encoding(data));
     match enc {
         TextEncoding::Utf8 => String::from_utf8_lossy(data).into_owned(),
-        TextEncoding::ShiftJis => {
-            encoding_rs::SHIFT_JIS.decode(data).0.into_owned()
-        }
-        TextEncoding::Latin1 => encoding_rs::WINDOWS_1252
-            .decode(data)
-            .0
-            .into_owned(),
+        TextEncoding::ShiftJis => encoding_rs::SHIFT_JIS.decode(data).0.into_owned(),
+        TextEncoding::Latin1 => encoding_rs::WINDOWS_1252.decode(data).0.into_owned(),
     }
 }
 

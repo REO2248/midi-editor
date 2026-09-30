@@ -340,9 +340,7 @@ struct EditorView {
     scan_rx: Option<std::sync::mpsc::Receiver<output::ScanReport>>,
     /// in-flight save worker — at most one: a second Ctrl+S while a slow
     /// save runs is ignored rather than queued
-    save_rx: Option<
-        std::sync::mpsc::Receiver<Result<mcp_server::service::SaveOutcome, String>>,
-    >,
+    save_rx: Option<std::sync::mpsc::Receiver<Result<mcp_server::service::SaveOutcome, String>>>,
     scan_note: Option<String>,
     scan_probe_used: Option<bool>,
     host_diag: output::HostDiag,
@@ -1717,10 +1715,8 @@ impl EditorView {
                 let shared = self.shared.clone();
                 let (tx, rx) = std::sync::mpsc::channel();
                 std::thread::spawn(move || {
-                    let _ = tx.send(
-                        mcp_server::service::finish_save(ticket)
-                            .map_err(|e| e.to_string()),
-                    );
+                    let _ = tx
+                        .send(mcp_server::service::finish_save(ticket).map_err(|e| e.to_string()));
                     drop(shared);
                 });
                 self.save_rx = Some(rx);
@@ -2062,7 +2058,8 @@ impl EditorView {
         let dir = diagnostics::app_data_dir().join("diagnostics");
         match diagnostics::export_bundle(&dir, &host_lines) {
             Ok(p) => {
-                self.status = tf("status.bundle_written", &[("p", &p.display().to_string())]).into();
+                self.status =
+                    tf("status.bundle_written", &[("p", &p.display().to_string())]).into();
                 diagnostics::reveal_file(&p);
             }
             Err(e) => {
@@ -2440,9 +2437,11 @@ impl EditorView {
             .filter(|(_, tr, _)| audible(*tr))
             .filter_map(|(us, tr, b)| sink_of.get(&dest_of(tr)).map(|&s| (us, s, b)))
             .collect();
-        events.extend(tagged.into_iter().filter_map(|(us, tr, b)| {
-            sink_of.get(&dest_of(tr)).map(|&s| (us, s, b))
-        }));
+        events.extend(
+            tagged
+                .into_iter()
+                .filter_map(|(us, tr, b)| sink_of.get(&dest_of(tr)).map(|&s| (us, s, b))),
+        );
         if metronome {
             // prefer a plain MIDI port for clicks; fall back to any sink
             let click_sink = dests
@@ -3154,8 +3153,12 @@ impl persist::json::Versioned for Prefs {
         self.zoom = self
             .zoom
             .and_then(|z| (z.is_finite() && z > 0.0).then(|| z.clamp(ZOOM_MIN, ZOOM_MAX)));
-        self.scroll_x = self.scroll_x.and_then(|x| x.is_finite().then(|| x.max(0.0)));
-        self.scroll_y = self.scroll_y.and_then(|y| y.is_finite().then(|| y.max(0.0)));
+        self.scroll_x = self
+            .scroll_x
+            .and_then(|x| x.is_finite().then(|| x.max(0.0)));
+        self.scroll_y = self
+            .scroll_y
+            .and_then(|y| y.is_finite().then(|| y.max(0.0)));
         self.snap = self.snap.map(|i| i.min(SNAPS.len() - 1));
         self.enc = self
             .enc
@@ -3419,7 +3422,10 @@ fn main() {
 /// loopback only). `mcp-bridge` is the stdio frontend for stdio-only clients.
 fn spawn_mcp(
     shared: SharedDoc,
-) -> (tokio::sync::oneshot::Sender<()>, std::thread::JoinHandle<()>) {
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    std::thread::JoinHandle<()>,
+) {
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
     let handle = std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
@@ -3435,10 +3441,11 @@ fn spawn_mcp(
         rt.block_on(async move {
             let token = std::env::var("MIDI_MCP_TOKEN").ok();
             // auth mode is safe to log; the token value never is
-            tracing::info!(auth = token.is_some(), "mcp http listening on 127.0.0.1:7878");
-            if let Err(e) =
-                mcp_server::serve_http(shared, "127.0.0.1:7878", token, stop_rx).await
-            {
+            tracing::info!(
+                auth = token.is_some(),
+                "mcp http listening on 127.0.0.1:7878"
+            );
+            if let Err(e) = mcp_server::serve_http(shared, "127.0.0.1:7878", token, stop_rx).await {
                 tracing::error!(error = %e, "mcp http stopped");
             }
         });
@@ -3839,7 +3846,11 @@ mod tests {
     fn global_prefs_v0_loads_and_newer_survives() {
         let dir = testdir("global_prefs_v0_loads_and_newer_survives");
         let p = dir.join("prefs.json");
-        std::fs::write(&p, br#"{"recent":["a.mid"],"count_in":true,"midi_in":"p1"}"#).unwrap();
+        std::fs::write(
+            &p,
+            br#"{"recent":["a.mid"],"count_in":true,"midi_in":"p1"}"#,
+        )
+        .unwrap();
         let l = persist::json::load_json::<GlobalPrefs>(&p);
         let g = l.value.expect("v0 globals load");
         assert_eq!(g.version, 1);

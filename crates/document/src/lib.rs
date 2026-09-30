@@ -94,11 +94,21 @@ pub enum Op {
     },
     /// Append a track at `index` (usually == tracks.len()); `track` is the
     /// inserted track's before-image so undo can remove it by position.
-    InsertTrack { index: usize, track: Track },
+    InsertTrack {
+        index: usize,
+        track: Track,
+    },
     /// Remove the whole track; `track` is its before-image.
-    RemoveTrack { index: usize, track: Track },
+    RemoveTrack {
+        index: usize,
+        track: Track,
+    },
     /// Replace the track's display name meta (0x03) before-image kept.
-    UpdateTrack { index: usize, before: Track, after: Track },
+    UpdateTrack {
+        index: usize,
+        before: Track,
+        after: Track,
+    },
 }
 
 impl Document {
@@ -295,14 +305,26 @@ impl Document {
         for (ti, t) in self.tracks.iter().enumerate() {
             let mut eot = false;
             for e in &t.events {
-                if matches!(e.kind, EventKind::Meta { meta_type: 0x2F, .. }) {
+                if matches!(
+                    e.kind,
+                    EventKind::Meta {
+                        meta_type: 0x2F,
+                        ..
+                    }
+                ) {
                     eot = true;
                 }
                 // tempo maps outside track 0 (format-1 files): legal but
                 // most players ignore them — worth flagging
                 if self.format == 1
                     && ti != 0
-                    && matches!(e.kind, EventKind::Meta { meta_type: 0x51, .. })
+                    && matches!(
+                        e.kind,
+                        EventKind::Meta {
+                            meta_type: 0x51,
+                            ..
+                        }
+                    )
                 {
                     out.push(Diagnostic {
                         code: "tempo-outside-conductor",
@@ -658,7 +680,11 @@ impl Document {
                     }
                 }
                 if st.sel_seen {
-                    let (msb, lsb) = if st.sel_nrpn { (99u8, 98u8) } else { (101, 100) };
+                    let (msb, lsb) = if st.sel_nrpn {
+                        (99u8, 98u8)
+                    } else {
+                        (101, 100)
+                    };
                     push!([0xB0 | ch, msb, st.sel_vals[(msb - 98) as usize]]);
                     push!([0xB0 | ch, lsb, st.sel_vals[(lsb - 98) as usize]]);
                     if let Some(v) = st.data_msb {
@@ -753,7 +779,9 @@ impl DocSnapshot {
 fn apply_op(tracks: &mut Vec<Track>, op: &Op) -> Result<(), ApplyError> {
     match op {
         Op::InsertEvents { track, events } => {
-            let t = tracks.get_mut(*track).ok_or(ApplyError::UnknownTrack(*track))?;
+            let t = tracks
+                .get_mut(*track)
+                .ok_or(ApplyError::UnknownTrack(*track))?;
             for e in events {
                 let pos = t
                     .events
@@ -763,7 +791,9 @@ fn apply_op(tracks: &mut Vec<Track>, op: &Op) -> Result<(), ApplyError> {
             }
         }
         Op::RemoveEvents { track, removed } => {
-            let t = tracks.get_mut(*track).ok_or(ApplyError::UnknownTrack(*track))?;
+            let t = tracks
+                .get_mut(*track)
+                .ok_or(ApplyError::UnknownTrack(*track))?;
             for (_, e) in removed {
                 if let Some(pos) = t.events.iter().position(|x| x.id == e.id) {
                     t.events.remove(pos);
@@ -771,7 +801,9 @@ fn apply_op(tracks: &mut Vec<Track>, op: &Op) -> Result<(), ApplyError> {
             }
         }
         Op::UpdateEvent { track, after, .. } => {
-            let t = tracks.get_mut(*track).ok_or(ApplyError::UnknownTrack(*track))?;
+            let t = tracks
+                .get_mut(*track)
+                .ok_or(ApplyError::UnknownTrack(*track))?;
             if let Some(pos) = t.events.iter().position(|x| x.id == after.id) {
                 let mut after = after.clone();
                 // a modified kind must be re-encoded on save; a stale raw_body
@@ -1031,13 +1063,7 @@ impl Document {
 
     /// Transpose all notes starting inside [from,to) by `semitones`
     /// (clamped to 0..=127; notes that would leave the range are skipped).
-    pub fn transpose_ops(
-        &mut self,
-        track: usize,
-        from: u64,
-        to: u64,
-        semitones: i32,
-    ) -> Vec<Op> {
+    pub fn transpose_ops(&mut self, track: usize, from: u64, to: u64, semitones: i32) -> Vec<Op> {
         let mut ops = Vec::new();
         for n in self
             .notes()
@@ -1058,7 +1084,11 @@ impl Document {
                     if let EventKind::Channel { data, .. } = &mut after.kind {
                         data[0] = new_key;
                     }
-                    ops.push(Op::UpdateEvent { track: ti, before, after });
+                    ops.push(Op::UpdateEvent {
+                        track: ti,
+                        before,
+                        after,
+                    });
                 }
             }
         }
@@ -1066,13 +1096,7 @@ impl Document {
     }
 
     /// Multiply noteOn velocities inside [from,to) by `factor` (clamped 1..127).
-    pub fn scale_velocity_ops(
-        &mut self,
-        track: usize,
-        from: u64,
-        to: u64,
-        factor: f64,
-    ) -> Vec<Op> {
+    pub fn scale_velocity_ops(&mut self, track: usize, from: u64, to: u64, factor: f64) -> Vec<Op> {
         let mut ops = Vec::new();
         for n in self
             .notes()
@@ -1089,7 +1113,11 @@ impl Document {
                 if let EventKind::Channel { data, .. } = &mut after.kind {
                     data[1] = nv;
                 }
-                ops.push(Op::UpdateEvent { track: ti, before, after });
+                ops.push(Op::UpdateEvent {
+                    track: ti,
+                    before,
+                    after,
+                });
             }
         }
         ops
@@ -1113,7 +1141,8 @@ impl Document {
             .into_iter()
             .filter(|n| n.track == track && n.start_tick >= from && n.start_tick < to)
         {
-            let mut r = n.on_id
+            let mut r = n
+                .on_id
                 .wrapping_mul(0x9E37_79B9_7F4A_7C15)
                 .wrapping_add(0xA076_1D64_78BD_642F);
             let mut next = || {
@@ -1191,13 +1220,7 @@ impl Document {
     }
 
     /// Set every note in [from,to) to exactly `ticks` long.
-    pub fn set_length_ops(
-        &mut self,
-        track: usize,
-        from: u64,
-        to: u64,
-        ticks: u64,
-    ) -> Vec<Op> {
+    pub fn set_length_ops(&mut self, track: usize, from: u64, to: u64, ticks: u64) -> Vec<Op> {
         let mut ops = Vec::new();
         for n in self
             .notes()
@@ -1224,13 +1247,7 @@ impl Document {
     }
 
     /// Set every noteOn velocity in [from,to) to `vel`.
-    pub fn set_velocity_ops(
-        &mut self,
-        track: usize,
-        from: u64,
-        to: u64,
-        vel: u8,
-    ) -> Vec<Op> {
+    pub fn set_velocity_ops(&mut self, track: usize, from: u64, to: u64, vel: u8) -> Vec<Op> {
         let mut ops = Vec::new();
         for n in self
             .notes()
@@ -1257,13 +1274,7 @@ impl Document {
     }
 
     /// Retarget every channel event in [from,to) to `channel` (0-indexed).
-    pub fn set_channel_ops(
-        &mut self,
-        track: usize,
-        from: u64,
-        to: u64,
-        channel: u8,
-    ) -> Vec<Op> {
+    pub fn set_channel_ops(&mut self, track: usize, from: u64, to: u64, channel: u8) -> Vec<Op> {
         let mut ops = Vec::new();
         let t = match self.tracks.get(track) {
             Some(t) => t,
@@ -1306,7 +1317,11 @@ impl Document {
         let mut mk = |kind: EventKind| Event {
             id: self.alloc_event_id(),
             tick,
-            seq: { let s = seq; seq = seq.saturating_add(1); s },
+            seq: {
+                let s = seq;
+                seq = seq.saturating_add(1);
+                s
+            },
             raw_body: None,
             kind,
         };
@@ -1371,7 +1386,9 @@ impl Document {
 
     /// Set/replace the tempo at `tick` on the conductor track (track 0).
     pub fn set_tempo_ops(&mut self, tick: u64, bpm: f64) -> Vec<Op> {
-        let mpq = (60_000_000.0 / bpm.max(1.0)).round().clamp(1.0, 0xFF_FFFF as f64) as u32;
+        let mpq = (60_000_000.0 / bpm.max(1.0))
+            .round()
+            .clamp(1.0, 0xFF_FFFF as f64) as u32;
         let data = Bytes::copy_from_slice(&mpq.to_be_bytes()[1..]);
         // replace an existing tempo event at the same tick
         if let Some(e) = self
@@ -1379,7 +1396,14 @@ impl Document {
             .first()
             .and_then(|t| {
                 t.events.iter().find(|e| {
-                    e.tick == tick && matches!(e.kind, EventKind::Meta { meta_type: 0x51, .. })
+                    e.tick == tick
+                        && matches!(
+                            e.kind,
+                            EventKind::Meta {
+                                meta_type: 0x51,
+                                ..
+                            }
+                        )
                 })
             })
             .cloned()
@@ -1420,7 +1444,14 @@ impl Document {
             .first()
             .and_then(|t| {
                 t.events.iter().find(|e| {
-                    e.tick == tick && matches!(e.kind, EventKind::Meta { meta_type: 0x58, .. })
+                    e.tick == tick
+                        && matches!(
+                            e.kind,
+                            EventKind::Meta {
+                                meta_type: 0x58,
+                                ..
+                            }
+                        )
                 })
             })
             .cloned()
@@ -1459,7 +1490,13 @@ impl Document {
             .get(track)
             .and_then(|t| {
                 t.events.iter().find(|e| {
-                    matches!(e.kind, EventKind::Meta { meta_type: 0x20, .. })
+                    matches!(
+                        e.kind,
+                        EventKind::Meta {
+                            meta_type: 0x20,
+                            ..
+                        }
+                    )
                 })
             })
             .cloned()
@@ -1512,8 +1549,7 @@ impl Document {
             .collect();
         // grab the NoteOff of any note whose start is in range — its tick may
         // lie past `to`, in which case the in-range filter missed it
-        let have: std::collections::BTreeSet<EventId> =
-            events.iter().map(|e| e.id).collect();
+        let have: std::collections::BTreeSet<EventId> = events.iter().map(|e| e.id).collect();
         let extra_offs: Vec<Event> = self
             .notes()
             .into_iter()
@@ -1629,9 +1665,15 @@ impl Document {
             .tracks
             .get(track)
             .and_then(|t| {
-                t.events
-                    .iter()
-                    .find(|e| matches!(e.kind, EventKind::Meta { meta_type: 0x03, .. }))
+                t.events.iter().find(|e| {
+                    matches!(
+                        e.kind,
+                        EventKind::Meta {
+                            meta_type: 0x03,
+                            ..
+                        }
+                    )
+                })
             })
             .cloned()
         {
@@ -1719,9 +1761,10 @@ impl TempoMap {
     /// Ticks per second for SMPTE timing (tempo events don't apply there).
     fn smpte_tps(&self) -> u64 {
         match self.division {
-            Division::Smpte { fps, ticks_per_frame } => {
-                fps.max(1) as u64 * ticks_per_frame.max(1) as u64
-            }
+            Division::Smpte {
+                fps,
+                ticks_per_frame,
+            } => fps.max(1) as u64 * ticks_per_frame.max(1) as u64,
             Division::Metrical(_) => 0,
         }
     }
@@ -1918,11 +1961,13 @@ mod tests {
             ev(40, 0xB0, 64, 127), // pedal down
             ev(100, 0x90, 60, 100),
             ev(200, 0x90, 64, 80),
-            ev(300, 0x80, 60, 0), // 60 released under pedal -> sustained
+            ev(300, 0x80, 60, 0),  // 60 released under pedal -> sustained
             ev(500, 0x90, 72, 70), // still held at the chase point
         ]);
         let chase = d.chase_events(d.tempo_map.tick_to_us(720));
-        assert!(chase.iter().all(|&(us, tr, _)| us == d.tempo_map.tick_to_us(720) && tr == 0));
+        assert!(chase
+            .iter()
+            .all(|&(us, tr, _)| us == d.tempo_map.tick_to_us(720) && tr == 0));
         assert_eq!(
             bytes_of(&chase),
             vec![
@@ -1974,10 +2019,7 @@ mod tests {
     #[test]
     fn chase_mode_messages_drop_notes_and_are_not_chased() {
         // all-notes-off releases held notes (no pedal): nothing to restrike
-        let d = chase_doc(vec![
-            ev(100, 0x90, 60, 100),
-            ev(600, 0xB0, 123, 0),
-        ]);
+        let d = chase_doc(vec![ev(100, 0x90, 60, 100), ev(600, 0xB0, 123, 0)]);
         assert!(d.chase_events(d.tempo_map.tick_to_us(720)).is_empty());
         // all-sound-off kills even pedal-caught notes
         let d = chase_doc(vec![
@@ -1997,10 +2039,10 @@ mod tests {
         let d = chase_doc(vec![
             ev(10, 0xB0, 101, 0), // RPN 0,0 (pitch bend sensitivity)
             ev(11, 0xB0, 100, 0),
-            ev(12, 0xB0, 6, 2),   // data MSB
-            ev(20, 0xB0, 99, 1),  // switch to NRPN 1,3
+            ev(12, 0xB0, 6, 2),  // data MSB
+            ev(20, 0xB0, 99, 1), // switch to NRPN 1,3
             ev(21, 0xB0, 98, 3),
-            ev(22, 0xB0, 38, 5),  // data LSB
+            ev(22, 0xB0, 38, 5), // data LSB
         ]);
         assert_eq!(
             bytes_of(&d.chase_events(d.tempo_map.tick_to_us(720))),
@@ -2036,8 +2078,12 @@ mod tests {
             format: 1,
             division: Division::Metrical(480),
             tracks: vec![
-                smf_core::Track { events: vec![ev(10, 0xB0, 7, 10)] },
-                smf_core::Track { events: vec![ev(10, 0xB0, 7, 20)] },
+                smf_core::Track {
+                    events: vec![ev(10, 0xB0, 7, 10)],
+                },
+                smf_core::Track {
+                    events: vec![ev(10, 0xB0, 7, 20)],
+                },
             ],
             warnings: vec![],
         };
@@ -2112,7 +2158,7 @@ mod tests {
         // standalone escapes carry arbitrary bytes — never sent
         let d = chase_doc(vec![
             esc(10, &[0x01, 0x02]),
-            sx(20, &[0x7E, 0x7F]), // never terminated
+            sx(20, &[0x7E, 0x7F]),                   // never terminated
             sx(30, &[0x7E, 0x7F, 0x09, 0x01, 0xF7]), // new F0 closes it
         ]);
         let t20 = d.tempo_map.tick_to_us(20);
@@ -2135,9 +2181,9 @@ mod tests {
     #[test]
     fn chase_sysex_picks_last_complete_per_track() {
         let d = chase_doc(vec![
-            sx(0, &[0x7E, 0x7F, 0x09, 0x01, 0xF7]), // GM on
+            sx(0, &[0x7E, 0x7F, 0x09, 0x01, 0xF7]),   // GM on
             sx(100, &[0x41, 0x10, 0x12, 0x00, 0xF7]), // later message wins
-            sx(200, &[0x41, 0x10, 0x40]), // incomplete at the boundary: skipped
+            sx(200, &[0x41, 0x10, 0x40]),             // incomplete at the boundary: skipped
         ]);
         let start = d.tempo_map.tick_to_us(720);
         assert_eq!(
