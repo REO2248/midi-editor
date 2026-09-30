@@ -92,3 +92,28 @@ jobs:
         with:
           name: coverage-report
           path: target/coverage/
+  corpus:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      # committed fixtures must match the generator byte-for-byte
+      - name: Corpus fixtures are in sync with generator
+        run: cargo run -p document --bin corpus_gen --locked -- --check fixtures/corpus
+      # every fixture must satisfy its manifest.json expectations
+      - name: Verify corpus behavior against manifest
+        run: cargo run -p document --bin corpus_check --locked -- --verify fixtures/corpus
+      # committed interop matrix must be current
+      - name: Regenerate interop matrix
+        run: cargo run -p document --bin corpus_check --locked -- --matrix fixtures/corpus docs/interop-matrix.md
+      - name: Matrix is in sync
+        run: git diff --exit-code docs/interop-matrix.md
