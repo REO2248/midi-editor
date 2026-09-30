@@ -3,11 +3,14 @@
 //! Private items are visible here because this is a child module of the
 //! crate root where EditorView is defined.
 
+use crate::a11y;
 use crate::geometry::{drag_window, tick_window, ZOOM_MAX, ZOOM_MIN};
 use crate::i18n::{t, tf};
 use crate::icons::icon;
 use crate::*;
+use gpui_kit::base::{ObservedElement, TestSupportExt};
 use gpui_kit::component::input::Input;
+use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use smf_core::EventKind;
 use std::any::Any;
@@ -356,6 +359,10 @@ impl Render for EditorView {
             (TopMenu::Help, "menu.help", 50.0),
         ];
         let mut menu_bar = div()
+            .id("menu-bar")
+            .test_support()
+            .role(Role::MenuBar)
+            .aria_label(t("a11y.menubar"))
             .flex()
             .items_center()
             .h(px(28.0))
@@ -379,6 +386,10 @@ impl Render for EditorView {
             menu_bar = menu_bar.child(
                 div()
                     .id(key)
+                    .test_support()
+                    .role(Role::MenuItem)
+                    .aria_label(t(key))
+                    .aria_expanded(is_open)
                     .w(px(w))
                     .h(px(22.0))
                     .flex()
@@ -416,6 +427,10 @@ impl Render for EditorView {
 
         // --- transport / tool bar: icon groups, DAW style -------------------------
         let transport_bar = div()
+            .id("transport-bar")
+            .test_support()
+            .role(Role::Toolbar)
+            .aria_label(t("a11y.toolbar"))
             .flex()
             .items_center()
             .gap(px(2.0))
@@ -547,6 +562,10 @@ impl Render for EditorView {
             // position + tempo + meter readouts (LCD style)
             .child(
                 div()
+                    .id("pos")
+                    .test_support()
+                    .role(Role::Label)
+                    .aria_label(tf("a11y.pos", &[("pos", pos.as_str())]))
                     .px_2()
                     .h(px(24.0))
                     .flex()
@@ -583,6 +602,35 @@ impl Render for EditorView {
             .child(
                 div()
                     .id("bpm")
+                    .test_support()
+                    .role(Role::SpinButton)
+                    .aria_label(tf(
+                        "a11y.tempo",
+                        &[("bpm", format!("{tempo0:.0}").as_str())],
+                    ))
+                    .aria_numeric_value(tempo0)
+                    .aria_min_numeric_value(10.0)
+                    .aria_max_numeric_value(400.0)
+                    .on_a11y_action(AccessibleAction::Increment, {
+                        let this = cx.entity().downgrade();
+                        move |_, _, cx| {
+                            this.update(cx, |this, cx| {
+                                this.bump_tempo(1.0);
+                                cx.notify();
+                            })
+                            .ok();
+                        }
+                    })
+                    .on_a11y_action(AccessibleAction::Decrement, {
+                        let this = cx.entity().downgrade();
+                        move |_, _, cx| {
+                            this.update(cx, |this, cx| {
+                                this.bump_tempo(-1.0);
+                                cx.notify();
+                            })
+                            .ok();
+                        }
+                    })
                     .px_2()
                     .h(px(24.0))
                     .flex()
@@ -610,24 +658,26 @@ impl Render for EditorView {
                         }),
                     ),
             )
-            .child(Self::chip("sig", sig.clone(), cx, |v, _e, cx| {
-                v.cycle_time_sig();
-                cx.notify();
-            }))
+            .child(Self::chip(
+                "sig",
+                sig.clone(),
+                tf("a11y.sig", &[("sig", sig.as_str())]),
+                cx,
+                |v, _e, cx| {
+                    v.cycle_time_sig();
+                    cx.notify();
+                },
+            ))
             // format-2 marker: the viewed sequence and the total — the
             // mode is explicit in chrome, never implicit in the file
             .children(is_seq.then(|| {
                 let i = (self.sel_track + 1).to_string();
                 let n = n_tracks.to_string();
-                Self::chip(
-                    "seq",
-                    tf("chip.seq", &[("i", i.as_str()), ("n", n.as_str())]),
-                    cx,
-                    move |v, _e, cx| {
-                        v.select_track((v.sel_track + 1) % n_tracks.max(1), cx);
-                        cx.notify();
-                    },
-                )
+                let label = tf("chip.seq", &[("i", i.as_str()), ("n", n.as_str())]);
+                Self::chip("seq", label.clone(), label, cx, move |v, _e, cx| {
+                    v.select_track((v.sel_track + 1) % n_tracks.max(1), cx);
+                    cx.notify();
+                })
             }))
             .child(Self::vsep())
             // edit tools
@@ -664,6 +714,29 @@ impl Render for EditorView {
             .child(
                 div()
                     .id("snap")
+                    .test_support()
+                    .role(Role::SpinButton)
+                    .aria_label(tf("a11y.snap", &[("grid", SNAPS[self.snap_idx].2)]))
+                    .aria_numeric_value(self.snap_idx as f64)
+                    .aria_min_numeric_value(0.0)
+                    .aria_max_numeric_value((SNAPS.len() - 1) as f64)
+                    .on_a11y_action(AccessibleAction::Increment, {
+                        let this = cx.entity().downgrade();
+                        move |_, _, cx| {
+                            this.update(cx, |this, cx| this.cycle_snap(cx)).ok();
+                        }
+                    })
+                    .on_a11y_action(AccessibleAction::Decrement, {
+                        let this = cx.entity().downgrade();
+                        move |_, _, cx| {
+                            this.update(cx, |this, cx| {
+                                this.snap_idx = (this.snap_idx + SNAPS.len() - 1) % SNAPS.len();
+                                this.persist();
+                                cx.notify();
+                            })
+                            .ok();
+                        }
+                    })
                     .h(px(26.0))
                     .pl_1()
                     .pr_2()
@@ -799,6 +872,10 @@ impl Render for EditorView {
             }));
         // --- event list: right-docked panel -------------------------------------
         let events_panel = div()
+            .id("events-panel")
+            .test_support()
+            .role(Role::Region)
+            .aria_label(t("a11y.events_list"))
             .w(px(340.0))
             .h_full()
             .flex()
@@ -821,6 +898,12 @@ impl Render for EditorView {
                     .children((n_diags > 0).then(|| {
                         div()
                             .id("fix-diags")
+                            .test_support()
+                            .role(Role::Button)
+                            .aria_label(tf(
+                                "a11y.fix_diags",
+                                &[("n", n_diags.to_string().as_str())],
+                            ))
                             .ml_2()
                             .px_1()
                             .text_size(px(10.0))
@@ -842,21 +925,33 @@ impl Render for EditorView {
             )
             .child({
                 let events = self.events.clone();
-                uniform_list("events", events.len(), move |range, _w, _cx| {
-                    range
-                        .map(|i| {
-                            div()
-                                .h(px(18.0))
-                                .px_2()
-                                .text_size(px(11.0))
-                                .font_family("Cascadia Mono")
-                                .text_color(rgb(0xb8b8c8))
-                                .child(events[i].clone())
+                div()
+                    .id("events-list")
+                    .test_support()
+                    .role(Role::List)
+                    .aria_label(t("a11y.events_list"))
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .child(
+                        uniform_list("events", events.len(), move |range, _w, _cx| {
+                            range
+                                .map(|i| {
+                                    div()
+                                        .id(("ev", i))
+                                        .test_support()
+                                        .role(Role::ListItem)
+                                        .aria_label(events[i].clone())
+                                        .h(px(18.0))
+                                        .px_2()
+                                        .text_size(px(11.0))
+                                        .font_family("Cascadia Mono")
+                                        .text_color(rgb(0xb8b8c8))
+                                        .child(events[i].clone())
+                                })
+                                .collect()
                         })
-                        .collect()
-                })
-                .h_full()
-                .flex_1()
+                        .h_full(),
+                    )
             });
 
         let body = div().flex().flex_1().min_h(px(0.0));
@@ -890,6 +985,9 @@ impl Render for EditorView {
                 // scrollable when a file has more tracks than fit the panel
                 div()
                     .id("track-list")
+                    .test_support()
+                    .role(Role::List)
+                    .aria_label(t("tracks.header"))
                     .flex_1()
                     .min_h(px(0.0))
                     .overflow_y_scroll()
@@ -898,8 +996,31 @@ impl Render for EditorView {
                         let muted = muted_set.contains(&i);
                         let soloed = soloed_set.contains(&i);
                         let color = TRACK_COLORS[i % TRACK_COLORS.len()];
+                        // screen-reader description: channel + mute/solo state
+                        let mut desc = tf(
+                            "a11y.ch",
+                            &[(
+                                "ch",
+                                (track_chs.get(i).copied().unwrap_or(0) + 1)
+                                    .to_string()
+                                    .as_str(),
+                            )],
+                        );
+                        for (on, key) in [(muted, "a11y.muted"), (soloed, "a11y.soloed")] {
+                            if on {
+                                desc.push_str(", ");
+                                desc.push_str(t(key));
+                            }
+                        }
                         div()
                             .id(("track", i))
+                            .test_support()
+                            .role(Role::ListBoxOption)
+                            .aria_label(name.to_string())
+                            .aria_selected(sel)
+                            .aria_description(desc)
+                            .aria_position_in_set(i + 1)
+                            .aria_size_of_set(track_names.len())
                             .flex()
                             .flex_row()
                             .items_center()
@@ -930,6 +1051,14 @@ impl Render for EditorView {
                             .child(
                                 div()
                                     .id(("mute", i))
+                                    .test_support()
+                                    .role(Role::CheckBox)
+                                    .aria_label(tf("a11y.mute", &[("track", name.as_str())]))
+                                    .aria_toggled(if muted {
+                                        Toggled::True
+                                    } else {
+                                        Toggled::False
+                                    })
                                     .px_1()
                                     .text_size(px(9.0))
                                     .text_color(rgb(if muted { 0xffb454 } else { 0x707080 }))
@@ -949,6 +1078,14 @@ impl Render for EditorView {
                             .child(
                                 div()
                                     .id(("solo", i))
+                                    .test_support()
+                                    .role(Role::CheckBox)
+                                    .aria_label(tf("a11y.solo", &[("track", name.as_str())]))
+                                    .aria_toggled(if soloed {
+                                        Toggled::True
+                                    } else {
+                                        Toggled::False
+                                    })
                                     .px_1()
                                     .text_size(px(9.0))
                                     .text_color(rgb(if soloed { 0xffd24f } else { 0x707080 }))
@@ -968,6 +1105,17 @@ impl Render for EditorView {
                             .child(
                                 div()
                                     .id(("ch", i))
+                                    .test_support()
+                                    .role(Role::Button)
+                                    .aria_label(tf(
+                                        "a11y.track_ch",
+                                        &[(
+                                            "ch",
+                                            (track_chs.get(i).copied().unwrap_or(0) + 1)
+                                                .to_string()
+                                                .as_str(),
+                                        )],
+                                    ))
                                     .px_1()
                                     .text_size(px(9.0))
                                     .text_color(rgb(0x7070a0))
@@ -1004,15 +1152,21 @@ impl Render for EditorView {
                     .border_t_1()
                     .border_color(rgb(BORDER_C))
                     .child(div().flex_1().min_w(px(0.0)).child(Input::new(&self.input)))
-                    .child(Self::chip("rename", "rename", cx, |v, _e, cx| {
-                        let name = v.input.read(cx).value().to_string();
-                        let ops = {
-                            let mut sh = crate::lock_shared(&v.shared);
-                            sh.doc.set_track_name_ops(v.sel_track, &name)
-                        };
-                        v.apply_tx("set track name", ops);
-                        cx.notify();
-                    })),
+                    .child(Self::chip(
+                        "rename",
+                        "rename",
+                        t("a11y.rename"),
+                        cx,
+                        |v, _e, cx| {
+                            let name = v.input.read(cx).value().to_string();
+                            let ops = {
+                                let mut sh = crate::lock_shared(&v.shared);
+                                sh.doc.set_track_name_ops(v.sel_track, &name)
+                            };
+                            v.apply_tx("set track name", ops);
+                            cx.notify();
+                        },
+                    )),
             );
 
         // velocity / CC / pitch-bend lane (selected track only)
@@ -1249,6 +1403,26 @@ impl Render for EditorView {
                 }))
                 .child(
                     div()
+                        .id("minimap")
+                        .test_support()
+                        .role(Role::Slider)
+                        .aria_label(t("a11y.minimap"))
+                        .aria_numeric_value(playhead_tick as f64)
+                        .aria_min_numeric_value(0.0)
+                        .aria_max_numeric_value(song_end as f64)
+                        .aria_orientation(Orientation::Horizontal)
+                        .on_a11y_action(AccessibleAction::Increment, {
+                            let this = cx.entity().downgrade();
+                            move |_, _, cx| {
+                                this.update(cx, |this, cx| this.seek_bars(1, cx)).ok();
+                            }
+                        })
+                        .on_a11y_action(AccessibleAction::Decrement, {
+                            let this = cx.entity().downgrade();
+                            move |_, _, cx| {
+                                this.update(cx, |this, cx| this.seek_bars(-1, cx)).ok();
+                            }
+                        })
                         .h(px(20.0))
                         .w_full()
                         .bg(rgb(0x111118))
@@ -1275,6 +1449,26 @@ impl Render for EditorView {
                 )
                 .child(
                     div()
+                        .id("ruler")
+                        .test_support()
+                        .role(Role::Slider)
+                        .aria_label(t("a11y.ruler"))
+                        .aria_numeric_value(playhead_tick as f64)
+                        .aria_min_numeric_value(0.0)
+                        .aria_max_numeric_value(song_end as f64)
+                        .aria_orientation(Orientation::Horizontal)
+                        .on_a11y_action(AccessibleAction::Increment, {
+                            let this = cx.entity().downgrade();
+                            move |_, _, cx| {
+                                this.update(cx, |this, cx| this.seek_bars(1, cx)).ok();
+                            }
+                        })
+                        .on_a11y_action(AccessibleAction::Decrement, {
+                            let this = cx.entity().downgrade();
+                            move |_, _, cx| {
+                                this.update(cx, |this, cx| this.seek_bars(-1, cx)).ok();
+                            }
+                        })
                         .h(px(26.0))
                         .w_full()
                         .bg(rgb(0x17171d))
@@ -1331,8 +1525,44 @@ impl Render for EditorView {
                             })
                         })),
                 )
-                .child(
+                .child({
+                    // a11y snapshot inputs for the piano-roll synthetic
+                    // subtree (note/selection/playhead/marquee nodes)
+                    let roll_bounds_a11y = self.roll_bounds.clone();
+                    let notes_a11y = self.notes.clone();
+                    let selection_a11y = self.selection.clone();
+                    let track_names_a11y = track_names.clone();
+                    let scale_a11y = window.scale_factor();
+                    let ppq = self.ppq();
                     div()
+                        .id("piano-roll")
+                        .test_support()
+                        .role(Role::Group)
+                        .aria_label(t("a11y.piano_roll"))
+                        .aria_description(tf(
+                            "a11y.roll_desc",
+                            &[
+                                ("n", self.notes.len().to_string().as_str()),
+                                ("sel", self.selection.len().to_string().as_str()),
+                            ],
+                        ))
+                        .a11y_synthetic_children(move |b| {
+                            a11y::RollA11y {
+                                bounds: roll_bounds_a11y.get(),
+                                scale: scale_a11y,
+                                scroll_x,
+                                scroll_y,
+                                zoom,
+                                ppq,
+                                notes: notes_a11y,
+                                selection: selection_a11y,
+                                track_names: track_names_a11y,
+                                drag,
+                                marquee,
+                                playhead_tick,
+                            }
+                            .build(b);
+                        })
                         .flex_1()
                         // a bare div is display:block — flex_row alone
                         // leaves children stacked vertically (rolled the
@@ -1585,9 +1815,41 @@ impl Render for EditorView {
                         this.commit_drag(cx);
                     }),
                 )
-                )
-                .child(
+                })
+                .child({
+                    // a11y snapshot inputs for the controller-lane synthetic
+                    // subtree (one slider node per point)
+                    let lane_bounds_a11y = self.lane_bounds.clone();
+                    let lane_events_a11y = lane_events.clone();
+                    let notes_a11y = self.notes.clone();
+                    let track_names_a11y = track_names.clone();
+                    let sel_track_a11y = self.sel_track;
+                    let scale_a11y = window.scale_factor();
+                    let ppq = self.ppq();
                     div()
+                        .id("lane")
+                        .test_support()
+                        .role(Role::Group)
+                        .aria_label(tf(
+                            "a11y.lane",
+                            &[("mode", lane_mode.label().as_str())],
+                        ))
+                        .a11y_synthetic_children(move |b| {
+                            a11y::LaneA11y {
+                                bounds: lane_bounds_a11y.get(),
+                                scale: scale_a11y,
+                                scroll_x,
+                                zoom,
+                                ppq,
+                                mode: lane_mode,
+                                events: lane_events_a11y,
+                                notes: notes_a11y,
+                                sel_track: sel_track_a11y,
+                                track_names: track_names_a11y,
+                                drag,
+                            }
+                            .build(b);
+                        })
                         .h(px(56.0))
                         .w_full()
                         .bg(rgb(0x14141a))
@@ -1600,6 +1862,12 @@ impl Render for EditorView {
                             // CC11 -> CC64 -> PB -> Vel
                             div()
                                 .id("lane-mode")
+                                .test_support()
+                                .role(Role::Button)
+                                .aria_label(tf(
+                                    "a11y.lane_mode",
+                                    &[("mode", lane_mode.label().as_str())],
+                                ))
                                 .absolute()
                                 .top(px(2.0))
                                 .right(px(4.0))
@@ -1739,8 +2007,8 @@ impl Render for EditorView {
                             cx.listener(|this, _ev: &MouseUpEvent, _w, cx| {
                                 this.commit_drag(cx)
                             }),
-                        ),
-                ),
+                        )
+                }),
         );
         let body = body.children(self.show_events.then_some(events_panel));
 
@@ -1769,6 +2037,9 @@ impl Render for EditorView {
             Some(
                 div()
                     .id("plugin-chip")
+                    .test_support()
+                    .role(Role::Button)
+                    .aria_label(format!("{name}, {tip}"))
                     .px_1()
                     .rounded_sm()
                     .cursor_pointer()
@@ -1787,6 +2058,10 @@ impl Render for EditorView {
             None
         };
         let status_bar = div()
+            .id("status-bar")
+            .test_support()
+            .role(Role::ContentInfo)
+            .aria_label(t("a11y.status"))
             .flex()
             .items_center()
             .gap_2()
@@ -1797,7 +2072,16 @@ impl Render for EditorView {
             .border_color(rgb(BORDER_C))
             .text_size(px(11.0))
             .child(
+                // live region: UIA announces aria_label changes politely —
+                // `status` only changes on real events, so no flooding
                 div()
+                    .id("status")
+                    .test_support()
+                    .role(Role::Status)
+                    .aria_label(self.status.to_string())
+                    .a11y_synthetic_children(|b| {
+                        b.parent_node().set_live(accesskit::Live::Polite);
+                    })
                     .flex_1()
                     .min_w(px(0.0))
                     .overflow_hidden()
@@ -1823,12 +2107,19 @@ impl Render for EditorView {
                         cx.new(|_| Tip(tip.into())).into()
                     })
             })
-            .child(Self::chip("st-lane", lane_mode.label(), cx, |v, _e, cx| {
-                v.set_lane(v.lane_mode.cycle(), cx);
-            }))
+            .child(Self::chip(
+                "st-lane",
+                lane_mode.label(),
+                tf("a11y.lane_mode", &[("mode", lane_mode.label().as_str())]),
+                cx,
+                |v, _e, cx| {
+                    v.set_lane(v.lane_mode.cycle(), cx);
+                },
+            ))
             .child(Self::chip(
                 "st-enc",
                 format!("enc {enc_label}"),
+                tf("a11y.enc", &[("enc", enc_label.as_str())]),
                 cx,
                 |v, _e, cx| {
                     let next = match v.enc_override {
@@ -1846,6 +2137,10 @@ impl Render for EditorView {
             ))
             .child(
                 div()
+                    .id("status-pos")
+                    .test_support()
+                    .role(Role::Label)
+                    .aria_label(tf("a11y.pos", &[("pos", pos.as_str())]))
                     .text_color(rgb(0x77778a))
                     .font_family("Cascadia Mono")
                     .whitespace_nowrap()
@@ -2373,6 +2668,9 @@ impl Render for EditorView {
             let popup_h = (items.len() as f32 * 24.0 + 16.0).min(popup_max_h);
             let popup = div()
                 .id("menu-popup")
+                .test_support()
+                .role(Role::Menu)
+                .aria_label(t(m.key()))
                 .absolute()
                 .top(px(0.0))
                 .left(px(mx))
@@ -2801,6 +3099,9 @@ impl Render for EditorView {
                 let top = (y - 30.0).clamp(0.0, (vh - h - 8.0).max(0.0));
                 div()
                     .id("sub-popup")
+                    .test_support()
+                    .role(Role::Menu)
+                    .aria_label(t("a11y.submenu"))
                     .absolute()
                     .top(px(top))
                     .left(px(x2))
@@ -2871,6 +3172,9 @@ impl Render for EditorView {
             ];
             let panel = div()
                 .id("help-panel")
+                .test_support()
+                .role(Role::Dialog)
+                .aria_label(t("help.shortcuts"))
                 .flex()
                 .flex_col()
                 .w(px(420.0))
@@ -3151,6 +3455,9 @@ impl Render for EditorView {
                 };
                 let mut row = div()
                     .id(("output-status", i))
+                    .test_support()
+                    .role(Role::ListItem)
+                    .aria_label(format!("{name} {state}"))
                     .flex()
                     .flex_col()
                     .gap_1()
@@ -3237,6 +3544,9 @@ impl Render for EditorView {
             let panel_content_h = 24.0 + rows.len() as f32 * 26.0 + 32.0 + 32.0;
             let panel = div()
                 .id("output-status-panel")
+                .test_support()
+                .role(Role::Dialog)
+                .aria_label(t("output.host_status"))
                 .w(px(520.0))
                 .flex()
                 .flex_col()
@@ -3264,6 +3574,7 @@ impl Render for EditorView {
                         .child(Self::chip(
                             "status.rescan",
                             t("output.rescan"),
+                            t("output.rescan"),
                             cx,
                             |v, _e, cx| {
                                 v.rescan_plugins(crate::ScanMode::Changed);
@@ -3272,6 +3583,7 @@ impl Render for EditorView {
                         ))
                         .child(Self::chip(
                             "status.close",
+                            t("output.close"),
                             t("output.close"),
                             cx,
                             |v, _e, cx| {
@@ -3307,6 +3619,10 @@ impl Render for EditorView {
         });
 
         div()
+            .id("editor")
+            .test_support()
+            .role(Role::Application)
+            .aria_label(t("a11y.editor"))
             .flex()
             .flex_col()
             .relative()
@@ -3664,9 +3980,28 @@ impl EditorView {
         clears_sub: bool,
         cx: &mut Context<Self>,
         f: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
-    ) -> Stateful<Div> {
+    ) -> ObservedElement<Stateful<Div>> {
+        let label: SharedString = label.into();
+        let shortcut: SharedString = shortcut.into();
         div()
             .id(id)
+            .test_support()
+            .role(if check.is_some() {
+                Role::MenuItemCheckBox
+            } else {
+                Role::MenuItem
+            })
+            .aria_label(label.clone())
+            .when(check.is_some(), |this| {
+                this.aria_toggled(if check == Some(true) {
+                    Toggled::True
+                } else {
+                    Toggled::False
+                })
+            })
+            .when(!shortcut.is_empty(), |this| {
+                this.aria_keyshortcuts(shortcut.clone())
+            })
             .flex()
             .items_center()
             .h(px(24.0))
@@ -3685,13 +4020,13 @@ impl EditorView {
                     .text_color(rgb(0x8fd0a0))
                     .child(if check == Some(true) { "✓" } else { "" }),
             )
-            .child(div().flex_1().child(label.into()))
+            .child(div().flex_1().child(label))
             .child(
                 div()
                     .pl_2()
                     .text_color(rgb(badge_color.unwrap_or(0x666677)))
                     .text_size(px(10.0))
-                    .child(shortcut.into()),
+                    .child(shortcut),
             )
             .on_mouse_move(cx.listener(move |v, _e: &MouseMoveEvent, _w, cx| {
                 // leaving a submenu parent closes the cascade
@@ -3718,7 +4053,7 @@ impl EditorView {
         check: Option<bool>,
         cx: &mut Context<Self>,
         f: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
-    ) -> Stateful<Div> {
+    ) -> ObservedElement<Stateful<Div>> {
         Self::mi_inner(id, label, shortcut, None, check, true, cx, f)
     }
 
@@ -3730,7 +4065,7 @@ impl EditorView {
         check: Option<bool>,
         cx: &mut Context<Self>,
         f: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
-    ) -> Stateful<Div> {
+    ) -> ObservedElement<Stateful<Div>> {
         Self::mi_inner(id, label, shortcut, None, check, false, cx, f)
     }
 
@@ -3740,9 +4075,12 @@ impl EditorView {
         label: &'static str,
         sub: Sub,
         cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
+    ) -> ObservedElement<Stateful<Div>> {
         div()
             .id(id)
+            .test_support()
+            .role(Role::MenuItem)
+            .aria_label(label)
             .flex()
             .items_center()
             .h(px(24.0))
@@ -3816,6 +4154,7 @@ impl EditorView {
     }
 
     /// Icon button: 26px square, tooltip, neutral gray icon.
+    /// Screen readers get `tip` as the name and the on/off state as a toggle.
     fn ibtn(
         id: &'static str,
         ic: &'static str,
@@ -3823,9 +4162,13 @@ impl EditorView {
         on: bool,
         cx: &mut Context<Self>,
         f: impl Fn(&mut Self, &ClickEvent, &mut Context<Self>) + 'static,
-    ) -> Stateful<Div> {
+    ) -> ObservedElement<Stateful<Div>> {
         div()
             .id(id)
+            .test_support()
+            .role(Role::Button)
+            .aria_label(tip)
+            .aria_toggled(if on { Toggled::True } else { Toggled::False })
             .w(px(26.0))
             .h(px(26.0))
             .flex()
@@ -3885,9 +4228,13 @@ impl EditorView {
         accent: u32,
         cx: &mut Context<Self>,
         f: impl Fn(&mut Self, &ClickEvent, &mut Context<Self>) + 'static,
-    ) -> Stateful<Div> {
+    ) -> ObservedElement<Stateful<Div>> {
         div()
             .id(id)
+            .test_support()
+            .role(Role::Button)
+            .aria_label(tip)
+            .aria_toggled(if on { Toggled::True } else { Toggled::False })
             .w(px(26.0))
             .h(px(26.0))
             .flex()

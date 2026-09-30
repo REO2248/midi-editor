@@ -3,6 +3,7 @@
 //! basic editing (draw / drag / delete) all going through
 //! `Document::apply(Transaction)` so undo is shared with MCP edits.
 
+mod a11y;
 mod audition;
 mod diagnostics;
 mod geometry;
@@ -23,6 +24,7 @@ use i18n::{t, tf};
 
 use commands::UndoStack;
 use document::{Document, Event as DocEvent, EventId, Note, Op, TimeDisplay};
+use gpui_kit::base::{ObservedElement, TestSupportExt};
 use gpui_kit::component::input::InputState;
 use gpui_kit::component::Root;
 use gpui_kit::*;
@@ -87,6 +89,20 @@ enum TopMenu {
     Output,
     Transport,
     Help,
+}
+
+impl TopMenu {
+    fn key(self) -> &'static str {
+        match self {
+            TopMenu::File => "menu.file",
+            TopMenu::Edit => "menu.edit",
+            TopMenu::View => "menu.view",
+            TopMenu::Track => "menu.track",
+            TopMenu::Output => "menu.output",
+            TopMenu::Transport => "menu.transport",
+            TopMenu::Help => "menu.help",
+        }
+    }
 }
 
 /// Second-level (cascading) menu that is open inside a dropdown.
@@ -1034,6 +1050,22 @@ impl EditorView {
     /// snap interval in ticks (0 = off)
     /// Current snap step in ticks (0 = off). Triplet entries are 2/3 of the
     /// duple cell — 1/8T = a third of a quarter note.
+    /// Ticks per quarter note for display grids; SMPTE docs use the same
+    /// 480 fallback the pre-format-2 code did (position labels only).
+    fn ppq(&self) -> u64 {
+        self.doc(|d| d.tempo_map.ppq().unwrap_or(480))
+    }
+
+    /// Move the playhead `bars` measures (used by the ruler/minimap
+    /// accessibility Increment/Decrement actions).
+    fn seek_bars(&mut self, bars: i64, cx: &mut Context<Self>) {
+        let step = self.ppq() as i64 * 4;
+        let cur = self.doc(|d| d.tempo_map.us_to_tick(self.play_us)) as i64;
+        let tick = (cur + bars * step).max(0).min(self.doc_end_ticks() as i64);
+        self.play_us = self.doc(|d| d.tempo_map.tick_to_us(tick as u64));
+        cx.notify();
+    }
+
     fn snap_ticks(&self) -> i64 {
         let (div, trip, _) = SNAPS[self.snap_idx];
         if div == 0 {
@@ -3874,14 +3906,19 @@ impl EditorView {
 
     /// Small chip with a literal label (symbols/numbers need no i18n key).
     /// `on` receives the ClickEvent so chips can honour Shift=×10 etc.
+    /// `a11y_name` is the screen-reader name (visible labels are often terse).
     fn chip(
         id: &'static str,
         label: impl Into<SharedString>,
+        a11y_name: impl Into<SharedString>,
         cx: &mut Context<Self>,
         on: impl Fn(&mut Self, &ClickEvent, &mut Context<Self>) + 'static,
-    ) -> Stateful<Div> {
+    ) -> ObservedElement<Stateful<Div>> {
         div()
             .id(id)
+            .test_support()
+            .role(Role::Button)
+            .aria_label(a11y_name)
             .px_2()
             .py_1()
             .rounded_sm()
@@ -5169,5 +5206,74 @@ mod tests {
             plugin_plan(Some(&loading(&b)), Some(&b), &a, false),
             PluginPlan::Open { retire: true }
         );
+    }
+
+    use crate::{i18n::t, EditorView};
+    use gpui_kit::component::input::InputState;
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{px, size, AppContext, Role, TestAppContext};
+
+    /// Accessibility smoke test: the a11y facts registered via
+    /// `.test_support()` mirror exactly what the real UIA tree would carry
+    /// (roles, names, selected/checked/expanded state) for every primary
+    /// control, and the interactions a screen reader drives still work.
+    #[gpui_kit::test]
+    fn a11y_tree_exposes_primary_controls(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
+            EditorView::new(
+                None,
+                cx.new(|cx| InputState::new(window, cx).placeholder(t("field.track_name"))),
+                cx,
+            )
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+
+            // shell landmarks
+            assert_eq!(window.find("editor").role(), Some(Role::Application));
+            assert_eq!(window.find("menu-bar").role(), Some(Role::MenuBar));
+            assert_eq!(window.find("transport-bar").role(), Some(Role::Toolbar));
+            assert_eq!(window.find("status-bar").role(), Some(Role::ContentInfo));
+            assert_eq!(window.find("status").role(), Some(Role::Status));
+            assert!(window.find("status").label().is_some());
+            assert_eq!(window.find("piano-roll").role(), Some(Role::Group));
+            assert_eq!(window.find("lane").role(), Some(Role::Group));
+            assert_eq!(window.find("ruler").role(), Some(Role::Slider));
+            assert_eq!(window.find("minimap").role(), Some(Role::Slider));
+            assert_eq!(window.find("events-list").role(), Some(Role::List));
+            assert_eq!(window.find("track-list").role(), Some(Role::List));
+
+            // transport buttons are named toggles
+            assert_eq!(window.find("i.play").role(), Some(Role::Button));
+            assert_eq!(window.find("i.play").label(), Some(t("tip.play")));
+            assert_eq!(window.find("i.loop").checked(), Some(false));
+
+            // track rows expose name + channel + mute/solo state
+            assert_eq!(
+                window.find(("track", 0usize)).role(),
+                Some(Role::ListBoxOption)
+            );
+            assert_eq!(window.find(("track", 0usize)).label(), Some("Track 1"));
+            assert_eq!(window.find(("mute", 0usize)).checked(), Some(false));
+            window.click(("mute", 0usize), cx);
+            window.render_frame(cx);
+            assert_eq!(window.find(("mute", 0usize)).checked(), Some(true));
+            assert_eq!(window.find(("solo", 0usize)).checked(), Some(false));
+
+            // opening a menu announces it expanded and exposes MenuItem rows
+            assert_eq!(window.find("menu.file").expanded(), Some(false));
+            window.click("menu.file", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("menu.file").expanded(), Some(true));
+            assert_eq!(window.find("menu-popup").role(), Some(Role::Menu));
+            assert_eq!(window.find("f.save").role(), Some(Role::MenuItem));
+            assert!(window.find("f.save").label().is_some());
+
+            // spinner / spinbutton values are machine-readable
+            assert_eq!(window.find("bpm").role(), Some(Role::SpinButton));
+            assert_eq!(window.find("snap").role(), Some(Role::SpinButton));
+        })
+        .unwrap();
     }
 }
