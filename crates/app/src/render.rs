@@ -3050,9 +3050,18 @@ impl EditorView {
                     .text_size(px(10.0))
                     .child(shortcut.into()),
             )
-            .on_mouse_move(cx.listener(move |v, _e: &MouseMoveEvent, _w, cx| {
-                // leaving a submenu parent closes the cascade
-                if clears_sub && v.open_sub.is_some() {
+            .on_mouse_move(cx.listener(move |v, e: &MouseMoveEvent, _w, cx| {
+                // Leaving a submenu's parent row closes the cascade — but
+                // only for rows ABOVE its anchor. A pointer sweeping
+                // diagonally down-right into the cascade crosses the leaf
+                // rows below the anchor inside the parent menu; clearing
+                // there unmounts the submenu mid-flight and the click
+                // lands on the dismiss overlay.
+                if clears_sub
+                    && v
+                        .open_sub
+                        .is_some_and(|(_, anchor_y)| f32::from(e.position.y) < anchor_y)
+                {
                     v.open_sub = None;
                     cx.notify();
                 }
