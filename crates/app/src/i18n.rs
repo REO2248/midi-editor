@@ -174,6 +174,7 @@ static EN: &[(&str, &str)] = &[
     ("plugin.phase_load", "plugin load"),
     ("plugin.phase_audio", "audio start"),
     ("status.rescan", "rescanned: {n} destination(s)"),
+    ("ui.scale", "display scale"),
 ];
 
 static JA: &[(&str, &str)] = &[
@@ -326,6 +327,7 @@ static JA: &[(&str, &str)] = &[
     ("tip.zout", "ズームアウト (Ctrl+-)"),
     ("tip.dest", "選択トラックの出力先"),
     ("tip.gui", "プラグインGUI"),
+    ("ui.scale", "表示スケール"),
 ];
 
 fn detect_lang() -> &'static str {
