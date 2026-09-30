@@ -1,6 +1,7 @@
 // Semantic ops generators: the same functions drive GUI chips and MCP tools.
 // Contract per generator: returns pure Vec<Op> (no doc mutation besides id
 // minting); applying then reverting the transaction restores the document.
+use bytes::Bytes;
 use document::*;
 use smf_core::{Division, EventKind};
 
@@ -183,7 +184,7 @@ fn set_program_emits_bank_then_pc_in_order() {
 #[test]
 fn set_tempo_replaces_same_tick_inserts_elsewhere() {
     let mut d = doc(vec![vec![], vec![chan(0, 0x90, 60, 100)]]);
-    let __ops = d.set_tempo_ops(0, 120.0);
+    let __ops = d.set_tempo_ops(0, 0, 120.0);
     apply(&mut d, __ops);
     let n_tempos = |d: &Document| {
         d.tracks[0]
@@ -201,12 +202,12 @@ fn set_tempo_replaces_same_tick_inserts_elsewhere() {
             .count()
     };
     assert_eq!(n_tempos(&d), 1);
-    let __ops = d.set_tempo_ops(0, 140.0); // same tick: replace
+    let __ops = d.set_tempo_ops(0, 0, 140.0); // same tick: replace
     apply(&mut d, __ops);
     assert_eq!(n_tempos(&d), 1);
     // 140bpm: 480 ticks = one quarter = 60e6/140 us
     assert_eq!(d.tempo_map.tick_to_us(480), 428_571);
-    let __ops = d.set_tempo_ops(960, 60.0); // new tick: insert
+    let __ops = d.set_tempo_ops(0, 960, 60.0); // new tick: insert
     apply(&mut d, __ops);
     assert_eq!(n_tempos(&d), 2);
     // tempo map: 0..960 at 140bpm, 960.. at 60bpm
@@ -218,7 +219,7 @@ fn set_tempo_replaces_same_tick_inserts_elsewhere() {
 #[test]
 fn set_time_sig_encodes_denominator_log2() {
     let mut d = doc(vec![vec![]]);
-    let __ops = d.set_time_sig_ops(0, 6, 8);
+    let __ops = d.set_time_sig_ops(0, 0, 6, 8);
     apply(&mut d, __ops);
     match &d.tracks[0].events[0].kind {
         EventKind::Meta {
@@ -500,7 +501,7 @@ fn kind_edits_survive_save_reload() {
 #[test]
 fn tempo_and_name_replace_survive_save_reload() {
     let mut d = parsed_doc();
-    let ops = d.set_tempo_ops(0, 240.0); // replaces the tick-0 tempo
+    let ops = d.set_tempo_ops(0, 0, 240.0); // replaces the tick-0 tempo
     apply(&mut d, ops);
     let ops = d.set_track_name_ops(1, "Bass");
     apply(&mut d, ops);
@@ -673,6 +674,35 @@ fn smpte_files_report_timecode_positions_not_fake_bars() {
     }
 }
 
+/// A format-2 document: each track is an independent sequence with its
+/// own tempo map — built via real SMF bytes so the header flag survives.
+fn seq_doc(tracks: Vec<Vec<smf_core::Event>>) -> Document {
+    let bytes = smf_core::write(
+        2,
+        Division::Metrical(480),
+        &tracks
+            .into_iter()
+            .map(|events| smf_core::Track { events })
+            .collect::<Vec<_>>(),
+        smf_core::WriteOptions::default(),
+    );
+    let f = smf_core::parse(&bytes).unwrap();
+    assert_eq!(f.format, 2, "fixture must actually be format 2");
+    Document::from_file(f)
+}
+
+fn tempo(tick: u64, mpq: u32) -> smf_core::Event {
+    smf_core::Event {
+        tick,
+        seq: 0,
+        raw_body: None,
+        kind: EventKind::Meta {
+            meta_type: 0x51,
+            data: Bytes::copy_from_slice(&mpq.to_be_bytes()[1..]),
+        },
+    }
+}
+
 #[test]
 fn smpte_time_and_positions_round_trip() {
     // 25fps * 40tpf = 1000 ticks/s — the classic PAL fixture
@@ -700,4 +730,85 @@ fn smpte_drop_frame_boundary_from_file() {
     assert_eq!(td.format_tick(179_900), "00:00:59.29");
     assert_eq!(td.format_tick(180_000), "00:01:00.02");
     assert_eq!(td.format_tick(1_798_200), "00:10:00.00");
+fn format2_is_detected_and_roundtrips() {
+    let d = seq_doc(vec![
+        vec![tempo(0, 500_000), chan(0, 0x90, 60, 100), chan(480, 0x80, 60, 0)],
+        vec![tempo(0, 250_000), chan(0, 0x90, 64, 100), chan(960, 0x80, 64, 0)],
+    ]);
+    assert!(d.is_sequential());
+    assert_eq!(d.tracks.len(), 2);
+    // serialize preserves the header format and each sequence's events
+    let bytes = d.serialize(smf_core::WriteOptions::default());
+    let re = smf_core::parse(&bytes).unwrap();
+    assert_eq!(re.format, 2);
+    assert_eq!(re.tracks.len(), 2);
+    let t0_ticks: Vec<u64> = re.tracks[0].events.iter().map(|e| e.tick).collect();
+    assert_eq!(t0_ticks, vec![0, 0, 480, 480], "sequence A: tempo,on,off,eot");
+}
+
+#[test]
+fn format2_sequences_have_independent_durations() {
+    let d = seq_doc(vec![
+        vec![chan(0, 0x90, 60, 100), chan(480, 0x80, 60, 0)],
+        vec![
+            chan(0, 0x90, 64, 100),
+            chan(1920, 0x80, 64, 0),
+            chan(1920, 0x90, 65, 100),
+            chan(2880, 0x80, 65, 0),
+        ],
+    ]);
+    assert_eq!(d.track_end_tick(0), 480);
+    assert_eq!(d.track_end_tick(1), 2880);
+    assert_eq!(d.track_end_tick(9), 0);
+}
+
+#[test]
+fn format2_tempo_maps_are_per_sequence() {
+    // seq A at 120bpm (500000µs/q), seq B at 240bpm — a quarter of B must
+    // take half the wall time of a quarter of A, never A's tempo
+    let d = seq_doc(vec![
+        vec![tempo(0, 500_000), chan(0, 0x90, 60, 100)],
+        vec![tempo(0, 250_000), chan(0, 0x90, 64, 100)],
+    ]);
+    assert_eq!(d.tempo_map_for(0).tick_to_us(480), 500_000);
+    assert_eq!(d.tempo_map_for(1).tick_to_us(480), 250_000);
+    // non-sequential docs keep the shared conductor map for every track
+    let flat = doc(vec![
+        vec![tempo(0, 500_000)],
+        vec![chan(0, 0x90, 60, 100)],
+    ]);
+    assert!(!flat.is_sequential());
+    assert_eq!(flat.tempo_map_for(1).tick_to_us(480), 500_000);
+}
+
+#[test]
+fn format2_playback_timeline_uses_each_sequence_tempo() {
+    // one note at tick 480 in each sequence: seq A (120bpm) sounds it at
+    // 500ms, seq B (240bpm) at 250ms — the tag lets the app pick ONE
+    // sequence to play rather than all concurrently
+    let d = seq_doc(vec![
+        vec![tempo(0, 500_000), chan(480, 0x90, 60, 100)],
+        vec![tempo(0, 250_000), chan(480, 0x90, 64, 100)],
+    ]);
+    let tl = d.timeline_tagged();
+    let us_of = |track: usize| tl.iter().find(|e| e.1 == track).unwrap().0;
+    assert_eq!(us_of(0), 500_000);
+    assert_eq!(us_of(1), 250_000);
+}
+
+#[test]
+fn format2_edits_stay_inside_their_sequence() {
+    // edits are ordinary track-scoped transactions: quantizing sequence B
+    // must not touch sequence A's events or its timeline
+    let mut d = seq_doc(vec![
+        vec![tempo(0, 500_000), chan(490, 0x90, 60, 100)],
+        vec![tempo(0, 250_000), chan(490, 0x90, 64, 100)],
+    ]);
+    let ops = d.quantize_ops(1, 0, u64::MAX, 480, 100);
+    apply(&mut d, ops);
+    assert_eq!(d.tracks[0].events[1].tick, 490, "sequence A untouched");
+    assert_eq!(d.tracks[1].events[1].tick, 480);
+    let bytes = d.serialize(smf_core::WriteOptions::default());
+    let re = smf_core::parse(&bytes).unwrap();
+    assert_eq!(re.format, 2, "edits never demote format 2");
 }

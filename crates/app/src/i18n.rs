@@ -49,6 +49,8 @@ static EN: &[(&str, &str)] = &[
     ("events.issues", "issues"),
     ("status.fixed", "diagnostics fixed"),
     ("tracks.header", "Tracks"),
+    ("tracks.header_seq", "Sequences (format 2)"),
+    ("chip.seq", "SEQ {i}/{n}"),
     ("field.track_name", "Track name"),
     // menubar
     ("menu.file", "File"),
@@ -290,6 +292,8 @@ static JA: &[(&str, &str)] = &[
     ("events.issues", "件の問題"),
     ("status.fixed", "診断を修正しました"),
     ("tracks.header", "トラック"),
+    ("tracks.header_seq", "シーケンス (フォーマット2)"),
+    ("chip.seq", "SEQ {i}/{n}"),
     ("field.track_name", "トラック名"),
     ("menu.file", "ファイル"),
     ("menu.edit", "編集"),

@@ -225,7 +225,7 @@
     },
     {
       "deprecated": null,
-      "description": "Tempo breakpoints: [{tick, us_per_quarter, bpm, cumulative_us}] + ppq. Read before editing tempo or converting ticks<->time.",
+      "description": "Tempo breakpoints: [{tick, us_per_quarter, bpm, cumulative_us}] + ppq (null for SMPTE — fps/ticks_per_frame are reported instead). Format-2 files report per-sequence maps (each track is an independent timeline). Read before editing tempo or converting ticks<->time.",
       "input_schema": {
         "properties": {},
         "type": "object"
@@ -304,7 +304,7 @@
     },
     {
       "deprecated": null,
-      "description": "Snap note onsets to a grid (duration preserved). Args: track? (all when omitted), from?, to?, grid? (ticks, default ppq/4), strength? (0-100, default 100). Optional base_revision.",
+      "description": "Snap note onsets to a grid (duration preserved). Args: track? (all when omitted), from?, to?, grid? (ticks, default ppq/4 metrical / one frame SMPTE), strength? (0-100, default 100). Optional base_revision.",
       "input_schema": {
         "properties": {
           "base_revision": {
@@ -564,7 +564,7 @@
     },
     {
       "deprecated": null,
-      "description": "Set/replace tempo at a tick (conductor track). Args: tick, bpm. Optional base_revision.",
+      "description": "Set/replace tempo at a tick. Args: tick, bpm, track? (default 0 = conductor; for format-2 files pass the sequence's track). Optional base_revision.",
       "input_schema": {
         "properties": {
           "base_revision": {
@@ -575,6 +575,9 @@
           },
           "tick": {
             "type": "integer"
+          },
+          "track": {
+            "type": "integer"
           }
         },
         "type": "object"
@@ -584,7 +587,7 @@
     },
     {
       "deprecated": null,
-      "description": "Set/replace time signature at a tick. Args: tick, num (beats/bar), den (beat value 4=quarter,8=eighth). Optional base_revision.",
+      "description": "Set/replace time signature at a tick. Args: tick, num (beats/bar), den (beat value 4=quarter,8=eighth), track? (default 0; pass the sequence's track for format-2). Optional base_revision.",
       "input_schema": {
         "properties": {
           "base_revision": {
@@ -597,6 +600,9 @@
             "type": "integer"
           },
           "tick": {
+            "type": "integer"
+          },
+          "track": {
             "type": "integer"
           }
         },

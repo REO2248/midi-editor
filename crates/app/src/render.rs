@@ -77,7 +77,8 @@ impl Render for EditorView {
         ) = {
             let sh = crate::lock_shared(&self.shared);
             (
-                sh.doc.tempo_map.us_to_tick(self.play_us),
+                // playhead ruler units come from the viewed sequence's map
+                sh.doc.tempo_map_for(self.sel_track).us_to_tick(self.play_us),
                 sh.path
                     .as_ref()
                     .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
@@ -105,6 +106,10 @@ impl Render for EditorView {
         let track_names = doc_ui.track_names.clone();
         let track_chs = doc_ui.track_chs.clone();
         let markers = &doc_ui.markers;
+        // SMF format 2: tracks are independent sequences — the app shows
+        // one at a time (the selected "track" IS the viewed sequence) and
+        // plays only it unless tracks are explicitly soloed
+        let (is_seq, n_tracks) = self.doc(|d| (d.is_sequential(), d.tracks.len()));
         // explicit UI timing mode — metrical bar/beat or SMPTE timecode,
         // drawn straight from the SMF division (never a pretend PPQ)
         let td = self.td();
@@ -551,6 +556,21 @@ impl Render for EditorView {
                 v.cycle_time_sig();
                 cx.notify();
             }))
+            // format-2 marker: the viewed sequence and the total — the
+            // mode is explicit in chrome, never implicit in the file
+            .children(is_seq.then(|| {
+                let i = (self.sel_track + 1).to_string();
+                let n = n_tracks.to_string();
+                Self::chip(
+                    "seq",
+                    tf("chip.seq", &[("i", i.as_str()), ("n", n.as_str())]),
+                    cx,
+                    move |v, _e, cx| {
+                        v.select_track((v.sel_track + 1) % n_tracks.max(1), cx);
+                        cx.notify();
+                    },
+                )
+            }))
             .child(Self::vsep())
             // edit tools
             .child(Self::ibtn_c(
@@ -802,7 +822,11 @@ impl Render for EditorView {
                     .border_color(rgb(BORDER_C))
                     .text_size(px(11.0))
                     .text_color(rgb(0x77778a))
-                    .child(t("tracks.header")),
+                    .child(t(if is_seq {
+                        "tracks.header_seq"
+                    } else {
+                        "tracks.header"
+                    })),
             )
             .child(
                 // scrollable when a file has more tracks than fit the panel
@@ -827,8 +851,9 @@ impl Render for EditorView {
                             .bg(if sel { rgb(0x2a2a3a) } else { rgb(0x1b1b24) })
                             .hover(|s| s.bg(rgb(0x252532)))
                             .on_click(cx.listener(move |v, _e, _w, cx| {
-                                v.sel_track = i;
-                                cx.notify();
+                                // format 2: this click also picks the
+                                // sequence being viewed/played
+                                v.select_track(i, cx);
                             }))
                             .child(div().w(px(10.0)).h(px(10.0)).rounded_sm().bg(rgb(if muted {
                                 0x555560

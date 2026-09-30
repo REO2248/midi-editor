@@ -1040,8 +1040,17 @@ fn summary_json(d: &Document, sh: &Shared) -> serde_json::Value {
         })).collect::<Vec<_>>(),
         "events": d.tracks.iter().map(|t| t.events.len()).sum::<usize>(),
         "notes": d.notes().len(),
+        // format 2: tracks are independent sequences — a single merged
+        // duration would lie, so report each sequence's own span
+        "sequential": d.is_sequential(),
         "last_tick": last_tick,
-        "duration_us": d.tempo_map.tick_to_us(last_tick),
+        "duration_us": (!d.is_sequential()).then(|| d.tempo_map.tick_to_us(last_tick)),
+        "durations_us": d.is_sequential().then(|| {
+            (0..d.tracks.len()).map(|i| {
+                let m = d.tempo_map_for(i);
+                m.tick_to_us(d.track_end_tick(i))
+            }).collect::<Vec<_>>()
+        }),
         "revision": d.revision(),
         "path": sh.path,
         "dirty": d.revision() != sh.saved_revision,
@@ -1479,7 +1488,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ),
         spec(
             "get_tempo_map",
-            "Tempo breakpoints: [{tick, us_per_quarter, bpm, cumulative_us}] + ppq (null for SMPTE — fps/ticks_per_frame are reported instead). Read before editing tempo or converting ticks<->time.",
+            "Tempo breakpoints: [{tick, us_per_quarter, bpm, cumulative_us}] + ppq (null for SMPTE — fps/ticks_per_frame are reported instead). Format-2 files report per-sequence maps (each track is an independent timeline). Read before editing tempo or converting ticks<->time.",
             object_schema(serde_json::json!({})),
         ),
         spec(
@@ -1595,17 +1604,19 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ),
         spec(
             "set_tempo",
-            "Set/replace tempo at a tick (conductor track). Args: tick, bpm. Optional base_revision.",
+            "Set/replace tempo at a tick. Args: tick, bpm, track? (default 0 = conductor; for format-2 files pass the sequence's track). Optional base_revision.",
             object_schema(serde_json::json!({
                 "tick": {"type": "integer"}, "bpm": {"type": "number"},
+                "track": {"type": "integer"},
                 "base_revision": {"type": "integer"},
             })),
         ),
         spec(
             "set_time_signature",
-            "Set/replace time signature at a tick. Args: tick, num (beats/bar), den (beat value 4=quarter,8=eighth). Optional base_revision.",
+            "Set/replace time signature at a tick. Args: tick, num (beats/bar), den (beat value 4=quarter,8=eighth), track? (default 0; pass the sequence's track for format-2). Optional base_revision.",
             object_schema(serde_json::json!({
                 "tick": {"type": "integer"}, "num": {"type": "integer"}, "den": {"type": "integer"},
+                "track": {"type": "integer"},
                 "base_revision": {"type": "integer"},
             })),
         ),
@@ -2072,19 +2083,34 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
                 } => (Some(fps), Some(ticks_per_frame)),
                 smf_core::Division::Metrical(_) => (None, None),
             };
-            ok_json(serde_json::json!({
-                // None for SMPTE: there is no quarter note — use
-                // fps*ticks_per_frame for tick<->time math instead
-                "ppq": tm.ppq(),
-                "fps": fps,
-                "ticks_per_frame": tpf,
-                "ticks_per_second": fps.map(|f| f as u64 * tpf.unwrap_or(1) as u64),
-                "points": tm.points().iter().map(|(tick, mpq, cum)| serde_json::json!({
-                    "tick": tick, "us_per_quarter": mpq,
-                    "bpm": (60_000_000.0 / *mpq as f64 * 100.0).round() / 100.0,
-                    "cumulative_us": cum,
-                })).collect::<Vec<_>>(),
-            }))
+            let point = |(tick, mpq, cum): &(u64, u32, u64)| serde_json::json!({
+                "tick": tick, "us_per_quarter": mpq,
+                "bpm": (60_000_000.0 / *mpq as f64 * 100.0).round() / 100.0,
+                "cumulative_us": cum,
+            });
+            ok_json(if sh.view().is_sequential() {
+                // format 2: every sequence is timed by its own tempo map
+                serde_json::json!({
+                    "scope": "per-sequence",
+                    "ppq": tm.ppq(),
+                    "fps": fps,
+                    "ticks_per_frame": tpf,
+                    "sequences": (0..sh.view().tracks.len()).map(|i| serde_json::json!({
+                        "track": i,
+                        "points": sh.view().tempo_map_for(i).points().iter().map(point).collect::<Vec<_>>(),
+                    })).collect::<Vec<_>>(),
+                })
+            } else {
+                serde_json::json!({
+                    // None for SMPTE: there is no quarter note — use
+                    // fps*ticks_per_frame for tick<->time math instead
+                    "ppq": tm.ppq(),
+                    "fps": fps,
+                    "ticks_per_frame": tpf,
+                    "ticks_per_second": fps.map(|f| f as u64 * tpf.unwrap_or(1) as u64),
+                    "points": tm.points().iter().map(point).collect::<Vec<_>>(),
+                })
+            })
         }
         "get_meta" => {
             let track = args["track"].as_u64().map(|v| v as usize);
@@ -2447,6 +2473,7 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
                 return r;
             }
             let ops = sh.view_mut().set_tempo_ops(
+                args["track"].as_u64().unwrap_or(0) as usize,
                 args["tick"].as_u64().unwrap_or(0),
                 args["bpm"].as_f64().unwrap_or(120.0),
             );
@@ -2457,6 +2484,7 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
                 return r;
             }
             let ops = sh.view_mut().set_time_sig_ops(
+                args["track"].as_u64().unwrap_or(0) as usize,
                 args["tick"].as_u64().unwrap_or(0),
                 args["num"].as_u64().unwrap_or(4) as u8,
                 args["den"].as_u64().unwrap_or(4) as u8,
