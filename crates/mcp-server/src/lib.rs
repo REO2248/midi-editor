@@ -217,7 +217,10 @@ pub const BATCH_TTL: Duration = Duration::from_secs(300);
 /// Result of routing an edit through `apply_or_stage`.
 pub enum StageOutcome {
     /// committed on the real document (no batch open)
-    Committed { revision: u64, summary: ChangeSummary },
+    Committed {
+        revision: u64,
+        summary: ChangeSummary,
+    },
     /// staged into the open batch — `summary` covers this call's ops
     Staged {
         pending_ops: usize,
@@ -593,9 +596,7 @@ pub fn change_summary(ops: &[Op]) -> ChangeSummary {
                     EventKind::Channel { data, .. } => data[0],
                     _ => 0,
                 };
-                if is_note_on(before)
-                    && (before.tick != after.tick || key(before) != key(after))
-                {
+                if is_note_on(before) && (before.tick != after.tick || key(before) != key(after)) {
                     s.notes_moved += 1;
                 } else {
                     match classify(after) {
@@ -1762,7 +1763,10 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
             let track = args["track"].as_u64().map(|v| v as usize);
             let from = args["from_tick"].as_u64().unwrap_or(0);
             let to = args["to_tick"].as_u64().unwrap_or(u64::MAX);
-            let limit = args["limit"].as_u64().unwrap_or(500).min(MAX_QUERY_LIMIT as u64) as usize;
+            let limit = args["limit"]
+                .as_u64()
+                .unwrap_or(500)
+                .min(MAX_QUERY_LIMIT as u64) as usize;
             let fields = field_projection(&args);
             let after = match cursor_arg(&sh, &args, 4) {
                 Ok(a) => a,
@@ -1770,8 +1774,7 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
             };
             // total sort key (start, key, track, on_id) — deterministic on a
             // fixed revision, so a cursor page neither duplicates nor skips
-            let key =
-                |n: &document::Note| (n.start_tick, n.key as u64, n.track as u64, n.on_id);
+            let key = |n: &document::Note| (n.start_tick, n.key as u64, n.track as u64, n.on_id);
             let mut notes: Vec<_> = sh
                 .view()
                 .notes()
@@ -1995,8 +1998,7 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
                     .to_string(),
                 );
             }
-            let txs: Vec<&TxRecord> =
-                sh.history.iter().filter(|r| r.revision > from).collect();
+            let txs: Vec<&TxRecord> = sh.history.iter().filter(|r| r.revision > from).collect();
             // coverage is only trustworthy while the oldest retained record
             // reaches back to `from`; older entries were evicted at the cap
             let truncated = from < cur
@@ -2075,7 +2077,10 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
         "get_meta" => {
             let track = args["track"].as_u64().map(|v| v as usize);
             let mt = args["meta_type"].as_u64().map(|v| v as u8);
-            let limit = args["limit"].as_u64().unwrap_or(500).min(MAX_QUERY_LIMIT as u64) as usize;
+            let limit = args["limit"]
+                .as_u64()
+                .unwrap_or(500)
+                .min(MAX_QUERY_LIMIT as u64) as usize;
             let fields = field_projection(&args);
             let after = match cursor_arg(&sh, &args, 4) {
                 Ok(a) => a,
@@ -2142,7 +2147,10 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
             let track = args["track"].as_u64().map(|v| v as usize);
             let chan = args["channel"].as_u64().map(|v| v as u8);
             let ccn = args["cc"].as_u64().map(|v| v as u8);
-            let limit = args["limit"].as_u64().unwrap_or(500).min(MAX_QUERY_LIMIT as u64) as usize;
+            let limit = args["limit"]
+                .as_u64()
+                .unwrap_or(500)
+                .min(MAX_QUERY_LIMIT as u64) as usize;
             let fields = field_projection(&args);
             let after = match cursor_arg(&sh, &args, 3) {
                 Ok(a) => a,
@@ -2263,7 +2271,9 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
                 return r;
             }
             let (from, to) = region(args);
-            let grid = args["grid"].as_u64().unwrap_or_else(|| sh.view().tempo_map.ppq() / 4);
+            let grid = args["grid"]
+                .as_u64()
+                .unwrap_or_else(|| sh.view().tempo_map.ppq() / 4);
             let strength = args["strength"].as_u64().unwrap_or(100) as u32;
             let tracks = match sel_tracks(&sh, args) {
                 Ok(t) => t,
@@ -2335,7 +2345,13 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
             let ch = args["channel"]
                 .as_u64()
                 .map(|c| (c.clamp(1, 16) - 1) as u8)
-                .unwrap_or_else(|| sh.view().tracks.get(track).map(|t| t.out_channel).unwrap_or(0));
+                .unwrap_or_else(|| {
+                    sh.view()
+                        .tracks
+                        .get(track)
+                        .map(|t| t.out_channel)
+                        .unwrap_or(0)
+                });
             let ops = sh.view_mut().set_program_ops(
                 track,
                 tick,
@@ -2357,7 +2373,13 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
             let ch = args["channel"]
                 .as_u64()
                 .map(|c| (c.clamp(1, 16) - 1) as u8)
-                .unwrap_or_else(|| sh.view().tracks.get(track).map(|t| t.out_channel).unwrap_or(0));
+                .unwrap_or_else(|| {
+                    sh.view()
+                        .tracks
+                        .get(track)
+                        .map(|t| t.out_channel)
+                        .unwrap_or(0)
+                });
             let mut ops = Vec::new();
             if let Some(points) = args["points"].as_array() {
                 for p in points {
@@ -2391,7 +2413,13 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
             let ch = args["channel"]
                 .as_u64()
                 .map(|c| (c.clamp(1, 16) - 1) as u8)
-                .unwrap_or_else(|| sh.view().tracks.get(track).map(|t| t.out_channel).unwrap_or(0));
+                .unwrap_or_else(|| {
+                    sh.view()
+                        .tracks
+                        .get(track)
+                        .map(|t| t.out_channel)
+                        .unwrap_or(0)
+                });
             let ops = sh.view_mut().set_pitch_bend_ops(
                 track,
                 args["tick"].as_u64().unwrap_or(0),
@@ -2489,7 +2517,9 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
             let from = args["from"].as_u64().unwrap_or(0);
             // default `to` = end of song: a full u64::MAX span would push
             // every copy to a nonsense saturated tick
-            let to = args["to"].as_u64().unwrap_or_else(|| doc_last_tick(sh.view()));
+            let to = args["to"]
+                .as_u64()
+                .unwrap_or_else(|| doc_last_tick(sh.view()));
             let ops = sh.view_mut().duplicate_range_ops(track, from, to);
             apply_ops(&mut sh, "duplicate range", ops)
         }
@@ -2658,9 +2688,7 @@ fn is_loopback_host(host: &str) -> bool {
 /// Anything surprising — userinfo, whitespace, unbalanced brackets, a stray
 /// colon, a non-numeric port — is malformed, not loopback.
 fn authority_host(authority: &str) -> Option<String> {
-    if authority.is_empty()
-        || authority.contains('@')
-        || authority.chars().any(char::is_whitespace)
+    if authority.is_empty() || authority.contains('@') || authority.chars().any(char::is_whitespace)
     {
         return None;
     }
@@ -2676,9 +2704,7 @@ fn authority_host(authority: &str) -> Option<String> {
     match authority.split(':').collect::<Vec<_>>().as_slice() {
         [host] if !host.is_empty() => Some(host.to_ascii_lowercase()),
         [host, port]
-            if !host.is_empty()
-                && !port.is_empty()
-                && port.chars().all(|c| c.is_ascii_digit()) =>
+            if !host.is_empty() && !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) =>
         {
             Some(host.to_ascii_lowercase())
         }
@@ -2966,9 +2992,8 @@ pub fn mcp_http_router(doc: SharedDoc, addr: &str, auth: HttpAuth) -> axum::Rout
         HttpAuth::Token(src) => (McpAuthMode::Bearer, src.describe()),
         HttpAuth::Insecure => (McpAuthMode::Open, "MIDI_MCP_ALLOW_INSECURE".into()),
     };
-    doc.lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .mcp_security = SecurityReport::http(addr, auth_mode, auth_detail);
+    doc.lock().unwrap_or_else(|e| e.into_inner()).mcp_security =
+        SecurityReport::http(addr, auth_mode, auth_detail);
 
     let factory = {
         let doc = doc.clone();
@@ -3286,13 +3311,9 @@ mod tests {
     #[test]
     fn rollback_leaves_document_unchanged() {
         let sh = shared();
-        let before = sh
-            .lock()
-            .unwrap()
-            .doc
-            .serialize(smf_core::WriteOptions {
-                running_status: false,
-            });
+        let before = sh.lock().unwrap().doc.serialize(smf_core::WriteOptions {
+            running_status: false,
+        });
         call(&sh, "begin_transaction", json!({"label": "experiment"}));
         call(
             &sh,
@@ -3346,7 +3367,11 @@ mod tests {
         assert!(!err);
         assert_eq!(v["valid"], true);
         assert_eq!(v["would_be_revision"], 1);
-        assert_eq!(sh.lock().unwrap().doc.revision(), 0, "dry run applied nothing");
+        assert_eq!(
+            sh.lock().unwrap().doc.revision(),
+            0,
+            "dry run applied nothing"
+        );
         let (_err, v) = call(&sh, "transaction_status", json!({}));
         assert_eq!(v["open"], true, "batch still open after dry_run");
         let (err, v) = call(&sh, "commit_transaction", json!({}));
@@ -3507,7 +3532,10 @@ mod tests {
         let starts: Vec<_> = rows.iter().map(|n| n["start"].as_u64().unwrap()).collect();
         let mut sorted = starts.clone();
         sorted.sort();
-        assert_eq!(starts, sorted, "pages stay in (start, key, track, id) order");
+        assert_eq!(
+            starts, sorted,
+            "pages stay in (start, key, track, id) order"
+        );
     }
 
     #[test]
@@ -3727,8 +3755,16 @@ mod tests {
         assert_eq!(authed_post(&addr, Some("tok-a")).await, 200);
         // rotate: rewrite the file — next request must require the new token
         std::fs::write(&p, "tok-b").unwrap();
-        assert_eq!(authed_post(&addr, Some("tok-a")).await, 401, "old token revoked");
-        assert_eq!(authed_post(&addr, Some("tok-b")).await, 200, "new token live");
+        assert_eq!(
+            authed_post(&addr, Some("tok-a")).await,
+            401,
+            "old token revoked"
+        );
+        assert_eq!(
+            authed_post(&addr, Some("tok-b")).await,
+            200,
+            "new token live"
+        );
         // revoke: delete the file — everything fails closed
         std::fs::remove_file(&p).unwrap();
         assert_eq!(authed_post(&addr, Some("tok-b")).await, 401);
@@ -3810,19 +3846,32 @@ mod tests {
 
     #[test]
     fn authority_parsing_accepts_only_wellformed() {
-        assert_eq!(authority_host("127.0.0.1:7878").as_deref(), Some("127.0.0.1"));
+        assert_eq!(
+            authority_host("127.0.0.1:7878").as_deref(),
+            Some("127.0.0.1")
+        );
         assert_eq!(authority_host("LOCALHOST").as_deref(), Some("localhost"));
         assert_eq!(authority_host("[::1]:7878").as_deref(), Some("::1"));
         assert_eq!(authority_host("[::1]").as_deref(), Some("::1"));
         // malformed / hostile spellings
         for bad in [
-            "", "127.0.0.1:", ":7878", "a:b:c", "127.0.0.1:8x", "[::1", "::1]",
-            "user@127.0.0.1", "evil.com@127.0.0.1", "127.0.0.1 @evil.com",
+            "",
+            "127.0.0.1:",
+            ":7878",
+            "a:b:c",
+            "127.0.0.1:8x",
+            "[::1",
+            "::1]",
+            "user@127.0.0.1",
+            "evil.com@127.0.0.1",
+            "127.0.0.1 @evil.com",
         ] {
             assert!(authority_host(bad).is_none(), "{bad:?} must be malformed");
         }
         // parses fine but is not loopback
-        assert!(!is_loopback_host(&authority_host("127.0.0.1.evil.com").unwrap()));
+        assert!(!is_loopback_host(
+            &authority_host("127.0.0.1.evil.com").unwrap()
+        ));
         assert!(!is_loopback_host(&authority_host("localhost.").unwrap()));
         assert!(!is_loopback_host(&authority_host("127.1").unwrap()));
     }
@@ -3966,7 +4015,12 @@ mod tests {
     #[tokio::test]
     async fn hostile_hosts_are_rejected() {
         let addr = start_http_insecure().await;
-        for host in ["evil.com", "127.0.0.1.evil.com", "localhost.evil.com", "user@127.0.0.1"] {
+        for host in [
+            "evil.com",
+            "127.0.0.1.evil.com",
+            "localhost.evil.com",
+            "user@127.0.0.1",
+        ] {
             let status = http_post(&addr, Some(host), MCP_HEADERS, INIT).await;
             assert_eq!(status, 403, "Host {host:?} must be rejected");
         }
@@ -3977,12 +4031,21 @@ mod tests {
         let addr = start_http_insecure().await;
         // Host variants the guard must accept (the socket is IPv4 but the
         // Host header is validated by value, not by interface)
-        for host in ["localhost:7878", "127.0.0.1:7878", "[::1]:7878", "localhost"] {
+        for host in [
+            "localhost:7878",
+            "127.0.0.1:7878",
+            "[::1]:7878",
+            "localhost",
+        ] {
             let status = http_post(&addr, Some(host), MCP_HEADERS, INIT).await;
             assert_eq!(status, 200, "Host {host:?} must pass");
         }
         // local browser tooling origins pass too
-        for origin in ["http://localhost:6274", "https://127.0.0.1:3000", "http://[::1]:9"] {
+        for origin in [
+            "http://localhost:6274",
+            "https://127.0.0.1:3000",
+            "http://[::1]:9",
+        ] {
             let headers: Vec<_> = MCP_HEADERS
                 .iter()
                 .cloned()
@@ -4027,7 +4090,10 @@ mod tests {
     #[tokio::test]
     async fn normal_request_passes_limits() {
         let addr = start_http_insecure().await;
-        assert_eq!(http_req(&addr, "POST", "/mcp", MCP_HEADERS, INIT.as_bytes()).await, 200);
+        assert_eq!(
+            http_req(&addr, "POST", "/mcp", MCP_HEADERS, INIT.as_bytes()).await,
+            200
+        );
     }
 
     #[tokio::test]
@@ -4035,16 +4101,17 @@ mod tests {
         let addr = start_http_insecure().await;
         let body = vec![b'x'; MAX_HTTP_BODY_BYTES + 1];
         let status = http_req(&addr, "POST", "/mcp", MCP_HEADERS, &body).await;
-        assert_eq!(status, 413, "over {MAX_HTTP_BODY_BYTES} bytes must not reach dispatch");
+        assert_eq!(
+            status, 413,
+            "over {MAX_HTTP_BODY_BYTES} bytes must not reach dispatch"
+        );
     }
 
     /// A stub endpoint behind `bounded_request` lets the limits be exercised
     /// with tiny values instead of the production constants.
     async fn stub_limited(slots: usize, timeout: std::time::Duration) -> String {
         use axum::middleware::Next;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let gate = Arc::new(tokio::sync::Semaphore::new(slots));
         let app = axum::Router::new()
@@ -4079,8 +4146,10 @@ mod tests {
         while let Some(c) = set.join_next().await {
             codes.push(c.unwrap());
         }
-        assert!(codes.iter().filter(|&&c| c == 429).count() >= 5,
-            "slots held by slow requests must reject the flood: {codes:?}");
+        assert!(
+            codes.iter().filter(|&&c| c == 429).count() >= 5,
+            "slots held by slow requests must reject the flood: {codes:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4174,7 +4243,10 @@ mod tests {
         assert!(text.contains("outside the MCP save scope"), "{text}");
         assert!(text.contains("MIDI_MCP_ALLOWED_ROOTS"), "{text}");
         assert!(!target.exists());
-        let _ = (std::fs::remove_dir_all(&allowed), std::fs::remove_dir_all(&elsewhere));
+        let _ = (
+            std::fs::remove_dir_all(&allowed),
+            std::fs::remove_dir_all(&elsewhere),
+        );
     }
 
     #[test]
@@ -4198,8 +4270,7 @@ mod tests {
             let sh = shared_in(&allowed);
             // looks inside the allowed root, resolves outside it
             let via_link = allowed.join("link").join("evil.mid");
-            let (err, text) =
-                call_text(&sh, "save", json!({"path": via_link.to_string_lossy()}));
+            let (err, text) = call_text(&sh, "save", json!({"path": via_link.to_string_lossy()}));
             assert!(err, "junction must be resolved before the root check");
             assert!(text.contains("outside the MCP save scope"), "{text}");
             assert!(!outside.join("evil.mid").exists());

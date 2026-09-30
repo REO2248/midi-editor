@@ -81,7 +81,10 @@ fn tool_surface_matches_snapshot() {
         std::fs::write(SNAPSHOT_PATH, &current).unwrap();
         return;
     }
-    let actual = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/schema_snapshot.actual.json");
+    let actual = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/schema_snapshot.actual.json"
+    );
     std::fs::write(actual, &current).unwrap();
     panic!(
         "MCP tool surface changed (first diff at line {} of the snapshot).\n\
