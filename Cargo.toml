@@ -46,6 +46,9 @@ axum = "0.8"
 http = "1"
 getrandom = "0.4"
 
+# testing
+proptest = "1"
+
 [profile.dev]
 # faster link times during spike work
 incremental = true

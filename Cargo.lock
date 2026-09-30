@@ -1117,6 +1117,7 @@ version = "0.0.0"
 dependencies = [
  "bytes",
  "document",
+ "proptest",
  "smf-core",
 ]
 
@@ -1728,6 +1729,7 @@ name = "document"
 version = "0.0.0"
 dependencies = [
  "bytes",
+ "proptest",
  "serde",
  "smf-core",
  "thiserror 2.0.21",
