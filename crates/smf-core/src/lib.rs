@@ -231,9 +231,9 @@ fn file_from_map(raw: &[u8], map: SmfBytemap<'_>, limits: &Limits) -> Result<Fil
             tick += ev.delta.as_int() as u64;
             let kind = convert_kind(&ev.kind);
             let payload = match &kind {
-                EventKind::Meta { data, .. }
-                | EventKind::SysEx(data)
-                | EventKind::Escape(data) => data.len(),
+                EventKind::Meta { data, .. } | EventKind::SysEx(data) | EventKind::Escape(data) => {
+                    data.len()
+                }
                 EventKind::Channel { .. } => 0,
             };
             limit_check("event payload", payload, limits.max_event_payload)?;
@@ -500,13 +500,17 @@ fn track_lenient(
             p += want;
         }
         let payload = match &kind {
-            EventKind::Meta { data, .. }
-            | EventKind::SysEx(data)
-            | EventKind::Escape(data) => data.len(),
+            EventKind::Meta { data, .. } | EventKind::SysEx(data) | EventKind::Escape(data) => {
+                data.len()
+            }
             EventKind::Channel { .. } => 0,
         };
         limit_check("event payload", payload, limits.max_event_payload)?;
-        limit_check("events in a track", events.len() + 1, limits.max_track_events)?;
+        limit_check(
+            "events in a track",
+            events.len() + 1,
+            limits.max_track_events,
+        )?;
         *total_events += 1;
         limit_check("total events", *total_events, limits.max_events)?;
         events.push(Event {
@@ -642,7 +646,11 @@ pub fn write_vlq(mut v: u64, out: &mut Vec<u8>) {
 
 fn encode_body(kind: &EventKind, out: &mut Vec<u8>) {
     match kind {
-        EventKind::Channel { status, data, len: _ } => {
+        EventKind::Channel {
+            status,
+            data,
+            len: _,
+        } => {
             out.push(*status);
             out.push(data[0]);
             // program change (0xC0..) and channel pressure (0xD0..) carry
@@ -992,12 +1000,7 @@ mod tests {
     fn format0_with_zero_tracks_upgrades() {
         // format 0 requires exactly one track; an empty document would emit
         // a header every parser (including ours) rejects
-        let out = write(
-            0,
-            Division::Metrical(480),
-            &[],
-            WriteOptions::default(),
-        );
+        let out = write(0, Division::Metrical(480), &[], WriteOptions::default());
         assert_eq!(&out[8..10], &[0x00, 0x01]);
         assert_eq!(parse(&out).unwrap().tracks.len(), 0);
     }
@@ -1019,11 +1022,21 @@ mod tests {
         };
         let one_track = |events| vec![Track { events }];
         // 0xD0 pressure is 1 data byte even when len says 2
-        let out = write(1, Division::Metrical(480), &one_track(vec![mk(0xD3, 2)]), WriteOptions::default());
+        let out = write(
+            1,
+            Division::Metrical(480),
+            &one_track(vec![mk(0xD3, 2)]),
+            WriteOptions::default(),
+        );
         assert!(out.windows(2).any(|w| w == [0xD3, 0x40]));
         assert!(!out.windows(3).any(|w| w == [0xD3, 0x40, 0x41]));
         // 0x90 note-on is 2 data bytes even when len says 1
-        let out = write(1, Division::Metrical(480), &one_track(vec![mk(0x90, 1)]), WriteOptions::default());
+        let out = write(
+            1,
+            Division::Metrical(480),
+            &one_track(vec![mk(0x90, 1)]),
+            WriteOptions::default(),
+        );
         assert!(out.windows(3).any(|w| w == [0x90, 0x40, 0x41]));
     }
 

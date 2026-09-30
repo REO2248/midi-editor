@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-static TABLE: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
+static TABLE: OnceLock<&'static HashMap<&'static str, &'static str>> = OnceLock::new();
 
 static EN: &[(&str, &str)] = &[
     ("app.title", "midi-editor"),
@@ -886,14 +886,35 @@ fn detect_lang() -> &'static str {
     }
 }
 
+static EN_MAP: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
+static JA_MAP: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
+
+fn lang_table(lang: &str) -> &'static HashMap<&'static str, &'static str> {
+    match lang {
+        "ja" => JA_MAP.get_or_init(|| JA.iter().copied().collect()),
+        _ => EN_MAP.get_or_init(|| EN.iter().copied().collect()),
+    }
+}
+
 fn table() -> &'static HashMap<&'static str, &'static str> {
-    TABLE.get_or_init(|| {
-        let src: &[(&str, &str)] = match detect_lang() {
-            "ja" => JA,
-            _ => EN,
-        };
-        src.iter().copied().collect()
-    })
+    #[cfg(test)]
+    if let Some(l) = TEST_LANG.with(|c| c.get()) {
+        return lang_table(l);
+    }
+    TABLE.get_or_init(|| lang_table(detect_lang()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_LANG: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Pin the UI locale on this thread. UI tests render on their own thread,
+/// so a Japanese golden cannot bleed into concurrent English tests.
+#[cfg(test)]
+pub(crate) fn set_test_lang(lang: &'static str) {
+    TEST_LANG.with(|c| c.set(Some(lang)));
 }
 
 /// Look up `key` in the active locale, falling back to English then the key.

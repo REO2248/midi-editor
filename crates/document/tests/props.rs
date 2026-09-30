@@ -81,25 +81,109 @@ pub fn arb_file() -> impl Strategy<Value = File> {
 /// One editor action applied through the real ops-builders.
 #[derive(Debug, Clone)]
 pub enum OpSpec {
-    Quantize { track: usize, from: u64, to: u64, grid: u64, strength: u32 },
-    Transpose { track: usize, from: u64, to: u64, semitones: i32 },
-    ScaleVelocity { track: usize, from: u64, to: u64, factor: f64 },
-    Humanize { track: usize, from: u64, to: u64, timing: i64, vel: i32 },
-    Legato { track: usize, from: u64, to: u64 },
-    SetLength { track: usize, from: u64, to: u64, ticks: u64 },
-    SetVelocity { track: usize, from: u64, to: u64, vel: u8 },
-    SetChannel { track: usize, from: u64, to: u64, channel: u8 },
-    SetProgram { track: usize, tick: u64, channel: u8, program: u8, msb: Option<u8>, lsb: Option<u8> },
-    SetCc { track: usize, tick: u64, channel: u8, cc: u8, value: u8 },
-    SetPitchBend { track: usize, tick: u64, channel: u8, value: u16 },
-    SetTempo { tick: u64, bpm: f64 },
-    SetTimeSig { tick: u64, num: u8, den: u8 },
-    SetTrackChannel { track: usize, channel: u8 },
-    DuplicateRange { track: usize, from: u64, to: u64 },
-    DeleteRange { track: usize, from: u64, to: u64 },
-    AddTrack { name: Option<String> },
-    RemoveTrack { index: usize },
-    SetTrackName { track: usize, name: String },
+    Quantize {
+        track: usize,
+        from: u64,
+        to: u64,
+        grid: u64,
+        strength: u32,
+    },
+    Transpose {
+        track: usize,
+        from: u64,
+        to: u64,
+        semitones: i32,
+    },
+    ScaleVelocity {
+        track: usize,
+        from: u64,
+        to: u64,
+        factor: f64,
+    },
+    Humanize {
+        track: usize,
+        from: u64,
+        to: u64,
+        timing: i64,
+        vel: i32,
+    },
+    Legato {
+        track: usize,
+        from: u64,
+        to: u64,
+    },
+    SetLength {
+        track: usize,
+        from: u64,
+        to: u64,
+        ticks: u64,
+    },
+    SetVelocity {
+        track: usize,
+        from: u64,
+        to: u64,
+        vel: u8,
+    },
+    SetChannel {
+        track: usize,
+        from: u64,
+        to: u64,
+        channel: u8,
+    },
+    SetProgram {
+        track: usize,
+        tick: u64,
+        channel: u8,
+        program: u8,
+        msb: Option<u8>,
+        lsb: Option<u8>,
+    },
+    SetCc {
+        track: usize,
+        tick: u64,
+        channel: u8,
+        cc: u8,
+        value: u8,
+    },
+    SetPitchBend {
+        track: usize,
+        tick: u64,
+        channel: u8,
+        value: u16,
+    },
+    SetTempo {
+        tick: u64,
+        bpm: f64,
+    },
+    SetTimeSig {
+        tick: u64,
+        num: u8,
+        den: u8,
+    },
+    SetTrackChannel {
+        track: usize,
+        channel: u8,
+    },
+    DuplicateRange {
+        track: usize,
+        from: u64,
+        to: u64,
+    },
+    DeleteRange {
+        track: usize,
+        from: u64,
+        to: u64,
+    },
+    AddTrack {
+        name: Option<String>,
+    },
+    RemoveTrack {
+        index: usize,
+    },
+    SetTrackName {
+        track: usize,
+        name: String,
+    },
 }
 
 pub fn arb_opspec() -> impl Strategy<Value = OpSpec> {
@@ -166,33 +250,72 @@ pub fn build_ops(doc: &mut Document, spec: &OpSpec) -> Vec<Op> {
         };
     }
     match *spec {
-        OpSpec::Quantize { track, from, to, grid, strength } => {
-            doc.quantize_ops(track % n, from, to, grid, strength)
-        }
-        OpSpec::Transpose { track, from, to, semitones } => {
-            doc.transpose_ops(track % n, from, to, semitones)
-        }
-        OpSpec::ScaleVelocity { track, from, to, factor } => {
-            doc.scale_velocity_ops(track % n, from, to, factor)
-        }
-        OpSpec::Humanize { track, from, to, timing, vel } => {
-            doc.humanize_ops(track % n, from, to, timing, vel)
-        }
+        OpSpec::Quantize {
+            track,
+            from,
+            to,
+            grid,
+            strength,
+        } => doc.quantize_ops(track % n, from, to, grid, strength),
+        OpSpec::Transpose {
+            track,
+            from,
+            to,
+            semitones,
+        } => doc.transpose_ops(track % n, from, to, semitones),
+        OpSpec::ScaleVelocity {
+            track,
+            from,
+            to,
+            factor,
+        } => doc.scale_velocity_ops(track % n, from, to, factor),
+        OpSpec::Humanize {
+            track,
+            from,
+            to,
+            timing,
+            vel,
+        } => doc.humanize_ops(track % n, from, to, timing, vel),
         OpSpec::Legato { track, from, to } => doc.legato_ops(track % n, from, to),
-        OpSpec::SetLength { track, from, to, ticks } => doc.set_length_ops(track % n, from, to, ticks),
-        OpSpec::SetVelocity { track, from, to, vel } => doc.set_velocity_ops(track % n, from, to, vel),
-        OpSpec::SetChannel { track, from, to, channel } => {
-            doc.set_channel_ops(track % n, from, to, channel)
-        }
-        OpSpec::SetProgram { track, tick, channel, program, msb, lsb } => {
-            doc.set_program_ops(track % n, tick, channel, program, msb, lsb)
-        }
-        OpSpec::SetCc { track, tick, channel, cc, value } => {
-            doc.set_cc_ops(track % n, tick, channel, cc, value)
-        }
-        OpSpec::SetPitchBend { track, tick, channel, value } => {
-            doc.set_pitch_bend_ops(track % n, tick, channel, value)
-        }
+        OpSpec::SetLength {
+            track,
+            from,
+            to,
+            ticks,
+        } => doc.set_length_ops(track % n, from, to, ticks),
+        OpSpec::SetVelocity {
+            track,
+            from,
+            to,
+            vel,
+        } => doc.set_velocity_ops(track % n, from, to, vel),
+        OpSpec::SetChannel {
+            track,
+            from,
+            to,
+            channel,
+        } => doc.set_channel_ops(track % n, from, to, channel),
+        OpSpec::SetProgram {
+            track,
+            tick,
+            channel,
+            program,
+            msb,
+            lsb,
+        } => doc.set_program_ops(track % n, tick, channel, program, msb, lsb),
+        OpSpec::SetCc {
+            track,
+            tick,
+            channel,
+            cc,
+            value,
+        } => doc.set_cc_ops(track % n, tick, channel, cc, value),
+        OpSpec::SetPitchBend {
+            track,
+            tick,
+            channel,
+            value,
+        } => doc.set_pitch_bend_ops(track % n, tick, channel, value),
         OpSpec::SetTempo { tick, bpm } => doc.set_tempo_ops(tick, bpm),
         OpSpec::SetTimeSig { tick, num, den } => doc.set_time_sig_ops(tick, num, den),
         OpSpec::SetTrackChannel { track, channel } => doc.set_track_channel_ops(track % n, channel),
@@ -549,7 +672,10 @@ fn conventional_metas_are_cached() {
         doc.text_encoding_hint(),
         Some(smf_core::TextEncoding::ShiftJis)
     ));
-    assert_eq!(doc.tracks[1].out_port, 0, "empty FF 21 payload must be ignored");
+    assert_eq!(
+        doc.tracks[1].out_port, 0,
+        "empty FF 21 payload must be ignored"
+    );
 }
 
 /// `diagnose` must find each documented class of import problem, and
@@ -647,7 +773,10 @@ fn diagnose_and_fix_ops_cover_each_finding() {
         "zero-length-note",
         "missing-eot",
     ] {
-        assert!(codes.contains(&want), "missing diagnostic {want}: {codes:?}");
+        assert!(
+            codes.contains(&want),
+            "missing diagnostic {want}: {codes:?}"
+        );
     }
 
     // filtered fix_ops only emits ops for the selected codes
@@ -733,15 +862,17 @@ fn transforms_respect_range_boundaries() {
     // transpose [480,1440) +12: notes at 480/960 move, the 1440/60/127-key
     // notes don't. 2 notes × (on+off) = 4 ops.
     let ops = doc.transpose_ops(0, 480, 1440, 12);
-    assert_eq!(ops.len(), 4, "transpose must hit exactly 2 in-range movable notes");
+    assert_eq!(
+        ops.len(),
+        4,
+        "transpose must hit exactly 2 in-range movable notes"
+    );
     for op in &ops {
         let Op::UpdateEvent { before, after, .. } = op else {
             panic!("transpose must emit UpdateEvent ops");
         };
-        let (
-            EventKind::Channel { data: bd, .. },
-            EventKind::Channel { data: ad, .. },
-        ) = (&before.kind, &after.kind)
+        let (EventKind::Channel { data: bd, .. }, EventKind::Channel { data: ad, .. }) =
+            (&before.kind, &after.kind)
         else {
             panic!("channel events only");
         };
@@ -757,10 +888,8 @@ fn transforms_respect_range_boundaries() {
         let Op::UpdateEvent { before, after, .. } = op else {
             panic!("scale_velocity must emit UpdateEvent ops");
         };
-        let (
-            EventKind::Channel { data: bd, .. },
-            EventKind::Channel { data: ad, .. },
-        ) = (&before.kind, &after.kind)
+        let (EventKind::Channel { data: bd, .. }, EventKind::Channel { data: ad, .. }) =
+            (&before.kind, &after.kind)
         else {
             panic!("channel events only");
         };
@@ -806,15 +935,17 @@ fn transforms_respect_range_boundaries() {
     // set_channel [480,1440) →ch5: every in-range channel event's status
     // low-nibble becomes 5, high nibble preserved.
     let ops = doc.set_channel_ops(0, 480, 1440, 5);
-    assert_eq!(ops.len(), 6, "set_channel covers every in-range channel event");
+    assert_eq!(
+        ops.len(),
+        6,
+        "set_channel covers every in-range channel event"
+    );
     for op in &ops {
         let Op::UpdateEvent { before, after, .. } = op else {
             panic!()
         };
-        let (
-            EventKind::Channel { status: bs, .. },
-            EventKind::Channel { status: a_s, .. },
-        ) = (&before.kind, &after.kind)
+        let (EventKind::Channel { status: bs, .. }, EventKind::Channel { status: a_s, .. }) =
+            (&before.kind, &after.kind)
         else {
             panic!()
         };
@@ -873,6 +1004,10 @@ fn transforms_respect_range_boundaries() {
     };
     assert_eq!(events.len(), 6);
     for e in events {
-        assert!(e.tick >= 1440 && e.tick < 2400, "dup tick {} out of range", e.tick);
+        assert!(
+            e.tick >= 1440 && e.tick < 2400,
+            "dup tick {} out of range",
+            e.tick
+        );
     }
 }

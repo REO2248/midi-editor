@@ -699,12 +699,7 @@ pub static COMMANDS: &[Command] = &[
         }
     ),
     cmd!("help.about", "help.about", &[], None, |v, _w, _cx| {
-        v.status = concat!(
-            "midi-editor ",
-            env!("BUILD_IDENTITY"),
-            " — pure-SMF editor"
-        )
-        .into();
+        v.status = concat!("midi-editor ", env!("BUILD_IDENTITY"), " — pure-SMF editor").into();
     }),
     cmd!("help.mcp", "help.mcp", &[], None, |v, _w, _cx| {
         v.status = "MCP: http://127.0.0.1:7878/mcp (mcp-bridge for stdio clients)".into();

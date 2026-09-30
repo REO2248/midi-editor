@@ -250,8 +250,7 @@ impl Document {
                     // mirror apply's `min(len)` clamp: the track landed at the
                     // clamped position, so remove it from there
                     if !self.tracks.is_empty() {
-                        self.tracks
-                            .remove((*index).min(self.tracks.len() - 1));
+                        self.tracks.remove((*index).min(self.tracks.len() - 1));
                     }
                 }
                 Op::RemoveTrack { index, track } => {
@@ -667,9 +666,7 @@ impl Document {
                 match (status & 0xF0, data[0], data[1]) {
                     // corrupt input can carry data bytes with the top bit
                     // set; those can't index the 128-entry key tables
-                    (0x90, key, v) if v > 0 && key < 0x80 => {
-                        st.pending[key as usize].push(v)
-                    }
+                    (0x90, key, v) if v > 0 && key < 0x80 => st.pending[key as usize].push(v),
                     (0x80, key, _) | (0x90, key, _) if key < 0x80 => {
                         // LIFO pairing, same as the notes() view
                         if let Some(vel) = st.pending[key as usize].pop() {
@@ -736,9 +733,7 @@ impl Document {
                     (0xC0, prog, _) => st.prog = Some(prog),
                     (0xD0, press, _) => st.pressure = Some(press),
                     (0xE0, lsb, msb) => st.bend = Some([lsb, msb]),
-                    (0xA0, key, v) if key < 0x80 => {
-                        st.poly[key as usize] = Some(v)
-                    }
+                    (0xA0, key, v) if key < 0x80 => st.poly[key as usize] = Some(v),
                     _ => {}
                 }
             }
@@ -2366,10 +2361,14 @@ impl Document {
                 after,
             }];
         }
-        self.insert_single_ops(track, tick, EventKind::Meta {
-            meta_type: 0x51,
-            data,
-        })
+        self.insert_single_ops(
+            track,
+            tick,
+            EventKind::Meta {
+                meta_type: 0x51,
+                data,
+            },
+        )
     }
 
     /// Shared tail for single-meta builders: inserts the event on `track`,
@@ -2435,10 +2434,14 @@ impl Document {
                 after,
             }];
         }
-        self.insert_single_ops(track, tick, EventKind::Meta {
-            meta_type: 0x58,
-            data,
-        })
+        self.insert_single_ops(
+            track,
+            tick,
+            EventKind::Meta {
+                meta_type: 0x58,
+                data,
+            },
+        )
     }
 
     /// Set the track's output channel meta (`FF 20`): update the existing
@@ -2863,8 +2866,8 @@ impl TempoMap {
 
     pub fn tick_to_us(&self, tick: u64) -> u64 {
         if let Division::Smpte { .. } = self.division {
-            return (((tick as u128) * 1_000_000) / self.smpte_tps() as u128)
-                .min(u64::MAX as u128) as u64;
+            return (((tick as u128) * 1_000_000) / self.smpte_tps() as u128).min(u64::MAX as u128)
+                as u64;
         }
         let ppq = match self.division {
             Division::Metrical(p) => p.max(1) as u64,
@@ -2881,8 +2884,8 @@ impl TempoMap {
     /// Inverse of `tick_to_us` — for playhead positioning.
     pub fn us_to_tick(&self, us: u64) -> u64 {
         if let Division::Smpte { .. } = self.division {
-            return (((us as u128) * self.smpte_tps() as u128) / 1_000_000)
-                .min(u64::MAX as u128) as u64;
+            return (((us as u128) * self.smpte_tps() as u128) / 1_000_000).min(u64::MAX as u128)
+                as u64;
         }
         let ppq = match self.division {
             Division::Metrical(p) => p.max(1) as u64,

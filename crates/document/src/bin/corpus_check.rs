@@ -343,14 +343,15 @@ fn scan(dirs: &[String]) -> i32 {
                 } else {
                     // non-clean input is allowed to normalize — but it must be
                     // a fixpoint: writing the written file must be stable.
-                    let out2 = match smf_core::parse_with_limits(&out, &smf_core::Limits::unlimited()) {
-                        Ok(f2) => smf_core::write(f2.format, f2.division, &f2.tracks, opts),
-                        Err(e) => {
-                            failed += 1;
-                            println!("{name}: re-parse failed: {e}");
-                            continue;
-                        }
-                    };
+                    let out2 =
+                        match smf_core::parse_with_limits(&out, &smf_core::Limits::unlimited()) {
+                            Ok(f2) => smf_core::write(f2.format, f2.division, &f2.tracks, opts),
+                            Err(e) => {
+                                failed += 1;
+                                println!("{name}: re-parse failed: {e}");
+                                continue;
+                            }
+                        };
                     if out2 == out {
                         normalized += 1;
                         println!(

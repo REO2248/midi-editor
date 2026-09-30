@@ -1190,6 +1190,8 @@ impl Render for EditorView {
         // --- track column: select / mute / solo -------------------------------
         let tracks_focused = area == FocusArea::Tracks;
         let track_col = div()
+            .id("track-col")
+            .test_support()
             .w(px(150.0))
             .h_full()
             .flex()
@@ -1600,6 +1602,8 @@ impl Render for EditorView {
 
         let body = body.child(track_col).child(
             div()
+                .id("timeline")
+                .test_support()
                 .flex_1()
                 .h_full()
                 .flex()
@@ -3249,6 +3253,7 @@ impl Render for EditorView {
             });
             div()
                 .id("menu-overlay")
+                .test_support()
                 .absolute()
                 .top(px(28.0))
                 .left(px(0.0))

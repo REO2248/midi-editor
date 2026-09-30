@@ -8,58 +8,61 @@ use proptest::prelude::*;
 use smf_core::{Division, Event as SmfEvent, EventKind, File, Track as SmfTrack, WriteOptions};
 
 fn arb_file() -> impl Strategy<Value = File> {
-    (
+    (prop::collection::vec(
         prop::collection::vec(
-            prop::collection::vec(
-                (
-                    0u64..=4_000,
-                    0x80u8..0xF0,
-                    any::<u8>(),
-                    any::<u8>(),
-                ),
-                0..16,
-            ),
-            1..=3,
-        )
-    )
-        .prop_map(|tracks| File {
-            format: 1,
-            division: Division::Metrical(480),
-            tracks: tracks
-                .into_iter()
-                .map(|mut evs| {
-                    evs.sort_by_key(|(tick, ..)| *tick);
-                    SmfTrack {
-                        events: evs
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, (tick, st, d0, d1))| SmfEvent {
-                                tick,
-                                seq: i as u32,
-                                raw_body: None,
-                                kind: EventKind::Channel {
-                                    status: st,
-                                    data: [d0 & 0x7F, d1 & 0x7F],
-                                    len: if (0xC0..0xE0).contains(&st) { 1 } else { 2 },
-                                },
-                            })
-                            .collect(),
-                    }
-                })
-                .collect(),
-            warnings: vec![],
-        })
+            (0u64..=4_000, 0x80u8..0xF0, any::<u8>(), any::<u8>()),
+            0..16,
+        ),
+        1..=3,
+    ))
+    .prop_map(|tracks| File {
+        format: 1,
+        division: Division::Metrical(480),
+        tracks: tracks
+            .into_iter()
+            .map(|mut evs| {
+                evs.sort_by_key(|(tick, ..)| *tick);
+                SmfTrack {
+                    events: evs
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, (tick, st, d0, d1))| SmfEvent {
+                            tick,
+                            seq: i as u32,
+                            raw_body: None,
+                            kind: EventKind::Channel {
+                                status: st,
+                                data: [d0 & 0x7F, d1 & 0x7F],
+                                len: if (0xC0..0xE0).contains(&st) { 1 } else { 2 },
+                            },
+                        })
+                        .collect(),
+                }
+            })
+            .collect(),
+        warnings: vec![],
+    })
 }
 
 /// A mixed script of edits and stack operations.
 #[derive(Debug, Clone)]
 enum Action {
     /// insert a note-on event into an existing track
-    Insert { track_idx: usize, tick: u64, key: u8 },
+    Insert {
+        track_idx: usize,
+        tick: u64,
+        key: u8,
+    },
     /// delete a tick range on an existing track
-    DeleteRange { track_idx: usize, from: u64, to: u64 },
+    DeleteRange {
+        track_idx: usize,
+        from: u64,
+        to: u64,
+    },
     /// remove a whole track
-    RemoveTrack { index: usize },
+    RemoveTrack {
+        index: usize,
+    },
     /// add an empty track
     AddTrack,
     Undo,

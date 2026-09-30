@@ -11,8 +11,8 @@
 //!              [--baseline PATH] [--out PATH]
 
 use document::{Document, TempoMap, Transaction};
-use mcp_server::{Shared, SharedDoc, dispatch};
-use serde_json::{Value, json};
+use mcp_server::{dispatch, Shared, SharedDoc};
+use serde_json::{json, Value};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::HashMap;
 use std::hint::black_box;
@@ -303,7 +303,11 @@ fn all_cases() -> Vec<CaseResult> {
             _ => "load_notes_10k",
         };
         out.push(timed(name, l_iters, || {
-            parse_doc(&bytes).tracks.iter().map(|t| t.events.len()).sum::<usize>() as u64
+            parse_doc(&bytes)
+                .tracks
+                .iter()
+                .map(|t| t.events.len())
+                .sum::<usize>() as u64
         }));
     }
 
@@ -312,14 +316,14 @@ fn all_cases() -> Vec<CaseResult> {
     let doc_1m = parse_doc(&notes_fixture(1_000_000));
 
     out.push(timed("tempo_map_1m", 3, || {
-        TempoMap::build(&doc_1m.tracks, doc_1m.division).points().len() as u64
+        TempoMap::build(&doc_1m.tracks, doc_1m.division)
+            .points()
+            .len() as u64
     }));
     out.push(timed("notes_derived_100k", 5, || {
         doc_100k.notes().len() as u64
     }));
-    out.push(timed("notes_derived_1m", 2, || {
-        doc_1m.notes().len() as u64
-    }));
+    out.push(timed("notes_derived_1m", 2, || doc_1m.notes().len() as u64));
     out.push(timed("diagnose_100k", 3, || {
         doc_100k.diagnose().len() as u64
     }));
@@ -435,7 +439,11 @@ fn all_cases() -> Vec<CaseResult> {
         _ => u64::MAX,
     };
     out.push(timed("query_events_1m_window", 3, || {
-        resp_len(dispatch("query_events", &query_args(500, 0), shared_1m.clone()))
+        resp_len(dispatch(
+            "query_events",
+            &query_args(500, 0),
+            shared_1m.clone(),
+        ))
     }));
     out.push(timed("query_events_1m_deep_page", 3, || {
         resp_len(dispatch(
@@ -454,9 +462,7 @@ fn all_cases() -> Vec<CaseResult> {
         let apply_args = json!({"label": "bench move", "ops": ops_json});
         out.push(timed("apply_patch_50moves_100k", 5, || {
             match dispatch("apply_patch", &apply_args, shared_100k.clone()) {
-                rmcp::model::CallToolResponse::Complete(r) => {
-                    r.is_error.unwrap_or(false) as u64
-                }
+                rmcp::model::CallToolResponse::Complete(r) => r.is_error.unwrap_or(false) as u64,
                 _ => u64::MAX,
             }
         }));
@@ -504,7 +510,10 @@ fn main() {
         .collect();
 
     // ---- report ----
-    println!("{:<28} {:>10} {:>10} {:>6} {:>12} units", "case", "median", "min", "iters", "peak+delta");
+    println!(
+        "{:<28} {:>10} {:>10} {:>6} {:>12} units",
+        "case", "median", "min", "iters", "peak+delta"
+    );
     for r in &results {
         println!(
             "{:<28} {:>8.1}ms {:>8.1}ms {:>6} {:>10.1}MB {}",
@@ -526,7 +535,10 @@ fn main() {
 
     if write_base {
         let base = Baseline {
-            cases: results.iter().map(|r| (r.name.into(), r.median_us)).collect(),
+            cases: results
+                .iter()
+                .map(|r| (r.name.into(), r.median_us))
+                .collect(),
             calibrate_us: calib,
         };
         std::fs::write(&baseline_path, serde_json::to_string_pretty(&base).unwrap()).unwrap();

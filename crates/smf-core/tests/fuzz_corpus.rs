@@ -18,7 +18,9 @@ fn corpus_files() -> Vec<std::path::PathBuf> {
     let mut files = Vec::new();
     let mut stack: Vec<std::path::PathBuf> = vec![root.join("corpus"), root.join("regressions")];
     while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for e in rd.flatten() {
             let p = e.path();
             if p.is_dir() {

@@ -246,10 +246,7 @@ fn stop_mid_schedule_skips_rest_and_panics() {
         |c, _| c.stop_on_wait = Some(3),
     );
     let log = r.log.lock().unwrap();
-    assert_eq!(
-        sends(&log),
-        vec![(0, on(60), 0, 100), (0, on(62), 0, 200)]
-    );
+    assert_eq!(sends(&log), vec![(0, on(60), 0, 100), (0, on(62), 0, 200)]);
     assert_eq!(log.last(), Some(&Entry::Panic(0)));
 }
 

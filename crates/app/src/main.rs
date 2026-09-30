@@ -17,6 +17,8 @@ mod recovery;
 mod render;
 mod shutdown;
 mod theme;
+#[cfg(test)]
+mod ui_tests;
 mod watch;
 
 use audition::Audition;
@@ -193,8 +195,8 @@ enum Follow {
 const FOLLOW_HOLD: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// What a bottom lane edits for the selected track.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum LaneMode {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LaneMode {
     Velocity,
     /// Control Change lane, controller number in the field
     CC(u8),
@@ -1301,7 +1303,6 @@ impl EditorView {
             .map(|p| (p.name, p.ord))
             .collect();
         let g = GlobalPrefs::load();
-        let shared = Arc::new(Mutex::new(sh));
         let (plugin_req, plugin_evt, host_thread) = output::spawn_plugin_host();
         tracing::info!("plugin host worker spawned");
         let hd = output::host_diag();
@@ -1311,6 +1312,54 @@ impl EditorView {
             audio_device = ?hd.audio_device,
             "host diagnostics"
         );
+        let mut v = Self::build(
+            sh,
+            status,
+            &path,
+            initial_plugins,
+            plugin_req,
+            plugin_evt,
+            hd,
+            host_thread,
+            &g,
+            input,
+            prop_input,
+            meta_input,
+            window,
+            cx,
+        );
+        if let Some(p) = &path {
+            let diags = v.apply_prefs(p);
+            if !diags.is_empty() {
+                v.status = tf("status.prefs_warn", &[("e", &diags.join("; "))]).into();
+            }
+            v.push_recent(p);
+        }
+        v.rescan_plugins(ScanMode::Changed);
+        v
+    }
+
+    /// Shared initializer: assembles the view around an already-loaded
+    /// document + plugin-host channel pair, then derives the view caches.
+    /// Side effects (plugin host thread spawn, prefs I/O, scans) stay in `new`.
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        sh: Shared,
+        status: SharedString,
+        path: &Option<PathBuf>,
+        initial_plugins: Vec<output::PluginInfo>,
+        plugin_req: std::sync::mpsc::Sender<output::PluginReq>,
+        plugin_evt: std::sync::mpsc::Receiver<output::PluginEvent>,
+        host_diag: output::HostDiag,
+        host_thread: std::thread::JoinHandle<()>,
+        g: &GlobalPrefs,
+        input: Entity<InputState>,
+        prop_input: Entity<InputState>,
+        meta_input: Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let shared = Arc::new(Mutex::new(sh));
         let mut v = Self {
             shared,
             doc_epoch: 0,
@@ -1400,7 +1449,7 @@ impl EditorView {
             probe_timeout_secs: g
                 .probe_timeout_secs
                 .unwrap_or(output::DEFAULT_SCAN_TIMEOUT.as_secs()),
-            host_diag: hd,
+            host_diag,
             show_output_status: false,
             audio_sel: output::AudioSelection {
                 device: g.audio_device.clone(),
@@ -1497,14 +1546,6 @@ impl EditorView {
         v.apply_theme(cx);
         v.sel_track = v.pick_default_track();
         v.refresh_derived();
-        if let Some(p) = &path {
-            let diags = v.apply_prefs(p);
-            if !diags.is_empty() {
-                v.status = tf("status.prefs_warn", &[("e", &diags.join("; "))]).into();
-            }
-            v.push_recent(p);
-        }
-        v.rescan_plugins(ScanMode::Changed);
         v
     }
 
@@ -1538,6 +1579,66 @@ impl EditorView {
                 self.apply_theme(cx);
             }
         }
+    }
+
+    /// Test-only constructor: skips the plugin host thread, plugin scan,
+    /// audio probe, and user prefs so tests stay inert and deterministic.
+    /// The shared doc has no path, so `persist()` is a no-op.
+    #[cfg(test)]
+    fn new_for_test(
+        doc: Document,
+        input: Entity<InputState>,
+        prop_input: Entity<InputState>,
+        meta_input: Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut sh = Shared::new(doc);
+        sh.path = None;
+        sh.saved_revision = sh.doc.revision();
+        sh.dests = vec![
+            (
+                "Test MIDI Out".into(),
+                midi_io::Destination::MidiPort {
+                    port_name: "Test MIDI Out".into(),
+                    ord: 0,
+                },
+            ),
+            (
+                "Test Synth".into(),
+                midi_io::Destination::Plugin {
+                    plugin_path: "C:/Fixtures/TestSynth.vst3".into(),
+                    component_id: None,
+                    vendor: None,
+                    plugin_name: None,
+                },
+            ),
+        ];
+        // no host worker: requests sent to plugin_req go nowhere and no
+        // plugin events ever arrive, which is exactly the inert state
+        // the plugin-unavailable golden wants
+        let (plugin_req, _req_rx) = std::sync::mpsc::channel::<output::PluginReq>();
+        let (_evt_tx, plugin_evt) = std::sync::mpsc::channel::<output::PluginEvent>();
+        Self::build(
+            sh,
+            "test document".into(),
+            &None,
+            Vec::new(),
+            plugin_req,
+            plugin_evt,
+            output::HostDiag {
+                helper: None,
+                probe: None,
+                audio_device: Err("test audio".into()),
+            },
+            std::thread::spawn(|| {}),
+            &GlobalPrefs::default(),
+            input,
+            prop_input,
+            meta_input,
+            window,
+            cx,
+        )
     }
 
     fn doc<R>(&self, f: impl FnOnce(&Document) -> R) -> R {
@@ -5255,8 +5356,12 @@ impl EditorView {
         // patch dumps) must land before notes struck at the same instant.
         // assemble_events' stable sort keeps sysex < channel < click at
         // equal µs.
-        let mut events: Vec<(u64, usize, Vec<u8>)> =
-            route_events(self.doc(|d| d.timeline_sysex()), &audible, &dest_of, &sink_of);
+        let mut events: Vec<(u64, usize, Vec<u8>)> = route_events(
+            self.doc(|d| d.timeline_sysex()),
+            &audible,
+            &dest_of,
+            &sink_of,
+        );
         events.extend(route_events(tagged, &audible, &dest_of, &sink_of));
         if metronome {
             // prefer a plain MIDI port for clicks; fall back to any sink
@@ -8694,15 +8799,12 @@ mod tests {
         let sink_of: HashMap<usize, usize> = HashMap::from([(0, 0), (2, 1)]);
         let got = route_events(
             timeline,
-            |tr| tr != 1,              // audible = "not track 1"
-            |tr| [0, 1, 0][tr],        // dest_of
+            |tr| tr != 1,       // audible = "not track 1"
+            |tr| [0, 1, 0][tr], // dest_of
             &sink_of,
         );
         // t0→d0→sink0, t2→d0→sink0; a d2 event would map to sink1
-        assert_eq!(
-            got,
-            vec![(10, 0, note(60)), (30, 0, note(64))]
-        );
+        assert_eq!(got, vec![(10, 0, note(60)), (30, 0, note(64))]);
         // destination with no open sink → event dropped
         let sink_of2: HashMap<usize, usize> = HashMap::from([(2, 0)]);
         let got2 = route_events(
@@ -8719,9 +8821,9 @@ mod tests {
         // concatenated in sysex, channel, click order — stable sort must keep
         // that order when µs tie
         let events = vec![
-            (100, 0, vec![0xF0, 0x7E, 0xF7]),    // sysex
-            (100, 0, note(60)),                 // channel
-            (100, 0, vec![0x99, 76, 110]),      // click
+            (100, 0, vec![0xF0, 0x7E, 0xF7]), // sysex
+            (100, 0, note(60)),               // channel
+            (100, 0, vec![0x99, 76, 110]),    // click
         ];
         let got = assemble_events(events, vec![], vec![], 0);
         assert_eq!(got[0].2, vec![0xF0, 0x7E, 0xF7]);
@@ -8736,7 +8838,7 @@ mod tests {
         // late every pass
         let events = vec![
             (300, 0, vec![0xF0, 0x7E, 0xF7]), // sysex at 300µs
-            (100, 0, note(60)),             // channel event at 100µs
+            (100, 0, note(60)),               // channel event at 100µs
         ];
         let got = assemble_events(events, vec![], vec![], 0);
         assert_eq!(got[0].2, note(60));

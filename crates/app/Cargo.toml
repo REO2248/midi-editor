@@ -33,7 +33,6 @@ gpui-kit = { workspace = true, features = ["test-support"] }
 [build-dependencies]
 # embeds icon + VERSIONINFO into midi-editor.exe (Windows only)
 embed-resource = "3"
-
 [[bin]]
 name = "midi-editor"
 path = "src/main.rs"

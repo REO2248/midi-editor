@@ -1455,7 +1455,10 @@ mod tests {
         let snapshot = log.lock().unwrap().clone();
         // note-on played twice → the schedule wrapped and replayed
         assert_eq!(
-            snapshot.iter().filter(|b| *b == &vec![0x90, 60, 100]).count(),
+            snapshot
+                .iter()
+                .filter(|b| *b == &vec![0x90, 60, 100])
+                .count(),
             2
         );
         // the wrap cleanup is notes-off only; 121/120 belong to a full panic
@@ -1773,7 +1776,12 @@ mod tests {
             (0u64, 0usize, vec![0xB0, 121, 0]),
             (0u64, 0usize, vec![0x90, 60, 100]),
         ];
-        let mut pb = Playback::start(vec![Box::new(RecordingSink::recording(log.clone()))], events, 0, None);
+        let mut pb = Playback::start(
+            vec![Box::new(RecordingSink::recording(log.clone()))],
+            events,
+            0,
+            None,
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let have = log.lock().unwrap().len();
@@ -1807,7 +1815,12 @@ mod tests {
             (0u64, 0usize, vec![0x90, 60, 100]),
             (60_000_000u64, 0usize, vec![0x80, 60, 0]), // far out: still running when stopped
         ];
-        let mut pb = Playback::start(vec![Box::new(RecordingSink::recording(log.clone()))], events, 0, None);
+        let mut pb = Playback::start(
+            vec![Box::new(RecordingSink::recording(log.clone()))],
+            events,
+            0,
+            None,
+        );
         std::thread::sleep(std::time::Duration::from_millis(50));
         pb.stop();
         let sent = log.lock().unwrap().clone();
