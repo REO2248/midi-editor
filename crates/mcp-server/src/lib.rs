@@ -534,7 +534,7 @@ fn tool_defs() -> Vec<(&'static str, Tool)> {
             "diagnostics",
             tool(
                 "diagnostics",
-                "Import-quality findings over the raw event layer: dangling noteOn, zero-length notes, missing End-of-Track, tempo events outside the conductor track. Each has code/track/tick/event_id + detail.",
+                "Import-quality findings over the raw event layer: dangling noteOn, zero-length notes, missing End-of-Track, tempo events outside the conductor track, overlapping (retriggered) noteOns. Each has code/track/tick/event_id + detail. Note pairing is deterministic LIFO per (channel,key); overlapping-noteon marks where that choice was ambiguous.",
                 object_schema(serde_json::json!({})),
             ),
         ),
@@ -542,7 +542,7 @@ fn tool_defs() -> Vec<(&'static str, Tool)> {
             "normalize",
             tool(
                 "normalize",
-                "Resolve import-quality findings as one undo step. Args: codes? (array of diagnostic codes; omitted = fix all). Returns resolved/failed counts.",
+                "Resolve import-quality findings as one undo step. Args: codes? (array of diagnostic codes; omitted = fix all). Returns resolved/failed counts. overlapping-noteon is reported but never auto-resolved — ambiguous performance data is preserved.",
                 object_schema(serde_json::json!({"codes": {"type": "array", "items": {"type": "string"}}})),
             ),
         ),

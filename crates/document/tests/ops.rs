@@ -566,3 +566,174 @@ fn smpte_tempo_map_uses_frames_not_ppq() {
     assert_eq!(d.tempo_map.tick_to_us(1500), 500_000);
     assert_eq!(d.tempo_map.us_to_tick(1_000_000), 3000);
 }
+
+// ---- note-pairing corpus (#23): deterministic LIFO per (channel,key),
+// overlapping ons are diagnosed, never silently normalized away ----
+
+#[test]
+fn pairing_is_lifo_for_overlapping_ons() {
+    // on@0, on@100, off@200, off@300 — the NEWEST on takes the FIRST off
+    let d = doc(vec![vec![
+        chan(0, 0x90, 60, 100),
+        chan(100, 0x90, 60, 80),
+        chan(200, 0x80, 60, 0),
+        chan(300, 0x80, 60, 0),
+    ]]);
+    let ns = notes_on(&d, 0);
+    assert_eq!(ns.len(), 2);
+    assert_eq!(
+        (ns[0].start_tick, ns[0].end_tick, ns[0].vel),
+        (0, Some(300), 100),
+        "older on pairs with the second off"
+    );
+    assert_eq!(
+        (ns[1].start_tick, ns[1].end_tick, ns[1].vel),
+        (100, Some(200), 80),
+        "newest on takes the first off (LIFO)"
+    );
+}
+
+#[test]
+fn overlapping_noteon_is_diagnosed_at_stable_event() {
+    let d = doc(vec![vec![
+        chan(0, 0x90, 60, 100),
+        chan(100, 0x90, 60, 80),
+        chan(200, 0x80, 60, 0),
+        chan(300, 0x80, 60, 0),
+    ]]);
+    let overlaps: Vec<_> = d
+        .diagnose()
+        .into_iter()
+        .filter(|d| d.code == "overlapping-noteon")
+        .collect();
+    assert_eq!(overlaps.len(), 1, "retrigger flagged exactly once");
+    assert_eq!(overlaps[0].tick, 100);
+    // the diag points at the retriggering on's stable EventId
+    assert_eq!(overlaps[0].event, Some(d.tracks[0].events[1].id));
+    assert!(overlaps[0].detail.contains("60"));
+}
+
+#[test]
+fn overlaps_are_scoped_per_channel_and_key() {
+    // same key on a different channel + a different key on the same
+    // channel — neither lane overlaps
+    let d = doc(vec![vec![
+        chan(0, 0x90, 60, 100),
+        chan(50, 0x91, 60, 90),  // ch1 key60 — different channel
+        chan(60, 0x90, 64, 90),  // ch0 key64 — different key
+        chan(200, 0x80, 60, 0),
+        chan(200, 0x81, 60, 0),
+        chan(200, 0x80, 64, 0),
+    ]]);
+    assert!(
+        d.diagnose()
+            .iter()
+            .all(|d| d.code != "overlapping-noteon"),
+        "cross-channel/cross-key ons must not be flagged"
+    );
+    assert_eq!(notes_on(&d, 0).len(), 3);
+    assert!(notes_on(&d, 0).iter().all(|n| n.end_tick.is_some()));
+}
+
+#[test]
+fn stacked_duplicates_diagnose_each_extra_on() {
+    // three stacked ons, one off → two overlap diags, one paired note,
+    // two dangling ons — every byte survives in the model
+    let d = doc(vec![vec![
+        chan(0, 0x90, 60, 100),
+        chan(50, 0x90, 60, 90),
+        chan(60, 0x90, 60, 80),
+        chan(200, 0x80, 60, 0),
+    ]]);
+    let diags = d.diagnose();
+    assert_eq!(
+        diags.iter().filter(|d| d.code == "overlapping-noteon").count(),
+        2,
+        "2nd and 3rd stacked ons each flag"
+    );
+    assert_eq!(
+        diags.iter().filter(|d| d.code == "dangling-noteon").count(),
+        2
+    );
+    let ns = notes_on(&d, 0);
+    assert_eq!(ns.len(), 3);
+    let paired = ns.iter().find(|n| n.end_tick.is_some()).unwrap();
+    assert_eq!(paired.vel, 80, "newest on pairs with the off");
+}
+
+#[test]
+fn same_tick_on_off_pairs_as_zero_length() {
+    let d = doc(vec![vec![
+        chan(100, 0x90, 60, 100),
+        chan(100, 0x80, 60, 0),
+        chan(200, 0x90, 64, 90),
+        chan(400, 0x80, 64, 0),
+    ]]);
+    let n = &notes_on(&d, 0)[0];
+    assert_eq!((n.start_tick, n.end_tick), (100, Some(100)));
+    assert!(d
+        .diagnose()
+        .iter()
+        .any(|d| d.code == "zero-length-note" && d.tick == 100));
+}
+
+#[test]
+fn sustain_pedal_does_not_affect_pairing() {
+    // CC64 changes playback sustain but not the on/off pairing rule —
+    // a retrigger under pedal is still an overlap
+    let d = doc(vec![vec![
+        chan(0, 0xB0, 64, 127),
+        chan(0, 0x90, 60, 100),
+        chan(100, 0x90, 60, 80),
+        chan(150, 0xB0, 64, 0),
+        chan(200, 0x80, 60, 0),
+        chan(300, 0x80, 60, 0),
+    ]]);
+    assert_eq!(
+        d.diagnose()
+            .iter()
+            .filter(|d| d.code == "overlapping-noteon")
+            .count(),
+        1
+    );
+    assert_eq!(notes_on(&d, 0).len(), 2);
+}
+
+#[test]
+fn overlapping_ons_are_preserved_not_normalized() {
+    // "fix all" resolves structural findings but MUST NOT delete
+    // ambiguous performance data — the overlap stays, diagnosed
+    let mut d = doc(vec![vec![
+        chan(0, 0x90, 60, 100),
+        chan(100, 0x90, 60, 80),
+        chan(200, 0x80, 60, 0),
+        chan(300, 0x80, 60, 0),
+    ]]);
+    let ops = d.fix_ops(&[]);
+    apply(&mut d, ops);
+    assert!(
+        d.diagnose()
+            .iter()
+            .any(|d| d.code == "overlapping-noteon"),
+        "overlap diag survives normalize"
+    );
+    assert_eq!(
+        d.tracks[0]
+            .events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::Channel { .. }))
+            .count(),
+        4,
+        "every channel event preserved"
+    );
+    // round-trip: the ambiguous bytes are in the file, not just the model
+    let bytes = d.serialize(smf_core::WriteOptions {
+        running_status: false,
+    });
+    let d2 = Document::from_file(smf_core::parse(&bytes).unwrap());
+    assert_eq!(notes_on(&d2, 0).len(), 2);
+    assert!(d2
+        .diagnose()
+        .iter()
+        .any(|d| d.code == "overlapping-noteon"));
+}
