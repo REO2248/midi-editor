@@ -21,6 +21,89 @@ pub enum Error {
     Parse(String),
     #[error("parser panicked on malformed input")]
     Panic,
+    /// Input is well-formed but exceeds a configured safety limit —
+    /// reported separately from `Parse` so callers can tell
+    /// "unsupported due to safety limit" apart from "malformed".
+    #[error("input exceeds the '{limit}' safety limit: {actual} > {allowed}")]
+    LimitExceeded {
+        limit: &'static str,
+        actual: u64,
+        allowed: u64,
+    },
+}
+
+/// Resource limits applied while parsing potentially hostile SMF input.
+/// Byte-length checks run before any allocation; count checks run during
+/// event materialization, so a pathological file fails with
+/// `Error::LimitExceeded` instead of driving memory or CPU to exhaustion.
+///
+/// Derived structures (document notes, controller caches) stay bounded by
+/// construction: every note/controller requires at least one event, so the
+/// event caps bound them transitively.
+#[derive(Debug, Clone)]
+pub struct Limits {
+    /// raw input bytes; checked before the parser runs
+    pub max_file_bytes: usize,
+    /// number of MTrk chunks accepted
+    pub max_tracks: usize,
+    /// total decoded events across all tracks
+    pub max_events: usize,
+    /// decoded events within a single track
+    pub max_track_events: usize,
+    /// payload bytes of a single meta / SysEx / escape event
+    pub max_event_payload: usize,
+}
+
+impl Default for Limits {
+    /// Generous but bounded: well past any real-world MIDI file (the
+    /// largest published scores are a few MB and ~10⁵ events) yet far
+    /// below anything that could exhaust desktop memory.
+    fn default() -> Self {
+        Self {
+            max_file_bytes: 256 * 1024 * 1024,
+            max_tracks: 4096,
+            max_events: 8_000_000,
+            max_track_events: 4_000_000,
+            max_event_payload: 64 * 1024 * 1024,
+        }
+    }
+}
+
+impl Limits {
+    /// Headless expert override: `MIDI_EDITOR_UNLIMITED_PARSE=1` (or
+    /// `true`) opts out of every check — a deliberate choice for users who
+    /// knowingly load out-of-limit files. Anything else keeps the
+    /// documented defaults.
+    pub fn from_env() -> Self {
+        match std::env::var("MIDI_EDITOR_UNLIMITED_PARSE") {
+            Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => Self::unlimited(),
+            _ => Self::default(),
+        }
+    }
+
+    /// Deliberate expert override for tooling that knows its input is
+    /// trusted (corpus checkers, the fuzzer) — bypasses every check.
+    pub fn unlimited() -> Self {
+        Self {
+            max_file_bytes: usize::MAX,
+            max_tracks: usize::MAX,
+            max_events: usize::MAX,
+            max_track_events: usize::MAX,
+            max_event_payload: usize::MAX,
+        }
+    }
+}
+
+fn limit_check(limit: &'static str, actual: usize, allowed: usize) -> Result<(), Error> {
+    if actual > allowed {
+        Err(Error::LimitExceeded {
+            limit,
+            actual: actual as u64,
+            allowed: allowed as u64,
+        })
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -79,12 +162,19 @@ pub struct File {
 }
 
 pub fn parse(raw: &[u8]) -> Result<File, Error> {
+    parse_with_limits(raw, &Limits::default())
+}
+
+/// `parse` under explicit resource limits — the entry point for callers
+/// that need a non-default (or deliberate `Limits::unlimited()`) budget.
+pub fn parse_with_limits(raw: &[u8], limits: &Limits) -> Result<File, Error> {
+    limit_check("file size", raw.len(), limits.max_file_bytes)?;
     match catch_unwind(AssertUnwindSafe(|| SmfBytemap::parse(raw))) {
-        Ok(Ok(m)) => Ok(file_from_map(raw, m)),
+        Ok(Ok(m)) => file_from_map(raw, m, limits),
         Ok(Err(e)) => {
             // keep the strict-parser reason even when lenient recovery also
             // fails — "no MTrk chunks" alone hides the real defect
-            parse_lenient(raw)
+            parse_lenient_with_limits(raw, limits)
                 .map(|mut f| {
                     f.warnings.insert(
                         0,
@@ -94,7 +184,7 @@ pub fn parse(raw: &[u8]) -> Result<File, Error> {
                 })
                 .map_err(|_| Error::Parse(format!("{e} (lenient recovery also failed)")))
         }
-        Err(_) => parse_lenient(raw).map(|mut f| {
+        Err(_) => parse_lenient_with_limits(raw, limits).map(|mut f| {
             f.warnings
                 .insert(0, "strict parser panicked; lenient recovery used".into());
             f
@@ -108,10 +198,10 @@ pub fn parse(raw: &[u8]) -> Result<File, Error> {
 /// for fuzzers and validators that must see the raw behavior.
 pub fn parse_strict(raw: &[u8]) -> Result<File, Error> {
     let map = SmfBytemap::parse(raw).map_err(|e| Error::Parse(format!("{e}")))?;
-    Ok(file_from_map(raw, map))
+    file_from_map(raw, map, &Limits::unlimited())
 }
 
-fn file_from_map(raw: &[u8], map: SmfBytemap<'_>) -> File {
+fn file_from_map(raw: &[u8], map: SmfBytemap<'_>, limits: &Limits) -> Result<File, Error> {
     let mut warnings = Vec::new();
     detect_extra_chunks(raw, &mut warnings);
 
@@ -128,34 +218,41 @@ fn file_from_map(raw: &[u8], map: SmfBytemap<'_>) -> File {
         },
     };
 
-    let tracks = map
-        .tracks
-        .iter()
-        .map(|t| {
-            let mut tick: u64 = 0;
-            let events = t
-                .iter()
-                .enumerate()
-                .map(|(seq, (span, ev))| {
-                    tick += ev.delta.as_int() as u64;
-                    Event {
-                        tick,
-                        seq: seq as u32,
-                        raw_body: Some(Bytes::copy_from_slice(span)),
-                        kind: convert_kind(&ev.kind),
-                    }
-                })
-                .collect();
-            Track { events }
-        })
-        .collect();
+    limit_check("track count", map.tracks.len(), limits.max_tracks)?;
+    let mut total_events = 0usize;
+    let mut tracks = Vec::new();
+    for t in map.tracks.iter() {
+        let mut tick: u64 = 0;
+        let mut events = Vec::new();
+        for (seq, (span, ev)) in t.iter().enumerate() {
+            limit_check("events in a track", seq + 1, limits.max_track_events)?;
+            total_events += 1;
+            limit_check("total events", total_events, limits.max_events)?;
+            tick += ev.delta.as_int() as u64;
+            let kind = convert_kind(&ev.kind);
+            let payload = match &kind {
+                EventKind::Meta { data, .. }
+                | EventKind::SysEx(data)
+                | EventKind::Escape(data) => data.len(),
+                EventKind::Channel { .. } => 0,
+            };
+            limit_check("event payload", payload, limits.max_event_payload)?;
+            events.push(Event {
+                tick,
+                seq: seq as u32,
+                raw_body: Some(Bytes::copy_from_slice(span)),
+                kind,
+            });
+        }
+        tracks.push(Track { events });
+    }
 
-    File {
+    Ok(File {
         format,
         division,
         tracks,
         warnings,
-    }
+    })
 }
 
 fn detect_extra_chunks(raw: &[u8], warnings: &mut Vec<String>) {
@@ -200,6 +297,13 @@ fn detect_extra_chunks(raw: &[u8], warnings: &mut Vec<String>) {
 /// fixpoint even though byte-exactness is lost. Public so fuzzers can target
 /// the recovery path directly; `parse` remains the normal entry point.
 pub fn parse_lenient(raw: &[u8]) -> Result<File, Error> {
+    parse_lenient_with_limits(raw, &Limits::default())
+}
+
+/// Lenient parse under explicit resource limits (see
+/// `parse_with_limits`).
+pub fn parse_lenient_with_limits(raw: &[u8], limits: &Limits) -> Result<File, Error> {
+    limit_check("file size", raw.len(), limits.max_file_bytes)?;
     if raw.len() < 14 || &raw[0..4] != b"MThd" {
         return Err(Error::Parse("missing MThd header".into()));
     }
@@ -221,17 +325,21 @@ pub fn parse_lenient(raw: &[u8]) -> Result<File, Error> {
     detect_extra_chunks(raw, &mut warnings);
 
     let mut tracks = Vec::new();
+    let mut total_events = 0usize;
     let mut pos = 8 + hlen;
     while pos + 8 <= raw.len() {
         let id = &raw[pos..pos + 4];
         let len = u32::from_be_bytes(raw[pos + 4..pos + 8].try_into().unwrap()) as usize;
         let body_end = pos.saturating_add(8).saturating_add(len).min(raw.len());
         if id == b"MTrk" {
+            limit_check("track count", tracks.len() + 1, limits.max_tracks)?;
             tracks.push(track_lenient(
                 &raw[pos + 8..body_end],
                 tracks.len(),
                 &mut warnings,
-            ));
+                limits,
+                &mut total_events,
+            )?);
         }
         let next = pos.saturating_add(8).saturating_add(len);
         if next <= pos {
@@ -269,7 +377,13 @@ fn read_vlq_lenient(data: &[u8], mut p: usize) -> (u64, usize) {
     (v, p)
 }
 
-fn track_lenient(data: &[u8], tno: usize, warnings: &mut Vec<String>) -> Track {
+fn track_lenient(
+    data: &[u8],
+    tno: usize,
+    warnings: &mut Vec<String>,
+    limits: &Limits,
+    total_events: &mut usize,
+) -> Result<Track, Error> {
     let mut events = Vec::new();
     let mut tick = 0u64;
     let mut running: Option<u8> = None;
@@ -385,6 +499,16 @@ fn track_lenient(data: &[u8], tno: usize, warnings: &mut Vec<String>) -> Track {
             };
             p += want;
         }
+        let payload = match &kind {
+            EventKind::Meta { data, .. }
+            | EventKind::SysEx(data)
+            | EventKind::Escape(data) => data.len(),
+            EventKind::Channel { .. } => 0,
+        };
+        limit_check("event payload", payload, limits.max_event_payload)?;
+        limit_check("events in a track", events.len() + 1, limits.max_track_events)?;
+        *total_events += 1;
+        limit_check("total events", *total_events, limits.max_events)?;
         events.push(Event {
             tick,
             seq: events.len() as u32,
@@ -392,7 +516,7 @@ fn track_lenient(data: &[u8], tno: usize, warnings: &mut Vec<String>) -> Track {
             kind,
         });
     }
-    Track { events }
+    Ok(Track { events })
 }
 
 fn convert_kind(kind: &TrackEventKind<'_>) -> EventKind {

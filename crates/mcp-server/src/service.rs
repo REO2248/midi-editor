@@ -209,10 +209,11 @@ pub fn load_document(path: &Path) -> Result<(Document, Vec<String>), LoadError> 
         path: path.to_path_buf(),
         source,
     })?;
-    let file = smf_core::parse(&bytes).map_err(|source| LoadError::Parse {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let file = smf_core::parse_with_limits(&bytes, &smf_core::Limits::from_env())
+        .map_err(|source| LoadError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })?;
     let warnings = file.warnings.clone();
     Ok((Document::from_file(file), warnings))
 }

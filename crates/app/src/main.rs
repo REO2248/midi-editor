@@ -1546,7 +1546,7 @@ impl EditorView {
         payload: &[u8],
         cx: &mut Context<Self>,
     ) {
-        match smf_core::parse(payload) {
+        match smf_core::parse_with_limits(payload, &smf_core::Limits::from_env()) {
             Ok(file) => {
                 let rec_discarded = self.rec.take().is_some();
                 self.stop_playback();
