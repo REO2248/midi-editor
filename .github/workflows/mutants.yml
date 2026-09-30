@@ -1,0 +1,71 @@
+name: mutants
+
+on:
+  # scheduled: mutation testing is expensive — run weekly, not per-PR
+  schedule:
+    - cron: "0 5 * * 3"
+  # and on demand, e.g. after landing changes to the covered crates
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: "cargo-mutants -p filter (blank = all configured)"
+        required: false
+        default: ""
+      in_diff:
+        description: "only mutate lines changed vs this ref (blank = full scan)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  mutants:
+    runs-on: windows-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+
+      - name: cargo mutants
+        shell: pwsh
+        working-directory: .
+        run: |
+          $args = @("--output", "mutants.out", "--colors", "never", "-j", "4")
+          if ("${{ inputs.packages }}" -ne "") {
+            foreach ($p in "${{ inputs.packages }}".Split(",")) { $args += @("-p", $p.Trim()) }
+          }
+          if ("${{ inputs.in_diff }}" -ne "") {
+            $args += @("--in-diff", "${{ inputs.in_diff }}")
+          }
+          cargo mutants @args
+          exit $LASTEXITCODE
+        continue-on-error: true
+
+      - name: mutation report
+        shell: pwsh
+        if: always()
+        run: |
+          if (Test-Path mutants.out) {
+            Get-Content mutants.out/mutants.out
+            Get-Content mutants.out/caught.txt -ErrorAction SilentlyContinue | Select-Object -First 5
+            "---- missed (surviving) mutants ----"
+            Get-Content mutants.out/missed.txt -ErrorAction SilentlyContinue
+          }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-report
+          path: mutants.out/
+          if-no-files-found: ignore
+          retention-days: 60

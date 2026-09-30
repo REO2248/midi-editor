@@ -1,0 +1,20 @@
+# cargo-mutants configuration — see .github/workflows/mutants.yml.
+# Scope: the core edit logic shared by GUI and MCP (transactions, undo
+# stack, SMF write path). The app/mcp-server/UI layers are excluded —
+# mutants there are dominated by UI glue that tests can't observe.
+
+# only look at the core crates
+examine_globs = [
+    "crates/commands/src/**",
+    "crates/document/src/**",
+    "crates/smf-core/src/**",
+]
+
+# skip helper binaries/examples — developer tools, not core edit logic
+exclude_globs = [
+    "crates/*/src/bin/**",
+    "crates/smf-core/examples/**",
+]
+
+# per-mutant timeout: default autoset (5x baseline test time, min 20s);
+# override on the command line with `--timeout <secs>` when needed

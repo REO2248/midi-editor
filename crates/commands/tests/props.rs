@@ -176,6 +176,9 @@ proptest! {
                 }
             }
             prop_assert_eq!(ser(&doc), snaps[pos].to_vec(), "step {}: document diverged from snapshot window", step);
+            // accessor invariants: len()/is_empty() mirror the undoable depth
+            prop_assert_eq!(stack.len(), pos, "step {}: len() desynced", step);
+            prop_assert_eq!(stack.is_empty(), pos == 0, "step {}: is_empty() desynced", step);
         }
 
         // unwind everything the stack still holds
