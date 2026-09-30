@@ -414,6 +414,34 @@ impl Document {
         ops
     }
 
+    /// Key signature in effect at `at_tick`: the latest meta 0x59 event at
+    /// or before it, else the earliest one in the file (a signature written
+    /// mid-song is the best hint before it's reached). Returns (sf, minor):
+    /// sf is the signed fifths byte (-7..=7), minor the mi flag.
+    pub fn key_signature(&self, at_tick: u64) -> Option<(i8, bool)> {
+        let mut best: Option<(u64, i8, bool)> = None;
+        let mut earliest: Option<(u64, i8, bool)> = None;
+        for t in &self.tracks {
+            for e in &t.events {
+                let EventKind::Meta { meta_type: 0x59, data } = &e.kind else {
+                    continue;
+                };
+                if data.len() < 2 {
+                    continue;
+                }
+                let ks = (e.tick, data[0] as i8, data[1] != 0);
+                if e.tick <= at_tick {
+                    if best.map_or(true, |(t, ..)| e.tick >= t) {
+                        best = Some(ks);
+                    }
+                } else if earliest.map_or(true, |(t, ..)| e.tick < t) {
+                    earliest = Some(ks);
+                }
+            }
+        }
+        best.or(earliest).map(|(_, sf, minor)| (sf, minor))
+    }
+
     /// `(absolute µs, source track index, raw channel message)` sorted by time.
     /// The track tag lets playback fan events out to per-track destinations.
     pub fn timeline_tagged(&self) -> Vec<(u64, usize, Vec<u8>)> {

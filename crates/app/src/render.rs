@@ -112,6 +112,11 @@ impl Render for EditorView {
         let playing = self.playback.is_some();
         let play_x_tick = playhead_tick;
         let active_track = self.sel_track;
+        // visible row→key map + row height (vertical zoom / fold / drum)
+        let vis_keys = self.vis_keys.clone();
+        let row_of = self.row_of;
+        let note_h = self.note_h;
+        let scale_pcs = self.scale_pcs;
 
         let roll = canvas(
             move |bounds, _window, _cx| {
@@ -124,21 +129,32 @@ impl Render for EditorView {
                 }
                 let w = bounds.size.width;
                 let h = bounds.size.height;
-                // key rows
-                let k0 = (scroll_y / NOTE_H).max(0.0) as i32;
-                let k1 = ((scroll_y + f32::from(h)) / NOTE_H + 1.0).min(128.0) as i32;
-                for k in k0..k1 {
-                    let black = matches!(k % 12, 1 | 3 | 6 | 8 | 10);
-                    let y = bounds.origin.y + px(k as f32 * NOTE_H - scroll_y);
-                    if black {
+                // key rows — `vis_keys` maps painted row → piano key (the
+                // identity map is all 128; fold/drum views shrink it)
+                let nrows = vis_keys.len() as f32;
+                let r0 = (scroll_y / note_h).max(0.0) as i32;
+                let r1 = ((scroll_y + f32::from(h)) / note_h + 1.0).min(nrows) as i32;
+                for r in r0..r1 {
+                    let key = vis_keys[r as usize];
+                    let black = matches!(key % 12, 1 | 3 | 6 | 8 | 10);
+                    let in_scale = scale_pcs
+                        .map(|p| p[(key % 12) as usize])
+                        .unwrap_or(false);
+                    let y = bounds.origin.y + px(r as f32 * note_h - scroll_y);
+                    if in_scale {
                         window.paint_quad(fill(
-                            Bounds::new(point(bounds.origin.x, y), size(w, px(NOTE_H))),
+                            Bounds::new(point(bounds.origin.x, y), size(w, px(note_h))),
+                            rgb(0x1e2436),
+                        ));
+                    } else if black {
+                        window.paint_quad(fill(
+                            Bounds::new(point(bounds.origin.x, y), size(w, px(note_h))),
                             rgb(0x1a1a21),
                         ));
                     }
                     window.paint_quad(fill(
                         Bounds::new(point(bounds.origin.x, y), size(w, px(1.0))),
-                        rgb(if k % 12 == 0 { 0x2e2e3a } else { 0x232329 }),
+                        rgb(if key % 12 == 0 { 0x2e2e3a } else { 0x232329 }),
                     ));
                 }
                 // beat/bar lines
@@ -198,19 +214,31 @@ impl Render for EditorView {
                             as f32
                             * zoom)
                             .max(3.0);
-                        let oy = bounds.origin.y + px((127.0 - n.key as f32) * NOTE_H - scroll_y);
-                        window.paint_quad(fill(
-                            Bounds::new(point(ox, oy + px(1.0)), size(px(ow), px(NOTE_H - 2.0))),
-                            rgba(0x80808044),
-                        ));
+                        let orow = row_of[n.key as usize];
+                        if orow >= 0 {
+                            let oy =
+                                bounds.origin.y + px(orow as f32 * note_h - scroll_y);
+                            window.paint_quad(fill(
+                                Bounds::new(
+                                    point(ox, oy + px(1.0)),
+                                    size(px(ow), px(note_h - 2.0)),
+                                ),
+                                rgba(0x80808044),
+                            ));
+                        }
                     }
                     let x = bounds.origin.x + px(st as f32 * zoom - scroll_x);
                     let wpx = ((en - st).max(1) as f32 * zoom).max(3.0);
                     if x + px(wpx) < bounds.origin.x {
                         continue;
                     }
-                    let y = bounds.origin.y + px((127.0 - key as f32) * NOTE_H - scroll_y);
-                    if y < bounds.origin.y - px(NOTE_H) || y > bounds.origin.y + h {
+                    // folded-out keys (or a drag delta past the map) get no row
+                    let row = row_of[key.clamp(0, 127) as usize];
+                    if row < 0 {
+                        continue;
+                    }
+                    let y = bounds.origin.y + px(row as f32 * note_h - scroll_y);
+                    if y < bounds.origin.y - px(note_h) || y > bounds.origin.y + h {
                         continue;
                     }
                     let c = if selection.contains(&n.on_id) {
@@ -226,7 +254,7 @@ impl Render for EditorView {
                         }
                     };
                     window.paint_quad(fill(
-                        Bounds::new(point(x, y + px(1.0)), size(px(wpx), px(NOTE_H - 2.0))),
+                        Bounds::new(point(x, y + px(1.0)), size(px(wpx), px(note_h - 2.0))),
                         rgb(c),
                     ));
                 }
@@ -238,18 +266,30 @@ impl Render for EditorView {
                         rgb(0x50ff9f),
                     ));
                 }
-                // marquee rubber band
+                // marquee rubber band — corners are keys from hit(); paint
+                // in row space so the band matches what commit_drag selects
                 if let Some((a_t, a_k, b_t, b_k)) = marquee {
-                    let (t0, t1) = (a_t.min(b_t), a_t.max(b_t));
-                    let (k0, k1) = (a_k.min(b_k), a_k.max(b_k));
-                    let x0 = bounds.origin.x + px(t0 as f32 * zoom - scroll_x);
-                    let x1 = bounds.origin.x + px(t1 as f32 * zoom - scroll_x);
-                    let y0 = bounds.origin.y + px((127.0 - k1 as f32) * NOTE_H - scroll_y);
-                    let y1 = bounds.origin.y + px((127.0 - k0 as f32) * NOTE_H - scroll_y);
-                    window.paint_quad(fill(
-                        Bounds::new(point(x0, y0), size(x1 - x0, y1 - y0)),
-                        rgba(0x4f8cff33),
-                    ));
+                    let row_at = |k: i32| -> i32 {
+                        if (0..=127).contains(&k) {
+                            row_of[k as usize]
+                        } else {
+                            -1
+                        }
+                    };
+                    let ra = row_at(a_k);
+                    let rb = row_at(b_k);
+                    if ra.max(rb) >= 0 {
+                        let (t0, t1) = (a_t.min(b_t), a_t.max(b_t));
+                        let (rt, rbm) = (ra.min(rb).max(0), ra.max(rb));
+                        let x0 = bounds.origin.x + px(t0 as f32 * zoom - scroll_x);
+                        let x1 = bounds.origin.x + px(t1 as f32 * zoom - scroll_x);
+                        let y0 = bounds.origin.y + px(rt as f32 * note_h - scroll_y);
+                        let y1 = bounds.origin.y + px((rbm + 1) as f32 * note_h - scroll_y);
+                        window.paint_quad(fill(
+                            Bounds::new(point(x0, y0), size(x1 - x0, y1 - y0)),
+                            rgba(0x4f8cff33),
+                        ));
+                    }
                 }
             },
         );
@@ -1106,7 +1146,17 @@ impl Render for EditorView {
                 // minimap, lane) — the strips share the same scroll offset
                 .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _w, cx| {
                     let d = ev.delta.pixel_delta(px(20.0));
-                    if ev.modifiers.control {
+                    if ev.modifiers.control && ev.modifiers.shift {
+                        // vertical zoom around the cursor: the row under it
+                        // stays put (same anchor math as the horizontal zoom)
+                        let b = this.roll_bounds.get();
+                        let off = (f32::from(ev.position.y) - f32::from(b.origin.y))
+                            .clamp(0.0, f32::from(b.size.height));
+                        let anchor_row = (off + this.scroll_y) / this.note_h;
+                        this.note_h = (this.note_h * (1.0 - d.y.to_f64() as f32 * 0.002))
+                            .clamp(NOTE_H_MIN, NOTE_H_MAX);
+                        this.scroll_y = (anchor_row * this.note_h - off).max(0.0);
+                    } else if ev.modifiers.control {
                         // zoom around the cursor: the tick under it stays put
                         let b = this.roll_bounds.get();
                         let off = (f32::from(ev.position.x) - f32::from(b.origin.x))
@@ -1212,6 +1262,35 @@ impl Render for EditorView {
                         .relative()
                         .overflow_hidden()
                         .child(roll.size_full())
+                        // drum view: GM names on the folded rows' left edge
+                        .children(if self.drum {
+                            let h = f32::from(self.roll_bounds.get().size.height);
+                            let r0 = (self.scroll_y / self.note_h).max(0.0) as i32;
+                            let r1 = ((self.scroll_y + h) / self.note_h + 1.0)
+                                .min(self.vis_keys.len() as f32)
+                                as i32;
+                            (r0..r1)
+                                .map(|r| {
+                                    let key = self.vis_keys[r as usize];
+                                    let y = r as f32 * self.note_h - self.scroll_y
+                                        + (self.note_h - 8.0) / 2.0;
+                                    div()
+                                        .absolute()
+                                        .left(px(2.0))
+                                        .top(px(y))
+                                        .text_size(px(8.0))
+                                        .text_color(rgb(0x9aa0c0))
+                                        .whitespace_nowrap()
+                                        .child(
+                                            drum_name(key)
+                                                .map(|s| s.to_string())
+                                                .unwrap_or_else(|| key.to_string()),
+                                        )
+                                })
+                                .collect::<Vec<_>>()
+                        } else {
+                            Vec::new()
+                        })
                         .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, ev: &MouseDownEvent, w, cx| {
@@ -1773,6 +1852,18 @@ impl Render for EditorView {
                     )
                     .into_any_element(),
                     Self::msep().into_any_element(),
+                    Self::mi_sub("v.rowh", t("view.row_height"), Sub::RowH, cx)
+                        .into_any_element(),
+                    Self::mi("v.fold", t("view.fold"), "", Some(self.fold), cx, |v, _e, cx| {
+                        v.set_fold(!v.fold, cx);
+                    })
+                    .into_any_element(),
+                    Self::mi("v.drum", t("view.drum"), "", Some(self.drum), cx, |v, _e, cx| {
+                        v.set_drum(!v.drum, cx);
+                    })
+                    .into_any_element(),
+                    Self::mi_sub("v.scale", t("view.scale"), Sub::Scale, cx).into_any_element(),
+                    Self::msep().into_any_element(),
                     Self::mi_sub("v.lane", t("view.lane"), Sub::Lane, cx).into_any_element(),
                     Self::mi_sub("v.enc", t("view.encoding"), Sub::Enc, cx).into_any_element(),
                 ],
@@ -2164,6 +2255,120 @@ impl Render for EditorView {
                                 .into_any_element()
                             })
                             .collect()
+                    }
+                    Sub::RowH => {
+                        // taller / shorter / reset + absolute presets — the
+                        // wheel does Ctrl+Shift vertical zoom too
+                        let mut rows = vec![
+                            Self::mi_leaf(
+                                "rowh.up",
+                                t("view.row_taller"),
+                                "Ctrl+Shift+Wheel",
+                                None,
+                                cx,
+                                |v, _e, cx| v.vzoom_by(1.25, cx),
+                            )
+                            .into_any_element(),
+                            Self::mi_leaf(
+                                "rowh.dn",
+                                t("view.row_shorter"),
+                                "",
+                                None,
+                                cx,
+                                |v, _e, cx| v.vzoom_by(1.0 / 1.25, cx),
+                            )
+                            .into_any_element(),
+                            Self::mi_leaf(
+                                "rowh.reset",
+                                t("view.row_reset"),
+                                "",
+                                Some((self.note_h - NOTE_H).abs() < 0.5),
+                                cx,
+                                |v, _e, cx| {
+                                    v.vzoom_set(
+                                        NOTE_H,
+                                        f32::from(v.roll_bounds.get().size.height) / 2.0,
+                                        cx,
+                                    );
+                                },
+                            )
+                            .into_any_element(),
+                            Self::msep().into_any_element(),
+                        ];
+                        for (i, h) in [8.0f32, 13.0, 18.0, 26.0, 34.0].iter().enumerate() {
+                            let h = *h;
+                            rows.push(
+                                Self::mi_leaf(
+                                    ("rowh.preset", i),
+                                    format!("{h}px"),
+                                    "",
+                                    Some((self.note_h - h).abs() < 0.5),
+                                    cx,
+                                    move |v, _e, cx| {
+                                        v.vzoom_set(
+                                            h,
+                                            f32::from(v.roll_bounds.get().size.height) / 2.0,
+                                            cx,
+                                        );
+                                    },
+                                )
+                                .into_any_element(),
+                            );
+                        }
+                        rows
+                    }
+                    Sub::Scale => {
+                        const PC_NAMES: [&str; 12] = [
+                            "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+                        ];
+                        let mut rows = vec![
+                            Self::mi_leaf(
+                                "scale.off",
+                                t("view.scale_off"),
+                                "",
+                                Some(self.scale_sel == -1),
+                                cx,
+                                |v, _e, cx| v.set_scale(-1, false, cx),
+                            )
+                            .into_any_element(),
+                            Self::mi_leaf(
+                                "scale.auto",
+                                t("view.scale_auto"),
+                                "",
+                                Some(self.scale_sel == -2),
+                                cx,
+                                |v, _e, cx| v.set_scale(-2, false, cx),
+                            )
+                            .into_any_element(),
+                            Self::msep().into_any_element(),
+                            Self::mi_leaf(
+                                "scale.minor",
+                                t("view.scale_minor"),
+                                "",
+                                Some(self.scale_minor),
+                                cx,
+                                |v, _e, cx| {
+                                    let sel = if v.scale_sel >= 0 { v.scale_sel } else { 0 };
+                                    v.set_scale(sel, !v.scale_minor, cx);
+                                },
+                            )
+                            .into_any_element(),
+                            Self::msep().into_any_element(),
+                        ];
+                        for (i, name) in PC_NAMES.iter().enumerate() {
+                            rows.push(
+                                Self::mi_leaf(
+                                    ("scale.root", i),
+                                    *name,
+                                    "",
+                                    Some(self.scale_sel == i as i8),
+                                    cx,
+                                    move |v, _e, cx| v.set_scale(i as i8, v.scale_minor, cx),
+                                )
+                                .into_any_element(),
+                            );
+                        }
+                        rows
                     }
                     Sub::Snap => SNAPS
                         .iter()
