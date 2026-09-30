@@ -837,7 +837,7 @@ impl EditorView {
             audition: Audition::spawn(),
             aud_enabled: g.audition.unwrap_or(true),
             aud_vel: g.aud_vel.unwrap_or(100).clamp(1, 127),
-            aud_ms: g.aud_ms.unwrap_or(400),
+            aud_ms: g.aud_ms.unwrap_or(500),
             aud_ships: HashSet::new(),
             aud_failed: HashSet::new(),
             scrub_key: None,
@@ -1737,7 +1737,11 @@ impl EditorView {
     fn commit_drag(&mut self, cx: &mut Context<Self>) {
         // every release ends any sounding preview (draw scrub, pitch drag,
         // key strip) — the worker's own deadline is the backstop
+        let was_scrub = self.scrub_key.is_some();
         self.audition_off();
+        if was_scrub {
+            cx.notify();
+        }
         let Some(d) = self.drag.take() else { return };
         match d.mode {
             DragMode::Erase => {
