@@ -1494,17 +1494,22 @@ impl EditorView {
                     }
                     return;
                 }
-                // rect select: notes intersecting the rubber-band box
+                // rect select: notes intersecting the rubber-band box.
+                // Same sequence gate as note_at/edge_at: a marquee must
+                // never select another sequence's ghosts for deletion.
                 let (t0, t1) = (d.a_tick.min(d.b_tick), d.a_tick.max(d.b_tick));
                 let (k0, k1) = (d.a_key.min(d.b_key), d.a_key.max(d.b_key));
+                let seq = self.is_seq();
                 self.selection = self
                     .notes
                     .iter()
                     .filter(|n| {
-                        let st = n.start_tick as i64;
-                        let en = n.end_tick.unwrap_or(n.start_tick) as i64;
-                        let key = n.key as i32;
-                        st <= t1 && en >= t0 && key >= k0 && key <= k1
+                        (!seq || n.track == self.sel_track) && {
+                            let st = n.start_tick as i64;
+                            let en = n.end_tick.unwrap_or(n.start_tick) as i64;
+                            let key = n.key as i32;
+                            st <= t1 && en >= t0 && key >= k0 && key <= k1
+                        }
                     })
                     .map(|n| n.on_id)
                     .collect();
