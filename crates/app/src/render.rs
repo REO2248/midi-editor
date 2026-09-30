@@ -465,6 +465,10 @@ impl Render for EditorView {
                 if this.open_menu.is_some() {
                     return;
                 }
+                // region keys are bare keys only — chords bubble to root
+                if ev.keystroke.modifiers.control || ev.keystroke.modifiers.alt {
+                    return;
+                }
                 match ev.keystroke.key.as_str() {
                     "left" | "right" => {
                         let d: usize = if ev.keystroke.key == "left" {
@@ -476,7 +480,7 @@ impl Render for EditorView {
                         cx.stop_propagation();
                         cx.notify();
                     }
-                    "down" | "enter" | " " => {
+                    "down" | "enter" | " " | "space" => {
                         let m = MENUS[this.menu_bar_sel.min(MENUS.len() - 1)].0;
                         this.open_menu_at(m, cx);
                         cx.stop_propagation();
@@ -1168,6 +1172,11 @@ impl Render for EditorView {
                     return;
                 }
                 let i = this.sel_track;
+                // bare keys only — Ctrl/Alt chords (Ctrl+S/C/V…) must reach
+                // the global handler, not toggle solo/channel/etc.
+                if ev.keystroke.modifiers.control || ev.keystroke.modifiers.alt {
+                    return;
+                }
                 match ev.keystroke.key.as_str() {
                     "up" => this.track_step(-1, cx),
                     "down" => this.track_step(1, cx),
@@ -1188,6 +1197,7 @@ impl Render for EditorView {
                     "enter" | "f2" => this.focus_rename(w, cx),
                     _ => return,
                 }
+                cx.notify();
                 cx.stop_propagation();
             }))
             .child(
@@ -2132,6 +2142,11 @@ impl Render for EditorView {
                         .track_focus(&self.lane_fh)
                         .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| {
                             if this.open_menu.is_some() {
+                                return;
+                            }
+                            // bare keys only — Ctrl/Alt chords belong to the
+                            // global handler (Ctrl+V must paste, not cycle)
+                            if ev.keystroke.modifiers.control || ev.keystroke.modifiers.alt {
                                 return;
                             }
                             let shift = ev.keystroke.modifiers.shift;
@@ -4249,7 +4264,7 @@ impl Render for EditorView {
                     (false, false, "1") => this.set_tool(Tool::Select, cx),
                     (false, false, "2") => this.set_tool(Tool::Draw, cx),
                     (false, false, "3") => this.set_tool(Tool::Erase, cx),
-                    (false, false, " ") => this.toggle_play(cx),
+                    (false, false, " ") | (false, false, "space") => this.toggle_play(cx),
                     // arrows/edit keys act on the roll only while the roll
                     // context (its handle or the root fallback) owns focus —
                     // tracks/lane/events have their own bindings
