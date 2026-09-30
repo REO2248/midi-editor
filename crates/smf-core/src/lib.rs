@@ -290,10 +290,11 @@ fn track_lenient(data: &[u8], tno: usize, warnings: &mut Vec<String>) -> Track {
             let Some(&mt) = data.get(p) else { break };
             p += 1;
             let (l, np) = read_vlq_lenient(data, p);
-            if np == p {
-                // chunk ends before the length VLQ — the raw isn't
-                // self-delimiting, so verbatim re-emission would let the next
-                // reader consume the following byte as the length
+            if np == p || data[np - 1] & 0x80 != 0 {
+                // the length VLQ is missing or continues past the chunk end —
+                // the raw isn't self-delimiting, so verbatim re-emission would
+                // let the next reader continue the VLQ into the following
+                // event's delta bytes
                 clean = false;
             }
             p = np;
@@ -318,8 +319,8 @@ fn track_lenient(data: &[u8], tno: usize, warnings: &mut Vec<String>) -> Track {
             let is_sysex = st == 0xF0;
             p += 1;
             let (l, np) = read_vlq_lenient(data, p);
-            if np == p {
-                clean = false; // missing length VLQ — see meta branch
+            if np == p || data[np - 1] & 0x80 != 0 {
+                clean = false; // missing/unterminated length VLQ — see meta branch
             }
             p = np;
             let overruns = l > (data.len() - p) as u64;
