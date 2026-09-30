@@ -13,6 +13,12 @@ pub struct PluginInfo {
     pub name: String,
     pub path: std::path::PathBuf,
     pub vendor: String,
+    /// Stable class/component uid (32-hex) when a real probe ran; empty for
+    /// filename-only scan results. This is the durable identity for state
+    /// persistence — paths move, uids don't.
+    pub uid: String,
+    /// Plugin version string, when the probe reported one.
+    pub version: String,
 }
 
 pub fn sidecar_binary(stem: &str) -> Option<std::path::PathBuf> {
@@ -115,6 +121,8 @@ pub fn discover_plugins() -> ScanReport {
                     name: p.info.name.clone(),
                     path: p.info.path.clone(),
                     vendor: p.info.vendor.clone(),
+                    uid: p.info.uid.clone(),
+                    version: p.info.version.clone(),
                 })
                 .collect();
             found.sort_by(|a, b| a.name.cmp(&b.name));
@@ -171,6 +179,8 @@ pub fn discover_plugin_paths() -> Vec<PluginInfo> {
                             .unwrap_or_else(|| "unknown".into()),
                         path: p,
                         vendor: String::new(),
+                        uid: String::new(),
+                        version: String::new(),
                     });
                 }
             }

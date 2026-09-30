@@ -70,7 +70,12 @@ wheel scrolls, Ctrl+wheel zooms.
 
 Destinations, mute/solo, metronome/loop state, zoom/scroll, selected track and
 encoding persist per-file in `<song>.mid.editor.json` next to the .mid — the
-SMF itself is never touched by editor state.
+SMF itself is never touched by editor state. VST3 patch/parameter state lives
+in a companion binary file `<song>.mid.editor.state`: records are keyed by the
+plugin's class uid (bundle path as a fallback), restored into each plugin
+after load and before playback, and kept even while a plugin is missing —
+incompatible or corrupt state files are skipped with a status note, never
+fatal.
 
 ## MCP server
 

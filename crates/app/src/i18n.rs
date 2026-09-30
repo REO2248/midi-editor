@@ -196,6 +196,7 @@ static EN: &[(&str, &str)] = &[
     ("audio.buffer", "buffer size"),
     ("audio.stream_ok", "stream ok"),
     ("audio.device_lost", "audio device lost: {e} — reopening"),
+    ("plugin.state_restore_failed", "{name}: could not restore saved state ({e})"),
     ("status.rescan", "rescanned: {n} destination(s)"),
     ("guard.unsaved", "You have unsaved changes."),
     (
@@ -404,6 +405,7 @@ static JA: &[(&str, &str)] = &[
     ("audio.buffer", "バッファサイズ"),
     ("audio.stream_ok", "ストリーム正常"),
     ("audio.device_lost", "オーディオデバイスが切断されました: {e} — 再オープン中"),
+    ("plugin.state_restore_failed", "{name}: 保存したステートを復元できません ({e})"),
     ("status.rescan", "再スキャン: {n} 件の出力先"),
     ("status.mcp_auth", "mcp: 認証あり"),
     ("status.mcp_open", "mcp: 無認証"),
