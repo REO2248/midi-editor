@@ -197,7 +197,7 @@ mod tests {
     // no `use super::*`: the parent's `gpui_kit::*` glob would shadow the
     // builtin `#[test]` attribute with `gpui::test`
     use super::{choice_for_index, needs_guard, verdict_for, GuardChoice, GuardVerdict};
-    use crate::{lock_shared, save_document};
+    use crate::lock_shared;
     use std::path::PathBuf;
 
     fn shared() -> mcp_server::SharedDoc {
@@ -271,7 +271,16 @@ mod tests {
         let sh = shared();
         dirty(&sh);
         let file = tmpdir("ok").join("a.mid");
-        assert!(save_document(&sh, &file).is_ok());
+        assert!(
+            mcp_server::service::save_document(
+                &sh,
+                mcp_server::service::SaveRequest {
+                    path: Some(&file),
+                    ..Default::default()
+                },
+            )
+            .is_ok()
+        );
         assert!(file.exists());
         let g = lock_shared(&sh);
         assert_eq!(g.doc.revision(), g.saved_revision);
@@ -287,7 +296,16 @@ mod tests {
         // a path inside a directory that does not exist makes write_atomic fail
         let file = tmpdir("fail").join("no-such-dir").join("a.mid");
         let rev = lock_shared(&sh).doc.revision();
-        assert!(save_document(&sh, &file).is_err());
+        assert!(
+            mcp_server::service::save_document(
+                &sh,
+                mcp_server::service::SaveRequest {
+                    path: Some(&file),
+                    ..Default::default()
+                },
+            )
+            .is_err()
+        );
         let g = lock_shared(&sh);
         assert_eq!(g.doc.revision(), rev);
         assert_ne!(g.doc.revision(), g.saved_revision);
