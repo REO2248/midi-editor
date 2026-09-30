@@ -940,6 +940,124 @@ fn set_timer_resolution(ms: u32) {
 #[cfg(not(windows))]
 fn set_timer_resolution(_ms: u32) {}
 
+/// Time source the playback schedule runs against. `SystemClock` drives real
+/// playback; tests substitute a manual clock so sequencing is exercised
+/// deterministically — no wall-clock sleeps, no timing tolerances.
+pub trait Clock {
+    /// Current time in µs. The epoch is arbitrary — only differences matter.
+    fn now_us(&self) -> u64;
+    /// Block until `target_us` (same epoch as `now_us`) or until `stop`
+    /// flips. Returns true if the target was reached; false on abort.
+    fn wait_until_us(&mut self, target_us: u64, stop: &std::sync::atomic::AtomicBool) -> bool;
+}
+
+/// Wall-clock `Clock`: `Instant` + 2 ms sleep/spin hybrid — the policy the
+/// playback thread always used, now behind an interface.
+pub struct SystemClock {
+    t0: std::time::Instant,
+}
+
+impl Default for SystemClock {
+    fn default() -> Self {
+        Self {
+            t0: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Clock for SystemClock {
+    fn now_us(&self) -> u64 {
+        self.t0.elapsed().as_micros() as u64
+    }
+    fn wait_until_us(&mut self, target_us: u64, stop: &std::sync::atomic::AtomicBool) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let target = self.t0 + std::time::Duration::from_micros(target_us);
+        loop {
+            let now = std::time::Instant::now();
+            if now >= target {
+                return true;
+            }
+            if stop.load(Relaxed) {
+                return false;
+            }
+            let rem = target - now;
+            if rem > std::time::Duration::from_millis(2) {
+                std::thread::sleep(rem.min(std::time::Duration::from_millis(2)));
+            } else {
+                std::hint::spin_loop();
+            }
+        }
+    }
+}
+
+/// The scheduling core of `Playback`, generic over `Clock` so tests can run
+/// it synchronously on a fake clock. See `Playback::start` for the contract.
+///
+/// `events` must be sorted by absolute µs; `start_us` seeks (earlier events
+/// skipped, clock base = `start_us`); `loop_from_us` notes-offs every sink at
+/// the end of each pass and restarts the schedule at that point. Every exit
+/// path — stop, end of timeline, or a loop with nothing left to replay —
+/// ends with `panic()` on every sink. `pos` is updated as the schedule
+/// advances so the UI can draw a playhead.
+pub fn run_schedule(
+    clock: &mut impl Clock,
+    sinks: &mut [Box<dyn EventSink>],
+    events: &[(u64, usize, Vec<u8>)],
+    start_us: u64,
+    loop_from_us: Option<u64>,
+    stop: &std::sync::atomic::AtomicBool,
+    pos: &std::sync::atomic::AtomicU64,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut base_us = start_us;
+    let mut epoch0_us = clock.now_us();
+    let mut i = events.partition_point(|(us, _, _)| *us < base_us);
+    'outer: loop {
+        while i < events.len() {
+            if stop.load(Relaxed) {
+                break 'outer;
+            }
+            let (us, sink_idx, bytes) = &events[i];
+            i += 1;
+            let us = *us;
+            let Some(sink) = sinks.get_mut(*sink_idx) else {
+                continue;
+            };
+            let wake_us = (epoch0_us + (us - base_us)).saturating_sub(sink.lead_us());
+            if !clock.wait_until_us(wake_us, stop) {
+                break 'outer;
+            }
+            pos.store(us, Relaxed);
+            let deadline_us = epoch0_us + (us - base_us);
+            let rem = deadline_us.saturating_sub(clock.now_us());
+            sink.send_at(bytes, rem);
+        }
+        // loop wrap: release notes but keep tails and controller
+        // state — the schedule restarts with chase events at the
+        // loop point, which re-establish whatever should sound
+        for s in sinks.iter_mut() {
+            s.notes_off();
+        }
+        match loop_from_us {
+            Some(ls) => {
+                let ni = events.partition_point(|(us, _, _)| *us < ls);
+                // nothing to replay → don't spin on panic forever
+                if ni >= events.len() {
+                    break;
+                }
+                base_us = ls;
+                epoch0_us = clock.now_us();
+                i = ni;
+                pos.store(ls, Relaxed);
+            }
+            None => break,
+        }
+    }
+    for s in sinks.iter_mut() {
+        s.panic();
+    }
+}
+
 /// Scheduled playback on a dedicated thread.
 ///
 /// The caller snapshots the timeline as `(absolute µs, sink index, message
@@ -972,70 +1090,17 @@ impl Playback {
         let position_us = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (stop2, pos2) = (stop.clone(), position_us.clone());
         let thread = std::thread::spawn(move || {
-            use std::sync::atomic::Ordering::Relaxed;
             set_timer_resolution(1);
-            let mut base_us = start_us;
-            let mut t0 = std::time::Instant::now();
-            let mut i = events.partition_point(|(us, _, _)| *us < base_us);
-            'outer: loop {
-                while i < events.len() {
-                    if stop2.load(Relaxed) {
-                        break 'outer;
-                    }
-                    let (us, sink_idx, bytes) = &events[i];
-                    i += 1;
-                    let us = *us;
-                    let Some(sink) = sinks.get_mut(*sink_idx) else {
-                        continue;
-                    };
-                    let target = t0 + std::time::Duration::from_micros(us - base_us)
-                        - std::time::Duration::from_micros(sink.lead_us());
-                    loop {
-                        let now = std::time::Instant::now();
-                        if now >= target {
-                            break;
-                        }
-                        if stop2.load(Relaxed) {
-                            break 'outer;
-                        }
-                        let rem = target - now;
-                        if rem > std::time::Duration::from_millis(2) {
-                            std::thread::sleep(rem.min(std::time::Duration::from_millis(2)));
-                        } else {
-                            std::hint::spin_loop();
-                        }
-                    }
-                    pos2.store(us, Relaxed);
-                    let deadline = t0 + std::time::Duration::from_micros(us - base_us);
-                    let rem = deadline
-                        .saturating_duration_since(std::time::Instant::now())
-                        .as_micros() as u64;
-                    sink.send_at(bytes, rem);
-                }
-                // loop wrap: release notes but keep tails and controller
-                // state — the schedule restarts with chase events at the
-                // loop point, which re-establish whatever should sound
-                for s in &mut sinks {
-                    s.notes_off();
-                }
-                match loop_from_us {
-                    Some(ls) => {
-                        let ni = events.partition_point(|(us, _, _)| *us < ls);
-                        // nothing to replay → don't spin on panic forever
-                        if ni >= events.len() {
-                            break;
-                        }
-                        base_us = ls;
-                        t0 = std::time::Instant::now();
-                        i = ni;
-                        pos2.store(ls, Relaxed);
-                    }
-                    None => break,
-                }
-            }
-            for s in &mut sinks {
-                s.panic();
-            }
+            let mut clock = SystemClock::default();
+            run_schedule(
+                &mut clock,
+                &mut sinks,
+                &events,
+                start_us,
+                loop_from_us,
+                &stop2,
+                &pos2,
+            );
             set_timer_resolution(0);
         });
         Self {
@@ -1072,6 +1137,8 @@ impl Drop for Playback {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering::Relaxed;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::sync::{Arc, Mutex};
 
     fn plugin(path: &str, cid: Option<&str>) -> Destination {
@@ -1171,16 +1238,63 @@ mod tests {
         ));
     }
 
-    struct RecordingSink(Arc<Mutex<Vec<Vec<u8>>>>);
+    /// Manual clock: `wait_until_us` jumps straight to the target — the
+    /// schedule runs synchronously, so assertions see exact µs values.
+    struct FakeClock {
+        now: u64,
+    }
+
+    impl Clock for FakeClock {
+        fn now_us(&self) -> u64 {
+            self.now
+        }
+        fn wait_until_us(&mut self, target_us: u64, _stop: &AtomicBool) -> bool {
+            self.now = target_us;
+            true
+        }
+    }
+
+    /// Fake sink recording every message verbatim; sets `stop` once it has
+    /// delivered `stop_after` sends, simulating a mid-playback transport stop.
+    struct RecordingSink {
+        log: Arc<Mutex<Vec<Vec<u8>>>>,
+        stop: Arc<AtomicBool>,
+        stop_after: usize,
+        sends: usize,
+    }
+
+    impl RecordingSink {
+        /// Wall-clock `Playback::start` tests only record traffic — no
+        /// external stop is ever raised.
+        fn recording(log: Arc<Mutex<Vec<Vec<u8>>>>) -> Self {
+            Self {
+                log,
+                stop: Arc::new(AtomicBool::new(false)),
+                stop_after: usize::MAX,
+                sends: 0,
+            }
+        }
+    }
 
     impl EventSink for RecordingSink {
         fn send_at(&mut self, bytes: &[u8], _rem_us: u64) {
-            self.0.lock().unwrap().push(bytes.to_vec());
+            self.log.lock().unwrap().push(bytes.to_vec());
+            self.sends += 1;
+            if self.sends == self.stop_after {
+                self.stop.store(true, Relaxed);
+            }
+        }
+        /// Same payload as the trait default, recorded without counting
+        /// against `stop_after` — wrap cleanup must not fire the stop.
+        fn notes_off(&mut self) {
+            for ch in 0u8..16 {
+                self.log.lock().unwrap().push(vec![0xB0 | ch, 123, 0]);
+            }
         }
         fn panic(&mut self) {
             for ch in 0u8..16 {
                 for ctl in [123u8, 121, 120] {
-                    self.0.lock().unwrap().push(vec![0xB0 | ch, ctl, 0]);
+                    self.log.lock().unwrap().push(vec![0xB0 | ch, ctl, 0]);
                 }
             }
         }
@@ -1322,44 +1436,40 @@ mod tests {
     #[test]
     fn loop_wrap_releases_notes_without_full_reset() {
         let log = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let pos = AtomicU64::new(0);
         let events = vec![
             (0u64, 0usize, vec![0x90, 60, 100]),
             (5_000u64, 0usize, vec![0x80, 60, 0]),
         ];
-        let mut pb = Playback::start(
-            vec![Box::new(RecordingSink(log.clone()))],
-            events,
-            0,
-            Some(0),
-        );
-        // wait for at least two passes: a wrap happened and the schedule
-        // replayed through it
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let strikes = log
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|b| b == &&vec![0x90, 60, 100])
-                .count();
-            if strikes >= 2 {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "schedule did not replay across the loop boundary"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
+        let mut sinks: Vec<Box<dyn EventSink>> = vec![Box::new(RecordingSink {
+            log: log.clone(),
+            stop: stop.clone(),
+            // stop right after the replayed note-on → the note-off of pass 2
+            // must be skipped and the run must end in panic()
+            stop_after: 3,
+            sends: 0,
+        })];
+        let mut clock = FakeClock { now: 0 };
+        run_schedule(&mut clock, &mut sinks, &events, 0, Some(0), &stop, &pos);
         let snapshot = log.lock().unwrap().clone();
-        pb.stop();
+        // note-on played twice → the schedule wrapped and replayed
+        assert_eq!(
+            snapshot.iter().filter(|b| *b == &vec![0x90, 60, 100]).count(),
+            2
+        );
         // the wrap cleanup is notes-off only; 121/120 belong to a full panic
-        assert!(snapshot
+        let notes_off_pos = snapshot
             .iter()
-            .any(|b| b.len() == 3 && b[0] == 0xB0 && b[1] == 123));
-        assert!(snapshot
+            .position(|b| b.len() == 3 && b[0] & 0xF0 == 0xB0 && b[1] == 123)
+            .expect("notes-off at loop wrap");
+        assert!(snapshot[..notes_off_pos]
             .iter()
-            .all(|b| !(b.len() == 3 && (b[1] == 121 || b[1] == 120))));
+            .all(|b| !(b.len() == 3 && b[0] & 0xF0 == 0xB0 && (b[1] == 121 || b[1] == 120))));
+        // panic() ran at the end — CC 121/120 appear, after the wrap cleanup
+        assert!(snapshot[notes_off_pos..]
+            .iter()
+            .any(|b| b.len() == 3 && b[0] & 0xF0 == 0xB0 && b[1] == 121));
     }
 
     // --- SysEx long-message policy ----------------------------------------
@@ -1634,7 +1744,7 @@ mod tests {
             (8_000u64, 0usize, vec![0x90, 64, 100]),
         ];
         let mut pb = Playback::start(
-            vec![Box::new(RecordingSink(log.clone()))],
+            vec![Box::new(RecordingSink::recording(log.clone()))],
             events,
             5_000,
             None,
@@ -1663,7 +1773,7 @@ mod tests {
             (0u64, 0usize, vec![0xB0, 121, 0]),
             (0u64, 0usize, vec![0x90, 60, 100]),
         ];
-        let mut pb = Playback::start(vec![Box::new(RecordingSink(log.clone()))], events, 0, None);
+        let mut pb = Playback::start(vec![Box::new(RecordingSink::recording(log.clone()))], events, 0, None);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let have = log.lock().unwrap().len();
@@ -1697,7 +1807,7 @@ mod tests {
             (0u64, 0usize, vec![0x90, 60, 100]),
             (60_000_000u64, 0usize, vec![0x80, 60, 0]), // far out: still running when stopped
         ];
-        let mut pb = Playback::start(vec![Box::new(RecordingSink(log.clone()))], events, 0, None);
+        let mut pb = Playback::start(vec![Box::new(RecordingSink::recording(log.clone()))], events, 0, None);
         std::thread::sleep(std::time::Duration::from_millis(50));
         pb.stop();
         let sent = log.lock().unwrap().clone();

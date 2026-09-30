@@ -22,8 +22,8 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
-      - name: Test (non-UI crates)
-        run: cargo test -p smf-core -p document -p commands -p mcp-server --locked
+      - name: Test
+        run: cargo test -p smf-core -p document -p commands -p mcp-server -p midi-io -p midi-editor --locked
       - name: Build workspace (gpui app needs Windows)
         run: cargo build --workspace --locked
 
