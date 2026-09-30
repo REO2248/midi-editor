@@ -5,6 +5,7 @@
 
 mod a11y;
 mod audition;
+mod cmd;
 mod diagnostics;
 mod geometry;
 mod guard;
@@ -666,6 +667,10 @@ struct EditorView {
     show_events: bool,
     /// F1 keyboard-shortcuts overlay
     help_open: bool,
+    /// command palette / keybindings overlay (Ctrl+Shift+P)
+    palette: Option<Palette>,
+    /// effective keybindings: registry defaults + user overrides
+    keys: cmd::KeyMap,
     /// one-bar count-in before MIDI recording starts (global pref)
     count_in: bool,
     /// recently opened files (global pref, newest first)
@@ -753,6 +758,26 @@ struct PropRow {
     label: SharedString,
     value: String,
     warn: bool,
+}
+
+/// Which list the palette overlay shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PaletteMode {
+    /// search + run commands
+    Commands,
+    /// view + rebind keyboard shortcuts
+    Keys,
+}
+
+/// Command palette state (also drives the keybindings overlay).
+pub struct Palette {
+    pub mode: PaletteMode,
+    pub input: Entity<InputState>,
+    pub sel: usize,
+    /// command id awaiting a new shortcut (Keys mode capture)
+    pub capture: Option<&'static str>,
+    /// keeps the input->repaint observation alive
+    _sub: Subscription,
 }
 
 enum PluginState {
@@ -1124,6 +1149,10 @@ impl EditorView {
             sysex_stats: Vec::new(),
             open_menu: None,
             help_open: false,
+            palette: None,
+            keys: cmd::KeyMap {
+                overrides: g.keymap.clone(),
+            },
             count_in: g.count_in,
             recent: g.recent.iter().map(|p| p.as_str().into()).collect(),
             midi_in: g.midi_in.clone().into(),
@@ -1558,6 +1587,190 @@ impl EditorView {
         let fh = self.input.read(cx).focus_handle(cx);
         window.focus(&fh, cx);
         cx.notify();
+    }
+
+    /// Open the palette overlay (Commands or Keys mode), closing menus.
+    fn open_palette(&mut self, mode: PaletteMode, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_menu = None;
+        self.open_sub = None;
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(t("ui.palette_hint")));
+        let sub = cx.subscribe(
+            &input,
+            |v, _e, ev: &gpui_kit::component::input::InputEvent, cx| {
+                if matches!(ev, gpui_kit::component::input::InputEvent::Change) {
+                    // filter text changed → reset selection + repaint
+                    if let Some(p) = v.palette.as_mut() {
+                        p.sel = 0;
+                    }
+                    cx.notify();
+                }
+            },
+        );
+        self.palette = Some(Palette {
+            mode,
+            input: input.clone(),
+            sel: 0,
+            capture: None,
+            _sub: sub,
+        });
+        let fh = input.read(cx).focus_handle(cx);
+        window.focus(&fh, cx);
+        cx.notify();
+    }
+
+    fn close_palette(&mut self, cx: &mut Context<Self>) {
+        if self.palette.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Commands matching the palette's filter text (label or id).
+    fn palette_rows(&self, cx: &App) -> Vec<&'static cmd::Command> {
+        let Some(p) = &self.palette else {
+            return Vec::new();
+        };
+        let q = p.input.read(cx).value().trim().to_lowercase();
+        cmd::COMMANDS
+            .iter()
+            .filter(|c| {
+                q.is_empty() || t(c.label_key).to_lowercase().contains(&q) || c.id.contains(&q)
+            })
+            .collect()
+    }
+
+    /// Every key pressed while the palette is open flows here (the root
+    /// handler routes it); nav/select keys are consumed, the rest reach
+    /// the filter input's own handler first and are ignored here.
+    fn palette_key(&mut self, ev: &KeyDownEvent, w: &mut Window, cx: &mut Context<Self>) {
+        let Some(p) = &self.palette else { return };
+        let mode = p.mode;
+        let capturing = p.capture;
+        let k = ev.keystroke.key.as_str();
+
+        // Keys-mode capture eats the next real keystroke as the new binding.
+        if let Some(id) = capturing {
+            match k {
+                "escape" => {
+                    if let Some(p) = self.palette.as_mut() {
+                        p.capture = None;
+                    }
+                }
+                // ignore modifiers on their own — wait for a real key
+                "control" | "shift" | "alt" | "capslock" | "function" | "platform" => {}
+                _ => {
+                    if let Some(p) = self.palette.as_mut() {
+                        p.capture = None;
+                    }
+                    let desc = cmd::describe(&ev.keystroke);
+                    match self.keys.assign(id, &desc) {
+                        Ok(()) => {
+                            self.save_global();
+                            let c = cmd::find(id).unwrap();
+                            self.status = tf(
+                                "ui.keys_bound",
+                                &[("label", &cmd::label(c)), ("key", &cmd::format_key(&desc))],
+                            )
+                            .into();
+                        }
+                        Err(other) => {
+                            self.status =
+                                tf("ui.keys_conflict", &[("label", &cmd::label(other))]).into();
+                        }
+                    }
+                }
+            }
+            // return focus to the filter after capture
+            if let Some(p) = &self.palette {
+                let fh = p.input.read(cx).focus_handle(cx);
+                w.focus(&fh, cx);
+            }
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+
+        let rows_len = self.palette_rows(cx).len();
+        let mut step = |d: isize| {
+            if let Some(p) = self.palette.as_mut() {
+                let n = rows_len.max(1) as isize;
+                p.sel = ((p.sel as isize + d) % n + n) as usize % n as usize;
+            }
+        };
+        match (k, ev.keystroke.modifiers.control) {
+            ("escape", _) => self.close_palette(cx),
+            ("tab", _) => {
+                if let Some(p) = self.palette.as_mut() {
+                    p.mode = match p.mode {
+                        PaletteMode::Commands => PaletteMode::Keys,
+                        PaletteMode::Keys => PaletteMode::Commands,
+                    };
+                    p.sel = 0;
+                }
+                cx.notify();
+            }
+            ("up", _) | ("down", _) => {
+                step(if k == "up" { -1 } else { 1 });
+                cx.notify();
+            }
+            ("pageup" | "page_up", _) | ("pagedown" | "page_down", _) => {
+                step(if k.starts_with("pageup") || k == "page_up" {
+                    -10
+                } else {
+                    10
+                });
+                cx.notify();
+            }
+            ("home", _) => {
+                if let Some(p) = self.palette.as_mut() {
+                    p.sel = 0;
+                }
+                cx.notify();
+            }
+            ("end", _) => {
+                if let Some(p) = self.palette.as_mut() {
+                    p.sel = rows_len.saturating_sub(1);
+                }
+                cx.notify();
+            }
+            ("enter", _) => self.palette_activate(w, cx),
+            ("delete", false) | ("backspace", false) | ("r", true) => {
+                // Keys mode: reset the selected command to its defaults.
+                // (Del is also consumed by the filter input when focused, so
+                // Ctrl+R is the reliable path — both are offered.)
+                if mode == PaletteMode::Keys {
+                    let rows = self.palette_rows(cx);
+                    if let Some(c) = rows.get(self.palette.as_ref().unwrap().sel).copied() {
+                        self.keys.reset(c.id);
+                        self.save_global();
+                        self.status = tf("ui.keys_reset", &[("label", &cmd::label(c))]).into();
+                        cx.notify();
+                    }
+                }
+            }
+            _ => {}
+        }
+        cx.stop_propagation();
+    }
+
+    /// Enter or click on the selected palette row: run it (Commands) or
+    /// begin keystroke capture (Keys).
+    fn palette_activate(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        let rows = self.palette_rows(cx);
+        let Some(p) = &self.palette else { return };
+        let mode = p.mode;
+        let Some(&c) = rows.get(p.sel) else { return };
+        match mode {
+            PaletteMode::Commands => {
+                self.close_palette(cx);
+                (c.act)(self, w, cx);
+            }
+            PaletteMode::Keys => {
+                // capture next keystroke: move focus off the filter so the
+                // key can't be typed as text
+                self.palette.as_mut().unwrap().capture = Some(c.id);
+                w.focus(&self.focus.clone(), cx);
+            }
+        }
     }
 
     fn pick_default_track(&self) -> usize {
@@ -5531,6 +5744,9 @@ struct GlobalPrefs {
     hc: Option<bool>,
     /// appearance mode: "system" | "dark" | "light" (None = system)
     theme: Option<String>,
+    /// keybinding overrides: command id -> "ctrl+shift+z" descriptor
+    #[serde(default)]
+    keymap: HashMap<String, String>,
 }
 
 impl Default for GlobalPrefs {
@@ -5550,6 +5766,7 @@ impl Default for GlobalPrefs {
             aud_ms: None,
             hc: None,
             theme: None,
+            keymap: HashMap::new(),
         }
     }
 }
@@ -5912,6 +6129,7 @@ impl EditorView {
             aud_ms: Some(self.aud_ms),
             hc: self.hc_pref,
             theme: Some(self.theme_mode.name().to_string()),
+            keymap: self.keys.overrides.clone(),
             ..Default::default()
         }
         .save();
@@ -6860,8 +7078,8 @@ mod tests {
             window.render_frame(cx);
             assert_eq!(window.find("menu.file").expanded(), Some(true));
             assert_eq!(window.find("menu-popup").role(), Some(Role::Menu));
-            assert_eq!(window.find("f.save").role(), Some(Role::MenuItem));
-            assert!(window.find("f.save").label().is_some());
+            assert_eq!(window.find("file.save").role(), Some(Role::MenuItem));
+            assert!(window.find("file.save").label().is_some());
 
             // spinner / spinbutton values are machine-readable
             assert_eq!(window.find("bpm").role(), Some(Role::SpinButton));

@@ -4,6 +4,7 @@
 //! crate root where EditorView is defined.
 
 use crate::a11y;
+use crate::cmd;
 use crate::geometry::{drag_window, tick_window, ZOOM_MAX, ZOOM_MIN};
 use crate::i18n::{t, tf};
 use crate::icons::icon;
@@ -2493,218 +2494,62 @@ impl Render for EditorView {
         let menu_layer = self.open_menu.map(|(m, mx)| {
             let items: Vec<MenuRow> = match m {
                 TopMenu::File => vec![
-                    Self::mi("f.new", t("menu.new"), "", None, cx, |v, w, cx| {
-                        v.confirm_discard_or_save(PendingAction::NewFile, w, cx);
-                    }),
-                    Self::mi("f.open", t("menu.open"), "Ctrl+O", None, cx, |v, w, cx| {
-                        v.confirm_discard_or_save(PendingAction::OpenDialog, w, cx);
-                    }),
+                    self.mi_cmd("file.new", None, cx),
+                    self.mi_cmd("file.open", None, cx),
                     Self::mi_sub("f.recent", t("menu.recent"), Sub::Recent, cx),
                     Self::msep(),
-                    Self::mi("f.save", t("menu.save"), "Ctrl+S", None, cx, |v, _e, cx| {
-                        v.save(cx);
-                    }),
-                    Self::mi("f.savas", t("menu.save_as"), "", None, cx, |v, _e, cx| {
-                        v.save_as(cx);
-                    }),
+                    self.mi_cmd("file.save", None, cx),
+                    self.mi_cmd("file.save_as", None, cx),
                 ],
                 TopMenu::Edit => vec![
-                    Self::mi("e.undo", t("menu.undo"), "Ctrl+Z", None, cx, |v, _e, cx| {
-                        v.undo(cx);
-                    }),
-                    Self::mi("e.redo", t("menu.redo"), "Ctrl+Y", None, cx, |v, _e, cx| {
-                        v.redo(cx);
-                    }),
+                    self.mi_cmd("edit.undo", None, cx),
+                    self.mi_cmd("edit.redo", None, cx),
                     Self::msep(),
-                    Self::mi(
-                        "e.selall",
-                        t("menu.select_all"),
-                        "Ctrl+A",
-                        None,
-                        cx,
-                        |v, _e, cx| {
-                            v.select_all(cx);
-                        },
-                    ),
+                    self.mi_cmd("edit.select_all", None, cx),
                     Self::msep(),
-                    Self::mi("e.cut", t("edit.cut"), "Ctrl+X", None, cx, |v, _e, cx| {
-                        v.copy_selected(true, cx);
-                    }),
-                    Self::mi("e.copy", t("edit.copy"), "Ctrl+C", None, cx, |v, _e, cx| {
-                        v.copy_selected(false, cx);
-                    }),
-                    Self::mi(
-                        "e.paste",
-                        t("edit.paste"),
-                        "Ctrl+V",
-                        None,
-                        cx,
-                        |v, _e, cx| {
-                            v.paste(cx);
-                        },
-                    ),
-                    Self::mi(
-                        "e.dup",
-                        t("edit.duplicate"),
-                        "Ctrl+D",
-                        None,
-                        cx,
-                        |v, _e, cx| {
-                            v.duplicate_selected(cx);
-                        },
-                    ),
-                    Self::mi("e.del", t("menu.delete"), "Del", None, cx, |v, _e, cx| {
-                        v.delete_selected(cx);
-                    }),
+                    self.mi_cmd("edit.cut", None, cx),
+                    self.mi_cmd("edit.copy", None, cx),
+                    self.mi_cmd("edit.paste", None, cx),
+                    self.mi_cmd("edit.duplicate", None, cx),
+                    self.mi_cmd("edit.delete", None, cx),
                     Self::msep(),
                     Self::mi_sub("e.tool", t("edit.tool"), Sub::Tool, cx),
                     Self::mi_sub("e.snap", t("edit.snap"), Sub::Snap, cx),
                     Self::msep(),
                     Self::mi_sub("e.quant", t("edit.quantize"), Sub::Quant, cx),
-                    Self::mi(
-                        "e.trup",
-                        t("edit.transpose_up"),
-                        "",
-                        None,
-                        cx,
-                        |v, _e, _cx| {
-                            v.apply_region_op("transpose +1", |d, t, f, to| {
-                                d.transpose_ops(t, f, to, 1)
-                            });
-                        },
-                    ),
-                    Self::mi(
-                        "e.trdn",
-                        t("edit.transpose_dn"),
-                        "",
-                        None,
-                        cx,
-                        |v, _e, _cx| {
-                            v.apply_region_op("transpose -1", |d, t, f, to| {
-                                d.transpose_ops(t, f, to, -1)
-                            });
-                        },
-                    ),
+                    self.mi_cmd("edit.transpose_up", None, cx),
+                    self.mi_cmd("edit.transpose_dn", None, cx),
                     Self::mi_sub("e.oct", t("edit.octave"), Sub::Oct, cx),
                     Self::msep(),
-                    Self::mi("e.human", t("edit.humanize"), "", None, cx, |v, _e, _cx| {
-                        v.apply_region_op("humanize", |d, t, f, to| {
-                            // revision as seed: identical ops replay the same
-                            // take; a different doc state reseeds the jitter
-                            d.humanize_ops(t, f, to, 12, 8, d.revision())
-                        });
-                    }),
-                    Self::mi("e.split", t("edit.split"), "", None, cx, |v, _e, cx| {
-                        v.split_at_playhead(cx);
-                    }),
+                    self.mi_cmd("edit.humanize", None, cx),
+                    self.mi_cmd("edit.split", None, cx),
                     Self::mi_sub("e.swing", t("edit.swing"), Sub::Swing, cx),
-                    Self::mi("e.join", t("edit.join"), "", None, cx, |v, _e, _cx| {
-                        v.apply_region_op("join", |d, t, f, to| d.join_ops(t, f, to));
-                    }),
-                    Self::mi(
-                        "e.fixov",
-                        t("edit.fix_overlaps"),
-                        "",
-                        None,
-                        cx,
-                        |v, _e, _cx| {
-                            v.apply_region_op("fix overlaps", |d, t, f, to| {
-                                d.fix_overlaps_ops(t, f, to)
-                            });
-                        },
-                    ),
+                    self.mi_cmd("edit.join", None, cx),
+                    self.mi_cmd("edit.fix_overlaps", None, cx),
                     Self::mi_sub("e.legato", t("edit.legato"), Sub::LegatoGap, cx),
                     Self::mi_sub("e.len", t("edit.set_length"), Sub::LenSet, cx),
                     Self::mi_sub("e.velset", t("edit.set_velocity"), Sub::VelSet, cx),
                     Self::mi_sub("e.relset", t("edit.set_release"), Sub::RelSet, cx),
                     Self::msep(),
-                    Self::mi("e.velup", t("edit.vel_up"), "", None, cx, |v, _e, _cx| {
-                        v.apply_region_op("vel ×1.25", |d, t, f, to| {
-                            d.scale_velocity_ops(t, f, to, 1.25)
-                        });
-                    }),
-                    Self::mi("e.veldn", t("edit.vel_dn"), "", None, cx, |v, _e, _cx| {
-                        v.apply_region_op("vel ×0.8", |d, t, f, to| {
-                            d.scale_velocity_ops(t, f, to, 0.8)
-                        });
-                    }),
+                    self.mi_cmd("edit.vel_up", None, cx),
+                    self.mi_cmd("edit.vel_dn", None, cx),
                 ],
                 TopMenu::View => vec![
-                    Self::mi(
-                        "v.events",
-                        t("view.events"),
-                        "",
-                        Some(self.show_events),
-                        cx,
-                        |v, _e, _cx| {
-                            v.show_events = !v.show_events;
-                            v.persist();
-                        },
-                    ),
+                    self.mi_cmd("view.events", Some(self.show_events), cx),
                     Self::mi_sub("v.theme", t("view.theme"), Sub::Theme, cx),
-                    Self::mi(
-                        "v.hc",
-                        t("view.hc"),
-                        "",
+                    self.mi_cmd(
+                        "view.hc",
                         Some(self.theme == theme::Theme::high_contrast()),
                         cx,
-                        |v, _e, cx| {
-                            v.toggle_hc(cx);
-                        },
                     ),
                     Self::msep(),
-                    Self::mi(
-                        "v.zin",
-                        t("view.zoom_in"),
-                        "Ctrl+=",
-                        None,
-                        cx,
-                        |v, _e, cx| {
-                            v.zoom_by(1.3, cx);
-                        },
-                    ),
-                    Self::mi(
-                        "v.zout",
-                        t("view.zoom_out"),
-                        "Ctrl+-",
-                        None,
-                        cx,
-                        |v, _e, cx| {
-                            v.zoom_by(1.0 / 1.3, cx);
-                        },
-                    ),
-                    Self::mi(
-                        "v.z0",
-                        t("view.zoom_reset"),
-                        "Ctrl+0",
-                        None,
-                        cx,
-                        |v, _e, cx| {
-                            v.zoom_set(0.08, cx);
-                        },
-                    ),
+                    self.mi_cmd("view.zoom_in", None, cx),
+                    self.mi_cmd("view.zoom_out", None, cx),
+                    self.mi_cmd("view.zoom_reset", None, cx),
                     Self::msep(),
                     Self::mi_sub("v.rowh", t("view.row_height"), Sub::RowH, cx),
-                    Self::mi(
-                        "v.fold",
-                        t("view.fold"),
-                        "",
-                        Some(self.fold),
-                        cx,
-                        |v, _e, cx| {
-                            v.set_fold(!v.fold, cx);
-                        },
-                    ),
-                    Self::mi(
-                        "v.drum",
-                        t("view.drum"),
-                        "",
-                        Some(self.drum),
-                        cx,
-                        |v, _e, cx| {
-                            v.set_drum(!v.drum, cx);
-                        },
-                    ),
+                    self.mi_cmd("view.fold", Some(self.fold), cx),
+                    self.mi_cmd("view.drum", Some(self.drum), cx),
                     Self::mi_sub("v.scale", t("view.scale"), Sub::Scale, cx),
                     Self::msep(),
                     Self::mi_sub("v.lane", t("view.lane"), Sub::Lane, cx),
@@ -2712,60 +2557,17 @@ impl Render for EditorView {
                 ],
                 TopMenu::Track => {
                     let mut items = vec![
-                        Self::mi("t.rename", t("track.rename"), "", None, cx, |v, w, cx| {
-                            v.focus_rename(w, cx);
-                        }),
+                        self.mi_cmd("track.rename", None, cx),
                         Self::msep(),
-                        Self::mi(
-                            "t.mute",
-                            t("track.mute"),
-                            "",
-                            Some(muted_set.contains(&self.sel_track)),
-                            cx,
-                            |v, _e, _cx| {
-                                let t = v.sel_track;
-                                {
-                                    let mut sh = crate::lock_shared(&v.shared);
-                                    if !sh.muted.remove(&t) {
-                                        sh.muted.insert(t);
-                                    }
-                                }
-                                v.persist();
-                            },
-                        ),
-                        Self::mi(
-                            "t.solo",
-                            t("track.solo"),
-                            "",
-                            Some(soloed_set.contains(&self.sel_track)),
-                            cx,
-                            |v, _e, _cx| {
-                                let t = v.sel_track;
-                                {
-                                    let mut sh = crate::lock_shared(&v.shared);
-                                    if !sh.soloed.remove(&t) {
-                                        sh.soloed.insert(t);
-                                    }
-                                }
-                                v.persist();
-                            },
-                        ),
+                        self.mi_cmd("track.mute", Some(muted_set.contains(&self.sel_track)), cx),
+                        self.mi_cmd("track.solo", Some(soloed_set.contains(&self.sel_track)), cx),
                         Self::msep(),
                         Self::mi_sub("t.chan", t("track.channel"), Sub::Chan, cx),
                         Self::mi_sub("t.dest", t("track.dest"), Sub::Dest, cx),
                     ];
                     if sel_is_plugin {
                         items.push(Self::msep());
-                        items.push(Self::mi(
-                            "t.gui",
-                            t("track.plugin_gui"),
-                            "",
-                            None,
-                            cx,
-                            |v, _e, _cx| {
-                                v.open_plugin_gui();
-                            },
-                        ));
+                        items.push(self.mi_cmd("track.plugin_gui", None, cx));
                     }
                     items
                 }
@@ -2783,7 +2585,7 @@ impl Render for EditorView {
                             } else {
                                 t("output.editor_open")
                             },
-                            "",
+                            self.keys.shortcut_label("track.plugin_gui"),
                             Some(self.plugin_window.is_some()),
                             cx,
                             |v, _e, _cx| v.open_plugin_gui(),
@@ -2793,7 +2595,7 @@ impl Render for EditorView {
                         items.push(Self::mi(
                             "o.retry",
                             t("output.retry"),
-                            "",
+                            self.keys.shortcut_label("output.retry"),
                             None,
                             cx,
                             |v, _e, _cx| {
@@ -2804,10 +2606,7 @@ impl Render for EditorView {
                     }
                     items.extend([
                         Self::msep(),
-                        Self::mi("o.rescan", t("output.rescan"), "", None, cx, |v, _e, cx| {
-                            v.rescan_plugins(crate::ScanMode::Changed);
-                            cx.notify();
-                        }),
+                        self.mi_cmd("output.rescan", None, cx),
                         Self::mi(
                             "o.rescan_all",
                             t("output.rescan_all"),
@@ -2830,83 +2629,16 @@ impl Render for EditorView {
                                 cx.notify();
                             },
                         ),
-                        Self::mi(
-                            "o.status",
-                            t("output.host_status"),
-                            "",
-                            None,
-                            cx,
-                            |v, _e, cx| {
-                                v.show_output_status = true;
-                                cx.notify();
-                            },
-                        ),
+                        self.mi_cmd("output.host_status", None, cx),
                     ]);
                     items
                 }
                 TopMenu::Transport => vec![
-                    Self::mi(
-                        "tr.play",
-                        t("transport.play_stop"),
-                        "Space",
-                        Some(self.playback.is_some()),
-                        cx,
-                        |v, _e, cx| {
-                            v.toggle_play(cx);
-                        },
-                    ),
-                    Self::mi(
-                        "tr.rec",
-                        t("transport.record"),
-                        "",
-                        Some(self.rec.is_some()),
-                        cx,
-                        |v, _e, _cx| {
-                            v.toggle_record();
-                        },
-                    ),
-                    Self::mi(
-                        "tr.loop",
-                        t("transport.loop"),
-                        "",
-                        Some(loop_en),
-                        cx,
-                        |v, _e, _cx| {
-                            {
-                                let mut sh = crate::lock_shared(&v.shared);
-                                sh.loop_enabled = !sh.loop_enabled;
-                            }
-                            v.persist();
-                        },
-                    ),
-                    Self::mi(
-                        "tr.met",
-                        t("transport.met"),
-                        "",
-                        Some(met_en),
-                        cx,
-                        |v, _e, _cx| {
-                            {
-                                let mut sh = crate::lock_shared(&v.shared);
-                                sh.metronome = !sh.metronome;
-                            }
-                            v.persist();
-                        },
-                    ),
-                    Self::mi(
-                        "tr.chsy",
-                        t("transport.chase_sysex"),
-                        "",
-                        Some(chsy_en),
-                        cx,
-                        |v, _e, _cx| {
-                            {
-                                let mut sh = crate::lock_shared(&v.shared);
-                                sh.chase_sysex = !sh.chase_sysex;
-                            }
-                            v.persist();
-                        },
-                    ),
+                    self.mi_cmd("transport.play_stop", Some(self.playback.is_some()), cx),
+                    self.mi_cmd("transport.record", Some(self.rec.is_some()), cx),
+                    self.mi_cmd("transport.loop", Some(loop_en), cx),
+                    self.mi_cmd("transport.met", Some(met_en), cx),
+                    self.mi_cmd("transport.chase_sysex", Some(chsy_en), cx),
                     Self::mi(
                         "tr.sxp",
                         tf(
@@ -2931,73 +2663,21 @@ impl Render for EditorView {
                             v.persist();
                         },
                     ),
-                    Self::mi(
-                        "tr.cin",
-                        t("transport.count_in"),
-                        "",
-                        Some(self.count_in),
-                        cx,
-                        |v, _e, _cx| {
-                            v.count_in = !v.count_in;
-                            v.save_global();
-                        },
-                    ),
+                    self.mi_cmd("transport.count_in", Some(self.count_in), cx),
                     Self::msep(),
-                    Self::mi(
-                        "tr.aud",
-                        t("transport.audition"),
-                        "",
-                        Some(self.aud_enabled),
-                        cx,
-                        |v, _e, _cx| {
-                            v.aud_enabled = !v.aud_enabled;
-                            // disabling mid-ring must silence immediately
-                            if !v.aud_enabled {
-                                v.audition_off();
-                            }
-                            v.save_global();
-                        },
-                    ),
+                    self.mi_cmd("transport.audition", Some(self.aud_enabled), cx),
                     Self::mi_sub("tr.audv", t("transport.aud_vel"), Sub::AudVel, cx),
                     Self::mi_sub("tr.audd", t("transport.aud_dur"), Sub::AudDur, cx),
                 ],
                 TopMenu::Help => vec![
-                    Self::mi(
-                        "h.keys",
-                        t("help.shortcuts"),
-                        "F1",
-                        None,
-                        cx,
-                        |v, _e, cx| {
-                            v.help_open = !v.help_open;
-                            cx.notify();
-                        },
-                    ),
-                    Self::mi("h.about", t("help.about"), "", None, cx, |v, _e, _cx| {
-                        v.status = concat!(
-                            "midi-editor ",
-                            env!("CARGO_PKG_VERSION"),
-                            " — pure-SMF editor"
-                        )
-                        .into();
-                    }),
-                    Self::mi("h.mcp", t("help.mcp"), "", None, cx, |v, _e, _cx| {
-                        v.status =
-                            "MCP: http://127.0.0.1:7878/mcp (mcp-bridge for stdio clients)".into();
-                    }),
-                    Self::mi("h.logs", t("help.open_logs"), "", None, cx, |v, _e, cx| {
-                        v.open_logs(cx);
-                    }),
-                    Self::mi(
-                        "h.diag",
-                        t("help.export_diag"),
-                        "",
-                        None,
-                        cx,
-                        |v, _e, cx| {
-                            v.export_diagnostics(cx);
-                        },
-                    ),
+                    self.mi_cmd("app.palette", None, cx),
+                    self.mi_cmd("app.keys", None, cx),
+                    Self::msep(),
+                    self.mi_cmd("help.shortcuts", None, cx),
+                    self.mi_cmd("help.about", None, cx),
+                    self.mi_cmd("help.mcp", None, cx),
+                    self.mi_cmd("help.logs", None, cx),
+                    self.mi_cmd("help.diag", None, cx),
                 ],
             };
             // keep the last-rendered model for keyboard navigation
@@ -3164,17 +2844,17 @@ impl Render for EditorView {
                     }
                     Sub::Tool => {
                         let opts = [
-                            ("1", Tool::Select, "tool.select"),
-                            ("2", Tool::Draw, "tool.draw"),
-                            ("3", Tool::Erase, "tool.erase"),
+                            (Tool::Select, "tool.select"),
+                            (Tool::Draw, "tool.draw"),
+                            (Tool::Erase, "tool.erase"),
                         ];
                         opts.into_iter()
                             .enumerate()
-                            .map(|(i, (key, tool, label))| {
+                            .map(|(i, (tool, label))| {
                                 Self::mi_leaf(
                                     ("tool", i),
                                     t(label),
-                                    key,
+                                    self.keys.shortcut_label(label),
                                     Some(self.tool == tool),
                                     cx,
                                     move |v, _e, cx| v.set_tool(tool, cx),
@@ -3636,39 +3316,62 @@ impl Render for EditorView {
                 .children(sub_popup)
         });
 
-        // shortcuts overlay (F1 / Help > Keyboard Shortcuts)
+        // shortcuts overlay (F1 / Help > Keyboard Shortcuts) — command rows are
+        // derived from the registry + keymap so the panel always shows the
+        // actual active bindings, including user overrides
         let help_layer = self.help_open.then(|| {
-            const ROWS: [(&str, &str); 29] = [
-                ("Space", "Play / stop"),
-                ("F1", "This panel"),
-                ("F10", "Focus the menu bar"),
-                ("Tab / Shift+Tab", "Move focus between regions"),
-                ("Esc", "Close menus / clear selection"),
-                ("Ctrl+N / O / S", "New / Open / Save"),
-                ("Ctrl+Z / Y", "Undo / redo"),
-                ("Ctrl+A", "Select all notes"),
-                ("Ctrl+X / C / V", "Cut / copy / paste"),
-                ("Ctrl+D", "Duplicate selection"),
-                ("Del", "Delete selection"),
-                ("1 / 2 / 3", "Select / draw / erase tool"),
-                ("← →", "Nudge by grid step / move cursor"),
-                ("Shift+← →", "Nudge by 1 tick"),
-                ("↑ ↓", "Transpose by semitone / move cursor"),
-                ("Shift+↑ ↓", "Transpose by octave"),
-                ("Enter (roll)", "Select note / insert note at cursor"),
-                ("↑ ↓ (tracks)", "Select track"),
-                ("M / S / C (tracks)", "Mute / solo / channel"),
-                ("Enter / F2 (tracks)", "Rename track"),
-                ("← → ↑ ↓ (menus)", "Navigate menus"),
-                ("↑ ↓ + Enter (event list)", "Select event / seek to it"),
-                ("↑ ↓ (lane)", "Velocity of selected notes"),
-                ("Alt+drag note", "Duplicate note(s)"),
-                ("Right-edge drag", "Resize note"),
-                ("Click ruler", "Seek playhead"),
-                ("Double-click ruler", "Play from here"),
-                ("Click minimap", "Jump to position"),
-                ("Ctrl+wheel", "Zoom timeline"),
-            ];
+            let row = |k: String, v: SharedString| {
+                div()
+                    .flex()
+                    .h(px(20.0))
+                    .items_center()
+                    .child(
+                        div()
+                            .w(px(150.0))
+                            .font_family("Cascadia Mono")
+                            .text_color(rgb(0x8fd0a0))
+                            .child(k),
+                    )
+                    .child(div().text_color(rgb(0xd8d8e0)).child(v))
+                    .into_any_element()
+            };
+            let cmd_rows: Vec<AnyElement> = cmd::COMMANDS
+                .iter()
+                .filter_map(|c| {
+                    let s = self.keys.shortcut_label(c.id);
+                    if s.is_empty() {
+                        None
+                    } else {
+                        Some(row(s.to_string(), cmd::label(c)))
+                    }
+                })
+                .collect();
+            // mouse-only gestures — not keyboard bindings
+            let gesture_rows: Vec<AnyElement> = [
+                (t("help.g_dup"), "Alt+drag note"),
+                (t("help.g_resize"), "Right-edge drag"),
+                (t("help.g_seek"), "Click ruler"),
+                (t("help.g_playfrom"), "Double-click ruler"),
+                (t("help.g_minimap"), "Click minimap"),
+                (t("help.g_zoom"), "Ctrl+wheel"),
+                (t("help.g_drop"), "Drag .mid file"),
+            ]
+            .into_iter()
+            .map(|(desc, gesture)| row(gesture.to_string(), desc.into()))
+            .collect();
+            // region-scoped navigation — handled by focused regions, not the
+            // global keymap, so they stay an explicit list
+            let region_rows: Vec<AnyElement> = [
+                (t("help.n_regions"), "Tab / Shift+Tab"),
+                (t("help.n_menubar"), "F10"),
+                (t("help.n_menus"), "← → ↑ ↓ (menus)"),
+                (t("help.n_tracks"), "↑ ↓ · M / S / C · Enter / F2 (tracks)"),
+                (t("help.n_events"), "↑ ↓ + Enter (event list)"),
+                (t("help.n_lane"), "↑ ↓ (lane)"),
+            ]
+            .into_iter()
+            .map(|(desc, keys)| row(keys.to_string(), desc.into()))
+            .collect();
             let panel = div()
                 .id("help-panel")
                 .test_support()
@@ -3676,7 +3379,9 @@ impl Render for EditorView {
                 .aria_label(t("help.shortcuts"))
                 .flex()
                 .flex_col()
-                .w(px(420.0))
+                .w(px(440.0))
+                .max_h(px(560.0))
+                .overflow_y_scroll()
                 .py_2()
                 .px_3()
                 .bg(rgb(0x20202c))
@@ -3696,20 +3401,23 @@ impl Render for EditorView {
                         .pb_2()
                         .child(t("help.shortcuts")),
                 )
-                .children(ROWS.iter().map(|(k, v)| {
+                .children(cmd_rows)
+                .child(
                     div()
-                        .flex()
-                        .h(px(20.0))
-                        .items_center()
-                        .child(
-                            div()
-                                .w(px(150.0))
-                                .font_family("Cascadia Mono")
-                                .text_color(rgb(0x8fd0a0))
-                                .child(*k),
-                        )
-                        .child(div().text_color(rgb(0xd8d8e0)).child(*v))
-                }));
+                        .pt_2()
+                        .pb_1()
+                        .text_color(rgb(0x9fd0ff))
+                        .child(t("help.regions")),
+                )
+                .children(region_rows)
+                .child(
+                    div()
+                        .pt_2()
+                        .pb_1()
+                        .text_color(rgb(0x9fd0ff))
+                        .child(t("help.gestures")),
+                )
+                .children(gesture_rows);
             div()
                 .absolute()
                 .inset_0()
@@ -4158,6 +3866,143 @@ impl Render for EditorView {
                 .child(panel)
         });
 
+        // command palette / keybindings overlay (Ctrl+Shift+P, Help menu)
+        let palette_layer = self.palette.as_ref().map(|p| {
+            let keys_mode = p.mode == PaletteMode::Keys;
+            let capturing = p.capture;
+            let rows = self.palette_rows(cx);
+            let list_rows: Vec<AnyElement> = if rows.is_empty() {
+                vec![div()
+                    .px_2()
+                    .py_1()
+                    .text_color(rgb(0x888898))
+                    .child(t("ui.no_matches"))
+                    .into_any_element()]
+            } else {
+                rows.iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        let sel = i == p.sel;
+                        let right: SharedString = if keys_mode && capturing == Some(c.id) {
+                            t("ui.keys_capture").into()
+                        } else {
+                            self.keys.shortcut_label(c.id).into()
+                        };
+                        let overridden = keys_mode && !self.keys.is_default(c.id);
+                        div()
+                            .id(("pal", i))
+                            .flex()
+                            .items_center()
+                            .h(px(26.0))
+                            .px_2()
+                            .mx_1()
+                            .rounded_sm()
+                            .when(sel, |d| d.bg(rgb(0x2f4a66)))
+                            .text_size(px(12.0))
+                            .text_color(rgb(if sel { 0xffffff } else { 0xd8d8e0 }))
+                            .child(div().flex_1().whitespace_nowrap().child(cmd::label(c)))
+                            .when(overridden, |d| {
+                                d.child(div().text_color(rgb(0xe0b060)).child("●"))
+                            })
+                            .child(
+                                div()
+                                    .pl_2()
+                                    .font_family("Cascadia Mono")
+                                    .text_size(px(10.0))
+                                    .text_color(rgb(if sel { 0xcfe0f0 } else { 0x666677 }))
+                                    .child(right),
+                            )
+                            .on_mouse_move(cx.listener(move |v, _e: &MouseMoveEvent, _w, cx| {
+                                if let Some(p) = v.palette.as_mut() {
+                                    if p.sel != i {
+                                        p.sel = i;
+                                        cx.notify();
+                                    }
+                                }
+                            }))
+                            .on_click(cx.listener(move |v, _e, w, cx| {
+                                cx.stop_propagation();
+                                if let Some(p) = v.palette.as_mut() {
+                                    p.sel = i;
+                                }
+                                v.palette_activate(w, cx);
+                                cx.notify();
+                            }))
+                            .into_any_element()
+                    })
+                    .collect()
+            };
+            let title = if keys_mode {
+                t("ui.keys")
+            } else {
+                t("ui.palette")
+            };
+            let hint = if keys_mode {
+                t("ui.keys_hint")
+            } else {
+                t("ui.palette_hint")
+            };
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .justify_center()
+                .bg(rgba(0x00000066))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|v, _e, _w, cx| {
+                        v.close_palette(cx);
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .id("palette-panel")
+                        .mt(px(96.0))
+                        .flex()
+                        .flex_col()
+                        .w(px(520.0))
+                        .h(px(420.0))
+                        .bg(rgb(0x20202c))
+                        .border_1()
+                        .border_color(rgb(0x3c3c4a))
+                        .rounded_lg()
+                        .shadow_lg()
+                        .text_size(px(12.0))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_v, _e, _w, cx| cx.stop_propagation()),
+                        )
+                        .child(
+                            div().flex().items_center().px_3().pt_2().pb_1().child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .text_color(rgb(0x9fd0ff))
+                                    .child(title),
+                            ),
+                        )
+                        .child(div().px_2().pb_1().child(Input::new(&p.input)))
+                        .child(
+                            div()
+                                .id("pal-scroll")
+                                .flex_1()
+                                .overflow_y_scroll()
+                                .py_1()
+                                .children(list_rows),
+                        )
+                        .child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .border_t_1()
+                                .border_color(rgb(0x3c3c4a))
+                                .text_size(px(10.0))
+                                .text_color(rgb(0x666677))
+                                .child(hint),
+                        ),
+                )
+        });
+
         div()
             .id("editor")
             .test_support()
@@ -4208,6 +4053,16 @@ impl Render for EditorView {
                     }
                     return;
                 }
+                // the inspector's value field owns its keys too — typing a
+                // number must not hit tool/clipboard commands
+                if this.prop_input.read(cx).focus_handle(cx).is_focused(w) {
+                    return;
+                }
+                // palette/keys overlay owns every key while open
+                if this.palette.is_some() {
+                    this.palette_key(ev, w, cx);
+                    return;
+                }
                 // while a menu is open, menu navigation owns arrows/enter/
                 // escape; other chords (Ctrl+S …) still work
                 if this.open_menu.is_some() && this.menu_key(ev, w, cx) {
@@ -4239,64 +4094,43 @@ impl Render for EditorView {
                         this.td().nudge_ticks() as i64
                     }
                 };
-                match (ctrl, shift, k) {
-                    (true, false, "z") => this.undo(cx),
-                    (true, false, "y") | (true, true, "z") => this.redo(cx),
-                    (true, false, "s") => this.save(cx),
-                    (true, false, "o") => {
-                        this.confirm_discard_or_save(PendingAction::OpenDialog, w, cx)
+                if k == "escape" && !ctrl {
+                    // dismiss overlays + clear selection — modal, not a
+                    // registry command
+                    this.open_menu = None;
+                    this.open_sub = None;
+                    this.help_open = false;
+                    this.show_output_status = false;
+                    this.selection.clear();
+                    this.sel_events.clear();
+                    cx.notify();
+                    return;
+                }
+                // arrows/edit keys act on the roll only while the roll
+                // context (its handle or the root fallback) owns focus —
+                // tracks/lane/events have their own bindings
+                if !ctrl
+                    && matches!(k, "left" | "right" | "up" | "down" | "enter")
+                    && (this.roll_fh.contains_focused(w, cx) || this.focus.is_focused(w))
+                {
+                    match (shift, k) {
+                        (false, "left") => this.roll_arrow(-st, 0, cx),
+                        (false, "right") => this.roll_arrow(st, 0, cx),
+                        (true, "left") => this.roll_arrow(-1, 0, cx),
+                        (true, "right") => this.roll_arrow(1, 0, cx),
+                        (false, "up") => this.roll_arrow(0, 1, cx),
+                        (false, "down") => this.roll_arrow(0, -1, cx),
+                        (true, "up") => this.roll_arrow(0, 12, cx),
+                        (true, "down") => this.roll_arrow(0, -12, cx),
+                        (false, "enter") => this.cursor_activate(cx),
+                        _ => {}
                     }
-                    (true, false, "n") => {
-                        this.confirm_discard_or_save(PendingAction::NewFile, w, cx)
-                    }
-                    (true, false, "a") => this.select_all(cx),
-                    (true, false, "=") | (true, false, "+") => this.zoom_by(1.3, cx),
-                    (true, false, "-") => this.zoom_by(1.0 / 1.3, cx),
-                    (true, false, "0") => this.zoom_set(0.08, cx),
-                    (false, false, "escape") => {
-                        this.open_menu = None;
-                        this.open_sub = None;
-                        this.help_open = false;
-                        this.show_output_status = false;
-                        this.selection.clear();
-                        this.sel_events.clear();
-                        cx.notify();
-                    }
-                    (true, false, "x") => this.copy_selected(true, cx),
-                    (true, false, "c") => this.copy_selected(false, cx),
-                    (true, false, "v") => this.paste(cx),
-                    (true, false, "d") => this.duplicate_selected(cx),
-                    (false, false, "f1") => {
-                        this.help_open = !this.help_open;
-                        cx.notify();
-                    }
-                    (false, false, "delete") | (false, false, "backspace") => {
-                        this.delete_selected(cx)
-                    }
-                    (false, false, "1") => this.set_tool(Tool::Select, cx),
-                    (false, false, "2") => this.set_tool(Tool::Draw, cx),
-                    (false, false, "3") => this.set_tool(Tool::Erase, cx),
-                    (false, false, " ") | (false, false, "space") => this.toggle_play(cx),
-                    // arrows/edit keys act on the roll only while the roll
-                    // context (its handle or the root fallback) owns focus —
-                    // tracks/lane/events have their own bindings
-                    (false, s, "left" | "right" | "up" | "down" | "enter")
-                        if this.roll_fh.contains_focused(w, cx) || this.focus.is_focused(w) =>
-                    {
-                        match (s, k) {
-                            (false, "left") => this.roll_arrow(-st, 0, cx),
-                            (false, "right") => this.roll_arrow(st, 0, cx),
-                            (true, "left") => this.roll_arrow(-1, 0, cx),
-                            (true, "right") => this.roll_arrow(1, 0, cx),
-                            (false, "up") => this.roll_arrow(0, 1, cx),
-                            (false, "down") => this.roll_arrow(0, -1, cx),
-                            (true, "up") => this.roll_arrow(0, 12, cx),
-                            (true, "down") => this.roll_arrow(0, -12, cx),
-                            (false, "enter") => this.cursor_activate(cx),
-                            _ => {}
-                        }
-                    }
-                    _ => {}
+                    return;
+                }
+                // everything else is a registry command: the keymap (defaults
+                // + user overrides) maps the keystroke to a canonical action
+                if let Some(c) = this.keys.command_at(&cmd::describe(&ev.keystroke)) {
+                    (c.act)(this, w, cx);
                 }
             }))
             .child(menu_bar)
@@ -4306,6 +4140,7 @@ impl Render for EditorView {
             .children(menu_layer)
             .children(help_layer)
             .children(output_status)
+            .children(palette_layer)
             // drag a .mid file anywhere to open it
             .can_drop(|drag: &dyn Any, _w, _cx| drag.is::<ExternalPaths>())
             .drag_over::<ExternalPaths>(|s, _p, _w, _cx| s.bg(rgb(0x16202e)))
@@ -4527,11 +4362,10 @@ impl EditorView {
         rows
     }
 
-    /// Dropdown leaf row; hovering clears the open cascade.
     fn mi(
         id: impl Into<ElementId>,
         label: impl Into<SharedString>,
-        shortcut: &'static str,
+        shortcut: impl Into<SharedString>,
         check: Option<bool>,
         _cx: &mut Context<Self>,
         f: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
@@ -4548,11 +4382,28 @@ impl EditorView {
         })
     }
 
+    /// Menu row for a registry command — label, effective shortcut, enabled
+    /// state, and action all come from the command table (one definition).
+    fn mi_cmd(&self, id: &'static str, check: Option<bool>, _cx: &mut Context<Self>) -> MenuRow {
+        let c = cmd::find(id).expect("unknown command id");
+        let enabled = c.enabled.map(|f| f(self)).unwrap_or(true);
+        MenuRow::Leaf(LeafRow {
+            id: c.id.into(),
+            label: cmd::label(c),
+            shortcut: self.keys.shortcut_label(c.id).into(),
+            check,
+            badge_color: None,
+            detail: None,
+            enabled,
+            act: std::rc::Rc::new(move |v, w, cx| (c.act)(v, w, cx)),
+        })
+    }
+
     /// Submenu leaf row — must not clear the cascade it lives in.
     fn mi_leaf(
         id: impl Into<ElementId>,
         label: impl Into<SharedString>,
-        shortcut: &'static str,
+        shortcut: impl Into<SharedString>,
         check: Option<bool>,
         cx: &mut Context<Self>,
         f: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
