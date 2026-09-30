@@ -793,6 +793,149 @@ fn channel_event(b: &[u8]) -> Option<vst3_host::MidiEvent> {
     }
 }
 
+/// One scheduled transport update for a hosted plugin — encoded into a
+/// playback event payload by `encode_transport` and applied by
+/// `TransportSink`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TransportCmd {
+    /// beats per minute → `Plugin::set_tempo`
+    Tempo(f64),
+    /// numerator, denominator → `Plugin::set_time_signature`
+    TimeSig(i32, i32),
+}
+
+/// Wire tag for transport payloads in an event list. `0xF7` (EOX) can never
+/// appear as a channel-message status byte and SysEx chases always start
+/// `0xF0`, so transport payloads share the schedule with note/SysEx events
+/// without collisions.
+pub const TRANSPORT_TAG: u8 = 0xF7;
+
+/// How far ahead of its deadline a transport update is handed to the
+/// plugin's control queue. The host applies queued transport commands at
+/// the start of the next audio block, so the lead must comfortably cover
+/// one block — 25 ms ≈ 2 blocks at 44.1 kHz / 512 — for a change to land at
+/// a block boundary within ~one block of its document-time deadline.
+const TRANSPORT_LEAD_US: u64 = 25_000;
+
+/// Encode a transport update into an event payload.
+pub fn encode_transport(cmd: &TransportCmd) -> Vec<u8> {
+    match *cmd {
+        TransportCmd::Tempo(bpm) => {
+            let mut v = Vec::with_capacity(10);
+            v.extend_from_slice(&[TRANSPORT_TAG, 1]);
+            v.extend_from_slice(&bpm.to_be_bytes());
+            v
+        }
+        TransportCmd::TimeSig(n, d) => {
+            let mut v = Vec::with_capacity(10);
+            v.extend_from_slice(&[TRANSPORT_TAG, 2]);
+            v.extend_from_slice(&n.to_be_bytes());
+            v.extend_from_slice(&d.to_be_bytes());
+            v
+        }
+    }
+}
+
+/// Decode a transport payload. Untagged or malformed bytes return `None` —
+/// a `TransportSink` sharing the schedule must never mistake channel or
+/// SysEx traffic for a transport update.
+pub fn decode_transport(bytes: &[u8]) -> Option<TransportCmd> {
+    match bytes {
+        [TRANSPORT_TAG, 1, rest @ ..] if rest.len() == 8 => {
+            Some(TransportCmd::Tempo(f64::from_be_bytes(rest.try_into().ok()?)))
+        }
+        [TRANSPORT_TAG, 2, rest @ ..] if rest.len() == 8 => {
+            let (n, d) = rest.split_at(4);
+            Some(TransportCmd::TimeSig(
+                i32::from_be_bytes(n.try_into().ok()?),
+                i32::from_be_bytes(d.try_into().ok()?),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// The transport state in effect at `pos_us`, retimed to `pos_us`. A seek
+/// or loop wrap skips past boundary points — this is the chase that
+/// re-asserts the position's tempo and meter so the plugin hears the state
+/// it would have reached playing through, not whatever was last scheduled.
+/// `points` must be sorted by µs (the playback schedule already is).
+pub fn chase_transport(
+    points: &[(u64, TransportCmd)],
+    pos_us: u64,
+) -> Vec<(u64, TransportCmd)> {
+    let mut tempo = None;
+    let mut sig = None;
+    for (us, c) in points {
+        if *us > pos_us {
+            break;
+        }
+        match c {
+            TransportCmd::Tempo(_) => tempo = Some(c.clone()),
+            TransportCmd::TimeSig(..) => sig = Some(c.clone()),
+        }
+    }
+    [tempo, sig]
+        .into_iter()
+        .flatten()
+        .map(|c| (pos_us, c))
+        .collect()
+}
+
+/// What a decoded transport update is applied to — the plugin's control
+/// queue in production, a recorder in tests (the synthetic processor that
+/// captures the context it would receive).
+pub trait TransportTarget: Send {
+    fn apply_transport(&mut self, cmd: &TransportCmd);
+}
+
+impl TransportTarget for std::sync::Arc<std::sync::Mutex<vst3_host::Plugin>> {
+    fn apply_transport(&mut self, cmd: &TransportCmd) {
+        let mut p = self.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        match *cmd {
+            TransportCmd::Tempo(bpm) => {
+                let _ = p.set_tempo(bpm);
+            }
+            TransportCmd::TimeSig(n, d) => {
+                let _ = p.set_time_signature(n, d);
+            }
+        }
+    }
+}
+
+/// `EventSink` that turns scheduled transport payloads into plugin
+/// `ProcessContext` updates (`set_tempo`/`set_time_signature`) through the
+/// lock-free control queue — the host applies them at the start of the next
+/// audio block, on the same deadline clock as the note stream, so a
+/// tempo/meter change lands at a block boundary rather than at a ~16 ms
+/// UI-frame poll.
+///
+/// It is not a MIDI destination: `panic`/`notes_off` are no-ops, and
+/// untagged payloads are ignored by `decode_transport`.
+#[derive(Clone)]
+pub struct TransportSink<T: TransportTarget> {
+    target: T,
+}
+
+impl<T: TransportTarget> TransportSink<T> {
+    pub fn new(target: T) -> Self {
+        Self { target }
+    }
+}
+
+impl<T: TransportTarget> midi_io::EventSink for TransportSink<T> {
+    fn lead_us(&self) -> u64 {
+        TRANSPORT_LEAD_US
+    }
+    fn send_at(&mut self, bytes: &[u8], _rem_us: u64) {
+        if let Some(cmd) = decode_transport(bytes) {
+            self.target.apply_transport(&cmd);
+        }
+    }
+    fn panic(&mut self) {}
+    fn notes_off(&mut self) {}
+}
+
 /// One `IComponentHandler::restartComponent` notification, named — the
 /// audit view of `vst3_host::RestartFlags`' predicate set. Ordering is the
 /// VST3 bit order so a drain walks them deterministically.
@@ -1056,5 +1199,98 @@ mod tests {
         let take = |s: &SharedStreamState| s.lock().ok().and_then(|mut g| g.error.take());
         assert_eq!(take(&shared).as_deref(), Some("device lost"));
         assert!(take(&shared).is_none());
+    }
+
+    #[test]
+    fn transport_codec_roundtrips_and_rejects_garbage() {
+        for cmd in [
+            TransportCmd::Tempo(121.5),
+            TransportCmd::Tempo(60.0),
+            TransportCmd::TimeSig(7, 8),
+        ] {
+            assert_eq!(decode_transport(&encode_transport(&cmd)), Some(cmd));
+        }
+        // channel traffic, a stray F7 payload, short and unknown kinds
+        assert_eq!(decode_transport(&[0x90, 60, 100]), None);
+        assert_eq!(decode_transport(&[0xF7, 1, 0, 0]), None);
+        assert_eq!(decode_transport(&[TRANSPORT_TAG, 9, 0, 0, 0, 0, 0, 0, 0, 0]), None);
+    }
+
+    /// The recording "processor" behind `TransportSink`: every update the
+    /// playback schedule delivers is decoded and pushed to the target — the
+    /// context a real plugin would see applied at the next block.
+    struct RecTarget(std::sync::Arc<std::sync::Mutex<Vec<TransportCmd>>>);
+
+    impl TransportTarget for RecTarget {
+        fn apply_transport(&mut self, cmd: &TransportCmd) {
+            self.0.lock().unwrap().push(cmd.clone());
+        }
+    }
+
+    #[test]
+    fn transport_sink_forwards_only_decoded_updates() {
+        use midi_io::EventSink;
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut sink = TransportSink::new(RecTarget(log.clone()));
+        sink.send_at(&encode_transport(&TransportCmd::Tempo(140.0)), 5_000);
+        sink.send_at(&[0x90, 60, 100], 0); // a note: not transport, ignored
+        sink.send_at(&encode_transport(&TransportCmd::TimeSig(3, 4)), 0);
+        sink.notes_off(); // loop-wrap cleanup must not reach the plugin
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![TransportCmd::Tempo(140.0), TransportCmd::TimeSig(3, 4)]
+        );
+    }
+
+    #[test]
+    fn transport_lead_covers_two_blocks_at_44k() {
+        // the host applies queued transport commands at the next block
+        // start; arriving ~2 blocks early keeps the effective change within
+        // ~one block of its document-time deadline
+        let block_us = (512.0 / 44_100.0 * 1e6) as u64;
+        assert!(TRANSPORT_LEAD_US >= block_us * 2);
+    }
+
+    #[test]
+    fn chase_transport_restores_state_at_position() {
+        let pts = vec![
+            (0u64, TransportCmd::Tempo(120.0)),
+            (1_000, TransportCmd::TimeSig(3, 4)),
+            (2_000, TransportCmd::Tempo(90.0)),
+            (3_000, TransportCmd::TimeSig(6, 8)),
+        ];
+        // seek mid-map: last tempo AND last sig in effect at the position
+        assert_eq!(
+            chase_transport(&pts, 2_500),
+            vec![
+                (2_500, TransportCmd::Tempo(90.0)),
+                (2_500, TransportCmd::TimeSig(3, 4)),
+            ]
+        );
+        // nothing before the position: no updates to chase
+        assert!(chase_transport(&pts[..0], 0).is_empty());
+        // landing exactly on a boundary re-asserts the boundary's own state
+        assert_eq!(
+            chase_transport(&pts, 2_000),
+            vec![
+                (2_000, TransportCmd::Tempo(90.0)),
+                (2_000, TransportCmd::TimeSig(3, 4)),
+            ]
+        );
+    }
+
+    #[test]
+    fn offset_truncation_error_stays_below_one_sample() {
+        // offset() truncates rem*s toward zero — the documented rounding
+        // error of sample scheduling is strictly under one sample
+        let c = LatencyComp::new(0.0441); // 44.1 kHz
+        for rem in (0..100_000).step_by(997) {
+            let ideal = rem as f64 * 0.0441;
+            let got = c.offset(rem) as f64;
+            assert!(
+                (0.0..1.0).contains(&(ideal - got)),
+                "rem={rem} ideal={ideal} got={got}"
+            );
+        }
     }
 }

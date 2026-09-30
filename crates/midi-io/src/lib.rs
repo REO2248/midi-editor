@@ -401,6 +401,90 @@ mod tests {
         }
     }
 
+    /// Sink that also records `rem_us` — the value a VST3 sink converts to a
+    /// sample offset, so its schedule-vs-deadline relationship is testable.
+    struct TimingSink(Arc<Mutex<Vec<(Vec<u8>, u64)>>>, u64);
+
+    impl EventSink for TimingSink {
+        fn lead_us(&self) -> u64 {
+            self.1
+        }
+        fn send_at(&mut self, bytes: &[u8], rem_us: u64) {
+            self.0.lock().unwrap().push((bytes.to_vec(), rem_us));
+        }
+        fn panic(&mut self) {}
+        fn notes_off(&mut self) {} // stop() cleanup isn't scheduled traffic
+    }
+
+    fn wait_for(log: &Arc<Mutex<Vec<(Vec<u8>, u64)>>>, n: usize) -> Vec<(Vec<u8>, u64)> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let snap = log.lock().unwrap().clone();
+            if snap.len() >= n {
+                return snap;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "schedule delivered {} events, wanted {n}",
+                snap.len()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// A sink waking `lead_us` early sees `rem ≈ lead` at delivery — the
+    /// offset a VST3 sink schedules on the same clock the plugin's
+    /// ProcessContext advances on. Slack is generous for wall-clock jitter;
+    /// the invariant is rem lands just under/at the lead, never past it.
+    #[test]
+    fn send_at_rem_tracks_lead_within_jitter() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let lead = 20_000u64;
+        let events = vec![
+            (200_000u64, 0usize, vec![0x90, 60, 100]),
+            (300_000u64, 0usize, vec![0x80, 60, 0]),
+        ];
+        let mut pb = Playback::start(
+            vec![Box::new(TimingSink(log.clone(), lead))],
+            events,
+            0,
+            None,
+        );
+        let snap = wait_for(&log, 2);
+        pb.stop();
+        for (b, rem) in &snap {
+            assert!(
+                *rem <= lead && *rem + 10_000 >= lead,
+                "rem={rem} for {b:x?} drifted too far from lead={lead}"
+            );
+        }
+    }
+
+    /// Seeking past an event skips it and keeps the survivor's rem on the
+    /// same deadline clock — the sample position it produces is the same as
+    /// if playback had run through from zero.
+    #[test]
+    fn seek_skips_past_events_and_keeps_deadline_rem() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let lead = 10_000u64;
+        let events = vec![
+            (100_000u64, 0usize, vec![0x90, 60, 100]), // before the seek point
+            (1_000_000u64, 0usize, vec![0x90, 64, 100]),
+        ];
+        let mut pb = Playback::start(
+            vec![Box::new(TimingSink(log.clone(), lead))],
+            events,
+            900_000, // 100 ms before the second event
+            None,
+        );
+        let snap = wait_for(&log, 1);
+        pb.stop();
+        assert_eq!(snap.len(), 1, "the pre-seek event leaked: {snap:x?}");
+        assert_eq!(snap[0].0, vec![0x90, 64, 100]);
+        // same lead discipline as an unseeked event: rem ≤ lead, close to it
+        assert!(snap[0].1 <= lead && snap[0].1 + 10_000 >= lead, "rem={}", snap[0].1);
+    }
+
     #[test]
     fn loop_wrap_releases_notes_without_full_reset() {
         let log = Arc::new(Mutex::new(Vec::new()));
