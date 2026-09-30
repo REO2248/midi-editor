@@ -644,6 +644,17 @@ pub fn decode_text(data: &[u8], hint: Option<TextEncoding>) -> String {
     }
 }
 
+/// Encode a meta text payload for writing. The chosen encoding is explicit
+/// — mirroring `decode_text` — so the bytes produced are deterministic
+/// given (text, encoding).
+pub fn encode_text(s: &str, enc: TextEncoding) -> Vec<u8> {
+    match enc {
+        TextEncoding::Utf8 => s.as_bytes().to_vec(),
+        TextEncoding::ShiftJis => encoding_rs::SHIFT_JIS.encode(s).0.into_owned(),
+        TextEncoding::Latin1 => encoding_rs::WINDOWS_1252.encode(s).0.into_owned(),
+    }
+}
+
 /// Heuristic: valid UTF-8 wins (pure ASCII included); else SJIS if the byte
 /// pattern parses cleanly as SJIS (no replacement chars produced); else
 /// Latin-1.

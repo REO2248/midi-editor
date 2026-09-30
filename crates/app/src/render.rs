@@ -4,7 +4,7 @@
 //! crate root where EditorView is defined.
 
 use crate::geometry::{drag_window, tick_window, ZOOM_MAX, ZOOM_MIN};
-use crate::i18n::t;
+use crate::i18n::{t, tf};
 use crate::icons::icon;
 use crate::*;
 use gpui_kit::component::input::Input;
@@ -33,6 +33,9 @@ impl Render for EditorView {
         // the plugin editor lives in the helper subprocess's own window —
         // no native event queue to pump here
         self.refresh_derived();
+        if let Some((tr, tick, mt, id)) = self.meta_pending.take() {
+            self.open_meta_edit(tr, tick, mt, id, window, cx);
+        }
         // keep both scroll axes inside the content (resizes, zooms, edits all
         // self-heal here) and edge-scroll while a drag is parked at a border;
         // `panning` keeps animation frames flowing only while it actually moves
@@ -723,16 +726,38 @@ impl Render for EditorView {
             )
             .child({
                 let events = self.events.clone();
-                uniform_list("events", events.len(), move |range, _w, _cx| {
+                let ev_ids = self.ev_ids.clone();
+                let meta_sel = self.meta_sel;
+                let view_weak = cx.weak_entity();
+                uniform_list("events", events.len(), move |range, _w, _app| {
                     range
                         .map(|i| {
-                            div()
+                            // meta rows are clickable: selects + opens the
+                            // edit dialog — no raw-hex workflow needed
+                            let meta = ev_ids.get(i).copied().flatten();
+                            let sel =
+                                meta.is_some_and(|(tr, id, _, _)| meta_sel == Some((tr, id)));
+                            let mut row = div()
+                                .id(("ev", i))
                                 .h(px(18.0))
                                 .px_2()
                                 .text_size(px(11.0))
                                 .font_family("Cascadia Mono")
-                                .text_color(rgb(0xb8b8c8))
-                                .child(events[i].clone())
+                                .bg(if sel { rgb(0x2b3d4f) } else { rgb(0x000000) })
+                                .text_color(rgb(0xb8b8c8));
+                            if let Some((tr, id, tick, mt)) = meta {
+                                let weak = view_weak.clone();
+                                row = row.cursor_pointer().on_mouse_down(
+                                    MouseButton::Left,
+                                    move |_e, _w, app| {
+                                        let _ = weak.update_in(app, |v, w, cx| {
+                                            v.meta_sel = Some((tr, id));
+                                            v.open_meta_edit(tr, tick, mt, id, w, cx);
+                                        });
+                                    },
+                                );
+                            }
+                            row.child(events[i].clone())
                         })
                         .collect()
                 })
@@ -1184,7 +1209,8 @@ impl Render for EditorView {
                             cx.notify();
                         })),
                 )
-                // marker/lyric strip — meta 0x06/0x05 shown at their tick
+                // marker/lyric strip — meta 0x06/0x05 shown at their tick;
+                // click selects + seeks (then `e` edits, `Del` removes)
                 .child(
                     div()
                         .h(px(14.0))
@@ -1192,19 +1218,40 @@ impl Render for EditorView {
                         .relative()
                         .overflow_hidden()
                         .bg(rgb(0x17171d))
-                        .children(markers.iter().filter_map(|(tk, txt)| {
-                            let x = *tk as f32 * zoom - scroll_x;
-                            (x > -80.0).then(|| {
-                                div()
-                                    .absolute()
-                                    .left(px(x))
-                                    .top(px(0.0))
-                                    .text_size(px(9.0))
-                                    .text_color(rgb(0x9fd0ff))
-                                    .whitespace_nowrap()
-                                    .child(txt.clone())
-                            })
-                        })),
+                        .children(markers.iter().enumerate().filter_map(
+                            |(i, (tk, id, ti, txt))| {
+                                let (tk, id, ti) = (*tk, *id, *ti);
+                                let x = tk as f32 * zoom - scroll_x;
+                                let sel = self.meta_sel == Some((ti, id));
+                                (x > -80.0).then(|| {
+                                    div()
+                                        .id(("mark", i))
+                                        .absolute()
+                                        .left(px(x))
+                                        .top(px(0.0))
+                                        .text_size(px(9.0))
+                                        .text_color(if sel {
+                                            rgb(0xffffff)
+                                        } else {
+                                            rgb(0x9fd0ff)
+                                        })
+                                        .whitespace_nowrap()
+                                        .cursor_pointer()
+                                        .child(txt.clone())
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(
+                                                move |this, ev: &MouseDownEvent, _w, cx| {
+                                                    cx.stop_propagation();
+                                                    this.meta_sel = Some((ti, id));
+                                                    this.seek_to_tick(tk, false, cx);
+                                                    this.mouse_pos = Some(ev.position);
+                                                },
+                                            ),
+                                        )
+                                })
+                            },
+                        )),
                 )
                 .child(
                     div()
@@ -1665,6 +1712,7 @@ impl Render for EditorView {
                         v.delete_selected(cx);
                     })
                     .into_any_element(),
+                    Self::mi_sub("e.meta", t("edit.meta"), Sub::Meta, cx).into_any_element(),
                     Self::msep().into_any_element(),
                     Self::mi_sub("e.tool", t("edit.tool"), Sub::Tool, cx).into_any_element(),
                     Self::mi_sub("e.snap", t("edit.snap"), Sub::Snap, cx).into_any_element(),
@@ -2144,6 +2192,35 @@ impl Render for EditorView {
                             })
                             .collect()
                     }
+                    Sub::Meta => {
+                        // insert at the playhead, conductor track — editing
+                        // existing metas happens via strip/event-list clicks
+                        const METAS: [u8; 7] =
+                            [0x06, 0x05, 0x07, 0x01, 0x02, 0x04, 0x59];
+                        METAS
+                            .iter()
+                            .enumerate()
+                            .map(|(i, mt)| {
+                                let mt = *mt;
+                                Self::mi_leaf(
+                                    ("meta", i),
+                                    t(EditorView::meta_type_label(mt)),
+                                    "",
+                                    None,
+                                    cx,
+                                    move |v, _e, cx| {
+                                        let tick =
+                                            v.doc(|d| d.tempo_map.us_to_tick(v.play_us));
+                                        // no Window in menu callbacks —
+                                        // render opens + focuses next frame
+                                        v.meta_pending = Some((0, tick, mt, 0));
+                                        cx.notify();
+                                    },
+                                )
+                                .into_any_element()
+                            })
+                            .collect()
+                    }
                     Sub::Tool => {
                         let opts = [
                             ("1", Tool::Select, "tool.select"),
@@ -2375,7 +2452,7 @@ impl Render for EditorView {
 
         // shortcuts overlay (F1 / Help > Keyboard Shortcuts)
         let help_layer = self.help_open.then(|| {
-            const ROWS: [(&str, &str); 21] = [
+            const ROWS: [(&str, &str); 24] = [
                 ("Space", "Play / stop"),
                 ("F1", "This panel"),
                 ("Esc", "Close menus / clear selection"),
@@ -2397,6 +2474,9 @@ impl Render for EditorView {
                 ("Click minimap", "Jump to position"),
                 ("Ctrl+wheel", "Zoom timeline"),
                 ("Drag .mid file", "Drop to open"),
+                ("Click marker", "Select + seek to marker"),
+                ("[ / ]", "Prev / next marker"),
+                ("M / E", "Insert marker / edit selected meta"),
             ];
             let panel = div()
                 .id("help-panel")
@@ -2447,6 +2527,67 @@ impl Render for EditorView {
                     MouseButton::Left,
                     cx.listener(|v, _e, _w, cx| {
                         v.help_open = false;
+                        cx.notify();
+                    }),
+                )
+                .child(panel)
+        });
+
+        // meta edit dialog — title = type label, hint shows write encoding
+        let meta_layer = self.meta_edit.map(|me| {
+            let enc = self
+                .enc_override
+                .map(|e| e.label())
+                .unwrap_or("utf8")
+                .to_string();
+            let hint = if me.meta_type == 0x59 {
+                "e.g. -3 minor · eb major · f#m".to_string()
+            } else {
+                tf("meta.hint", &[("enc", &enc)])
+            };
+            let panel = div()
+                .id("meta-panel")
+                .flex()
+                .flex_col()
+                .w(px(420.0))
+                .py_2()
+                .px_3()
+                .gap_1()
+                .bg(rgb(0x20202c))
+                .border_1()
+                .border_color(rgb(0x3c3c4a))
+                .rounded_lg()
+                .shadow_lg()
+                .text_size(px(12.0))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_v, _e, _w, cx| cx.stop_propagation()),
+                )
+                .child(
+                    div()
+                        .text_size(px(14.0))
+                        .text_color(rgb(0x9fd0ff))
+                        .pb_2()
+                        .child(t(EditorView::meta_type_label(me.meta_type))),
+                )
+                .child(Input::new(&self.meta_input).w_full())
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(rgb(0x8a8a9a))
+                        .child(hint),
+                );
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgba(0x00000066))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|v, _e, _w, cx| {
+                        v.meta_edit = None;
                         cx.notify();
                     }),
                 )
@@ -2680,11 +2821,23 @@ impl Render for EditorView {
                 cx.notify();
             }))
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+                let k = ev.keystroke.key.as_str();
+                // meta dialog swallows keys (typing must not trigger editor
+                // keys); Enter applies, Esc cancels
+                if this.meta_edit.is_some() {
+                    match (ev.keystroke.modifiers.control, k) {
+                        (false, "escape") => {
+                            this.meta_edit = None;
+                            cx.notify();
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
                 // typing in the track-name field must not trigger editor keys
                 if this.input.read(cx).focus_handle(cx).is_focused(w) {
                     return;
                 }
-                let k = ev.keystroke.key.as_str();
                 let ctrl = ev.keystroke.modifiers.control;
                 let shift = ev.keystroke.modifiers.shift;
                 let st = {
@@ -2711,6 +2864,7 @@ impl Render for EditorView {
                         this.help_open = false;
                         this.show_output_status = false;
                         this.selection.clear();
+                        this.meta_sel = None;
                         cx.notify();
                     }
                     (true, false, "x") => this.copy_selected(true, cx),
@@ -2732,6 +2886,33 @@ impl Render for EditorView {
                     (false, false, "delete") | (false, false, "backspace") => {
                         this.delete_selected(cx)
                     }
+                    // marker workflow: [ ] navigate, click selects, m inserts,
+                    // e edits, Del deletes the selected meta
+                    (false, false, "[") => this.meta_nav(-1, cx),
+                    (false, false, "]") => this.meta_nav(1, cx),
+                    (false, false, "m") => {
+                        let tick = this.doc(|d| d.tempo_map.us_to_tick(this.play_us));
+                        this.open_meta_edit(0, tick, 0x06, 0, w, cx);
+                    }
+                    (false, false, "e") => {
+                        if let Some((tr, id)) = this.meta_sel {
+                            let m = this.doc(|d| {
+                                d.tracks.get(tr).and_then(|t| {
+                                    t.events.iter().find(|e| e.id == id).and_then(|e| {
+                                        match &e.kind {
+                                            EventKind::Meta { meta_type, .. } => {
+                                                Some((e.tick, *meta_type))
+                                            }
+                                            _ => None,
+                                        }
+                                    })
+                                })
+                            });
+                            if let Some((tick, mt)) = m {
+                                this.open_meta_edit(tr, tick, mt, id, w, cx);
+                            }
+                        }
+                    }
                     (false, false, "1") => this.set_tool(Tool::Select, cx),
                     (false, false, "2") => this.set_tool(Tool::Draw, cx),
                     (false, false, "3") => this.set_tool(Tool::Erase, cx),
@@ -2745,6 +2926,7 @@ impl Render for EditorView {
             .child(status_bar)
             .children(menu_layer)
             .children(help_layer)
+            .children(meta_layer)
             .children(output_status)
             // drag a .mid file anywhere to open it
             .can_drop(|drag: &dyn Any, _w, _cx| drag.is::<ExternalPaths>())

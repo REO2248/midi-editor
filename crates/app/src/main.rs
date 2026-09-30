@@ -82,6 +82,7 @@ enum Sub {
     LenSet,
     VelSet,
     Oct,
+    Meta,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -181,7 +182,8 @@ struct Drag {
 /// edit instead of once per frame.
 #[derive(Default)]
 struct DocUi {
-    markers: Vec<(u64, String)>,
+    /// (tick, event id, track, text) — meta 0x05/0x06 for the timeline strip
+    markers: Vec<(u64, EventId, usize, SharedString)>,
     n_diags: usize,
     track_names: Vec<String>,
     track_chs: Vec<u8>,
@@ -198,14 +200,19 @@ impl DocUi {
         let hint = enc_override.or_else(|| doc.text_encoding_hint());
         // meta 0x06/0x05 markers, from any track, at their tick
         let mut markers = Vec::new();
-        for t in &doc.tracks {
+        for (ti, t) in doc.tracks.iter().enumerate() {
             for e in &t.events {
                 if let EventKind::Meta {
                     meta_type: 0x05 | 0x06,
                     data,
                 } = &e.kind
                 {
-                    markers.push((e.tick, smf_core::decode_text(data, hint)));
+                    markers.push((
+                        e.tick,
+                        e.id,
+                        ti,
+                        smf_core::decode_text(data, hint).into(),
+                    ));
                 }
             }
         }
@@ -257,6 +264,16 @@ impl DocUi {
     }
 }
 
+/// Meta edit dialog target: `id > 0` rewrites that event's bytes (same
+/// meta_type), `id == 0` inserts a new meta at (track, tick).
+#[derive(Clone, Copy)]
+struct MetaEdit {
+    track: usize,
+    tick: u64,
+    meta_type: u8,
+    id: EventId,
+}
+
 struct EditorView {
     shared: SharedDoc,
     /// Bumped every time the whole document is swapped in (open / new file).
@@ -269,6 +286,8 @@ struct EditorView {
     notes: Arc<Vec<Note>>,
     ev_key: (u64, u64),
     events: Arc<Vec<SharedString>>,
+    /// parallel to `events`: (track, event id, tick, meta_type) for meta rows
+    ev_ids: Arc<Vec<Option<(usize, EventId, u64, u8)>>>,
     /// Document-derived UI data (markers, track names, diagnostics count…).
     /// Rebuilt only when the document key or encoding hint changes — render
     /// runs at animation-frame rate during playback and must not rescan
@@ -349,6 +368,15 @@ struct EditorView {
     show_events: bool,
     /// F1 keyboard-shortcuts overlay
     help_open: bool,
+    /// separate input for the meta editor (track-name `input` stays exclusive)
+    meta_input: Entity<InputState>,
+    /// open meta edit dialog: which event (id>0) or insert point (id=0)
+    meta_edit: Option<MetaEdit>,
+    /// (track, event id) of a clicked marker / meta event — for Del / `e` edit
+    meta_sel: Option<(usize, EventId)>,
+    /// set by menu clicks (which lack a Window) — render picks it up, opens
+    /// the dialog, and focuses the input
+    meta_pending: Option<(usize, u64, u8, EventId)>,
     /// one-bar count-in before MIDI recording starts (global pref)
     count_in: bool,
     /// recently opened files (global pref, newest first)
@@ -419,6 +447,59 @@ pub(crate) fn lock_shared(m: &Mutex<Shared>) -> std::sync::MutexGuard<'_, Shared
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Parse a key-signature spec: "-3 minor" / "2 major" / "-3" use literal
+/// sf bytes; names ("eb", "f#m", "a minor") resolve through the circle of
+/// fifths — minor shifts sf by -3 relative to the same-named major key.
+fn parse_key_sig(s: &str) -> Option<(i8, u8)> {
+    let mut rest = s.trim().to_lowercase();
+    if rest.is_empty() {
+        return None;
+    }
+    let mut mi = 0u8;
+    for suf in ["minor", "min", "m"] {
+        if let Some(r) = rest.strip_suffix(suf) {
+            rest = r.trim().to_string();
+            mi = 1;
+            break;
+        }
+    }
+    if mi == 0 {
+        for suf in ["major", "maj"] {
+            if let Some(r) = rest.strip_suffix(suf) {
+                rest = r.trim().to_string();
+                break;
+            }
+        }
+    }
+    let sf: i8 = match rest.parse() {
+        Ok(v) => v,
+        Err(_) => {
+            const NAMES: [(&str, i8); 15] = [
+                ("cb", -7),
+                ("gb", -6),
+                ("db", -5),
+                ("ab", -4),
+                ("eb", -3),
+                ("bb", -2),
+                ("f", -1),
+                ("c", 0),
+                ("g", 1),
+                ("d", 2),
+                ("a", 3),
+                ("e", 4),
+                ("b", 5),
+                ("f#", 6),
+                ("c#", 7),
+            ];
+            NAMES
+                .iter()
+                .find(|(n, _)| *n == rest)
+                .map(|(_, v)| v - 3 * mi as i8)?
+        }
+    };
+    (-7..=7).contains(&sf).then_some((sf, mi))
+}
+
 fn empty_doc() -> Document {
     let f = smf_core::File {
         format: 1,
@@ -430,7 +511,12 @@ fn empty_doc() -> Document {
 }
 
 impl EditorView {
-    fn new(path: Option<PathBuf>, input: Entity<InputState>, cx: &mut Context<Self>) -> Self {
+    fn new(
+        path: Option<PathBuf>,
+        input: Entity<InputState>,
+        meta_input: Entity<InputState>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let loaded = path.as_deref().map(load_document);
         // the warning(s) belong in the status line, not swallowed
         let (doc, status): (Document, SharedString) = match loaded {
@@ -461,6 +547,7 @@ impl EditorView {
             notes: Arc::new(vec![]),
             ev_key: (u64::MAX, u64::MAX),
             events: Arc::new(vec![]),
+            ev_ids: Arc::new(vec![]),
             doc_ui: Arc::new(DocUi::default()),
             doc_ui_key: (u64::MAX, u64::MAX),
             doc_ui_enc: None,
@@ -519,6 +606,10 @@ impl EditorView {
             rec: None,
             open_menu: None,
             help_open: false,
+            meta_input,
+            meta_edit: None,
+            meta_sel: None,
+            meta_pending: None,
             count_in: g.count_in,
             recent: g.recent.iter().map(|p| p.as_str().into()).collect(),
             midi_in: g.midi_in.clone().into(),
@@ -764,7 +855,9 @@ impl EditorView {
             self.notes_key = key;
         }
         if self.ev_key != key {
-            self.events = Arc::new(self.build_event_rows(&sh.doc));
+            let (rows, ids) = self.build_event_rows(&sh.doc);
+            self.events = Arc::new(rows);
+            self.ev_ids = Arc::new(ids);
             self.ev_key = key;
         }
         if self.doc_ui_key != key || self.doc_ui_enc != self.enc_override {
@@ -824,15 +917,25 @@ impl EditorView {
         }
     }
 
-    fn build_event_rows(&self, doc: &Document) -> Vec<SharedString> {
+    /// (row text, meta click-target) — the parallel ids let the event list
+    /// select/edit meta rows directly instead of via raw-hex surgery.
+    fn build_event_rows(
+        &self,
+        doc: &Document,
+    ) -> (
+        Vec<SharedString>,
+        Vec<Option<(usize, EventId, u64, u8)>>,
+    ) {
         let ppq = match doc.division {
             Division::Metrical(p) => (p as u64).max(1),
             Division::Smpte { .. } => 480,
         };
         let hint = self.enc_override.or(doc.text_encoding_hint());
         let mut rows = Vec::new();
+        let mut ids: Vec<Option<(usize, EventId, u64, u8)>> = Vec::new();
         for d in doc.diagnose() {
             rows.push(format!("[{}] tk{} @{}", d.code, d.track + 1, d.tick).into());
+            ids.push(None);
         }
         for (ti, tr) in doc.tracks.iter().enumerate() {
             for e in &tr.events {
@@ -878,9 +981,18 @@ impl EditorView {
                 rows.push(SharedString::from(format!(
                     "{bar:>4}.{beat}.{tk:>3}  T{ti}  {body}"
                 )));
+                ids.push(match &e.kind {
+                    // only text metas + key sig edit through the dialog
+                    EventKind::Meta { meta_type, .. }
+                        if (0x01..=0x0f).contains(meta_type) || *meta_type == 0x59 =>
+                    {
+                        Some((ti, e.id, e.tick, *meta_type))
+                    }
+                    _ => None,
+                });
             }
         }
-        rows
+        (rows, ids)
     }
 
     fn apply_tx(&mut self, label: &str, ops: Vec<Op>) {
@@ -1046,6 +1158,10 @@ impl EditorView {
     }
 
     fn delete_selected(&mut self, cx: &mut Context<Self>) {
+        if self.meta_sel.is_some() {
+            self.delete_meta(cx);
+            return;
+        }
         if self.selection.is_empty() {
             return;
         }
@@ -1067,6 +1183,141 @@ impl EditorView {
         }
         self.selection.clear();
         cx.notify();
+    }
+
+    /// Open the meta edit dialog. `id > 0` edits that event (prefilled);
+    /// `id == 0` creates a new meta at (track, tick).
+    fn open_meta_edit(
+        &mut self,
+        track: usize,
+        tick: u64,
+        meta_type: u8,
+        id: EventId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let sh = lock_shared(&self.shared);
+        let cur = if id != 0 {
+            sh.doc
+                .tracks
+                .get(track)
+                .and_then(|t| t.events.iter().find(|e| e.id == id))
+                .and_then(|e| match &e.kind {
+                    EventKind::Meta { meta_type: mt, data } if *mt == meta_type => {
+                        if meta_type == 0x59 && data.len() >= 2 {
+                            Some(format!(
+                                "{} {}",
+                                data[0] as i8,
+                                if data[1] == 1 { "minor" } else { "major" }
+                            ))
+                        } else {
+                            Some(smf_core::decode_text(data, None))
+                        }
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        drop(sh);
+        self.meta_input.update(cx, |i, cx| {
+            i.set_value(cur, window, cx);
+        });
+        self.meta_edit = Some(MetaEdit {
+            track,
+            tick,
+            meta_type,
+            id,
+        });
+        window.focus(&self.meta_input.read(cx).focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    /// Apply the dialog: encode via `enc_override` (UTF-8 default) for text
+    /// metas, parse "sf minor" / key names for key signature.
+    fn commit_meta_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(me) = self.meta_edit.take() else {
+            return;
+        };
+        let text = self.meta_input.read(cx).value().to_string();
+        let ops = {
+            let mut sh = lock_shared(&self.shared);
+            if me.meta_type == 0x59 {
+                match parse_key_sig(&text) {
+                    Some((sf, mi)) => sh.doc.set_key_sig_ops(me.tick, sf, mi),
+                    None => {
+                        self.meta_edit = Some(me);
+                        self.status = t("status.keysig_parse").into();
+                        cx.notify();
+                        return;
+                    }
+                }
+            } else {
+                sh.doc.set_meta_text_ops(
+                    me.track,
+                    me.tick,
+                    me.meta_type,
+                    me.id,
+                    &text,
+                    self.enc_override,
+                )
+            }
+        };
+        if ops.is_empty() {
+            self.status = t("status.meta_none").into();
+        } else {
+            self.apply_tx("meta", ops);
+        }
+        cx.notify();
+    }
+
+    /// `[` / `]` — jump the playhead to the previous/next marker or lyric
+    /// and select it (so `e` edits, `Del` removes).
+    fn meta_nav(&mut self, dir: i32, cx: &mut Context<Self>) {
+        let cur = self.doc(|d| d.tempo_map.us_to_tick(self.play_us));
+        let marks = self.doc_ui.markers.clone();
+        let next = if dir > 0 {
+            marks.iter().find(|m| m.0 > cur)
+        } else {
+            marks.iter().rev().find(|m| m.0 < cur)
+        };
+        if let Some(&(tick, id, track, ref _t)) = next {
+            self.meta_sel = Some((track, id));
+            self.seek_to_tick(tick, false, cx);
+        }
+    }
+
+    /// Delete the marker/meta selected via strip click or `[`/`]` nav.
+    fn delete_meta(&mut self, cx: &mut Context<Self>) {
+        let Some((track, id)) = self.meta_sel else {
+            return;
+        };
+        let ops = {
+            let mut sh = lock_shared(&self.shared);
+            sh.doc.remove_meta_ops(track, id)
+        };
+        if ops.is_empty() {
+            self.status = t("status.meta_none").into();
+        } else {
+            self.apply_tx("delete meta", ops);
+            self.meta_sel = None;
+        }
+        cx.notify();
+    }
+
+    /// Meta type label for the dialog title + menu.
+    fn meta_type_label(meta_type: u8) -> &'static str {
+        match meta_type {
+            0x01 => "meta.text",
+            0x02 => "meta.copyright",
+            0x04 => "meta.instrument",
+            0x05 => "meta.lyric",
+            0x06 => "meta.marker",
+            0x07 => "meta.cue",
+            0x59 => "meta.keysig",
+            _ => "meta.text",
+        }
     }
 
     /// Copy the selection into the note clipboard (`cut` also deletes it).
@@ -2747,8 +2998,24 @@ fn main() {
             cx.open_window(WindowOptions::default(), move |window, cx| {
                 let input =
                     cx.new(|cx| InputState::new(window, cx).placeholder(t("field.track_name")));
+                let meta_input = cx.new(|cx| {
+                    InputState::new(window, cx).placeholder(t("field.meta_value"))
+                });
                 let view = cx.new(|cx| {
-                    let v = EditorView::new(path.clone(), input, cx);
+                    let v = EditorView::new(path.clone(), input, meta_input.clone(), cx);
+                    // Enter inside the meta dialog applies it.
+                    cx.subscribe(
+                        &meta_input,
+                        |this, _e, ev: &gpui_kit::component::input::InputEvent, cx| {
+                            if matches!(
+                                ev,
+                                gpui_kit::component::input::InputEvent::PressEnter { .. }
+                            ) {
+                                this.commit_meta_edit(cx);
+                            }
+                        },
+                    )
+                    .detach();
                     spawn_mcp(v.shared.clone());
                     spawn_doc_watch(cx, v.shared.clone());
                     window.focus(&v.focus.clone(), cx);

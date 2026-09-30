@@ -599,6 +599,45 @@ fn tool_defs() -> Vec<(&'static str, Tool)> {
             ),
         ),
         (
+            "set_meta",
+            tool(
+                "set_meta",
+                "Create/update a text meta (0x01-0x0F: text, copyright, track/instrument name, lyric, marker, cue). Args: track? (0), tick, meta_type (1-15), text, id? (event id to overwrite), enc? (utf8|sjis|latin1, default utf8). Optional base_revision.",
+                object_schema(serde_json::json!({
+                    "track": {"type": "integer"},
+                    "tick": {"type": "integer"},
+                    "meta_type": {"type": "integer"},
+                    "text": {"type": "string"},
+                    "id": {"type": "integer"},
+                    "enc": {"type": "string"},
+                    "base_revision": {"type": "integer"},
+                })),
+            ),
+        ),
+        (
+            "remove_meta",
+            tool(
+                "remove_meta",
+                "Delete one meta event by id. Args: track, id. Optional base_revision.",
+                object_schema(serde_json::json!({
+                    "track": {"type": "integer"}, "id": {"type": "integer"},
+                    "base_revision": {"type": "integer"},
+                })),
+            ),
+        ),
+        (
+            "set_key_signature",
+            tool(
+                "set_key_signature",
+                "Set the song key signature (FF59). Args: sf (-7..7, negative = flats), mi (0 major / 1 minor), tick? (0). Optional base_revision.",
+                object_schema(serde_json::json!({
+                    "sf": {"type": "integer"}, "mi": {"type": "integer"},
+                    "tick": {"type": "integer"},
+                    "base_revision": {"type": "integer"},
+                })),
+            ),
+        ),
+        (
             "get_cc",
             tool(
                 "get_cc",
@@ -1312,6 +1351,55 @@ fn dispatch(
             );
             apply_ops(&mut sh, "set time signature", ops)
         }
+        "set_meta" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let track = match req_track(&sh, args) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
+            let meta_type = args["meta_type"].as_u64().unwrap_or(0x06) as u8;
+            if !(0x01..=0x0f).contains(&meta_type) {
+                return err_json("meta_type must be a text type (0x01-0x0F)");
+            }
+            let enc = match args["enc"].as_str().unwrap_or("utf8") {
+                "sjis" | "shiftjis" | "shift_jis" => smf_core::TextEncoding::ShiftJis,
+                "latin1" | "latin-1" => smf_core::TextEncoding::Latin1,
+                _ => smf_core::TextEncoding::Utf8,
+            };
+            let ops = sh.doc.set_meta_text_ops(
+                track,
+                args["tick"].as_u64().unwrap_or(0),
+                meta_type,
+                args["id"].as_u64().unwrap_or(0),
+                args["text"].as_str().unwrap_or(""),
+                Some(enc),
+            );
+            apply_ops(&mut sh, "set meta", ops)
+        }
+        "remove_meta" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let track = match req_track(&sh, args) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
+            let ops = sh.doc.remove_meta_ops(track, args["id"].as_u64().unwrap_or(0));
+            apply_ops(&mut sh, "remove meta", ops)
+        }
+        "set_key_signature" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let ops = sh.doc.set_key_sig_ops(
+                args["tick"].as_u64().unwrap_or(0),
+                args["sf"].as_i64().unwrap_or(0).clamp(-7, 7) as i8,
+                args["mi"].as_u64().unwrap_or(0).min(1) as u8,
+            );
+            apply_ops(&mut sh, "set key signature", ops)
+        }
         "set_track_channel" => {
             if let Some(r) = check_base(&sh, args) {
                 return r;
@@ -1755,5 +1843,52 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty());
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn meta_tools_create_update_remove() {
+        let sh = shared();
+        // create a marker on track 0 at tick 120
+        let (e, r) = call(
+            &sh,
+            "set_meta",
+            json!({"track": 0, "tick": 120, "meta_type": 6, "text": "Verse"}),
+        );
+        assert!(!e, "{r}");
+        let (_, m) = call(&sh, "get_meta", json!({"track": 0, "meta_type": 6}));
+        assert_eq!(m["count"], 1);
+        let id = m["meta"][0]["id"].as_u64().unwrap();
+        assert_eq!(m["meta"][0]["text"], "Verse");
+        // update by id — same event, new text
+        let (e, r) = call(
+            &sh,
+            "set_meta",
+            json!({"track": 0, "tick": 120, "meta_type": 6, "text": "Chorus", "id": id}),
+        );
+        assert!(!e, "{r}");
+        let (_, m) = call(&sh, "get_meta", json!({"track": 0, "meta_type": 6}));
+        assert_eq!(m["meta"][0]["text"], "Chorus");
+        // sjis bytes stay sjis on write (enc is explicit)
+        let (e, _) = call(
+            &sh,
+            "set_meta",
+            json!({"track": 0, "tick": 240, "meta_type": 5, "text": "歌", "enc": "sjis"}),
+        );
+        assert!(!e);
+        let (_, m) = call(&sh, "get_meta", json!({"track": 0, "meta_type": 5}));
+        assert_eq!(m["meta"][0]["text"], "歌");
+        // key signature: insert once then update in place
+        call(&sh, "set_key_signature", json!({"sf": -3, "mi": 1}));
+        call(&sh, "set_key_signature", json!({"sf": 2, "mi": 0}));
+        let (_, m) = call(&sh, "get_meta", json!({"track": 0, "meta_type": 89}));
+        assert_eq!(m["count"], 1);
+        // non-text types are rejected from set_meta
+        let (e, _) = call(&sh, "set_meta", json!({"track": 0, "tick": 0, "meta_type": 0x59, "text": "x"}));
+        assert!(e);
+        // remove only the named event
+        let (e, _) = call(&sh, "remove_meta", json!({"track": 0, "id": id}));
+        assert!(!e);
+        let (_, m) = call(&sh, "get_meta", json!({"track": 0, "meta_type": 6}));
+        assert_eq!(m["count"], 0);
     }
 }

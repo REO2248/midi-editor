@@ -1627,6 +1627,109 @@ impl Document {
             }],
         }]
     }
+
+    /// Create or overwrite a text-family meta (FF 01–0F: text, copyright,
+    /// track name, instrument, lyric, marker, cue, …). With `id` naming an
+    /// existing event of that type only its payload is rewritten — metas
+    /// stay byte-preserved unless explicitly edited. Otherwise a new event
+    /// is inserted at `tick`. `enc` is the requested write encoding
+    /// (`None` = UTF-8); the editor's encoding override is passed through
+    /// by callers, never guessed.
+    pub fn set_meta_text_ops(
+        &mut self,
+        track: usize,
+        tick: u64,
+        meta_type: u8,
+        id: EventId,
+        text: &str,
+        enc: Option<smf_core::TextEncoding>,
+    ) -> Vec<Op> {
+        let enc = enc.unwrap_or(smf_core::TextEncoding::Utf8);
+        let data = Bytes::copy_from_slice(&smf_core::encode_text(text, enc));
+        let existing = self.tracks.get(track).and_then(|t| {
+            t.events.iter().find(|e| {
+                e.id == id
+                    && matches!(e.kind, EventKind::Meta { meta_type: m, .. } if m == meta_type)
+            })
+        }).cloned();
+        if let Some(e) = existing {
+            let mut after = e.clone();
+            after.kind = EventKind::Meta { meta_type, data };
+            return vec![Op::UpdateEvent {
+                track,
+                before: e,
+                after,
+            }];
+        }
+        vec![Op::InsertEvents {
+            track,
+            events: vec![Event {
+                id: self.alloc_event_id(),
+                tick,
+                seq: self.next_seq(track, tick),
+                raw_body: None,
+                kind: EventKind::Meta { meta_type, data },
+            }],
+        }]
+    }
+
+    /// Delete a single meta event by id — exact removal of one row, nothing
+    /// else is touched.
+    pub fn remove_meta_ops(&mut self, track: usize, id: EventId) -> Vec<Op> {
+        let Some((idx, e)) = self.tracks.get(track).and_then(|t| {
+            t.events
+                .iter()
+                .enumerate()
+                .find(|(_, e)| e.id == id && matches!(e.kind, EventKind::Meta { .. }))
+                .map(|(i, e)| (i, e.clone()))
+        }) else {
+            return vec![];
+        };
+        vec![Op::RemoveEvents {
+            track,
+            removed: vec![(idx, e)],
+        }]
+    }
+
+    /// Set the song's key signature (FF 59 `sf`/`mi`, track 0 like tempo):
+    /// update the first existing key sig in place, else insert at `tick`.
+    pub fn set_key_sig_ops(&mut self, tick: u64, sf: i8, mi: u8) -> Vec<Op> {
+        let data = Bytes::copy_from_slice(&[sf as u8, mi.min(1)]);
+        if let Some(e) = self
+            .tracks
+            .first()
+            .and_then(|t| {
+                t.events.iter().find(|e| {
+                    matches!(e.kind, EventKind::Meta { meta_type: 0x59, .. })
+                })
+            })
+            .cloned()
+        {
+            let mut after = e.clone();
+            after.kind = EventKind::Meta {
+                meta_type: 0x59,
+                data,
+            };
+            return vec![Op::UpdateEvent {
+                track: 0,
+                before: e,
+                after,
+            }];
+        }
+        vec![Op::InsertEvents {
+            track: 0,
+            events: vec![Event {
+                id: self.alloc_event_id(),
+                tick,
+                seq: self.next_seq(0, tick),
+                raw_body: None,
+                kind: EventKind::Meta {
+                    meta_type: 0x59,
+                    data,
+                },
+            }],
+        }]
+    }
 }
 #[derive(Debug, Default)]
 pub struct TempoMap {
@@ -1751,6 +1854,70 @@ mod tests {
             warnings: vec![],
         };
         Document::from_file(f)
+    }
+
+    #[test]
+    fn meta_text_ops_create_update_remove() {
+        let mut d = doc_with_note();
+        let apply = |d: &mut Document, ops: Vec<Op>| {
+            let base = d.revision();
+            d.apply(Transaction {
+                label: "t".into(),
+                base,
+                ops,
+            })
+            .unwrap();
+        };
+        // create a marker at tick 240 — UTF-8 by default
+        let ops = d.set_meta_text_ops(0, 240, 0x06, 0, "Verse", None);
+        apply(&mut d, ops);
+        let id = d.tracks[0]
+            .events
+            .iter()
+            .find(|e| matches!(e.kind, EventKind::Meta { meta_type: 0x06, .. }))
+            .unwrap()
+            .id;
+        // update by id — tick stays, only the payload is rewritten
+        let ops = d.set_meta_text_ops(0, 240, 0x06, id, "Chorus", None);
+        apply(&mut d, ops);
+        let e = d.tracks[0]
+            .events
+            .iter()
+            .find(|e| e.id == id)
+            .unwrap();
+        assert_eq!(e.tick, 240);
+        assert!(matches!(&e.kind, EventKind::Meta { meta_type: 0x06, data } if data.as_ref() == b"Chorus"));
+        // explicit non-UTF-8 write encodes bytes, never mutates siblings
+        let ops =
+            d.set_meta_text_ops(0, 480, 0x05, 0, "héllo", Some(smf_core::TextEncoding::Latin1));
+        apply(&mut d, ops);
+        let ly = d.tracks[0]
+            .events
+            .iter()
+            .find(|e| matches!(e.kind, EventKind::Meta { meta_type: 0x05, .. }))
+            .unwrap();
+        assert!(matches!(&ly.kind, EventKind::Meta { data, .. } if data.as_ref() == b"h\xE9llo"));
+        // sjis encodes multibyte; utf8 round-trips through decode_text
+        let sj = smf_core::encode_text("歌詞", smf_core::TextEncoding::ShiftJis);
+        assert_eq!(smf_core::decode_text(&sj, Some(smf_core::TextEncoding::ShiftJis)), "歌詞");
+        // remove only the named event
+        let n = d.tracks[0].events.len();
+        let ops = d.remove_meta_ops(0, id);
+        apply(&mut d, ops);
+        assert_eq!(d.tracks[0].events.len(), n - 1);
+        assert!(d.tracks[0].events.iter().all(|e| e.id != id));
+        // key sig: insert then update-in-place
+        let ops = d.set_key_sig_ops(0, -3, 1);
+        apply(&mut d, ops);
+        let ops = d.set_key_sig_ops(0, 2, 0);
+        apply(&mut d, ops);
+        let ks: Vec<_> = d.tracks[0]
+            .events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::Meta { meta_type: 0x59, .. }))
+            .collect();
+        assert_eq!(ks.len(), 1);
+        assert!(matches!(&ks[0].kind, EventKind::Meta { data, .. } if data.as_ref() == &[2u8, 0]));
     }
 
     #[test]
