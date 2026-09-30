@@ -87,6 +87,12 @@ impl Render for EditorView {
         if let Some((tr, tick, mt, id)) = self.meta_pending.take() {
             self.open_meta_edit(tr, tick, mt, id, window, cx);
         }
+        // a closed meta dialog must hand keyboard focus back to the editor
+        // (Enter has no Window in the input subscription, so it's deferred)
+        if self.meta_refocus {
+            self.meta_refocus = false;
+            window.focus(&self.focus.clone(), cx);
+        }
         // keep both scroll axes inside the content (resizes, zooms, edits all
         // self-heal here) and edge-scroll while a drag is parked at a border;
         // `panning` keeps animation frames flowing only while it actually moves
@@ -1164,6 +1170,7 @@ impl Render for EditorView {
                                                     i,
                                                     ev.modifiers.control,
                                                     ev.modifiers.shift,
+                                                    ev.click_count == 2,
                                                     cx,
                                                 );
                                                 w.focus(&this.events_fh, cx);
@@ -3348,8 +3355,9 @@ impl Render for EditorView {
                 .bg(rgba(0x00000066))
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|v, _e, _w, cx| {
+                    cx.listener(|v, _e, w, cx| {
                         v.meta_edit = None;
+                        w.focus(&v.focus.clone(), cx);
                         cx.notify();
                     }),
                 )

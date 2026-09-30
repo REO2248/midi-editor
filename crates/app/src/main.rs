@@ -808,6 +808,10 @@ struct EditorView {
     /// set by menu clicks (which lack a Window) — render picks it up, opens
     /// the dialog, and focuses the input
     meta_pending: Option<(usize, u64, u8, EventId)>,
+    /// set when the meta dialog closes from a path that lacks a Window
+    /// (Enter in the input subscription) — render refocuses the editor so
+    /// editor keys (Del, arrows) keep working after commit
+    meta_refocus: bool,
     /// one-bar count-in before MIDI recording starts (global pref)
     count_in: bool,
     /// recently opened files (global pref, newest first)
@@ -1347,6 +1351,7 @@ impl EditorView {
             meta_edit: None,
             meta_sel: None,
             meta_pending: None,
+            meta_refocus: false,
             count_in: g.count_in,
             recent: g.recent.iter().map(|p| p.as_str().into()).collect(),
             midi_in: g.midi_in.clone().into(),
@@ -2546,7 +2551,14 @@ impl EditorView {
     /// Click on an event-list row: plain = single-select + inspect, ctrl =
     /// toggle, shift = range from the last anchor. Diagnostic rows (no ref)
     /// just clear the inspector selection.
-    fn ev_row_click(&mut self, row: usize, ctrl: bool, shift: bool, cx: &mut Context<Self>) {
+    fn ev_row_click(
+        &mut self,
+        row: usize,
+        ctrl: bool,
+        shift: bool,
+        double: bool,
+        cx: &mut Context<Self>,
+    ) {
         self.ev_sel = row;
         let Some(&Some((_, _, id))) = self.event_refs.get(row) else {
             self.sel_events.clear();
@@ -2588,6 +2600,26 @@ impl EditorView {
                 })
             })
             .map(|(tr, _, id)| (tr, id));
+        // double-clicking a meta row opens the edit dialog (deferred to
+        // render — this path has no Window)
+        if double {
+            if let Some((tr, id)) = self.meta_sel {
+                let m = self.doc(|d| {
+                    d.tracks.get(tr).and_then(|t| {
+                        t.events
+                            .iter()
+                            .find(|e| e.id == id)
+                            .and_then(|e| match &e.kind {
+                                EventKind::Meta { meta_type, .. } => Some((e.tick, *meta_type)),
+                                _ => None,
+                            })
+                    })
+                });
+                if let Some((tick, mt)) = m {
+                    self.meta_pending = Some((tr, tick, mt, id));
+                }
+            }
+        }
         cx.notify();
     }
 
@@ -3209,6 +3241,7 @@ impl EditorView {
         } else {
             self.apply_tx("meta", ops);
         }
+        self.meta_refocus = true;
         cx.notify();
     }
 
