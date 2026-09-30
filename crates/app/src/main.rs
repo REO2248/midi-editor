@@ -82,6 +82,8 @@ enum Sub {
     LenSet,
     VelSet,
     Oct,
+    /// Edit → swing amount presets
+    Swing,
 }
 
 #[derive(Clone, Copy, PartialEq)]

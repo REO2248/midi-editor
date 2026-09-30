@@ -1073,6 +1073,7 @@ impl Document {
         to: u64,
         timing: i64,
         vel: i32,
+        seed: u64,
     ) -> Vec<Op> {
         let mut ops = Vec::new();
         for n in self
@@ -1080,9 +1081,12 @@ impl Document {
             .into_iter()
             .filter(|n| n.track == track && n.start_tick >= from && n.start_tick < to)
         {
-            let mut r = n.on_id
+            // deterministic per (note, seed): same seed and settings always
+            // produce the same deltas
+            let mut r = n
+                .on_id
                 .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                .wrapping_add(0xA076_1D64_78BD_642F);
+                .wrapping_add(seed ^ 0xA076_1D64_78BD_642F);
             let mut next = || {
                 r ^= r << 13;
                 r ^= r >> 7;
@@ -1112,6 +1116,55 @@ impl Document {
                             data[1] = (data[1] as i32 + dv).clamp(1, 127) as u8;
                         }
                     }
+                    ops.push(Op::UpdateEvent {
+                        track: ti,
+                        before,
+                        after,
+                    });
+                }
+            }
+        }
+        ops
+    }
+
+    /// Swing: notes whose start snaps to an odd `grid` index are pushed
+    /// later by `amount`% of one grid cell (0..=100). On and off move
+    /// together so durations hold; notes more than a grid cell from the
+    /// swung line, or already swung, are left alone.
+    pub fn swing_ops(
+        &mut self,
+        track: usize,
+        from: u64,
+        to: u64,
+        grid: u64,
+        amount: u32,
+    ) -> Vec<Op> {
+        let grid = grid.max(1) as i64;
+        let shift = (grid * amount.min(100) as i64 / 100).min(grid - 1);
+        if shift == 0 {
+            return Vec::new();
+        }
+        let mut ops = Vec::new();
+        for n in self
+            .notes()
+            .into_iter()
+            .filter(|n| n.track == track && n.start_tick >= from && n.start_tick < to)
+        {
+            let start = n.start_tick as i64;
+            let idx = start / grid;
+            if idx % 2 == 0 {
+                continue;
+            }
+            let swung = idx * grid + shift;
+            let delta = swung - start;
+            if delta == 0 || delta.abs() > grid {
+                continue;
+            }
+            for id in [Some(n.on_id), n.off_id].into_iter().flatten() {
+                if let Some((ti, ei)) = self.by_id.get(&id).copied() {
+                    let before = self.tracks[ti].events[ei].clone();
+                    let mut after = before.clone();
+                    after.tick = after.tick.saturating_add_signed(delta);
                     ops.push(Op::UpdateEvent {
                         track: ti,
                         before,
