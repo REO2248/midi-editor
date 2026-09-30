@@ -142,3 +142,29 @@ jobs:
         with:
           name: bench-results
           path: target/bench/results.json
+  package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Build release workspace
+        run: cargo build --release --workspace --locked
+      # Assembles dist/ (midi-editor.exe + vst3-host helper/probe + icons +
+      # licenses), validates expected files + x64 PE architecture, and runs
+      # the packaged binary's --smoke mode. Fails the job on any gap.
+      - name: Assemble and validate dist
+        run: ./scripts/package_dist.ps1 -SkipBuild
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dist
+          path: dist/
