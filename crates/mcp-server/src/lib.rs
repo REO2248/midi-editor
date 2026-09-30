@@ -60,6 +60,9 @@ pub struct Shared {
     /// opt-in: also chase the last complete SysEx message on play/loop wrap
     /// (a chased GM/GS/XG reset can wipe the channel-state chase)
     pub chase_sysex: bool,
+    /// how long SysEx dumps leave a MIDI port sink during playback
+    /// (serialize / background lane / skip) — `midi_io::SysexPolicy`
+    pub sysex_policy: midi_io::SysexPolicy,
     /// drained by the GUI watcher
     pub transport_req: Vec<TransportReq>,
 }
@@ -82,6 +85,7 @@ impl Shared {
             metronome: false,
             loop_enabled: false,
             chase_sysex: false,
+            sysex_policy: midi_io::SysexPolicy::Serialize,
             transport_req: Vec::new(),
         }
     }

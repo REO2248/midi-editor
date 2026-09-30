@@ -341,6 +341,9 @@ struct EditorView {
     lane_mode: LaneMode,
     /// live MIDI input capture while `rec` is armed
     rec: Option<Rec>,
+    /// per-sink SysEx counters for the current/last playback pass — read at
+    /// stop to surface a deferred/dropped/worst-send diagnostic
+    sysex_stats: Vec<std::sync::Arc<midi_io::SysexStats>>,
     /// open menubar dropdown + the x-coordinate it was opened at
     open_menu: Option<(TopMenu, f32)>,
     /// open cascading submenu + the y of its parent item
@@ -517,6 +520,7 @@ impl EditorView {
             loop_start_us: 0,
             lane_mode: LaneMode::Velocity,
             rec: None,
+            sysex_stats: Vec::new(),
             open_menu: None,
             help_open: false,
             count_in: g.count_in,
@@ -1840,7 +1844,7 @@ impl EditorView {
 
     fn start_playback(&mut self) {
         // snapshot routing state so no lock is held while opening sinks
-        let (dests, dest_of_track, muted, soloed, metronome, loop_enabled, chase_sysex) = {
+        let (dests, dest_of_track, muted, soloed, metronome, loop_enabled, chase_sysex, sxp) = {
             let sh = lock_shared(&self.shared);
             let map: HashMap<usize, usize> = (0..sh.doc.tracks.len())
                 .map(|t| (t, sh.dest_of(t)))
@@ -1853,8 +1857,14 @@ impl EditorView {
                 sh.metronome,
                 sh.loop_enabled,
                 sh.chase_sysex,
+                sh.sysex_policy,
             )
         };
+        let sxp_cfg = midi_io::SysexConfig {
+            policy: sxp,
+            ..Default::default()
+        };
+        self.sysex_stats.clear();
         let dest_of = |t: usize| dest_of_track.get(&t).copied().unwrap_or(0);
         if dests.is_empty() {
             self.status = t("status.no_port").into();
@@ -1888,8 +1898,10 @@ impl EditorView {
                 output::Destination::MidiPort { port_name } => {
                     match midi_io::Output::open_named(port_name) {
                         Ok(out) => {
+                            let sink = PortSink::with_config(out, sxp_cfg);
+                            self.sysex_stats.push(sink.stats());
                             sink_of.insert(d, sinks.len());
-                            sinks.push(Box::new(PortSink::new(out)));
+                            sinks.push(Box::new(sink));
                         }
                         Err(e) => self.status = format!("{e}").into(),
                     }
@@ -2000,6 +2012,29 @@ impl EditorView {
         if let Some(mut p) = self.playback.take() {
             self.play_us = p.position_us();
             p.stop();
+        }
+        // surface the long-message diagnostic for the pass that just ended:
+        // a dump that was deferred or dropped is silent unless reported
+        let (mut inl, mut def, mut drop_n, mut worst) = (0u64, 0u64, 0u64, 0u64);
+        for s in self.sysex_stats.drain(..) {
+            let (i, d, x, _l, m) = s.snapshot();
+            inl += i;
+            def += d;
+            drop_n += x;
+            worst = worst.max(m);
+        }
+        if drop_n > 0 || def > 0 {
+            let (i, d, x, ms) = (
+                inl.to_string(),
+                def.to_string(),
+                drop_n.to_string(),
+                (worst / 1000).to_string(),
+            );
+            self.status = tf(
+                "status.sysex_diag",
+                &[("i", &i), ("d", &d), ("x", &x), ("ms", &ms)],
+            )
+            .into();
         }
         // silence every warm instance but keep it loaded — the next Play
         // (and parameter edits made meanwhile) start instantly
@@ -2545,6 +2580,8 @@ struct Prefs {
     loop_enabled: bool,
     /// None in old sidecars = keep the default (off)
     chase_sysex: Option<bool>,
+    /// None in old sidecars = keep the default (`SysexPolicy::Serialize`)
+    sysex_policy: Option<String>,
     zoom: Option<f32>,
     scroll_x: Option<f32>,
     scroll_y: Option<f32>,
@@ -2609,6 +2646,9 @@ impl EditorView {
             sh.loop_enabled = p.loop_enabled;
             if let Some(c) = p.chase_sysex {
                 sh.chase_sysex = c;
+            }
+            if let Some(sp) = p.sysex_policy.as_deref().and_then(midi_io::SysexPolicy::from_label) {
+                sh.sysex_policy = sp;
             }
         }
         // a hand-edited or corrupted sidecar must not blank the roll: a NaN
@@ -2695,6 +2735,7 @@ impl EditorView {
             metronome: sh.metronome,
             loop_enabled: sh.loop_enabled,
             chase_sysex: Some(sh.chase_sysex),
+            sysex_policy: Some(sh.sysex_policy.label().to_string()),
             zoom: Some(self.zoom),
             scroll_x: Some(self.scroll_x),
             scroll_y: Some(self.scroll_y),

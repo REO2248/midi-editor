@@ -4,7 +4,7 @@
 //! crate root where EditorView is defined.
 
 use crate::geometry::{drag_window, tick_window, ZOOM_MAX, ZOOM_MIN};
-use crate::i18n::t;
+use crate::i18n::{t, tf};
 use crate::icons::icon;
 use crate::*;
 use gpui_kit::component::input::Input;
@@ -58,6 +58,7 @@ impl Render for EditorView {
             loop_en,
             met_en,
             chsy_en,
+            sxp,
             muted_set,
             soloed_set,
             has_track_dest,
@@ -76,6 +77,7 @@ impl Render for EditorView {
                 sh.loop_enabled,
                 sh.metronome,
                 sh.chase_sysex,
+                sh.sysex_policy,
                 sh.muted.clone(),
                 sh.soloed.clone(),
                 sh.track_dest.contains_key(&self.sel_track),
@@ -1961,6 +1963,28 @@ impl Render for EditorView {
                             {
                                 let mut sh = crate::lock_shared(&v.shared);
                                 sh.chase_sysex = !sh.chase_sysex;
+                            }
+                            v.persist();
+                        },
+                    )
+                    .into_any_element(),
+                    Self::mi(
+                        "tr.sxp",
+                        tf(
+                            "transport.sysex_pol",
+                            &[("mode", t(match sxp {
+                                midi_io::SysexPolicy::Serialize => "transport.sysex_ser",
+                                midi_io::SysexPolicy::Background => "transport.sysex_bg",
+                                midi_io::SysexPolicy::Skip => "transport.sysex_skip",
+                            }))],
+                        ),
+                        "",
+                        None,
+                        cx,
+                        |v, _e, _cx| {
+                            {
+                                let mut sh = crate::lock_shared(&v.shared);
+                                sh.sysex_policy = sh.sysex_policy.cycle();
                             }
                             v.persist();
                         },
