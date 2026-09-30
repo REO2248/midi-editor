@@ -176,6 +176,10 @@ pub struct Shared {
     /// how long SysEx dumps leave a MIDI port sink during playback
     /// (serialize / background lane / skip) — `midi_io::SysexPolicy`
     pub sysex_policy: midi_io::SysexPolicy,
+    /// (port_name, ord) pairs the last MIDI output enumeration reported —
+    /// refreshed by the GUI watcher; a MidiPort dest absent from this set is
+    /// currently offline but keeps its identity and assignment
+    pub port_present: std::collections::HashSet<(String, usize)>,
     /// drained by the GUI watcher
     pub transport_req: Vec<TransportReq>,
     /// effective security posture of the MCP transport serving this doc
@@ -309,6 +313,7 @@ impl Shared {
             chase_sysex: false,
             gui_attached: false,
             sysex_policy: midi_io::SysexPolicy::Serialize,
+            port_present: std::collections::HashSet::new(),
             transport_req: Vec::new(),
             mcp_security: SecurityReport::stdio(),
             batch: None,
@@ -2269,7 +2274,7 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
             let ins = midi_io::list_inputs()
                 .unwrap_or_default()
                 .iter()
-                .map(|p| serde_json::json!({"index": p.index, "name": p.name}))
+                .map(|p| serde_json::json!({"index": p.index, "name": p.name, "ord": p.ord}))
                 .collect::<Vec<_>>();
             ok_json(serde_json::json!({"outputs": outs, "inputs": ins}))
         }
@@ -2289,6 +2294,7 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
                 let dest = if let Some(p) = d["midi_port"].as_str() {
                     Destination::MidiPort {
                         port_name: p.to_string(),
+                        ord: d["ord"].as_u64().unwrap_or(0) as usize,
                     }
                 } else if let Some(p) = d["vst3"].as_str() {
                     Destination::Plugin {
@@ -2695,7 +2701,14 @@ fn apply_reply(outcome: StageOutcome, mut v: serde_json::Value) -> CallToolRespo
 
 fn dest_label(d: &Destination) -> String {
     match d {
-        Destination::MidiPort { port_name } => port_name.clone(),
+        Destination::MidiPort { port_name, ord } => {
+            // same-name sibling devices get a visible discriminator
+            if *ord == 0 {
+                port_name.clone()
+            } else {
+                format!("{port_name} #{}", ord + 1)
+            }
+        }
         Destination::Plugin { plugin_path } => {
             format!("{} [VST3]", plugin_path)
         }
@@ -2704,8 +2717,8 @@ fn dest_label(d: &Destination) -> String {
 
 fn dest_json(d: &Destination) -> serde_json::Value {
     match d {
-        Destination::MidiPort { port_name } => {
-            serde_json::json!({"kind": "midi_port", "port_name": port_name})
+        Destination::MidiPort { port_name, ord } => {
+            serde_json::json!({"kind": "midi_port", "port_name": port_name, "ord": ord})
         }
         Destination::Plugin { plugin_path } => {
             serde_json::json!({"kind": "vst3", "plugin_path": plugin_path})
@@ -2719,6 +2732,14 @@ fn dests_json(sh: &Shared) -> serde_json::Value {
             let mut j = dest_json(d);
             j["index"] = i.into();
             j["label"] = label.clone().into();
+            // offline destinations stay listed so assignments survive a
+            // temporary unplug — `available` marks what is live now
+            j["available"] = match d {
+                Destination::MidiPort { port_name, ord } => {
+                    sh.port_present.contains(&(port_name.clone(), *ord)).into()
+                }
+                Destination::Plugin { .. } => true.into(),
+            };
             j
         }).collect::<Vec<_>>(),
         "default_dest": sh.default_dest,

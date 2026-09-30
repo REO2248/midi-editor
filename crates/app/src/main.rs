@@ -448,7 +448,10 @@ type RecBuf = std::sync::Arc<Mutex<Vec<(u64, Vec<u8>)>>>;
 
 /// Armed recording: timestamps channel messages against the playhead's µs base.
 struct Rec {
-    _input: midi_io::Input,
+    input: midi_io::Input,
+    /// the input port vanished mid-take — the watcher reconnects the exact
+    /// (name, ord) endpoint when it returns
+    input_lost: bool,
     buf: RecBuf,
     /// document time (µs) corresponding to Input's t=0
     base_us: u64,
@@ -462,13 +465,26 @@ struct Rec {
 /// Output destination catalog: real MIDI ports by name, then discovered
 /// VST3s. Rebuilt on `Output ▸ Rescan Plugins`.
 fn build_dest_catalog(plugins: &[output::PluginInfo]) -> Vec<(String, midi_io::Destination)> {
-    let mut dests: Vec<(String, midi_io::Destination)> = midi_io::list_outputs()
-        .unwrap_or_default()
+    let ports = midi_io::list_outputs().unwrap_or_default();
+    // same-name devices need a visible discriminator in the menu
+    let mut name_counts: HashMap<String, usize> = HashMap::new();
+    for p in &ports {
+        *name_counts.entry(p.name.clone()).or_default() += 1;
+    }
+    let mut dests: Vec<(String, midi_io::Destination)> = ports
         .into_iter()
         .map(|p| {
+            let label = if name_counts.get(p.name.as_str()).copied().unwrap_or(0) > 1 {
+                format!("{} #{}", p.name, p.ord + 1)
+            } else {
+                p.name.clone()
+            };
             (
-                p.name.clone(),
-                midi_io::Destination::MidiPort { port_name: p.name },
+                label,
+                midi_io::Destination::MidiPort {
+                    port_name: p.name,
+                    ord: p.ord,
+                },
             )
         })
         .collect();
@@ -525,6 +541,11 @@ impl EditorView {
         sh.gui_attached = true;
         let initial_plugins = output::discover_plugin_paths();
         sh.dests = build_dest_catalog(&initial_plugins);
+        sh.port_present = midi_io::list_outputs()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| (p.name, p.ord))
+            .collect();
         let g = GlobalPrefs::load();
         let shared = Arc::new(Mutex::new(sh));
         let (plugin_req, plugin_evt, host_thread) = output::spawn_plugin_host();
@@ -2518,8 +2539,10 @@ impl EditorView {
                 continue;
             };
             match dest {
-                output::Destination::MidiPort { port_name } => {
-                    match midi_io::Output::open_named(port_name) {
+                output::Destination::MidiPort { port_name, ord } => {
+                    // bind by (name, ord) — a same-name sibling must never
+                    // silently take over this destination
+                    match midi_io::Output::open_ord(port_name, *ord) {
                         Ok(out) => {
                             let sink = PortSink::with_config(out, sxp_cfg);
                             self.sysex_stats.push(sink.stats());
@@ -2747,7 +2770,8 @@ impl EditorView {
         match opened {
             Ok(input) => {
                 self.rec = Some(Rec {
-                    _input: input,
+                    input,
+                    input_lost: false,
                     buf,
                     base_us: self.play_us,
                     cin_us,
@@ -2911,11 +2935,24 @@ impl EditorView {
             .collect();
         sh.dests = fresh;
         sh.default_dest = old_default
-            .and_then(|d| sh.dests.iter().position(|(_, dd)| *dd == d))
+            .and_then(|d| {
+                // an offline port keeps its identity: re-add it rather than
+                // dropping the assignment — it plays again once replugged
+                Some(match sh.dests.iter().position(|(_, dd)| *dd == d) {
+                    Some(i) => i,
+                    None => sh.ensure_dest(&dest_label(&d), d),
+                })
+            })
             .unwrap_or(0);
         sh.track_dest = old_tracks
             .into_iter()
-            .filter_map(|(t, d)| sh.dests.iter().position(|(_, dd)| *dd == d).map(|i| (t, i)))
+            .map(|(t, d)| {
+                let i = match sh.dests.iter().position(|(_, dd)| *dd == d) {
+                    Some(i) => i,
+                    None => sh.ensure_dest(&dest_label(&d), d),
+                };
+                (t, i)
+            })
             .collect();
         let n = sh.dests.len();
         drop(sh);
@@ -3397,7 +3434,13 @@ fn prefs_path(doc_path: &std::path::Path) -> PathBuf {
 /// Display label for a destination identity (sidecar paths -> stem).
 fn dest_label(d: &output::Destination) -> String {
     match d {
-        output::Destination::MidiPort { port_name } => port_name.clone(),
+        output::Destination::MidiPort { port_name, ord } => {
+            if *ord == 0 {
+                port_name.clone()
+            } else {
+                format!("{port_name} #{}", ord + 1)
+            }
+        }
         output::Destination::Plugin { plugin_path } => {
             let stem = PathBuf::from(plugin_path)
                 .file_stem()
@@ -3785,12 +3828,90 @@ fn fmt_rel_time(unix_ts: u64) -> String {
     }
 }
 
+impl EditorView {
+    /// Periodic MIDI endpoint reconcile (called ~every 2 s by the doc
+    /// watcher): refresh the present-port set, append newly discovered
+    /// outputs to the catalog — an assignment targeting a vanished port
+    /// keeps its identity and plays again on replug — and reopen an armed
+    /// recording's input connection when its endpoint comes back.
+    /// Returns true when the catalog or availability changed.
+    fn reconcile_ports(&mut self) -> bool {
+        let outs = midi_io::list_outputs().unwrap_or_default();
+        let present: std::collections::HashSet<(String, usize)> =
+            outs.iter().map(|p| (p.name.clone(), p.ord)).collect();
+        let mut changed = false;
+        {
+            let mut sh = lock_shared(&self.shared);
+            if sh.port_present != present {
+                // brand-new outputs become assignable immediately
+                let mut name_counts: HashMap<String, usize> = HashMap::new();
+                for p in &outs {
+                    *name_counts.entry(p.name.clone()).or_default() += 1;
+                }
+                for p in &outs {
+                    let d = midi_io::Destination::MidiPort {
+                        port_name: p.name.clone(),
+                        ord: p.ord,
+                    };
+                    if !sh.dests.iter().any(|(_, dd)| *dd == d) {
+                        let label = if name_counts.get(p.name.as_str()).copied().unwrap_or(0) > 1 {
+                            format!("{} #{}", p.name, p.ord + 1)
+                        } else {
+                            p.name.clone()
+                        };
+                        sh.dests.push((label, d));
+                    }
+                }
+                sh.port_present = present;
+                changed = true;
+            }
+        }
+        // armed input whose endpoint returned: swap in a fresh connection —
+        // its t=0 restarts, so re-anchor the take's doc-time base at now
+        if let Some(rec) = self.rec.as_mut() {
+            let (name, ord) = (rec.input.name.clone(), rec.input.ord);
+            let found = midi_io::list_inputs()
+                .unwrap_or_default()
+                .iter()
+                .any(|p| p.name == name && p.ord == ord);
+            if found && rec.input_lost {
+                let buf2 = rec.buf.clone();
+                let cb = move |us, b: &[u8]| {
+                    buf2.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((us, b.to_vec()));
+                };
+                if let Ok(inp) = midi_io::Input::open_ord(&name, ord, cb) {
+                    rec.input = inp;
+                    rec.input_lost = false;
+                    // the new connection's t=0 restarts — re-anchor the
+                    // doc-time base and clear the already-consumed count-in
+                    rec.base_us = self
+                        .playback
+                        .as_ref()
+                        .map(|p| p.position_us())
+                        .unwrap_or(self.play_us);
+                    rec.cin_us = 0;
+                    tracing::info!("recording input '{name}' reconnected");
+                    changed = true;
+                }
+            } else if !found && !rec.input_lost {
+                rec.input_lost = true;
+                tracing::warn!("recording input '{name}' disappeared; reconnect on return");
+                changed = true;
+            }
+        }
+        changed
+    }
+}
+
 /// Poll the shared doc's notify counter so MCP-driven edits repaint the UI
 /// even while the user is idle.
 fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
     cx.spawn(async move |this, cx| {
         let mut last = 0u64;
         let mut last_tx = 0u64;
+        let mut tick = 0u32;
         // autosave: the last revision a snapshot captured and the last
         // write attempt (started one debounce early so the first dirty
         // revision snapshots without an artificial delay)
@@ -3839,6 +3960,11 @@ fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
                 });
             if let Some(this) = this.upgrade() {
                 this.update(cx, |v, cx| {
+                    // hotplug reconcile ~every 2 s: fresh endpoints join the
+                    // catalog, vanished ones stay visible but marked offline,
+                    // and an armed recording's input reconnects on return
+                    tick += 1;
+                    let ports_changed = tick % 13 == 0 && v.reconcile_ports();
                     // MCP transport requests -> real playback actions
                     for r in reqs {
                         match r {
@@ -3933,7 +4059,11 @@ fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
                             v.sync_editor_state_into_slot();
                         }
                     }
-                    if dirty || plugin_changed || v.playback.is_some() || v.plugin_window.is_some()
+                    if dirty
+                        || plugin_changed
+                        || ports_changed
+                        || v.playback.is_some()
+                        || v.plugin_window.is_some()
                     {
                         cx.notify();
                     }
