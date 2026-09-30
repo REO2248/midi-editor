@@ -147,6 +147,21 @@ const MAX_HEX_BYTES: usize = 1 << 20; // 1 MiB decoded
 const MAX_INSERT_EVENTS: usize = 10_000;
 /// Cap on the number of rows a read tool may return in one call.
 const MAX_QUERY_LIMIT: usize = 10_000;
+/// Cap on the ops array of one apply_patch call — clients paginate large
+/// edits instead of one request forcing an unbounded build pass.
+const MAX_PATCH_OPS: usize = 1_000;
+/// Cap on diagnostics rows returned in one call; the full count is still
+/// reported so callers know there is more.
+const MAX_DIAG_RESULTS: usize = 500;
+/// One HTTP request body may not exceed this — an over-large JSON-RPC post
+/// must be rejected before it allocates.
+const MAX_HTTP_BODY_BYTES: usize = 4 << 20; // 4 MiB
+/// In-flight MCP requests are bounded; excess gets an immediate 429 rather
+/// than queueing unboundedly behind the document lock.
+const MAX_CONCURRENT_REQUESTS: usize = 16;
+/// Time budget for producing a response. The SSE stream's Response object is
+/// produced up front, so this bounds time-to-response, not stream lifetime.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
     let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
@@ -833,8 +848,10 @@ fn dispatch(
         "diagnostics" => {
             let diags = sh.doc.diagnose();
             ok_json(serde_json::json!({
-                "count": diags.len(),
-                "diagnostics": diags.iter().map(|d| serde_json::json!({
+                "count": diags.len().min(MAX_DIAG_RESULTS),
+                "total": diags.len(),
+                "truncated": diags.len() > MAX_DIAG_RESULTS,
+                "diagnostics": diags.iter().take(MAX_DIAG_RESULTS).map(|d| serde_json::json!({
                     "code": d.code,
                     "track": d.track,
                     "tick": d.tick,
@@ -923,6 +940,13 @@ fn dispatch(
             }
             let label = args["label"].as_str().unwrap_or("mcp patch");
             let ops_json = args["ops"].as_array().cloned().unwrap_or_default();
+            if ops_json.len() > MAX_PATCH_OPS {
+                return err_json(format!(
+                    "ops array too large ({} > {MAX_PATCH_OPS}); \
+                     split into multiple apply_patch calls",
+                    ops_json.len()
+                ));
+            }
             let ops = match build_ops(&mut sh.doc, &ops_json) {
                 Ok(o) => o,
                 Err(PatchError::Msg(m)) => return err_json(m),
@@ -1431,7 +1455,11 @@ pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let tmp = dir.join(format!(".{stem}.sav{}", std::process::id()));
+    // unique per write: two concurrent saves sharing one pid-temp name would
+    // otherwise have the second write clobber the first's temp file mid-rename
+    static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".{stem}.sav{}.{}", std::process::id(), seq));
     std::fs::write(&tmp, bytes)?;
     match std::fs::rename(&tmp, path) {
         Ok(()) => Ok(()),
@@ -1518,14 +1546,48 @@ pub async fn serve_stdio(doc: SharedDoc) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Serve Streamable-HTTP on `addr` (e.g. "127.0.0.1:7878") at path `/mcp`.
-/// When `token` is Some, requests must carry `Authorization: Bearer <token>`.
-/// Host/Origin validation stays at rmcp's loopback defaults.
-pub async fn serve_http(
-    doc: SharedDoc,
-    addr: &str,
-    token: Option<String>,
-) -> anyhow::Result<()> {
+// ---------- HTTP request limits ----------
+
+/// Structured rejection for transport-level limits — a JSON-RPC-shaped error
+/// body so MCP clients surface something actionable instead of raw HTTP text.
+fn limit_error(status: axum::http::StatusCode, msg: &'static str) -> axum::response::Response {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0", "id": null,
+        "error": {"code": -32000, "message": msg},
+    })
+    .to_string();
+    axum::response::Response::builder()
+        .status(status)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(body))
+        .expect("static response")
+}
+
+/// Bound a request's concurrency slot and total time-to-response. Dropping
+/// the future on client disconnect cancels the work — axum/tokio do that for
+/// free; the permit releases either way.
+async fn bounded_request(
+    gate: Arc<tokio::sync::Semaphore>,
+    timeout: std::time::Duration,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let Ok(_permit) = gate.try_acquire_owned() else {
+        return limit_error(
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "MCP concurrency limit reached — retry later",
+        );
+    };
+    match tokio::time::timeout(timeout, next.run(req)).await {
+        Ok(resp) => resp,
+        Err(_) => limit_error(axum::http::StatusCode::GATEWAY_TIMEOUT, "request timed out"),
+    }
+}
+
+/// Build the `/mcp` router: body-size cap (rmcp), bounded concurrency and a
+/// time budget (middleware), then optional Bearer auth. Split out of
+/// [`serve_http`] so tests can mount it on an ephemeral port.
+pub fn mcp_http_router(doc: SharedDoc, token: Option<String>) -> axum::Router {
     use axum::middleware::Next;
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::{
@@ -1539,7 +1601,8 @@ pub async fn serve_http(
     let service = StreamableHttpService::new(
         factory,
         Arc::new(LocalSessionManager::default()),
-        StreamableHttpServerConfig::default(),
+        StreamableHttpServerConfig::default()
+            .with_max_request_body_bytes(MAX_HTTP_BODY_BYTES),
     );
 
     let mut app = axum::Router::new().route_service("/mcp", service);
@@ -1566,6 +1629,25 @@ pub async fn serve_http(
             },
         ));
     }
+    // outermost layer: cheap limit checks run before auth/body work
+    let gate = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS));
+    app.layer(axum::middleware::from_fn(
+        move |req: axum::extract::Request, next: Next| {
+            let gate = gate.clone();
+            async move { bounded_request(gate, REQUEST_TIMEOUT, req, next).await }
+        },
+    ))
+}
+
+/// Serve Streamable-HTTP on `addr` (e.g. "127.0.0.1:7878") at path `/mcp`.
+/// When `token` is Some, requests must carry `Authorization: Bearer <token>`.
+/// Host/Origin validation stays at rmcp's loopback defaults.
+pub async fn serve_http(
+    doc: SharedDoc,
+    addr: &str,
+    token: Option<String>,
+) -> anyhow::Result<()> {
+    let app = mcp_http_router(doc, token);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!("mcp http listening on {addr}");
     axum::serve(listener, app).await?;
@@ -1604,6 +1686,12 @@ mod tests {
 
     /// dispatch a tool and decode its (is_error, first text block as JSON)
     fn call(shared: &SharedDoc, name: &str, args: serde_json::Value) -> (bool, serde_json::Value) {
+        let (is_err, text) = call_text(shared, name, args);
+        (is_err, serde_json::from_str(&text).unwrap_or(json!(null)))
+    }
+
+    /// dispatch a tool and decode its (is_error, first text block verbatim)
+    fn call_text(shared: &SharedDoc, name: &str, args: serde_json::Value) -> (bool, String) {
         match dispatch(name, &args, shared.clone()) {
             CallToolResponse::Complete(r) => {
                 let is_err = r.is_error.unwrap_or(false);
@@ -1611,7 +1699,7 @@ mod tests {
                     Some(ContentBlock::Text(t)) => t.text.clone(),
                     other => panic!("expected text content, got {other:?}"),
                 };
-                (is_err, serde_json::from_str(&text).unwrap_or(json!(null)))
+                (is_err, text)
             }
             other => panic!("unexpected response kind: {other:?}"),
         }
@@ -1737,6 +1825,174 @@ mod tests {
             ]}]}),
         );
         assert!(err);
+    }
+
+    // ---------- issue #11: limits ----------
+
+    /// Start the real router on an ephemeral port; returns the bound address.
+    async fn start_http() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            axum::serve(listener, mcp_http_router(shared(), None))
+                .await
+                .expect("serve");
+        });
+        addr
+    }
+
+    /// Raw HTTP/1.1 request; returns the status code.
+    async fn http_req(
+        addr: &str,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut req = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        );
+        for (k, v) in headers {
+            req += &format!("{k}: {v}\r\n");
+        }
+        req += "\r\n";
+        s.write_all(req.as_bytes()).await.unwrap();
+        s.write_all(body).await.unwrap();
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), s.read_to_end(&mut buf))
+            .await
+            .expect("response timed out");
+        String::from_utf8_lossy(&buf)
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0)
+    }
+
+    const INIT: &str = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","#,
+        r#""params":{"protocolVersion":"2025-03-26","capabilities":{},"#,
+        r#""clientInfo":{"name":"t","version":"0"}}}"#,
+    );
+    const MCP_HEADERS: &[(&str, &str)] = &[
+        ("Content-Type", "application/json"),
+        ("Accept", "application/json, text/event-stream"),
+    ];
+
+    #[tokio::test]
+    async fn normal_request_passes_limits() {
+        let addr = start_http().await;
+        assert_eq!(http_req(&addr, "POST", "/mcp", MCP_HEADERS, INIT.as_bytes()).await, 200);
+    }
+
+    #[tokio::test]
+    async fn oversized_body_is_rejected() {
+        let addr = start_http().await;
+        let body = vec![b'x'; MAX_HTTP_BODY_BYTES + 1];
+        let status = http_req(&addr, "POST", "/mcp", MCP_HEADERS, &body).await;
+        assert_eq!(status, 413, "over {MAX_HTTP_BODY_BYTES} bytes must not reach dispatch");
+    }
+
+    /// A stub endpoint behind `bounded_request` lets the limits be exercised
+    /// with tiny values instead of the production constants.
+    async fn stub_limited(slots: usize, timeout: std::time::Duration) -> String {
+        use axum::middleware::Next;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let gate = Arc::new(tokio::sync::Semaphore::new(slots));
+        let app = axum::Router::new()
+            .route(
+                "/slow",
+                axum::routing::get(|| async {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    "ok"
+                }),
+            )
+            .layer(axum::middleware::from_fn(
+                move |req: axum::extract::Request, next: Next| {
+                    let gate = gate.clone();
+                    async move { bounded_request(gate, timeout, req, next).await }
+                },
+            ));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_requests_are_bounded() {
+        let addr = stub_limited(2, std::time::Duration::from_secs(30)).await;
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let addr = addr.clone();
+            set.spawn(async move { http_req(&addr, "GET", "/slow", &[], &[]).await });
+        }
+        let mut codes = Vec::new();
+        while let Some(c) = set.join_next().await {
+            codes.push(c.unwrap());
+        }
+        assert!(codes.iter().filter(|&&c| c == 429).count() >= 5,
+            "slots held by slow requests must reject the flood: {codes:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn slow_requests_time_out() {
+        let addr = stub_limited(8, std::time::Duration::from_millis(50)).await;
+        assert_eq!(http_req(&addr, "GET", "/slow", &[], &[]).await, 504);
+    }
+
+    #[test]
+    fn apply_patch_ops_array_is_bounded() {
+        let sh = shared();
+        let ops = vec![serde_json::json!({"op": "insert_note"}); MAX_PATCH_OPS + 1];
+        let (err, text) = call_text(&sh, "apply_patch", json!({"ops": ops}));
+        assert!(err);
+        assert!(text.contains("too large"), "{text}");
+        // exactly at the cap the size check must not fire
+        let ops = vec![serde_json::json!({"op": "bogus"}); MAX_PATCH_OPS];
+        let (err, text) = call_text(&sh, "apply_patch", json!({"ops": ops}));
+        assert!(err);
+        assert!(!text.contains("too large"), "{text}");
+    }
+
+    #[test]
+    fn concurrent_saves_do_not_collide_on_temp_name() {
+        let dir = std::env::temp_dir()
+            .join("midi-editor-mcp-tests")
+            .join(format!("saves-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("song.mid");
+        std::thread::scope(|s| {
+            for tag in ["a", "b"] {
+                let p = p.clone();
+                s.spawn(move || {
+                    for i in 0..50 {
+                        write_atomic(&p, format!("{tag}{i}").as_bytes())
+                            .expect("save must not fail under concurrency");
+                    }
+                });
+            }
+        });
+        let final_bytes = std::fs::read(&p).unwrap();
+        assert!(final_bytes == b"a49" || final_bytes == b"b49");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diagnostics_report_total_and_truncation() {
+        let sh = shared();
+        let (err, v) = call(&sh, "diagnostics", json!({}));
+        assert!(!err);
+        assert_eq!(v["total"], v["count"]);
+        assert_eq!(v["truncated"], false);
     }
 
     #[test]
