@@ -120,6 +120,12 @@ pub(crate) struct Theme {
     pub dim_target: u32,
     /// blend target for inactive-track notes on the minimap
     pub mini_dim: u32,
+    /// in-scale row highlight on the roll (#40)
+    pub scale_row: u32,
+    /// subtle hover wash for rows (with alpha)
+    pub hover_wash: u32,
+    /// playhead line (with alpha)
+    pub ok_fill: u32,
     /// per-track note colors (track index mod 8)
     pub track_colors: [u32; 8],
 }
@@ -182,6 +188,9 @@ impl Theme {
             scrim: 0x00000066,
             dim_target: 0x12121a,
             mini_dim: 0x111118,
+            scale_row: 0x1e2436,
+            hover_wash: 0xffffff12,
+            ok_fill: 0x50ff9f88,
             track_colors: [
                 0x4f8cff, 0xff8c4f, 0x4fd08c, 0xd04fff, 0xffd24f, 0x4fd0ff, 0xff4f7a, 0x9dff4f,
             ],
@@ -247,6 +256,9 @@ impl Theme {
             scrim: 0x000000aa,
             dim_target: 0x000000,
             mini_dim: 0x000000,
+            scale_row: 0x002a2a,
+            hover_wash: 0xffffff44,
+            ok_fill: 0x00ff00aa,
             // saturated, widely-separated hues stay distinct in HC
             track_colors: [
                 0x00ffff, 0xffff00, 0x00ff00, 0xff00ff, 0xff8000, 0x8080ff, 0xff4040, 0x80ff80,
@@ -312,6 +324,9 @@ impl Theme {
             scrim: 0x00000040,
             dim_target: 0xe9e9ef,
             mini_dim: 0xe9e9ef,
+            scale_row: 0xd8e2f5,
+            hover_wash: 0x00000010,
+            ok_fill: 0x0a7a3588,
             track_colors: [
                 0x2f6fdf, 0xc05a10, 0x1a9050, 0x9030c0, 0x9a7800, 0x1090a8, 0xd02060, 0x60a010,
             ],

@@ -332,14 +332,14 @@ impl EditorView {
                                         // event's x
                                         window.paint_quad(fill(
                                             Bounds::new(point(px_, py_), size(x - px_, px(1.0))),
-                                            rgba(0x4fd0ff88),
+                                            rgba(theme::current().lane_fill),
                                         ));
                                         window.paint_quad(fill(
                                             Bounds::new(
                                                 point(x, y.min(py_)),
                                                 size(px(1.0), (y - py_).abs().max(px(1.0))),
                                             ),
-                                            rgba(0x4fd0ff88),
+                                            rgba(theme::current().lane_fill),
                                         ));
                                     }
                                     prev = Some((x, y));
@@ -388,7 +388,7 @@ impl EditorView {
                         let y1 = bounds.origin.y + px((h - 4.0) * (1.0 - v0 as f32 / vrange) + 2.0);
                         window.paint_quad(fill(
                             Bounds::new(point(x0, y0), size(x1 - x0, (y1 - y0).max(px(1.0)))),
-                            rgba(0x4f8cff33),
+                            rgba(theme::current().sel_fill),
                         ));
                     }
                     // shared time cursor — the same playhead x in every lane
@@ -396,7 +396,7 @@ impl EditorView {
                     if hx >= bounds.origin.x && hx <= bounds.origin.x + px(w) {
                         window.paint_quad(fill(
                             Bounds::new(point(hx, bounds.origin.y), size(px(1.0), px(h))),
-                            rgba(0x50ff9f88),
+                            rgba(theme::current().ok_fill),
                         ));
                     }
                 }
@@ -470,7 +470,7 @@ impl EditorView {
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(th.bg_chip_hover)))
                     .text_size(px(9.0))
-                    .text_color(rgb(0x9fd0ff))
+                    .text_color(rgb(theme::current().accent))
                     .child(mode.label())
                     // swallow the mouse_down so a chip press can't start a
                     // lane insert-drag or a header resize underneath it
@@ -497,7 +497,7 @@ impl EditorView {
                         .cursor_pointer()
                         .hover(|s| s.bg(rgb(th.bg_chip_hover)))
                         .text_size(px(9.0))
-                        .text_color(rgb(0x9fd0ff))
+                        .text_color(rgb(theme::current().accent))
                         .child(match pkey {
                             Some(k) => format!("k{k}"),
                             None => "k*".to_string(),
@@ -524,7 +524,7 @@ impl EditorView {
                         .cursor_pointer()
                         .hover(|s| s.bg(rgb(th.bg_hover)))
                         .text_size(px(9.0))
-                        .text_color(rgb(0x9fd0ff))
+                        .text_color(rgb(theme::current().accent))
                         .child("+")
                         .on_mouse_down(
                             MouseButton::Left,
@@ -544,7 +544,7 @@ impl EditorView {
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(th.bg_hover)))
                     .text_size(px(9.0))
-                    .text_color(rgb(0x9fd0ff))
+                    .text_color(rgb(theme::current().accent))
                     .child(if cfg.collapsed { "▸" } else { "▾" })
                     .on_mouse_down(
                         MouseButton::Left,
@@ -567,7 +567,7 @@ impl EditorView {
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(th.bg_hover)))
                     .text_size(px(9.0))
-                    .text_color(rgb(0x9fd0ff))
+                    .text_color(rgb(theme::current().accent))
                     .child("×")
                     .on_mouse_down(
                         MouseButton::Left,
@@ -1134,7 +1134,7 @@ impl EditorView {
                 let value = r.value.clone();
                 row = row
                     .cursor_pointer()
-                    .hover(|s| s.bg(rgba(0xffffff10)))
+                    .hover(|s| s.bg(rgba(theme::current().hover_wash)))
                     .on_click(
                         cx.listener(move |v, _e, w, cx| v.prop_edit(field, value.clone(), w, cx)),
                     );
@@ -1179,9 +1179,9 @@ impl Render for Tip {
         div()
             .px_2()
             .py_1()
-            .bg(rgb(0x26262e))
+            .bg(rgb(theme::current().bg_tooltip))
             .border_1()
-            .border_color(rgb(0x3c3c4a))
+            .border_color(rgb(theme::current().border_strong))
             .rounded_md()
             .shadow_lg()
             .text_size(px(metrics::TEXT_MD))
