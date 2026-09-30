@@ -1385,4 +1385,80 @@ mod tests {
         let s1 = tb.stamp(50_000, t0 + ms(60));
         assert_eq!(s1, s0);
     }
+
+    /// Seek: events scheduled before `start_us` are skipped at the same
+    /// partition boundary the caller inserts chase events into.
+    #[test]
+    fn seek_skips_events_before_start() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let events = vec![
+            (0u64, 0usize, vec![0x90, 60, 100]),
+            (4_000u64, 0usize, vec![0x90, 62, 100]),
+            (8_000u64, 0usize, vec![0x90, 64, 100]),
+        ];
+        let mut pb = Playback::start(vec![Box::new(RecordingSink(log.clone()))], events, 5_000, None);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while log.lock().unwrap().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "no event arrived");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        pb.stop();
+        let sent = log.lock().unwrap().clone();
+        // only the 8ms event plays; the two earlier ones are behind the seek
+        assert!(sent.contains(&vec![0x90, 64, 100]));
+        assert!(!sent.contains(&vec![0x90, 60, 100]));
+        assert!(!sent.contains(&vec![0x90, 62, 100]));
+    }
+
+    /// Events sharing a timestamp are delivered in schedule order — the
+    /// ordering rule that lets SysEx/setup traffic precede notes struck at
+    /// the same instant.
+    #[test]
+    fn equal_timestamps_keep_schedule_order() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let events = vec![
+            (0u64, 0usize, vec![0xF0, 0x7E, 0xF7]), // sysex first
+            (0u64, 0usize, vec![0xB0, 121, 0]),
+            (0u64, 0usize, vec![0x90, 60, 100]),
+        ];
+        let mut pb = Playback::start(vec![Box::new(RecordingSink(log.clone()))], events, 0, None);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let have = log.lock().unwrap().len();
+            if have >= 3 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "events not delivered");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let sent = log.lock().unwrap().clone();
+        pb.stop();
+        // trailing notes_off/panic resets may follow; only the schedule's
+        // own order matters here
+        assert_eq!(
+            &sent[..3],
+            [vec![0xF0, 0x7E, 0xF7], vec![0xB0, 121, 0], vec![0x90, 60, 100]].as_slice()
+        );
+    }
+
+    /// Stopping mid-play always ends with the full panic reset (121/120),
+    /// not just the loop-boundary notes-off.
+    #[test]
+    fn stop_sends_full_panic_reset() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let events = vec![
+            (0u64, 0usize, vec![0x90, 60, 100]),
+            (60_000_000u64, 0usize, vec![0x80, 60, 0]), // far out: still running when stopped
+        ];
+        let mut pb = Playback::start(vec![Box::new(RecordingSink(log.clone()))], events, 0, None);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        pb.stop();
+        let sent = log.lock().unwrap().clone();
+        for ctl in [123u8, 121, 120] {
+            assert!(
+                sent.iter().any(|b| b == &vec![0xB0, ctl, 0]),
+                "missing panic controller {ctl}"
+            );
+        }
+    }
 }
