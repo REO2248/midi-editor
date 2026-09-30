@@ -4236,10 +4236,12 @@ dependencies = [
  "document",
  "http",
  "midi-io",
+ "persist",
  "rmcp",
  "serde",
  "serde_json",
  "smf-core",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -5320,6 +5322,13 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
+
+[[package]]
+name = "persist"
+version = "0.0.0"
+dependencies = [
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "phf"

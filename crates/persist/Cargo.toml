@@ -1,0 +1,8 @@
+[package]
+name = "persist"
+edition.workspace = true
+license.workspace = true
+description = "Persistence core shared by GUI, MCP server, and stdio bridge: atomic writes and file recovery"
+
+[dependencies]
+thiserror.workspace = true

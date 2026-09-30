@@ -15,6 +15,7 @@ commands = { path = "crates/commands" }
 midi-io = { path = "crates/midi-io" }
 output = { path = "crates/output" }
 mcp-server = { path = "crates/mcp-server" }
+persist = { path = "crates/persist" }
 
 anyhow = "1"
 thiserror = "2"
