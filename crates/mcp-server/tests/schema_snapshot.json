@@ -20,7 +20,7 @@
     },
     {
       "deprecated": null,
-      "description": "Atomic edit as one undo step. Optional base_revision: when given it must match document_summary.revision (optimistic concurrency). dry_run:true returns the op breakdown without applying. ops: insert_note {track,key,vel,start,dur,channel} | insert_events {track,events:[{tick,seq,kind:{channel|meta|sysex_hex}}]} | remove_events {ids} | move_note {on_id,dtick,dkey,dur_dtick} | set_tempo {tick,bpm}",
+      "description": "Atomic edit as one undo step. Optional base_revision: when given it must match document_summary.revision (optimistic concurrency). dry_run:true returns the op breakdown without applying. ops: insert_note {track,key,vel,start,dur,channel,off_vel?,off_form?} | insert_events {track,events:[{tick,seq,kind:{channel|meta|sysex_hex}}]} | remove_events {ids} | move_note {on_id,dtick,dkey,dur_dtick} | set_tempo {tick,bpm}",
       "input_schema": {
         "properties": {
           "base_revision": {
@@ -560,6 +560,32 @@
         "type": "object"
       },
       "name": "set_program",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Set note-OFF (release) velocities. Args: track?, from?, to?, vel (0-127). vel>0 upgrades NoteOn-vel0 offs to real 0x80 note-offs; vel=0 keeps the stored form. Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "from": {
+            "type": "integer"
+          },
+          "to": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          },
+          "vel": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "set_release_velocity",
       "version": 1
     },
     {

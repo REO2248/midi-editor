@@ -885,6 +885,10 @@ fn note_json(n: &document::Note) -> serde_json::Value {
     serde_json::json!({
         "track": n.track, "channel": n.channel, "key": n.key, "vel": n.vel,
         "start": n.start_tick, "end": n.end_tick, "on_id": n.on_id, "off_id": n.off_id,
+        // release velocity + which wire form closes the note (0x80 vs
+        // 0x90-vel0 — identical on the wire, distinct in the file)
+        "off_vel": n.off_vel,
+        "off_form": if n.off_via_on { "on_vel0" } else { "note_off" },
     })
 }
 
@@ -1106,6 +1110,10 @@ fn build_ops(doc: &mut Document, ops: &[serde_json::Value]) -> Result<Vec<Op>, P
                 let start = op["start"].as_u64().unwrap_or(0);
                 let dur = op["dur"].as_u64().unwrap_or(480);
                 let ch = op["channel"].as_u64().unwrap_or(0).clamp(0, 15) as u8;
+                // release velocity needs the real 0x80 off form — 0x90v0
+                // has no byte to carry it in
+                let off_vel = op["off_vel"].as_u64().unwrap_or(0).clamp(0, 127) as u8;
+                let off_via_on = op["off_form"].as_str() == Some("on_vel0") && off_vel == 0;
                 let on_id = doc.alloc_event_id();
                 let off_id = doc.alloc_event_id();
                 out.push(Op::InsertEvents {
@@ -1128,8 +1136,8 @@ fn build_ops(doc: &mut Document, ops: &[serde_json::Value]) -> Result<Vec<Op>, P
                             seq: u32::MAX / 2,
                             raw_body: None,
                             kind: EventKind::Channel {
-                                status: 0x80 | ch,
-                                data: [key, 0],
+                                status: (if off_via_on { 0x90 } else { 0x80 }) | ch,
+                                data: [key, off_vel],
                                 len: 2,
                             },
                         },
@@ -1458,7 +1466,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         spec(
             "apply_patch",
             "Atomic edit as one undo step. Optional base_revision: when given it must match document_summary.revision (optimistic concurrency). \
-             dry_run:true returns the op breakdown without applying. ops: insert_note {track,key,vel,start,dur,channel} | \
+             dry_run:true returns the op breakdown without applying. ops: insert_note {track,key,vel,start,dur,channel,off_vel?,off_form?} | \
              insert_events {track,events:[{tick,seq,kind:{channel|meta|sysex_hex}}]} | \
              remove_events {ids} | move_note {on_id,dtick,dkey,dur_dtick} | \
              set_tempo {tick,bpm}",
@@ -1563,6 +1571,14 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             object_schema(serde_json::json!({
                 "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
                 "factor": {"type": "number"}, "base_revision": {"type": "integer"},
+            })),
+        ),
+        spec(
+            "set_release_velocity",
+            "Set note-OFF (release) velocities. Args: track?, from?, to?, vel (0-127). vel>0 upgrades NoteOn-vel0 offs to real 0x80 note-offs; vel=0 keeps the stored form. Optional base_revision.",
+            object_schema(serde_json::json!({
+                "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
+                "vel": {"type": "integer"}, "base_revision": {"type": "integer"},
             })),
         ),
         spec(
@@ -2356,6 +2372,22 @@ fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> CallTool
                 ops.extend(sh.view_mut().scale_velocity_ops(t, from, to, f));
             }
             apply_ops(&mut sh, "scale velocity", ops)
+        }
+        "set_release_velocity" => {
+            if let Some(r) = check_base(&sh, args) {
+                return r;
+            }
+            let (from, to) = region(args);
+            let vel = args["vel"].as_u64().unwrap_or(0).clamp(0, 127) as u8;
+            let tracks = match sel_tracks(&sh, args) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
+            let mut ops = Vec::new();
+            for t in tracks {
+                ops.extend(sh.doc.set_release_velocity_ops(t, from, to, vel));
+            }
+            apply_ops(&mut sh, "set release velocity", ops)
         }
         "set_channel" => {
             if let Some(r) = check_base(&sh, args) {

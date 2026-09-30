@@ -100,6 +100,7 @@ enum Sub {
     Quant,
     LenSet,
     VelSet,
+    RelSet,
     Oct,
 }
 
@@ -146,6 +147,10 @@ struct ClipNote {
     key: u8,
     len: u64,
     vel: u8,
+    /// release velocity + wire form carried through copy/paste/duplicate
+    /// so a copied note doesn't flatten its release to 0x80 vel-0
+    off_vel: u8,
+    off_via_on: bool,
     ch: u8,
     track: usize,
 }
@@ -1288,6 +1293,8 @@ impl EditorView {
                     .saturating_sub(n.start_tick)
                     .max(1),
                 vel: n.vel,
+                off_vel: n.off_vel,
+                off_via_on: n.off_via_on,
                 ch: n.channel,
                 track: n.track,
             })
@@ -1348,8 +1355,10 @@ impl EditorView {
                         seq: u32::MAX / 2,
                         raw_body: None,
                         kind: EventKind::Channel {
-                            status: 0x80 | ch,
-                            data: [c.key, 0],
+                            // keep the copied note's off form: a 0x90v0
+                            // can't carry release velocity; 0x80 can
+                            status: (if c.off_via_on { 0x90 } else { 0x80 }) | ch,
+                            data: [c.key, if c.off_via_on { 0 } else { c.off_vel }],
                             len: 2,
                         },
                     },
@@ -1412,6 +1421,8 @@ impl EditorView {
                     .saturating_sub(n.start_tick)
                     .max(1),
                 vel: n.vel,
+                off_vel: n.off_vel,
+                off_via_on: n.off_via_on,
                 ch: n.channel,
                 track: n.track,
             })
@@ -1447,10 +1458,10 @@ impl EditorView {
                     }
                     let mut after = e.clone();
                     after.tick = after.tick.saturating_add_signed(dtick);
-                    if e.id == n.on_id {
-                        if let EventKind::Channel { data, .. } = &mut after.kind {
-                            data[0] = nk;
-                        }
+                    // the pitch moves on BOTH ends — an off left at the old
+                    // key leaves the on dangling and re-pairs wrong
+                    if let EventKind::Channel { data, .. } = &mut after.kind {
+                        data[0] = nk;
                     }
                     ops.push(Op::UpdateEvent {
                         track: n.track,

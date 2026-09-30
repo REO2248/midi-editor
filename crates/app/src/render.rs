@@ -1795,6 +1795,8 @@ impl Render for EditorView {
                     Self::mi_sub("e.len", t("edit.set_length"), Sub::LenSet, cx).into_any_element(),
                     Self::mi_sub("e.velset", t("edit.set_velocity"), Sub::VelSet, cx)
                         .into_any_element(),
+                    Self::mi_sub("e.relset", t("edit.set_release"), Sub::RelSet, cx)
+                        .into_any_element(),
                     Self::msep().into_any_element(),
                     Self::mi("e.velup", t("edit.vel_up"), "", None, cx, |v, _e, _cx| {
                         v.apply_region_op("vel ×1.25", |d, t, f, to| {
@@ -2410,6 +2412,34 @@ impl Render for EditorView {
                                     move |v, _e, _cx| {
                                         v.apply_region_op("set velocity", move |d, t, f, to| {
                                             d.set_velocity_ops(t, f, to, vel)
+                                        });
+                                    },
+                                )
+                                .into_any_element()
+                            })
+                            .collect()
+                    }
+                    // release velocity lives on the note-OFF — a nonzero
+                    // value upgrades a 0x90-vel0 off to a real 0x80
+                    Sub::RelSet => {
+                        let opts = [
+                            ("zero (0)", 0u8),
+                            ("soft (32)", 32),
+                            ("medium (64)", 64),
+                            ("hard (100)", 100),
+                        ];
+                        opts.into_iter()
+                            .enumerate()
+                            .map(|(i, (label, vel))| {
+                                Self::mi_leaf(
+                                    ("rset", i),
+                                    label,
+                                    "",
+                                    None,
+                                    cx,
+                                    move |v, _e, _cx| {
+                                        v.apply_region_op("set release velocity", move |d, t, f, to| {
+                                            d.set_release_velocity_ops(t, f, to, vel)
                                         });
                                     },
                                 )

@@ -927,6 +927,14 @@ pub struct Note {
     pub end_tick: Option<u64>,
     pub on_id: EventId,
     pub off_id: Option<EventId>,
+    /// Release velocity carried by the off event's second data byte.
+    /// Meaningful for the 0x80 form; always 0 for the 0x90-vel0 form and
+    /// for dangling note-ons.
+    pub off_vel: u8,
+    /// Which wire form closes the note: `true` = NoteOn velocity 0 (0x90),
+    /// `false` = real NoteOff (0x80). The forms are semantically identical
+    /// to receivers but distinct in the file — preserved on edits.
+    pub off_via_on: bool,
 }
 
 /// Per-(track, channel) state reconstructed by `Document::chase_events` while
@@ -999,7 +1007,7 @@ impl Document {
                         pending[ch][key].push(on_events.len());
                         on_events.push((e.tick, v, e.id));
                     }
-                    (0x80, _) | (0x90, _) => {
+                    (0x80, off_vel) | (0x90, off_vel) => {
                         if let Some(idx) = pending[ch][key].pop() {
                             let (start, vel, on_id) = on_events[idx];
                             out.push(Note {
@@ -1011,6 +1019,8 @@ impl Document {
                                 end_tick: Some(e.tick),
                                 on_id,
                                 off_id: Some(e.id),
+                                off_vel,
+                                off_via_on: msg == 0x90,
                             });
                         }
                     }
@@ -1031,6 +1041,8 @@ impl Document {
                             end_tick: None,
                             on_id,
                             off_id: None,
+                            off_vel: 0,
+                            off_via_on: false,
                         });
                     }
                 }
@@ -1312,6 +1324,50 @@ impl Document {
                 let mut after = before.clone();
                 if let EventKind::Channel { data, .. } = &mut after.kind {
                     data[1] = vel.clamp(1, 127);
+                }
+                ops.push(Op::UpdateEvent {
+                    track: ti,
+                    before,
+                    after,
+                });
+            }
+        }
+        ops
+    }
+
+    /// Set every note-OFF's release velocity in [from,to) to `vel`.
+    /// `vel > 0` upgrades a NoteOn-vel0 off to a real 0x80 NoteOff — the
+    /// 0x90 form has nowhere to carry release data. `vel = 0` keeps the
+    /// stored form (an 0x80 stays 0x80, a 0x90v0 stays 0x90v0).
+    pub fn set_release_velocity_ops(
+        &mut self,
+        track: usize,
+        from: u64,
+        to: u64,
+        vel: u8,
+    ) -> Vec<Op> {
+        let mut ops = Vec::new();
+        for n in self
+            .notes()
+            .into_iter()
+            .filter(|n| n.track == track && n.start_tick >= from && n.start_tick < to)
+        {
+            let Some(off_id) = n.off_id else { continue };
+            // 0x90-vel0 at vel 0 is already what would be written — no-op
+            if vel == 0 && n.off_via_on {
+                continue;
+            }
+            if vel == n.off_vel && !n.off_via_on {
+                continue;
+            }
+            if let Some((ti, ei)) = self.by_id.get(&off_id).copied() {
+                let before = self.tracks[ti].events[ei].clone();
+                let mut after = before.clone();
+                if let EventKind::Channel { status, data, .. } = &mut after.kind {
+                    if vel > 0 {
+                        *status = (*status & 0x0F) | 0x80;
+                    }
+                    data[1] = vel;
                 }
                 ops.push(Op::UpdateEvent {
                     track: ti,
