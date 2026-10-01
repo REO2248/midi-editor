@@ -741,10 +741,10 @@ impl Render for EditorView {
                 "i.rec",
                 "fiber_manual_record",
                 t("tip.rec"),
-                self.rec.is_some(),
+                self.is_recording(),
                 theme::current().danger,
                 cx,
-                |v, _e, _cx| v.toggle_record(),
+                |v, _e, cx| v.transport_record(cx),
             ))
             .child(Self::ibtn_c(
                 "i.loop",
@@ -1392,6 +1392,35 @@ impl Render for EditorView {
                                     .when(muted, |s| s.italic())
                                     .overflow_hidden()
                                     .child(name.to_string()),
+                            )
+                            .child(
+                                // record arm — DAW per-track arm state,
+                                // separate from transport Record (#159)
+                                div()
+                                    .id(("arm", i))
+                                    .test_support()
+                                    .role(Role::CheckBox)
+                                    .aria_label(tf("a11y.arm", &[("track", name.as_str())]))
+                                    .aria_toggled(if self.armed_track == Some(i) {
+                                        Toggled::True
+                                    } else {
+                                        Toggled::False
+                                    })
+                                    .px_1()
+                                    .text_size(px(9.0))
+                                    .text_color(rgb(if self.armed_track == Some(i) {
+                                        theme::current().danger
+                                    } else {
+                                        theme::current().text_muted_name
+                                    }))
+                                    .on_click(cx.listener(move |v, _e: &ClickEvent, w, cx| {
+                                        cx.stop_propagation();
+                                        v.sel_track = i;
+                                        v.toggle_arm();
+                                        w.focus(&v.tracks_fh, cx);
+                                        cx.notify();
+                                    }))
+                                    .child("R"),
                             )
                             .child(
                                 div()
@@ -2691,7 +2720,13 @@ impl Render for EditorView {
                         Some(self.return_to_start_on_stop),
                         cx,
                     ),
-                    self.mi_cmd("transport.record", Some(self.rec.is_some()), cx),
+                    self.mi_cmd("transport.record", Some(self.is_recording()), cx),
+                    self.mi_cmd(
+                        "rec.arm",
+                        Some(self.armed_track == Some(self.sel_track)),
+                        cx,
+                    ),
+                    Self::mi_sub("tr.mon", t("transport.monitor"), Sub::Monitor, cx),
                     self.mi_cmd("transport.loop", Some(loop_en), cx),
                     self.mi_cmd("loop.set_start", None, cx),
                     self.mi_cmd("loop.set_end", None, cx),
@@ -2923,6 +2958,31 @@ impl Render for EditorView {
                         has_track_dest,
                         cx,
                     ),
+                    Sub::Monitor => [
+                        crate::recording::MonMode::Off,
+                        crate::recording::MonMode::Auto,
+                        crate::recording::MonMode::In,
+                    ]
+                    .iter()
+                    .map(|&m| {
+                        Self::mi_leaf(
+                            ("mon", m.label().len()),
+                            t(match m {
+                                crate::recording::MonMode::Off => "mon.off",
+                                crate::recording::MonMode::Auto => "mon.auto",
+                                crate::recording::MonMode::In => "mon.in",
+                            }),
+                            "",
+                            Some(self.monitor == m),
+                            cx,
+                            move |v, _e, _cx| {
+                                v.monitor = m;
+                                v.update_monitor();
+                                v.save_global();
+                            },
+                        )
+                    })
+                    .collect(),
                     Sub::CountIn => [0u8, 1, 2, 4]
                         .iter()
                         .map(|&b| {
@@ -3000,6 +3060,34 @@ impl Render for EditorView {
                                 v.save_global();
                             },
                         ));
+                        // armed track's input channel filter (#159):
+                        // All / 1..16 — SysEx passes unfiltered by design
+                        rows.push(Self::msep());
+                        rows.push(Self::mhead(t("input.chan")));
+                        rows.push(Self::mi_leaf(
+                            "inchan.all",
+                            t("inchan.all"),
+                            "",
+                            Some(self.rec_in_ch.is_none()),
+                            cx,
+                            |v, _e, _cx| {
+                                v.rec_in_ch = None;
+                                v.save_global();
+                            },
+                        ));
+                        rows.extend((0u8..16).map(|ch| {
+                            Self::mi_leaf(
+                                ("inchan", ch as usize),
+                                format!("{}", ch + 1),
+                                "",
+                                Some(self.rec_in_ch == Some(ch)),
+                                cx,
+                                move |v, _e, _cx| {
+                                    v.rec_in_ch = Some(ch);
+                                    v.save_global();
+                                },
+                            )
+                        }));
                         rows
                     }
                     Sub::Lane => {

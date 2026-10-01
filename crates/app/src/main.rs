@@ -209,6 +209,8 @@ enum Sub {
     MetDest,
     /// Transport → count-in length
     CountIn,
+    /// Transport → input monitor mode (#159)
+    Monitor,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -716,6 +718,12 @@ struct EditorView {
     meta_refocus: bool,
     /// one-bar count-in before MIDI recording starts (global pref)
     count_in_bars: u8,
+    /// armed track for recording — session state, `None` = no arm (#159)
+    armed_track: Option<usize>,
+    /// input monitor mode — Off / Auto / In (#159)
+    monitor: crate::recording::MonMode,
+    /// armed track's input channel filter — `None` = all channels (#159)
+    rec_in_ch: Option<u8>,
     /// reset-on-stop preference: full CC121/120 controller reset on
     /// transport stop — off means a normal stop only releases notes (#161)
     reset_on_stop: bool,
@@ -1156,6 +1164,13 @@ impl EditorView {
             hc_pref: g.hc,
             _appearance: None,
             rec_mode: RecMode::Overdub,
+            armed_track: None,
+            monitor: g
+                .monitor
+                .as_deref()
+                .and_then(recording::MonMode::from_label)
+                .unwrap_or(recording::MonMode::Auto),
+            rec_in_ch: g.rec_in_ch.filter(|c| *c < 16),
             punch_in: None,
             punch_out: None,
             last_take: None,

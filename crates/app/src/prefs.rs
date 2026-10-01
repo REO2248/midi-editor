@@ -61,6 +61,10 @@ pub(crate) struct GlobalPrefs {
     /// the legacy `count_in` bool maps to 1/0 bars.
     #[serde(default)]
     pub(crate) count_in_bars: Option<u8>,
+    /// input monitor mode: "off" | "auto" | "in" (#159); absent = auto
+    pub(crate) monitor: Option<String>,
+    /// armed track's input channel filter 0-15 (#159); absent = all
+    pub(crate) rec_in_ch: Option<u8>,
     /// return-to-start-on-stop (Cubase preference): a transport stop moves
     /// the play point back to where the pass began. None (older files) =
     /// on, the DAW-conventional default (#156).
@@ -88,6 +92,8 @@ impl Default for GlobalPrefs {
             reset_on_stop: false,
             return_to_start_on_stop: None,
             count_in_bars: None,
+            monitor: None,
+            rec_in_ch: None,
         }
     }
 }
@@ -541,6 +547,8 @@ impl EditorView {
             midi_in: self.midi_in.to_string(),
             in_latency_ms: self.in_latency_ms,
             count_in_bars: Some(self.count_in_bars),
+            monitor: Some(self.monitor.label().to_string()),
+            rec_in_ch: self.rec_in_ch,
             audio_device: self.audio_sel.device.clone(),
             sample_rate: self.audio_sel.sample_rate,
             buffer_size: self.audio_sel.buffer_size,

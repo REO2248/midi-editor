@@ -398,7 +398,23 @@ impl Timebase {
         if let Some(d) = &self.diag {
             d.note(dev_us != 0, arrival.saturating_sub(raw));
         }
+
         raw.saturating_sub(self.latency_us)
+    }
+
+    /// Stream clock reading at call time — µs since `new()` under arrival
+    /// stamping; once a device timestamp anchors the map, advances by host
+    /// time from the anchor (the backend clock can't be queried outside the
+    /// callback). Used to rebase a take's zero when recording starts long
+    /// after the input opened (#159 arm-vs-record split).
+    pub fn now_us(&self) -> u64 {
+        match self.anchor {
+            Some((_, i0)) => {
+                let base = i0.saturating_duration_since(self.t0).as_micros() as u64;
+                base.saturating_add(i0.elapsed().as_micros() as u64)
+            }
+            None => self.t0.elapsed().as_micros() as u64,
+        }
     }
 }
 
@@ -415,6 +431,16 @@ pub struct Input {
     /// reopening with `(name, ord)` retargets the exact same endpoint
     /// after an unplug/replug
     pub ord: usize,
+    /// stream clock — `now_us()` reads the timestamp domain `cb` sees
+    tb: std::sync::Arc<std::sync::Mutex<Timebase>>,
+}
+
+impl Input {
+    /// Current reading of the timestamp domain the callback reports (#159):
+    /// lets a take rebase its zero when recording engages after monitoring.
+    pub fn now_us(&self) -> u64 {
+        self.tb.lock().unwrap_or_else(|e| e.into_inner()).now_us()
+    }
 }
 
 impl Input {
@@ -498,12 +524,22 @@ impl Input {
     where
         F: FnMut(u64, &[u8]) + Send + 'static,
     {
-        let mut tb = Timebase::new(opts.latency_us, opts.diag);
+        let tb = std::sync::Arc::new(std::sync::Mutex::new(Timebase::new(
+            opts.latency_us,
+            opts.diag,
+        )));
+        let tb2 = tb.clone();
         let conn = inp
             .connect(
                 &port,
                 "midi-editor-in",
-                move |ts, bytes, _| cb(tb.stamp(ts, std::time::Instant::now()), bytes),
+                move |ts, bytes, _| {
+                    let us = tb2
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .stamp(ts, std::time::Instant::now());
+                    cb(us, bytes)
+                },
                 (),
             )
             .map_err(|e| Error::Connect(e.to_string()))?;
@@ -511,6 +547,7 @@ impl Input {
             _conn: conn,
             name,
             ord,
+            tb,
         })
     }
 }

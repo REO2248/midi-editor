@@ -648,7 +648,12 @@ impl EditorView {
         }
         // record arm with a count-in: the pass carries the lead-in length so
         // click generation covers it on the click destination (#137)
-        ctx.countin_us = self.rec.as_ref().map(|r| r.cin_us).unwrap_or(0);
+        ctx.countin_us = self
+            .rec
+            .as_ref()
+            .filter(|r| r.recording.load(std::sync::atomic::Ordering::Relaxed))
+            .map(|r| r.cin_us)
+            .unwrap_or(0);
         let needed = self.needed_dests(&ctx);
         let (sinks, sink_of, transport_of, loading) = self.open_sinks(&ctx, &needed);
         if !loading.is_empty() {
@@ -677,6 +682,8 @@ impl EditorView {
             loop_end,
             self.reset_on_stop,
         ));
+        // Auto monitoring silences the echo while the transport runs
+        self.update_monitor();
     }
 
     /// MIDI Panic: the user-facing emergency silence — a full CC123/121/120
@@ -760,7 +767,13 @@ impl EditorView {
         for d in self.plugin_slots.keys() {
             self.pending_state_capture.insert(*d);
         }
-        self.finish_record();
+        // transport Stop while recording commits the take (#159); a merely
+        // armed input stays armed and keeps listening
+        if self.is_recording() {
+            self.finish_record();
+        }
+        // Auto monitoring resumes once the transport halts
+        self.update_monitor();
     }
 
     /// The document's tempo map + meter map as scheduled transport updates

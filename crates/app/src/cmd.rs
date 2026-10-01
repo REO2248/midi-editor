@@ -667,8 +667,11 @@ pub static COMMANDS: &[Command] = &[
         "transport.record",
         &[],
         None,
-        |v, _w, _cx| v.toggle_record()
+        |v, _w, cx| v.transport_record(cx)
     ),
+    cmd!("rec.arm", "rec.arm", &[], None, |v, _w, _cx| {
+        v.toggle_arm()
+    }),
     cmd!(
         "transport.loop",
         "transport.loop",
