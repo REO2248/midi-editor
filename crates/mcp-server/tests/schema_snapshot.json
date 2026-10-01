@@ -1168,11 +1168,17 @@
     },
     {
       "deprecated": null,
-      "description": "Ask the GUI transport: {action: \"play\"|\"stop\"|\"seek\", tick?}. Only works while the app is running.",
+      "description": "Ask the GUI transport: {action: \"play\"|\"stop\"|\"seek\"|\"set_loop\", tick?, start?, end?}. set_loop sets/clears the explicit loop locators in ticks (omit a bound to clear it). Only works while the app is running.",
       "input_schema": {
         "properties": {
           "action": {
             "type": "string"
+          },
+          "end": {
+            "type": "integer"
+          },
+          "start": {
+            "type": "integer"
           },
           "tick": {
             "type": "integer"
@@ -1181,7 +1187,7 @@
         "type": "object"
       },
       "name": "transport",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,

@@ -53,6 +53,14 @@ pub(crate) struct GlobalPrefs {
     /// keybinding overrides: command id -> "ctrl+shift+z" descriptor
     #[serde(default)]
     pub(crate) keymap: HashMap<String, String>,
+    /// reset-on-stop: normal transport stop sends the full CC123/121/120
+    /// sweep instead of notes-off only (#161)
+    #[serde(default)]
+    pub(crate) reset_on_stop: bool,
+    /// return-to-start-on-stop (Cubase preference): a transport stop moves
+    /// the play point back to where the pass began. None (older files) =
+    /// on, the DAW-conventional default (#156).
+    pub(crate) return_to_start_on_stop: Option<bool>,
 }
 
 impl Default for GlobalPrefs {
@@ -73,6 +81,8 @@ impl Default for GlobalPrefs {
             hc: None,
             theme: None,
             keymap: HashMap::new(),
+            reset_on_stop: false,
+            return_to_start_on_stop: None,
         }
     }
 }
@@ -141,6 +151,12 @@ pub(crate) struct Prefs {
     pub(crate) metronome: bool,
     #[serde(default)]
     pub(crate) loop_enabled: bool,
+    /// explicit loop locators in ticks — None = unset (#130); absent in
+    /// old sidecars
+    #[serde(default)]
+    pub(crate) loop_start: Option<u64>,
+    #[serde(default)]
+    pub(crate) loop_end: Option<u64>,
     /// None in old sidecars = keep the default (overdub)
     pub(crate) rec_mode: Option<String>,
     /// punch bounds in ticks — None = not set
@@ -192,6 +208,8 @@ impl Default for Prefs {
             soloed: Vec::new(),
             metronome: false,
             loop_enabled: false,
+            loop_start: None,
+            loop_end: None,
             chase_sysex: None,
             sysex_policy: None,
             rec_mode: None,
@@ -360,6 +378,8 @@ impl EditorView {
             sh.soloed = p.soloed.into_iter().collect();
             sh.metronome = p.metronome;
             sh.loop_enabled = p.loop_enabled;
+            sh.loop_start = p.loop_start;
+            sh.loop_end = p.loop_end;
             if let Some(c) = p.chase_sysex {
                 sh.chase_sysex = c;
             }
@@ -517,6 +537,8 @@ impl EditorView {
             hc: self.hc_pref,
             theme: Some(self.theme_mode.name().to_string()),
             keymap: self.keys.overrides.clone(),
+            reset_on_stop: self.reset_on_stop,
+            return_to_start_on_stop: Some(self.return_to_start_on_stop),
         }
         .save();
     }
@@ -538,6 +560,8 @@ impl EditorView {
             soloed: sh.soloed.iter().copied().collect(),
             metronome: sh.metronome,
             loop_enabled: sh.loop_enabled,
+            loop_start: sh.loop_start,
+            loop_end: sh.loop_end,
             chase_sysex: Some(sh.chase_sysex),
             sysex_policy: Some(sh.sysex_policy.label().to_string()),
             rec_mode: Some(self.rec_mode.label().to_string()),

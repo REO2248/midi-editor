@@ -99,7 +99,11 @@ impl Render for EditorView {
             self.play_us = p.position_us();
             if !p.is_running() {
                 self.playback = None;
-                self.play_us = 0;
+                // natural end follows the same stop policy as a manual
+                // stop — return to the pass start when enabled (#156)
+                if self.return_to_start_on_stop {
+                    self.play_us = self.play_start_us;
+                }
             }
         }
         let (
@@ -718,11 +722,15 @@ impl Render for EditorView {
                 t("tip.stop"),
                 false,
                 cx,
-                |v, _e, cx| {
-                    v.stop_playback();
-                    v.play_us = 0;
-                    cx.notify();
-                },
+                |v, _e, cx| v.transport_stop(cx),
+            ))
+            .child(Self::ibtn(
+                "i.start",
+                "skip_previous",
+                t("tip.go_start"),
+                false,
+                cx,
+                |v, _e, cx| v.go_to_start(cx),
             ))
             .child(Self::ibtn_c(
                 "i.rec",
@@ -1636,6 +1644,10 @@ impl Render for EditorView {
         let ruler_bounds_cell = self.ruler_bounds.clone();
         let ruler_play_tick = playhead_tick;
         let pos_fmt_ruler = pos_fmt.clone();
+        let (loop_s, loop_e) = {
+            let sh = crate::lock_shared(&self.shared);
+            (sh.loop_start, sh.loop_end)
+        };
         let ruler = canvas(
             move |bounds, _window, _cx| {
                 ruler_bounds_cell.set(bounds);
@@ -1673,6 +1685,32 @@ impl Render for EditorView {
                             ));
                             t += grid_major;
                         }
+                    }
+                }
+                // explicit loop locators (#130): range band + edge handles
+                if let (Some(ls), Some(le)) = (loop_s, loop_e) {
+                    if le > ls {
+                        let x0 = bounds.origin.x + px(ls as f32 * zoom - scroll_x);
+                        let x1 = bounds.origin.x + px(le as f32 * zoom - scroll_x);
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                point(x0, bounds.origin.y),
+                                size(px(f32::from(x1 - x0).max(0.0)), px(4.0)),
+                            ),
+                            rgb(theme::current().accent),
+                        ));
+                    }
+                }
+                for lt in [loop_s, loop_e].into_iter().flatten() {
+                    let x = bounds.origin.x + px(lt as f32 * zoom - scroll_x);
+                    if x >= bounds.origin.x - px(4.0) && x <= bounds.origin.x + w + px(4.0) {
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                point(x - px(3.0), bounds.origin.y),
+                                size(px(6.0), px(8.0)),
+                            ),
+                            rgb(theme::current().accent),
+                        ));
                     }
                 }
                 // playhead marker
@@ -1812,11 +1850,56 @@ impl Render for EditorView {
                                 let b = this.ruler_bounds.get();
                                 let x = f32::from(ev.position.x) - f32::from(b.origin.x);
                                 let tick = ((x + this.scroll_x) / this.zoom).max(0.0) as u64;
+                                // grabbing a loop locator edge moves the
+                                // bound instead of seeking (#130)
+                                let near = |lt: Option<u64>| {
+                                    lt.is_some_and(|t| {
+                                        (t as f32 * this.zoom - this.scroll_x - x).abs() <= 6.0
+                                    })
+                                };
+                                let (ls, le) = {
+                                    let sh = crate::lock_shared(&this.shared);
+                                    (sh.loop_start, sh.loop_end)
+                                };
+                                if near(le) {
+                                    this.loop_drag = Some(crate::LoopDrag::End);
+                                    cx.notify();
+                                    return;
+                                }
+                                if near(ls) {
+                                    this.loop_drag = Some(crate::LoopDrag::Start);
+                                    cx.notify();
+                                    return;
+                                }
                                 // double-click on the ruler plays from that bar position
                                 this.seek_to_tick(tick, ev.click_count == 2, cx);
                             }),
                         )
                         .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
+                            // locator drag wins over scrub and works while
+                            // transport runs — the patch lands on mouse-up
+                            if let Some(which) = this.loop_drag {
+                                if ev.pressed_button != Some(MouseButton::Left) {
+                                    this.loop_drag = None;
+                                    return;
+                                }
+                                let b = this.ruler_bounds.get();
+                                let x = f32::from(ev.position.x) - f32::from(b.origin.x);
+                                let tick = ((x + this.scroll_x) / this.zoom).max(0.0) as u64;
+                                {
+                                    let mut sh = crate::lock_shared(&this.shared);
+                                    match which {
+                                        crate::LoopDrag::Start => {
+                                            sh.loop_start = Some(tick);
+                                        }
+                                        crate::LoopDrag::End => {
+                                            sh.loop_end = Some(tick);
+                                        }
+                                    }
+                                }
+                                cx.notify();
+                                return;
+                            }
                             // scrub: drag on the ruler moves the playhead.
                             // While playing, keep the engine running — a
                             // restart per move event would stutter audio.
@@ -1831,7 +1914,27 @@ impl Render for EditorView {
                             let tick = ((x + this.scroll_x) / this.zoom).max(0.0) as u64;
                             this.play_us = this.doc(|d| d.tempo_map.tick_to_us(tick));
                             cx.notify();
-                        })),
+                        }))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _ev: &MouseUpEvent, _w, cx| {
+                                if this.loop_drag.take().is_some() {
+                                    this.persist();
+                                    this.refresh_live_schedule();
+                                    cx.notify();
+                                }
+                            }),
+                        )
+                        .on_mouse_up_out(
+                            MouseButton::Left,
+                            cx.listener(|this, _ev: &MouseUpEvent, _w, cx| {
+                                if this.loop_drag.take().is_some() {
+                                    this.persist();
+                                    this.refresh_live_schedule();
+                                    cx.notify();
+                                }
+                            }),
+                        ),
                 )
                 // marker/lyric strip — meta 0x06/0x05 shown at their tick;
                 // click selects + seeks (then `e` edits, `Del` removes)
@@ -2575,8 +2678,20 @@ impl Render for EditorView {
                 }
                 TopMenu::Transport => vec![
                     self.mi_cmd("transport.play_stop", Some(self.playback.is_some()), cx),
+                    self.mi_cmd("transport.pause", None, cx),
+                    self.mi_cmd("transport.return_start", None, cx),
+                    self.mi_cmd("transport.go_start", None, cx),
+                    self.mi_cmd(
+                        "transport.return_on_stop",
+                        Some(self.return_to_start_on_stop),
+                        cx,
+                    ),
                     self.mi_cmd("transport.record", Some(self.rec.is_some()), cx),
                     self.mi_cmd("transport.loop", Some(loop_en), cx),
+                    self.mi_cmd("loop.set_start", None, cx),
+                    self.mi_cmd("loop.set_end", None, cx),
+                    self.mi_cmd("loop.set_selection", None, cx),
+                    self.mi_cmd("loop.clear", None, cx),
                     self.mi_cmd("transport.met", Some(met_en), cx),
                     self.mi_cmd("transport.chase_sysex", Some(chsy_en), cx),
                     Self::mi(
@@ -2693,6 +2808,8 @@ impl Render for EditorView {
                         },
                     ),
                     self.mi_cmd("transport.count_in", Some(self.count_in), cx),
+                    self.mi_cmd("transport.panic", None, cx),
+                    self.mi_cmd("transport.reset_on_stop", Some(self.reset_on_stop), cx),
                     Self::msep(),
                     self.mi_cmd("transport.audition", Some(self.aud_enabled), cx),
                     Self::mi_sub("tr.audv", t("transport.aud_vel"), Sub::AudVel, cx),

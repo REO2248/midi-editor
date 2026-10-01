@@ -58,19 +58,21 @@ impl EditorView {
                 if self.playback.is_none() {
                     self.start_playback();
                 }
-                // armed inside a loop: the transport wraps at the last
-                // scheduled event — snapshot the span so past-wrap input can
-                // be mapped back into it (per-pass take)
+                // armed inside a loop: the transport wraps at the right
+                // locator back to the left one — snapshot the span so
+                // past-wrap input maps back into it (per-pass take).
+                // Explicit locators (#130) define the span; the legacy
+                // play-start→end wrap falls back to the schedule end.
                 if lock_shared(&self.shared).loop_enabled {
-                    let end = self
-                        .doc(|d| d.timeline_tagged())
-                        .iter()
-                        .map(|e| e.0)
-                        .max()
-                        .unwrap_or(0);
-                    if end > self.loop_start_us {
-                        if let Some(r) = self.rec.as_mut() {
-                            r.loop_span_us = Some((self.loop_start_us, end));
+                    let ctx = self.live_ctx();
+                    let (ls, le) = self.loop_range_us(&ctx);
+                    let end =
+                        le.or_else(|| self.doc(|d| d.timeline_tagged()).iter().map(|e| e.0).max());
+                    if let (Some(a), Some(b)) = (ls, end) {
+                        if b > a {
+                            if let Some(r) = self.rec.as_mut() {
+                                r.loop_span_us = Some((a, b));
+                            }
                         }
                     }
                 }

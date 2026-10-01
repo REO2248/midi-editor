@@ -100,6 +100,9 @@ impl EditorView {
                         drop(sh);
                         v.audition_off();
                         v.persist();
+                        // destination change reaches the running pass
+                        // (events + sinks) — #140
+                        v.refresh_live_schedule();
                     },
                 ));
             }

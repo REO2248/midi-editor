@@ -196,11 +196,21 @@ pub(crate) fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
                             mcp_server::TransportReq::Play if v.playback.is_none() => {
                                 v.start_playback();
                             }
-                            mcp_server::TransportReq::Stop => v.stop_playback(),
+                            mcp_server::TransportReq::Stop => v.transport_stop(cx),
+                            mcp_server::TransportReq::SetLoop { start, end } => {
+                                {
+                                    let mut sh = crate::lock_shared(&v.shared);
+                                    sh.loop_start = start;
+                                    sh.loop_end = end;
+                                }
+                                v.persist();
+                                v.refresh_live_schedule();
+                            }
                             mcp_server::TransportReq::Seek { tick } => {
                                 v.play_us = v.doc(|d| {
                                     d.tempo_map_for(v.sel_track).tick_to_us(tick)
                                 });
+                                v.play_start_us = v.play_us;
                                 if v.playback.is_some() {
                                     v.stop_playback();
                                     v.start_playback();
@@ -249,6 +259,9 @@ pub(crate) fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
                         // a preview ringing on a route MCP just changed
                         // must not keep sounding into the wrong place
                         v.audition_off();
+                        // MCP-originated edits/routing reach the running
+                        // pass through the same live-update path (#140/#141)
+                        v.refresh_live_schedule();
                     }
                     // watch the backing .mid for external modification /
                     // deletion (only the MIDI file — the sidecar doesn't count)
@@ -376,6 +389,7 @@ impl EditorView {
         self.sel_track = 0;
         self.enc_override = None;
         self.play_us = 0;
+        self.play_start_us = 0;
         self.refresh_derived();
         self.reset_view_to_content();
         // the replaced document's snapshots no longer apply
@@ -464,6 +478,8 @@ impl EditorView {
             self.selection.clear();
             self.refresh_derived_sh(&mut sh);
             drop(sh);
+            // undo reaches the running pass too (#141)
+            self.refresh_live_schedule();
             cx.notify();
         }
     }
@@ -479,6 +495,7 @@ impl EditorView {
             self.selection.clear();
             self.refresh_derived_sh(&mut sh);
             drop(sh);
+            self.refresh_live_schedule();
             cx.notify();
         }
     }
@@ -928,6 +945,7 @@ impl EditorView {
         self.mouse_pos = None;
         self.enc_override = None;
         self.play_us = 0;
+        self.play_start_us = 0;
         {
             let mut sh = lock_shared(&self.shared);
             sh.muted.clear();
@@ -972,6 +990,7 @@ impl EditorView {
                 self.mouse_pos = None;
                 self.enc_override = None;
                 self.play_us = 0;
+                self.play_start_us = 0;
                 // rebuild the derived views, then land the view on the new
                 // content — a saved per-file sidecar (applied next) overrides
                 self.refresh_derived();

@@ -578,6 +578,8 @@ pub static COMMANDS: &[Command] = &[
             }
         }
         v.persist();
+        // live mix control: the running pass updates in place (#140)
+        v.refresh_live_schedule();
     }),
     cmd!("track.solo", "track.solo", &[], None, |v, _w, _cx| {
         let t = v.sel_track;
@@ -588,6 +590,7 @@ pub static COMMANDS: &[Command] = &[
             }
         }
         v.persist();
+        v.refresh_live_schedule();
     }),
     cmd!(
         "track.plugin_gui",
@@ -623,6 +626,42 @@ pub static COMMANDS: &[Command] = &[
         None,
         |v, _w, cx| v.toggle_play(cx)
     ),
+    // pause/continue: stop in place (play point kept) / resume — the
+    // in-place counterpart of Stop (#156)
+    cmd!(
+        "transport.pause",
+        "transport.pause",
+        &[],
+        None,
+        |v, _w, cx| v.toggle_pause(cx)
+    ),
+    // return to where the current transport pass began
+    cmd!(
+        "transport.return_start",
+        "transport.return_start",
+        &[],
+        None,
+        |v, _w, cx| v.return_to_start(cx)
+    ),
+    // go to song start (tick 0)
+    cmd!(
+        "transport.go_start",
+        "transport.go_start",
+        &["home"],
+        None,
+        |v, _w, cx| v.go_to_start(cx)
+    ),
+    // return-on-stop preference (#156)
+    cmd!(
+        "transport.return_on_stop",
+        "transport.return_on_stop",
+        &[],
+        None,
+        |v, _w, _cx| {
+            v.return_to_start_on_stop = !v.return_to_start_on_stop;
+            v.save_global();
+        }
+    ),
     cmd!(
         "transport.record",
         "transport.record",
@@ -641,14 +680,83 @@ pub static COMMANDS: &[Command] = &[
                 sh.loop_enabled = !sh.loop_enabled;
             }
             v.persist();
+            v.refresh_live_schedule();
         }
     ),
+    // explicit loop locators (#130) — Set Start/End to Playhead, Set to
+    // Selection, Clear. A bound that collides with the other clears it
+    // rather than silently swapping or producing an inverted range.
+    cmd!(
+        "loop.set_start",
+        "loop.set_start",
+        &[],
+        None,
+        |v, _w, _cx| {
+            let t = v.playhead_tick();
+            {
+                let mut sh = crate::lock_shared(&v.shared);
+                sh.loop_start = Some(t);
+                if sh.loop_end.is_some_and(|e| e <= t) {
+                    sh.loop_end = None;
+                }
+            }
+            v.persist();
+            v.refresh_live_schedule();
+        }
+    ),
+    cmd!("loop.set_end", "loop.set_end", &[], None, |v, _w, _cx| {
+        let t = v.playhead_tick();
+        {
+            let mut sh = crate::lock_shared(&v.shared);
+            sh.loop_end = Some(t);
+            if sh.loop_start.is_some_and(|s| s >= t) {
+                sh.loop_start = None;
+            }
+        }
+        v.persist();
+        v.refresh_live_schedule();
+    }),
+    cmd!(
+        "loop.set_selection",
+        "loop.set_selection",
+        &[],
+        None,
+        |v, _w, _cx| {
+            let mut lo = u64::MAX;
+            let mut hi = 0u64;
+            for n in v.notes.iter().filter(|n| v.selection.contains(&n.on_id)) {
+                lo = lo.min(n.start_tick);
+                hi = hi.max(n.end_tick.unwrap_or(n.start_tick + 1));
+            }
+            if lo > hi {
+                v.status = t("status.nosel").into();
+                return;
+            }
+            {
+                let mut sh = crate::lock_shared(&v.shared);
+                sh.loop_start = Some(lo);
+                sh.loop_end = Some(hi);
+            }
+            v.persist();
+            v.refresh_live_schedule();
+        }
+    ),
+    cmd!("loop.clear", "loop.clear", &[], None, |v, _w, _cx| {
+        {
+            let mut sh = crate::lock_shared(&v.shared);
+            sh.loop_start = None;
+            sh.loop_end = None;
+        }
+        v.persist();
+        v.refresh_live_schedule();
+    }),
     cmd!("transport.met", "transport.met", &[], None, |v, _w, _cx| {
         {
             let mut sh = crate::lock_shared(&v.shared);
             sh.metronome = !sh.metronome;
         }
         v.persist();
+        v.refresh_live_schedule();
     }),
     cmd!(
         "transport.chase_sysex",
@@ -661,6 +769,7 @@ pub static COMMANDS: &[Command] = &[
                 sh.chase_sysex = !sh.chase_sysex;
             }
             v.persist();
+            v.refresh_live_schedule();
         }
     ),
     cmd!(
@@ -670,6 +779,28 @@ pub static COMMANDS: &[Command] = &[
         None,
         |v, _w, _cx| {
             v.count_in = !v.count_in;
+            v.save_global();
+        }
+    ),
+    // explicit emergency silence — full CC123/121/120 sweep (#161)
+    cmd!(
+        "transport.panic",
+        "transport.panic",
+        &[],
+        None,
+        |v, _w, cx| {
+            v.midi_panic();
+            cx.notify();
+        }
+    ),
+    // reset-on-stop preference: off = stop releases notes only
+    cmd!(
+        "transport.reset_on_stop",
+        "transport.reset_on_stop",
+        &[],
+        None,
+        |v, _w, _cx| {
+            v.reset_on_stop = !v.reset_on_stop;
             v.save_global();
         }
     ),

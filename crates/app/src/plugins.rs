@@ -305,6 +305,19 @@ impl EditorView {
                 changed = true;
             }
         }
+        // a live routing refresh deferred while a plugin loaded — retry once
+        // nothing needed is still on the way up
+        if self.live_route_dirty && self.playback.is_some() {
+            let still_loading = self
+                .plugin_state
+                .values()
+                .any(|s| matches!(s, PluginState::Loading { .. }));
+            if !still_loading {
+                self.live_route_dirty = false;
+                self.refresh_live_routing();
+                changed = true;
+            }
+        }
         changed
     }
 

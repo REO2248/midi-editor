@@ -97,6 +97,13 @@ enum DragMode {
     Erase,
 }
 
+/// Which loop locator a ruler drag is moving (#130).
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum LoopDrag {
+    Start,
+    End,
+}
+
 /// A document-replacing action parked behind the discard guard
 /// (`guard.rs`). `CloseWindow` covers window close and, transitively, app
 /// quit — quitting always goes through closing the last window.
@@ -523,6 +530,8 @@ struct EditorView {
     /// selected note `on_id`s (marquee multi-select)
     selection: BTreeSet<EventId>,
     drag: Option<Drag>,
+    /// active loop-locator drag on the ruler (#130)
+    loop_drag: Option<LoopDrag>,
     /// active piano-roll tool
     tool: Tool,
     /// index into SNAPS — grid snap divisor of a whole note
@@ -630,9 +639,25 @@ struct EditorView {
     enc_override: Option<smf_core::TextEncoding>,
     playback: Option<Playback>,
     play_us: u64,
+    /// µs position where the current transport pass began — the anchor
+    /// Return-to-Start and return-on-stop use (#156)
+    play_start_us: u64,
+    /// return-to-start-on-stop preference (Cubase-style): a transport stop
+    /// moves the play point back to where the pass began (#156)
+    return_to_start_on_stop: bool,
     /// restart at `loop_start_us` when playback reaches the end
     /// (`loop_enabled` itself lives in `shared` so MCP can toggle it)
     loop_start_us: u64,
+    /// live-schedule routing snapshot (#140/#141): dest → sink index, the
+    /// transport-lane sink indices, and track → dest as of the last schedule
+    /// build. A committed edit with an unchanged dest map needs only an
+    /// events patch; a routing change rebuilds sinks and patches both.
+    live_sink_of: HashMap<usize, usize>,
+    live_transport: Vec<usize>,
+    live_dest_of: HashMap<usize, usize>,
+    /// a routing refresh was deferred because a newly-assigned plugin is
+    /// still loading — retried when its slot reports Ready
+    live_route_dirty: bool,
     /// playhead follow mode during playback (per-song pref)
     follow: Follow,
     /// manual scroll pauses follow until this instant
@@ -693,6 +718,9 @@ struct EditorView {
     meta_refocus: bool,
     /// one-bar count-in before MIDI recording starts (global pref)
     count_in: bool,
+    /// reset-on-stop preference: full CC121/120 controller reset on
+    /// transport stop — off means a normal stop only releases notes (#161)
+    reset_on_stop: bool,
     /// recently opened files (global pref, newest first)
     recent: Vec<SharedString>,
     /// recording source — MIDI input port name; empty = first available
@@ -1006,6 +1034,7 @@ impl EditorView {
             sel_track: 0,
             selection: BTreeSet::new(),
             drag: None,
+            loop_drag: None,
             tool: Tool::Select,
             snap_idx: 7, // 1/16
             erase_ids: BTreeSet::new(),
@@ -1086,7 +1115,13 @@ impl EditorView {
             enc_override: None,
             playback: None,
             play_us: 0,
+            play_start_us: 0,
+            return_to_start_on_stop: g.return_to_start_on_stop.unwrap_or(true),
             loop_start_us: 0,
+            live_sink_of: HashMap::new(),
+            live_transport: Vec::new(),
+            live_dest_of: HashMap::new(),
+            live_route_dirty: false,
             follow: Follow::Page,
             follow_hold: None,
             lanes: vec![LaneCfg::default()],
@@ -1105,6 +1140,7 @@ impl EditorView {
             meta_pending: None,
             meta_refocus: false,
             count_in: g.count_in,
+            reset_on_stop: g.reset_on_stop,
             recent: g.recent.iter().map(|p| p.as_str().into()).collect(),
             midi_in: g.midi_in.clone().into(),
             in_latency_ms: g.in_latency_ms,
@@ -1648,11 +1684,15 @@ impl EditorView {
 
     pub(crate) fn apply_tx(&mut self, label: &str, ops: Vec<Op>) {
         let arc = self.shared.clone();
-        let mut sh = lock_shared(&arc);
-        match sh.apply(label, ops) {
-            Ok(_) => self.refresh_derived_sh(&mut sh),
-            Err(e) => self.status = tf("status.apply_failed", &[("e", &e.to_string())]).into(),
+        {
+            let mut sh = lock_shared(&arc);
+            match sh.apply(label, ops) {
+                Ok(_) => self.refresh_derived_sh(&mut sh),
+                Err(e) => self.status = tf("status.apply_failed", &[("e", &e.to_string())]).into(),
+            }
         }
+        // committed transactions reach the running pass (#141)
+        self.refresh_live_schedule();
     }
 
     // --- event-properties inspector -------------------------------------

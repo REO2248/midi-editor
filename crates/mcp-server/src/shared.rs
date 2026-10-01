@@ -30,6 +30,11 @@ pub struct Shared {
     pub soloed: HashSet<usize>,
     pub metronome: bool,
     pub loop_enabled: bool,
+    /// explicit loop locators in ticks — `None` = unset (#130). `Some` +
+    /// `loop_enabled` wraps playback at the right locator back to the left;
+    /// both unset falls back to the legacy play-start→end wrap.
+    pub loop_start: Option<u64>,
+    pub loop_end: Option<u64>,
     /// opt-in: also chase the last complete SysEx message on play/loop wrap
     /// (a chased GM/GS/XG reset can wipe the channel-state chase)
     pub chase_sysex: bool,
@@ -175,6 +180,8 @@ impl Shared {
             soloed: HashSet::new(),
             metronome: false,
             loop_enabled: false,
+            loop_start: None,
+            loop_end: None,
             chase_sysex: false,
             gui_attached: false,
             sysex_policy: midi_io::SysexPolicy::Serialize,
