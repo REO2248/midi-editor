@@ -217,11 +217,11 @@ fn duplicate_range_defaults_to_song_end() {
     let ticks: Vec<(u64, u8)> = sh.lock().unwrap().doc.tracks[1]
         .events
         .iter()
-        .map(|e| {
-            let EventKind::Channel { status, .. } = &e.kind else {
-                unreachable!()
-            };
-            (e.tick, *status)
+        // the track also carries its structural End-of-Track — meta, not
+        // a channel event
+        .filter_map(|e| match &e.kind {
+            EventKind::Channel { status, .. } => Some((e.tick, *status)),
+            _ => None,
         })
         .collect();
     // original on/off at 0/480 plus the copy on/off at 480/960 (the
@@ -413,7 +413,9 @@ fn history_and_changes_since_revision() {
     let (err, v) = call(&sh, "changes_since_revision", json!({"revision": 1}));
     assert!(!err);
     assert_eq!(v["count"], 1);
-    assert_eq!(v["aggregate"]["meta_changes"], 1);
+    // tempo write + the structural End-of-Track the touched track gains —
+    // both meta-class ops are reported
+    assert_eq!(v["aggregate"]["meta_changes"], 2);
     assert_eq!(v["truncated"], false);
 
     // undo is recorded too — revision moves are visible both ways
@@ -510,17 +512,18 @@ fn query_events_pages_and_field_projection() {
         json!({"ops": (0..4).map(|i| json!({"op": "insert_note", "track": 1,
             "key": 64, "start": i * 960, "dur": 120})).collect::<Vec<_>>()}),
     );
-    // 1 fixture note + 4 inserted = 10 channel events
+    // 1 fixture note + 4 inserted = 10 channel events + 1 structural
+    // End-of-Track the edited track gains
     let rows = paged(
         &sh,
         "query_events",
         json!({"limit": 4, "fields": ["id", "tick"]}),
         "events",
     );
-    assert_eq!(rows.len(), 10);
+    assert_eq!(rows.len(), 11);
     let ids: std::collections::HashSet<_> =
         rows.iter().map(|e| e["id"].as_u64().unwrap()).collect();
-    assert_eq!(ids.len(), 10);
+    assert_eq!(ids.len(), 11);
     for e in &rows {
         let obj = e.as_object().unwrap();
         assert_eq!(obj.len(), 2, "fields projection dropped everything else");

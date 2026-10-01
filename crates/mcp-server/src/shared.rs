@@ -132,6 +132,8 @@ pub struct ChangeSummary {
     pub other_events: usize,
     pub tracks_touched: Vec<usize>,
     pub tick_range: Option<(u64, u64)>,
+    /// (before, after) when the transaction converted the SMF format
+    pub format_change: Option<(u16, u16)>,
 }
 
 /// One entry in the bounded agent-facing transaction log.
@@ -223,15 +225,18 @@ impl Shared {
         label: &str,
         ops: Vec<Op>,
     ) -> Result<u64, ApplyError> {
-        let summary = change_summary(&ops);
         let tx = Transaction {
             label: label.into(),
             base: self.doc.revision(),
             ops,
         };
         let base = self.doc.revision();
-        let rev = self.doc.apply(tx.clone())?;
-        self.undo.push(tx);
+        let applied = self.doc.apply(tx)?;
+        let rev = applied.revision;
+        let summary = change_summary(&applied.tx.ops);
+        // undo replays the *effective* transaction (caller's ops plus any
+        // synthesized normalization) so pre-edit bytes restore exactly
+        self.undo.push(applied.tx);
         self.record_history(TxRecord {
             base,
             revision: rev,
@@ -323,10 +328,12 @@ impl Shared {
             let tx = Transaction {
                 label: label.into(),
                 base: b.staging.revision(),
-                ops,
+                ops: ops.clone(),
             };
-            let rev = b.staging.apply(tx.clone())?;
-            b.ops.extend(tx.ops);
+            let rev = b.staging.apply(tx)?.revision;
+            // batch accumulates the caller's ops; normalization is
+            // re-derived when the merged transaction commits
+            b.ops.extend(ops);
             b.last_activity = Instant::now();
             return Ok(StageOutcome::Staged {
                 pending_ops: b.ops.len(),
@@ -379,13 +386,13 @@ impl Shared {
             });
             self.batch = Some(b);
             return match result {
-                Ok(rev) => Ok(serde_json::json!({
+                Ok(applied) => Ok(serde_json::json!({
                     "dry_run": true,
                     "valid": true,
                     "label": label,
                     "ops": n_ops,
                     "summary": change_summary_json(&changes),
-                    "would_be_revision": rev,
+                    "would_be_revision": applied.revision,
                 })),
                 Err(e) => Err(err_json(format!("dry_run failed: {e}"))),
             };
@@ -505,6 +512,9 @@ pub fn change_summary(ops: &[Op]) -> ChangeSummary {
                 s.updated += 1;
                 s.meta_changes += 1; // the only UpdateTrack field is the name meta
             }
+            Op::SetFormat { before, after } => {
+                s.format_change = Some((*before, *after));
+            }
         }
     }
     s.tracks_touched = tracks.into_iter().collect();
@@ -522,6 +532,9 @@ pub(crate) fn merge_summary(a: &mut ChangeSummary, b: &ChangeSummary) {
     a.cc_changes += b.cc_changes;
     a.meta_changes += b.meta_changes;
     a.other_events += b.other_events;
+    if b.format_change.is_some() {
+        a.format_change = b.format_change;
+    }
     for t in &b.tracks_touched {
         if !a.tracks_touched.contains(t) {
             a.tracks_touched.push(*t);
@@ -552,6 +565,7 @@ pub(crate) fn change_summary_json(s: &ChangeSummary) -> serde_json::Value {
         "other_events": s.other_events,
         "tracks_touched": s.tracks_touched,
         "tick_range": s.tick_range.map(|(lo, hi)| vec![lo, hi]),
+        "format_change": s.format_change.map(|(b, a)| serde_json::json!({"before": b, "after": a})),
     })
 }
 

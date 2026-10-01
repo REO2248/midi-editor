@@ -394,7 +394,9 @@ proptest! {
                 base: doc.revision(),
                 ops,
             };
-            doc.apply(tx.clone()).expect("builder ops must apply cleanly");
+            // revert restores byte-exact state only via the *effective*
+            // transaction (includes synthesized normalization ops)
+            let tx = doc.apply(tx).expect("builder ops must apply cleanly").tx;
             prop_assert_eq!(doc.revision(), pre_rev + 1);
             // serialized output must always re-parse — writers never emit
             // something our own reader rejects
@@ -440,7 +442,7 @@ proptest! {
                 base: doc.revision(),
                 ops,
             };
-            doc.apply(tx.clone()).unwrap();
+            let tx = doc.apply(tx).unwrap().tx;
             applied.push(tx);
         }
         for tx in applied.iter().rev() {
@@ -547,23 +549,33 @@ proptest! {
         prop_assert!(unknown, "expected UnknownTrack for RemoveTrack past end");
         prop_assert_eq!(doc.tracks.len(), n, "rejected apply must not change tracks");
 
-        // InsertTrack past the end: clamps to the end of the list.
+        // InsertTrack past the end: clamps to the end of the list. The
+        // format/track-count invariant makes a second track on a format-0
+        // document illegal, so — like `add_track_ops` — pair the insert
+        // with an explicit SetFormat.
+        let mut ops = vec![Op::InsertTrack {
+            index: over_idx,
+            track: DocTrack {
+                name: Some(Bytes::from_static(b"appended")),
+                out_port: 0,
+                out_channel: 0,
+                events: vec![],
+            },
+        }];
+        if doc.format == 0 {
+            ops.push(Op::SetFormat {
+                before: 0,
+                after: 1,
+            });
+        }
         let tx = Transaction {
             label: "oob-insert".into(),
             base: doc.revision(),
-            ops: vec![Op::InsertTrack {
-                index: over_idx,
-                track: DocTrack {
-                    name: Some(Bytes::from_static(b"appended")),
-                    out_port: 0,
-                    out_channel: 0,
-                    events: vec![],
-                },
-            }],
+            ops,
         };
-        doc.apply(tx.clone()).expect("InsertTrack past end must clamp");
+        let applied = doc.apply(tx).expect("InsertTrack past end must clamp");
         prop_assert_eq!(doc.tracks.len(), n + 1);
-        doc.revert(&tx);
+        doc.revert(&applied.tx);
         prop_assert_eq!(doc.tracks.len(), n, "revert of clamped insert must remove it");
     }
 }

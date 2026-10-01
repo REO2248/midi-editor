@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ae1811839a97bcaf8d6c6c06a898eec565aa91864af91cb7b9354d128c902b58 # shrinks to file = File { format: 1, division: Metrical(480), tracks: [Track { events: [] }], warnings: [] }, script = [Insert { track_idx: 0, tick: 1, key: 0 }]

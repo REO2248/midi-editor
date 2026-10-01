@@ -185,9 +185,11 @@ fn apply_and_revert() {
             events: vec![new_ev],
         }],
     };
-    d.apply(tx.clone()).unwrap();
-    assert_eq!(d.tracks[0].events.len(), 2);
-    d.revert(&tx);
+    let applied = d.apply(tx).unwrap();
+    // inserted event + the structural End-of-Track the track gains
+    assert_eq!(d.tracks[0].events.len(), 3);
+    d.revert(&applied.tx);
+    // undo removes the minted EOT too — exact pre-edit state
     assert_eq!(d.tracks[0].events.len(), 1);
 }
 

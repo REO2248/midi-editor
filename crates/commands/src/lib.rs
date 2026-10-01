@@ -129,8 +129,11 @@ mod tests {
     }
 
     fn apply(doc: &mut Document, stack: &mut UndoStack, tx: Transaction) {
-        doc.apply(tx.clone()).unwrap();
-        stack.push(tx);
+        // undo needs the *effective* transaction — including any
+        // normalization ops the document synthesized — to restore the
+        // exact pre-edit state
+        let applied = doc.apply(tx).unwrap();
+        stack.push(applied.tx);
     }
 
     #[test]
@@ -139,13 +142,16 @@ mod tests {
         let mut stack = UndoStack::new(512);
         let tx = insert_tx(&mut doc, 0, 64);
         apply(&mut doc, &mut stack, tx);
-        assert_eq!(doc.tracks[0].events.len(), 2);
+        // +1 for the structural End-of-Track every track gains on first edit
+        assert_eq!(doc.tracks[0].events.len(), 3);
 
         assert_eq!(stack.undo(&mut doc).as_deref(), Some("insert 64"));
+        // undo removes the synthesized EOT too — the pre-edit state is
+        // restored byte-for-byte
         assert_eq!(doc.tracks[0].events.len(), 1);
 
         assert_eq!(stack.redo(&mut doc).as_deref(), Some("insert 64"));
-        assert_eq!(doc.tracks[0].events.len(), 2);
+        assert_eq!(doc.tracks[0].events.len(), 3);
     }
 
     #[test]
@@ -193,8 +199,10 @@ mod tests {
         let mut stack = UndoStack::new(512);
         let tx = insert_tx(&mut doc, 1, 64);
         apply(&mut doc, &mut stack, tx);
-        assert_eq!(doc.tracks[1].events.len(), 1);
+        // +1 for the structural End-of-Track every track gains on first edit
+        assert_eq!(doc.tracks[1].events.len(), 2);
         stack.undo(&mut doc);
+        // undo removes the synthesized EOT too — empty again
         assert_eq!(doc.tracks[1].events.len(), 0);
 
         // out-of-band removal (not pushed onto this stack)
@@ -233,6 +241,6 @@ mod tests {
         })
         .unwrap();
         assert_eq!(stack.redo(&mut doc).as_deref(), Some("insert 64"));
-        assert_eq!(doc.tracks[1].events.len(), 1);
+        assert_eq!(doc.tracks[1].events.len(), 2);
     }
 }

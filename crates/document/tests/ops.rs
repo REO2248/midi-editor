@@ -43,8 +43,9 @@ fn apply(d: &mut Document, ops: Vec<Op>) -> Transaction {
         base: d.revision(),
         ops,
     };
-    d.apply(tx.clone()).unwrap();
-    tx
+    // the effective transaction — synthesized normalization ops included —
+    // is the one `revert` restores byte-exactly
+    d.apply(tx).unwrap().tx
 }
 
 #[test]
@@ -357,10 +358,68 @@ fn set_time_sig_encodes_denominator_log2() {
             meta_type: 0x58,
             data,
         } => {
-            assert_eq!(&data[..], &[6, 3, 24, 8], "6/8 → dd=3");
+            // 6/8 → dd=3; a fresh compound meter clicks on the dotted
+            // quarter (36 clocks), bb stays the conventional 8
+            assert_eq!(&data[..], &[6, 3, 36, 8], "6/8 → dd=3");
         }
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn set_time_sig_rewrite_preserves_cc_bb() {
+    // a signature the file wrote with non-default cc/bb keeps those bytes
+    // when only nn/dd is rewritten
+    let mut d = doc(vec![vec![smf_core::Event {
+        tick: 0,
+        seq: 0,
+        raw_body: None,
+        kind: EventKind::Meta {
+            meta_type: 0x58,
+            data: Bytes::copy_from_slice(&[6, 3, 18, 4]),
+        },
+    }]]);
+    let __ops = d.set_time_sig_ops(0, 0, 3, 4);
+    apply(&mut d, __ops);
+    let e = d.tracks[0]
+        .events
+        .iter()
+        .find(|e| {
+            matches!(
+                e.kind,
+                EventKind::Meta {
+                    meta_type: 0x58,
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    match &e.kind {
+        EventKind::Meta { data, .. } => {
+            assert_eq!(
+                &data[..],
+                &[3, 2, 18, 4],
+                "cc/bb preserved across nn/dd rewrite"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    // the signature is still the single FF58 at that tick — set ops never
+    // grow a duplicate
+    assert_eq!(
+        d.tracks[0]
+            .events
+            .iter()
+            .filter(|e| matches!(
+                e.kind,
+                EventKind::Meta {
+                    meta_type: 0x58,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -458,8 +517,8 @@ fn delete_range_channel_ops_filters_channels() {
     assert_eq!(notes.len(), 1);
     assert_eq!(notes[0].channel, 1, "ch1 note must survive");
     assert_eq!(notes[0].key, 62);
-    // meta untouched; only ch0 events removed
-    assert_eq!(d.tracks[0].events.len(), 3);
+    // meta untouched; only ch0 events removed (+1 minted End-of-Track)
+    assert_eq!(d.tracks[0].events.len(), 4);
     assert!(d.tracks[0]
         .events
         .iter()
@@ -762,7 +821,8 @@ fn apply_is_atomic_on_unknown_track() {
             events: vec![new_ev],
         }],
     );
-    assert_eq!(d.tracks[0].events.len(), 2);
+    // original + insert + the structural End-of-Track the track gains
+    assert_eq!(d.tracks[0].events.len(), 3);
 }
 
 #[test]
@@ -770,7 +830,8 @@ fn duplicate_whole_track_range_does_not_overflow() {
     let mut d = doc(vec![vec![chan(100, 0x90, 60, 100)]]);
     let ops = d.duplicate_range_ops(0, 0, u64::MAX); // span = u64::MAX
     apply(&mut d, ops);
-    assert_eq!(d.tracks[0].events.len(), 2, "saturates instead of wrapping");
+    // original + duplicate + the structural End-of-Track
+    assert_eq!(d.tracks[0].events.len(), 3, "saturates instead of wrapping");
 }
 
 #[test]

@@ -706,14 +706,21 @@ pub fn write(format_req: u16, division: Division, tracks: &[Track], opts: WriteO
             (((fps as i16).wrapping_neg()) as u8 as u16) << 8 | ticks_per_frame as u16
         }
     };
-    let ntrks = tracks.len() as u16;
-    // preserve the source's declared format; only upgrade when the track
-    // count makes it invalid (format 0 requires exactly one track)
-    let format = if format_req == 0 && ntrks != 1 {
-        1
+    // the declared format is written verbatim — format/track-count
+    // coherence is an invariant of the *document* layer (Op::SetFormat),
+    // not something the serializer repairs silently. The one degenerate
+    // edge the writer still covers: format 0 declares exactly one track,
+    // so an empty track list still writes a single (empty) MTrk — without
+    // it the header would be a file our own reader rejects.
+    let format = format_req;
+    let empty_track;
+    let tracks: &[Track] = if format == 0 && tracks.is_empty() {
+        empty_track = Track { events: vec![] };
+        std::slice::from_ref(&empty_track)
     } else {
-        format_req
+        tracks
     };
+    let ntrks = tracks.len() as u16;
 
     let mut out = Vec::new();
     out.extend_from_slice(b"MThd");
@@ -729,7 +736,25 @@ pub fn write(format_req: u16, division: Division, tracks: &[Track], opts: WriteO
         let mut sorted: Vec<&Event> = track.events.iter().collect();
         sorted.sort_by_key(|e| (e.tick, e.seq));
 
+        // End-of-Track is the structural terminator: exactly one, always
+        // last. Stored EOTs mid-stream are skipped and re-emitted at the
+        // track's real end — their max tick is kept so an intentional
+        // silent tail survives.
+        let mut last_eot: Option<&Event> = None;
+        let mut eot_tick = 0u64;
         for ev in sorted {
+            if matches!(
+                ev.kind,
+                EventKind::Meta {
+                    meta_type: 0x2F,
+                    ..
+                }
+            ) {
+                eot_tick = eot_tick.max(ev.tick);
+                last_eot = Some(ev);
+                prev_status = None; // a meta event ends running status
+                continue;
+            }
             let delta = ev.tick - prev_tick;
             prev_tick = ev.tick;
             write_vlq(delta, &mut body);
@@ -763,11 +788,19 @@ pub fn write(format_req: u16, division: Division, tracks: &[Track], opts: WriteO
                 prev_status = if is_channel { Some(first) } else { None };
             }
         }
-        // ensure EOT
-        let has_eot = sorted_last_is_eot(track);
-        if !has_eot {
-            write_vlq(0, &mut body);
-            body.extend_from_slice(&[0xFF, 0x2F, 0x00]);
+        // emit the single terminator: at the stored max EOT tick or the
+        // last content tick, whichever is later
+        let end = eot_tick.max(prev_tick);
+        write_vlq(end - prev_tick, &mut body);
+        match last_eot {
+            Some(ev) => {
+                let body_bytes = match &ev.raw_body {
+                    Some(raw) if !raw.is_empty() => raw.clone(),
+                    _ => Bytes::from(vec![0xFF, 0x2F, 0x00]),
+                };
+                body.extend_from_slice(&body_bytes);
+            }
+            None => body.extend_from_slice(&[0xFF, 0x2F, 0x00]),
         }
 
         out.extend_from_slice(b"MTrk");
@@ -775,23 +808,6 @@ pub fn write(format_req: u16, division: Division, tracks: &[Track], opts: WriteO
         out.extend_from_slice(&body);
     }
     out
-}
-
-fn sorted_last_is_eot(track: &Track) -> bool {
-    track
-        .events
-        .iter()
-        .max_by_key(|e| (e.tick, e.seq))
-        .map(|e| {
-            matches!(
-                e.kind,
-                EventKind::Meta {
-                    meta_type: 0x2F,
-                    ..
-                }
-            )
-        })
-        .unwrap_or(false)
 }
 
 /// Guessed encoding of a meta text payload. SMF never specifies an encoding;
@@ -997,12 +1013,16 @@ mod tests {
     }
 
     #[test]
-    fn format0_with_zero_tracks_upgrades() {
-        // format 0 requires exactly one track; an empty document would emit
-        // a header every parser (including ours) rejects
+    fn format0_with_zero_tracks_writes_one_empty_track() {
+        // format 0 declares exactly one track — an empty track list still
+        // emits a single (empty) MTrk so the header stays a valid format-0
+        // file every parser accepts. The FORMAT byte is still verbatim.
         let out = write(0, Division::Metrical(480), &[], WriteOptions::default());
-        assert_eq!(&out[8..10], &[0x00, 0x01]);
-        assert_eq!(parse(&out).unwrap().tracks.len(), 0);
+        assert_eq!(&out[8..10], &[0x00, 0x00], "format verbatim");
+        assert_eq!(&out[10..12], &[0x00, 0x01], "one MTrk for format 0");
+        let back = parse(&out).unwrap();
+        assert_eq!(back.format, 0);
+        assert_eq!(back.tracks.len(), 1);
     }
 
     #[test]

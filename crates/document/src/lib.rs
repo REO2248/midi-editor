@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 use thiserror::Error;
 
 mod timing;
-pub use timing::TimeDisplay;
+pub use timing::{MeterEvent, MeterMap, PositionFormat, TimeDisplay};
 
 pub type EventId = u64;
 pub type Revision = u64;
@@ -58,6 +58,9 @@ pub struct Document {
     pub(crate) next_event_id: EventId,
     pub(crate) by_id: HashMap<EventId, (usize, usize)>, // id -> (track, event index)
     pub tempo_map: TempoMap,
+    /// FF 58 breakpoints for the shared (conductor) timeline; format-2
+    /// per-sequence maps derive on demand via `meter_map_for`.
+    pub meter_map: MeterMap,
 }
 
 #[derive(Debug, Error)]
@@ -68,6 +71,10 @@ pub enum ApplyError {
     UnknownEvent(EventId),
     #[error("unknown track {0}")]
     UnknownTrack(usize),
+    #[error("a document must keep at least one track")]
+    EmptyDocument,
+    #[error("format {format} cannot declare {tracks} tracks")]
+    FormatTrackMismatch { format: u16, tracks: usize },
 }
 
 /// One undo step. `before`/`after` are self-contained diffs so undo needs no
@@ -77,6 +84,18 @@ pub struct Transaction {
     pub label: String,
     pub base: Revision,
     pub ops: Vec<Op>,
+}
+
+/// Result of `Document::apply`: the new revision plus the *effective*
+/// transaction — the caller's ops followed by any structural-normalization
+/// ops the document synthesized (a lone End-of-Track is kept last after
+/// every touched track). Undo of the effective transaction restores the
+/// exact pre-edit state; redo replays it identically since normalization
+/// is deterministic.
+#[derive(Debug, Clone)]
+pub struct Applied {
+    pub revision: Revision,
+    pub tx: Transaction,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +130,13 @@ pub enum Op {
         index: usize,
         before: Track,
         after: Track,
+    },
+    /// Explicit SMF format conversion (0→1 when a track is added to a
+    /// format-0 file, or an explicit convert command). Never implicit —
+    /// the serializer writes exactly the declared format.
+    SetFormat {
+        before: u16,
+        after: u16,
     },
 }
 

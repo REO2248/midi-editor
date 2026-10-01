@@ -97,8 +97,10 @@ fn commit(doc: &mut Document, stack: &mut UndoStack, ops: Vec<Op>, label: &str) 
         base: doc.revision(),
         ops,
     };
-    doc.apply(tx.clone()).expect("ops built on current state");
-    stack.push(tx);
+    // push the *effective* transaction — undo of synthesized normalization
+    // ops is what restores the pre-edit bytes exactly
+    let applied = doc.apply(tx).expect("ops built on current state");
+    stack.push(applied.tx);
     true
 }
 

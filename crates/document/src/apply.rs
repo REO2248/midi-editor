@@ -53,17 +53,26 @@ impl Document {
                 }
             })
             .collect();
+        // A file that declares format 0 but carries several tracks is
+        // self-contradictory (format 0 means exactly one); read it as
+        // format 1 — an interpretation of the header, not a data rewrite.
+        let format = if f.format == 0 && tracks.len() != 1 {
+            1
+        } else {
+            f.format
+        };
         let mut doc = Document {
-            format: f.format,
+            format,
             division: f.division,
             tracks,
             revision: 0,
             next_event_id: next_id,
             by_id,
             tempo_map: TempoMap::default(),
+            meter_map: MeterMap::default(),
         };
         doc.rebuild_index();
-        doc.tempo_map = TempoMap::build(&doc.tracks, doc.division);
+        doc.rebuild_maps();
         doc
     }
 
@@ -88,29 +97,83 @@ impl Document {
         }
     }
 
+    /// Tempo and meter breakpoints are pure derivations of the event
+    /// list — rebuilt wholesale after every mutation, cheap and always
+    /// in sync.
+    fn rebuild_maps(&mut self) {
+        self.tempo_map = TempoMap::build(&self.tracks, self.division);
+        self.meter_map = MeterMap::build(&self.tracks, self.division);
+    }
+
     /// The single edit entry point shared by GUI and MCP. Atomic: either
     /// every op applies and the revision advances, or an error leaves the
     /// document (and its id index) exactly as it was.
-    pub fn apply(&mut self, tx: Transaction) -> Result<Revision, ApplyError> {
+    ///
+    /// Post-conditions enforced here (the "structural invariants"):
+    /// every touched track keeps a single End-of-Track as its last event
+    /// (re-ticked past the new content), the document never drops to zero
+    /// tracks, and the declared SMF format stays consistent with the
+    /// track count — callers must use `Op::SetFormat` to convert.
+    ///
+    /// Normalization is expressed as synthesized ops appended to the
+    /// returned `Applied::tx` — reverting THAT transaction restores the
+    /// exact pre-edit state (a minted EOT disappears again), and replaying
+    /// it reaches the same normalized state deterministically.
+    pub fn apply(&mut self, tx: Transaction) -> Result<Applied, ApplyError> {
         if tx.base != self.revision {
             return Err(ApplyError::StaleRevision {
                 expected: self.revision,
                 got: tx.base,
             });
         }
+        let mut format = self.format;
         let mut tracks = self.tracks.clone();
+        let mut touched = std::collections::BTreeSet::new();
         for op in &tx.ops {
-            apply_op(&mut tracks, op)?;
+            apply_op(&mut format, &mut tracks, op, &mut touched)?;
         }
+        if tracks.is_empty() {
+            return Err(ApplyError::EmptyDocument);
+        }
+        if format == 0 && tracks.len() != 1 {
+            return Err(ApplyError::FormatTrackMismatch {
+                format,
+                tracks: tracks.len(),
+            });
+        }
+        // synthesize first (before-images read post-user-op state), then
+        // apply — the synthesized ops carry their own before-images, so
+        // undo of the effective transaction restores the original bytes.
+        let mut synth = Vec::new();
+        for &ti in &touched {
+            synth.extend(eot_normalize_ops(ti, &tracks[ti], &mut self.next_event_id));
+        }
+        let mut extra = std::collections::BTreeSet::new();
+        for op in &synth {
+            apply_op(&mut format, &mut tracks, op, &mut extra)?;
+        }
+        self.format = format;
         self.tracks = tracks;
         self.revision += 1;
         self.rebuild_index();
-        self.tempo_map = TempoMap::build(&self.tracks, self.division);
-        Ok(self.revision)
+        self.rebuild_maps();
+        let mut ops = tx.ops;
+        ops.extend(synth);
+        Ok(Applied {
+            revision: self.revision,
+            tx: Transaction {
+                label: tx.label,
+                base: tx.base,
+                ops,
+            },
+        })
     }
 
-    /// restore the `before` images of a transaction (undo)
+    /// restore the `before` images of a transaction (undo). Pass the
+    /// *effective* transaction from `apply` — its synthesized trailing ops
+    /// are what restore the pre-normalization bytes exactly.
     pub fn revert(&mut self, tx: &Transaction) {
+        let mut touched = std::collections::BTreeSet::new();
         for op in tx.ops.iter().rev() {
             match op {
                 Op::InsertEvents { track, events } => {
@@ -157,6 +220,9 @@ impl Document {
                         *t = before.clone();
                     }
                 }
+                Op::SetFormat { before, .. } => {
+                    self.format = *before;
+                }
             }
             let ti = match op {
                 Op::InsertEvents { track, .. }
@@ -165,14 +231,16 @@ impl Document {
                 Op::InsertTrack { index, .. }
                 | Op::RemoveTrack { index, .. }
                 | Op::UpdateTrack { index, .. } => Some(*index),
+                Op::SetFormat { .. } => None,
             };
             if let Some(ti) = ti {
                 refresh_track_meta(&mut self.tracks, ti);
+                touched.insert(ti);
             }
         }
         self.revision += 1;
         self.rebuild_index();
-        self.tempo_map = TempoMap::build(&self.tracks, self.division);
+        self.rebuild_maps();
     }
 
     /// File-wide text-encoding hint from an XF `FF 09` charset marker
@@ -204,7 +272,8 @@ impl Document {
         let mut out = Vec::new();
         for (ti, t) in self.tracks.iter().enumerate() {
             let mut eot = false;
-            for e in &t.events {
+            let mut first_eot: Option<(usize, &Event)> = None;
+            for (ei, e) in t.events.iter().enumerate() {
                 if matches!(
                     e.kind,
                     EventKind::Meta {
@@ -212,6 +281,17 @@ impl Document {
                         ..
                     }
                 ) {
+                    if eot {
+                        out.push(Diagnostic {
+                            code: "duplicate-eot",
+                            track: ti,
+                            tick: e.tick,
+                            event: Some(e.id),
+                            detail: "track carries more than one End-of-Track".into(),
+                        });
+                    } else {
+                        first_eot = Some((ei, e));
+                    }
                     eot = true;
                 }
                 // tempo maps outside track 0 (format-1 files): legal but
@@ -243,6 +323,21 @@ impl Document {
                     event: None,
                     detail: "track has no End-of-Track meta event".into(),
                 });
+            }
+            // content past the first EOT is dead space to most players —
+            // the terminator is expected to be the last event
+            if let Some((ei, eot_e)) = first_eot {
+                if let Some(e) = t.events.get(ei + 1) {
+                    out.push(Diagnostic {
+                        code: "events-after-eot",
+                        track: ti,
+                        tick: e.tick,
+                        event: Some(eot_e.id),
+                        detail:
+                            "events sit after the End-of-Track marker and may be dropped by players"
+                                .into(),
+                    });
+                }
             }
         }
         let (notes, mut pairing_diags) = self.paired_notes();
@@ -310,6 +405,42 @@ impl Document {
                             ops.push(Op::RemoveEvents {
                                 track: ti,
                                 removed: vec![(ei, e)],
+                            });
+                        }
+                    }
+                }
+                "duplicate-eot" => {
+                    // drop the extra terminator; the first stays
+                    if let Some(id) = d.event {
+                        if let Some((ti, ei)) = self.by_id.get(&id).copied() {
+                            let e = self.tracks[ti].events[ei].clone();
+                            ops.push(Op::RemoveEvents {
+                                track: ti,
+                                removed: vec![(ei, e)],
+                            });
+                        }
+                    }
+                }
+                "events-after-eot" => {
+                    // slide the terminator past the track's last content
+                    // tick — a silent tail is preserved, orphaned content
+                    // becomes reachable again
+                    if let Some(id) = d.event {
+                        if let Some((ti, ei)) = self.by_id.get(&id).copied() {
+                            let before = self.tracks[ti].events[ei].clone();
+                            let mut after = before.clone();
+                            after.tick = self.tracks[ti]
+                                .events
+                                .iter()
+                                .map(|e| e.tick)
+                                .max()
+                                .unwrap_or(0);
+                            after.seq = u32::MAX;
+                            after.raw_body = None;
+                            ops.push(Op::UpdateEvent {
+                                track: ti,
+                                before,
+                                after,
                             });
                         }
                     }
@@ -739,6 +870,35 @@ impl Document {
         }
     }
 
+    /// The meter map a track's bars/beats count by. Format-2 tracks are
+    /// independent sequences — each counts its own signatures, so this
+    /// builds a map from that track alone (same rule as `tempo_map_for`).
+    /// Format 0/1 tracks share the conductor map.
+    pub fn meter_map_for(&self, track: usize) -> MeterMap {
+        if self.is_sequential() && track < self.tracks.len() {
+            MeterMap::build(std::slice::from_ref(&self.tracks[track]), self.division)
+        } else {
+            self.meter_map.clone()
+        }
+    }
+
+    /// Owned position formatter for `track`'s timeline — metrical
+    /// `bar.beat.tick` under that track's real `FF 58` map (format 2: the
+    /// sequence's own), SMPTE timecode otherwise. UI snapshot paths
+    /// (a11y subtrees, canvas closures) keep the value; immediate reads
+    /// can use `format_position_for`.
+    pub fn position_format_for(&self, track: usize) -> PositionFormat {
+        match self.time_display() {
+            TimeDisplay::Smpte { .. } => PositionFormat::Smpte(self.time_display()),
+            TimeDisplay::Metrical { .. } => PositionFormat::Bbt(self.meter_map_for(track)),
+        }
+    }
+
+    /// `tick` as UI position text — see `position_format_for`.
+    pub fn format_position_for(&self, track: usize, tick: u64) -> String {
+        self.position_format_for(track).fmt(tick)
+    }
+
     pub fn serialize(&self, opts: smf_core::WriteOptions) -> Vec<u8> {
         self.snapshot().serialize(opts)
     }
@@ -793,10 +953,17 @@ impl DocSnapshot {
     }
 }
 
-/// Apply one op to a working track list. Fails only on `UnknownTrack` /
-/// before any partial state is visible — `Document::apply` commits only when
-/// every op of the transaction succeeded.
-fn apply_op(tracks: &mut Vec<Track>, op: &Op) -> Result<(), ApplyError> {
+/// Apply one op to a working (format, tracks) pair. Fails only on
+/// `UnknownTrack` before any partial state is visible —
+/// `Document::apply` commits only when every op of the transaction
+/// succeeded. Track indexes the op mutates are collected into
+/// `touched` for the post-commit EOT normalization.
+fn apply_op(
+    format: &mut u16,
+    tracks: &mut Vec<Track>,
+    op: &Op,
+    touched: &mut std::collections::BTreeSet<usize>,
+) -> Result<(), ApplyError> {
     match op {
         Op::InsertEvents { track, events } => {
             let t = tracks
@@ -849,6 +1016,9 @@ fn apply_op(tracks: &mut Vec<Track>, op: &Op) -> Result<(), ApplyError> {
                 *t = after.clone();
             }
         }
+        Op::SetFormat { after, .. } => {
+            *format = *after;
+        }
     }
     // keep the track's cached conventional metas honest
     let ti = match op {
@@ -858,11 +1028,95 @@ fn apply_op(tracks: &mut Vec<Track>, op: &Op) -> Result<(), ApplyError> {
         Op::InsertTrack { index, .. }
         | Op::RemoveTrack { index, .. }
         | Op::UpdateTrack { index, .. } => Some(*index),
+        Op::SetFormat { .. } => None,
     };
     if let Some(ti) = ti {
-        refresh_track_meta(tracks, ti);
+        if ti < tracks.len() {
+            refresh_track_meta(tracks, ti);
+            touched.insert(ti);
+        }
     }
     Ok(())
+}
+
+/// Ops that restore a touched track's structural terminator: exactly one
+/// End-of-Track, sitting last. A lone EOT keeps its stored tick unless
+/// content was appended past it (it may intentionally pad a silent tail);
+/// duplicates collapse to the latest (by tick,seq) terminator, which is
+/// the one whose raw bytes survive a save; a track left without one gets
+/// a fresh event minted at the last content tick.
+///
+/// The ops carry before-images, so they are appended to the effective
+/// transaction and undo restores the pre-normalization state exactly.
+fn eot_normalize_ops(ti: usize, t: &Track, next_id: &mut EventId) -> Vec<Op> {
+    let is_eot = |e: &Event| {
+        matches!(
+            e.kind,
+            EventKind::Meta {
+                meta_type: 0x2F,
+                ..
+            }
+        )
+    };
+    let last_content = t.events.iter().filter(|e| !is_eot(e)).map(|e| e.tick).max();
+    let eot_pos: Vec<usize> = t
+        .events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| is_eot(e))
+        .map(|(i, _)| i)
+        .collect();
+    match (eot_pos.len(), last_content) {
+        (0, None) => vec![], // empty track: nothing to terminate
+        (0, Some(last)) => {
+            let id = *next_id;
+            *next_id += 1;
+            vec![Op::InsertEvents {
+                track: ti,
+                events: vec![Event {
+                    id,
+                    tick: last,
+                    seq: u32::MAX,
+                    raw_body: None,
+                    kind: EventKind::Meta {
+                        meta_type: 0x2F,
+                        data: Bytes::new(),
+                    },
+                }],
+            }]
+        }
+        (1, None) => vec![], // lone EOT keeps its tail tick
+        (_, _) => {
+            // the terminator to keep is the LAST one in (tick, seq)
+            // order — for an in-order track that is the trailing meta
+            let keep = *eot_pos.iter().max().unwrap();
+            let mut ops = Vec::new();
+            let removed: Vec<(usize, Event)> = eot_pos
+                .iter()
+                .filter(|&&i| i != keep)
+                .map(|&i| (i, t.events[i].clone()))
+                .collect();
+            if !removed.is_empty() {
+                ops.push(Op::RemoveEvents { track: ti, removed });
+            }
+            let before = t.events[keep].clone();
+            let target = before.tick.max(last_content.unwrap_or(0));
+            if before.tick != target || before.seq != u32::MAX {
+                let after = Event {
+                    tick: target,
+                    seq: u32::MAX,
+                    raw_body: None,
+                    ..before.clone()
+                };
+                ops.push(Op::UpdateEvent {
+                    track: ti,
+                    before,
+                    after,
+                });
+            }
+            ops
+        }
+    }
 }
 
 /// Rescan the first name/out-port/out-channel metas after an edit so the
