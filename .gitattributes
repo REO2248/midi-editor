@@ -1,0 +1,3 @@
+# corpus_gen writes the manifest with LF; stop git converting it to
+# CRLF on Windows checkouts or `corpus_gen --check` reports a false drift
+fixtures/corpus/manifest.json -text
