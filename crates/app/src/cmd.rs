@@ -199,11 +199,12 @@ fn has_ev_sel(v: &EditorView) -> bool {
 }
 
 fn has_sel(v: &EditorView) -> bool {
-    !v.selection.is_empty()
+    // any focused-context selection (#152): notes, lane marquee, event rows
+    !v.selection.is_empty() || !v.lane_sel.is_empty() || !v.sel_events.is_empty()
 }
 
 fn has_clip(v: &EditorView) -> bool {
-    !v.clipboard.is_empty()
+    v.clipboard.is_some()
 }
 
 fn can_undo(v: &EditorView) -> bool {
@@ -263,21 +264,21 @@ pub static COMMANDS: &[Command] = &[
         "menu.select_all",
         &["ctrl+a"],
         None,
-        |v, _w, cx| v.select_all(cx)
+        |v, w, cx| v.select_all(w, cx)
     ),
     cmd!(
         "edit.cut",
         "edit.cut",
         &["ctrl+x"],
         Some(has_sel),
-        |v, _w, cx| v.copy_selected(true, cx)
+        |v, w, cx| v.copy_selected(true, w, cx)
     ),
     cmd!(
         "edit.copy",
         "edit.copy",
         &["ctrl+c"],
         Some(has_sel),
-        |v, _w, cx| v.copy_selected(false, cx)
+        |v, w, cx| v.copy_selected(false, w, cx)
     ),
     cmd!(
         "edit.paste",
@@ -298,7 +299,7 @@ pub static COMMANDS: &[Command] = &[
         "menu.delete",
         &["delete", "backspace"],
         Some(has_sel),
-        |v, _w, cx| v.delete_selected(cx)
+        |v, w, cx| v.delete_selected(w, cx)
     ),
     cmd!(
         "edit.marker_ins",

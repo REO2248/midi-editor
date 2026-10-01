@@ -121,14 +121,41 @@ pub(crate) const SNAPS: [(u32, bool, &str); 10] = [
 ];
 
 impl EditorView {
-    /// Select every note in the selected track.
-    pub(crate) fn select_all(&mut self, cx: &mut Context<Self>) {
-        self.selection = self
-            .notes
-            .iter()
-            .filter(|n| n.track == self.sel_track)
-            .map(|n| n.on_id)
-            .collect();
+    /// Select everything in the focused context (#152): the event list
+    /// selects rows, the lane selects its events, the roll/track areas
+    /// select the selected track's notes.
+    pub(crate) fn select_all(&mut self, window: &Window, cx: &mut Context<Self>) {
+        match self.area(window, cx) {
+            FocusArea::Events => {
+                self.sel_events = self
+                    .event_refs
+                    .iter()
+                    .flatten()
+                    .map(|(_, _, id)| *id)
+                    .collect();
+            }
+            FocusArea::Lane => {
+                // every event shown by every visible lane of this track
+                let cfgs = self.lanes.clone();
+                let mut ids = BTreeSet::new();
+                for cfg in cfgs {
+                    ids.extend(
+                        self.lane_events_cached(cfg.mode, cfg.poly_key)
+                            .iter()
+                            .map(|(id, _, _, _)| *id),
+                    );
+                }
+                self.lane_sel = ids;
+            }
+            _ => {
+                self.selection = self
+                    .notes
+                    .iter()
+                    .filter(|n| n.track == self.sel_track)
+                    .map(|n| n.on_id)
+                    .collect();
+            }
+        }
         cx.notify();
     }
 
@@ -337,6 +364,22 @@ impl EditorView {
     /// 480 fallback the pre-format-2 code did (position labels only).
     pub(crate) fn ppq(&self) -> u64 {
         self.doc(|d| d.tempo_map.ppq().unwrap_or(480))
+    }
+
+    /// The quantize grid in ticks — a dedicated setting (#139), not the
+    /// draw snap. Shares the SNAPS table so its label language matches.
+    pub(crate) fn quantize_grid(&self) -> u64 {
+        let (div, trip, _) = SNAPS[self.q_snap.min(SNAPS.len() - 1)];
+        if div == 0 {
+            // "off" quantize = 1-tick grid (no visible movement)
+            return 1;
+        }
+        let base = self.td().snap_base_ticks() / div as u64;
+        if trip {
+            (base * 2 / 3).max(1)
+        } else {
+            base.max(1)
+        }
     }
 
     pub(crate) fn snap_ticks(&self) -> i64 {
@@ -837,9 +880,10 @@ impl EditorView {
         }
     }
 
-    /// Note length used by cursor inserts — same rule as `insert_note`.
+    /// Note length used by cursor inserts — the explicit Note Length
+    /// setting (#144), never the hidden max(snap, quarter) policy.
     pub(crate) fn cursor_insert_len(&self) -> u64 {
-        self.snap_ticks().max(self.ppq() as i64 / 4) as u64
+        self.note_len.ticks(self)
     }
 
     /// Move the roll edit cursor and scroll it into view.

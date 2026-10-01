@@ -35,6 +35,48 @@ pub(crate) const LANE_KEY_COLORS: [u32; 8] = [
 /// Snap-menu label: metrical files subdivide a whole note, SMPTE files a
 /// second — "1/16" vs "1/16s" makes the redefined grid explicit instead
 /// of silently suggesting beats that don't exist. "off" stays bare.
+impl EditorView {
+    /// Quantize grid rows (checkable) — labeled with the SNAPS table.
+    pub(crate) fn quant_grid_rows(&self, cx: &mut Context<Self>) -> Vec<MenuRow> {
+        let td = self.td();
+        SNAPS
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let label = snap_label(s.2, td);
+                Self::mi_leaf(
+                    ("qgrid", i),
+                    label,
+                    "",
+                    Some(self.q_snap == i),
+                    cx,
+                    move |v, _e, _cx| {
+                        v.q_snap = i;
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Quantize strength rows — 100/75/50 with the current pick checked.
+    pub(crate) fn quant_str_rows(&self, cx: &mut Context<Self>) -> Vec<MenuRow> {
+        [100u32, 75, 50]
+            .iter()
+            .enumerate()
+            .map(|(i, &st)| {
+                Self::mi_leaf(
+                    ("qstr", i),
+                    tf("quant.strength", &[("p", st.to_string().as_str())]),
+                    "",
+                    Some(self.q_str == st),
+                    cx,
+                    move |v, _e, _cx| v.q_str = st,
+                )
+            })
+            .collect()
+    }
+}
+
 fn snap_label(label: &'static str, td: TimeDisplay) -> String {
     if td.is_smpte() && label != "off" {
         format!("{label}s")
@@ -1016,9 +1058,10 @@ impl Render for EditorView {
                 false,
                 cx,
                 |v, _e, cx| {
-                    let g = v.snap_ticks().max(v.td().min_grid_ticks() as i64) as u64;
+                    let g = v.quantize_grid();
+                    let st = v.q_str;
                     v.apply_region_op("quantize", move |d, tr, f, to| {
-                        d.quantize_ops(tr, f, to, g, 100)
+                        d.quantize_ops(tr, f, to, g, st)
                     });
                     cx.notify();
                 },
@@ -2573,6 +2616,8 @@ impl Render for EditorView {
                     Self::msep(),
                     Self::mi_sub("e.tool", t("edit.tool"), Sub::Tool, cx),
                     Self::mi_sub("e.snap", t("edit.snap"), Sub::Snap, cx),
+                    Self::mi_sub("e.notelen", t("edit.note_len"), Sub::NoteLen, cx),
+                    Self::mi_sub("e.insvel", t("edit.ins_vel"), Sub::InsVel, cx),
                     Self::msep(),
                     Self::mi_sub("e.quant", t("edit.quantize"), Sub::Quant, cx),
                     self.mi_cmd("edit.transpose_up", None, cx),
@@ -3327,26 +3372,32 @@ impl Render for EditorView {
                                 .collect()
                         }
                     }
+                    // Quantize submenu (#139): the grid + strength are
+                    // visible settings picked before Apply — the toolbar
+                    // button and this menu resolve the same state.
                     Sub::Quant => {
-                        let g = self.snap_ticks().max(self.td().min_grid_ticks() as i64) as u64;
-                        [("100%", 100u32), ("75%", 75), ("50%", 50)]
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, (label, str_))| {
-                                Self::mi_leaf(
-                                    ("quant", i),
-                                    format!("Quantize {label}"),
-                                    "",
-                                    None,
-                                    cx,
-                                    move |v, _e, _cx| {
-                                        v.apply_region_op("quantize", move |d, t, f, to| {
-                                            d.quantize_ops(t, f, to, g, str_)
-                                        });
-                                    },
-                                )
-                            })
-                            .collect()
+                        let mut rows = vec![
+                            Self::mi_leaf(
+                                "quant.apply",
+                                t("quant.apply"),
+                                "",
+                                None,
+                                cx,
+                                |v, _e, cx| {
+                                    let g = v.quantize_grid();
+                                    let st = v.q_str;
+                                    v.apply_region_op("quantize", move |d, t, f, to| {
+                                        d.quantize_ops(t, f, to, g, st)
+                                    });
+                                    cx.notify();
+                                },
+                            ),
+                            Self::msep(),
+                        ];
+                        rows.extend(self.quant_grid_rows(cx));
+                        rows.push(Self::msep());
+                        rows.extend(self.quant_str_rows(cx));
+                        rows
                     }
                     Sub::Oct => {
                         let opts = [("+1 octave", 12i32), ("-1 octave", -12)];
@@ -3360,6 +3411,91 @@ impl Render for EditorView {
                                 })
                             })
                             .collect()
+                    }
+                    Sub::NoteLen => {
+                        let opts: Vec<NoteLen> = vec![
+                            NoteLen::Grid,
+                            NoteLen::LastUsed,
+                            NoteLen::Fixed {
+                                den: 4,
+                                trip: false,
+                                dot: false,
+                            },
+                            NoteLen::Fixed {
+                                den: 8,
+                                trip: false,
+                                dot: false,
+                            },
+                            NoteLen::Fixed {
+                                den: 16,
+                                trip: false,
+                                dot: false,
+                            },
+                            NoteLen::Fixed {
+                                den: 32,
+                                trip: false,
+                                dot: false,
+                            },
+                            NoteLen::Fixed {
+                                den: 8,
+                                trip: true,
+                                dot: false,
+                            },
+                            NoteLen::Fixed {
+                                den: 16,
+                                trip: true,
+                                dot: false,
+                            },
+                            NoteLen::Fixed {
+                                den: 8,
+                                trip: false,
+                                dot: true,
+                            },
+                            NoteLen::Fixed {
+                                den: 4,
+                                trip: false,
+                                dot: true,
+                            },
+                        ];
+                        opts.into_iter()
+                            .enumerate()
+                            .map(|(i, nl)| {
+                                Self::mi_leaf(
+                                    ("nlen", i),
+                                    nl.label(),
+                                    "",
+                                    Some(self.note_len == nl),
+                                    cx,
+                                    move |v, _e, _cx| {
+                                        v.note_len = nl;
+                                    },
+                                )
+                            })
+                            .collect()
+                    }
+                    Sub::InsVel => {
+                        let mut rows = Vec::new();
+                        rows.push(Self::mi_leaf(
+                            "ivel.last",
+                            tf("ins_vel.last", &[("v", self.last_vel.to_string().as_str())]),
+                            "",
+                            Some(self.vel_src == VelSrc::LastUsed),
+                            cx,
+                            |v, _e, _cx| v.vel_src = VelSrc::LastUsed,
+                        ));
+                        rows.extend([127u8, 112, 96, 80, 64, 48, 32].iter().enumerate().map(
+                            |(i, &v_)| {
+                                Self::mi_leaf(
+                                    ("ivel", i),
+                                    format!("{v_}"),
+                                    "",
+                                    Some(self.vel_src == VelSrc::Fixed(v_)),
+                                    cx,
+                                    move |v, _e, _cx| v.vel_src = VelSrc::Fixed(v_),
+                                )
+                            },
+                        ));
+                        rows
                     }
                     Sub::LenSet => {
                         // metrical: note fractions + a real bar at the

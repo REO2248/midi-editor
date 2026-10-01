@@ -214,6 +214,8 @@ fn dump(window: &Window, v: &EditorView) -> String {
             Sub::MetDest => "MetDest",
             Sub::CountIn => "CountIn",
             Sub::Monitor => "Monitor",
+            Sub::NoteLen => "NoteLen",
+            Sub::InsVel => "InsVel",
         })
         .unwrap_or("-");
     let _ = writeln!(

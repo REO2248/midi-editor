@@ -211,6 +211,10 @@ enum Sub {
     CountIn,
     /// Transport → input monitor mode (#159)
     Monitor,
+    /// Edit → new-note length picker (#144)
+    NoteLen,
+    /// Edit → new-note velocity picker (#153)
+    InsVel,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -304,6 +308,73 @@ struct LaneCfg {
     h: f32,
     collapsed: bool,
     poly_key: Option<u8>,
+}
+
+/// New-note length (#144) — an explicit user choice, separate from the
+/// snap grid. `Fixed(den)` is the note fraction; `trip`/`dot` modify it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoteLen {
+    /// follow the snap grid's current value
+    Grid,
+    /// reuse the length of the last inserted note
+    LastUsed,
+    /// fixed length as a note fraction: denominator 4/8/16/32, optional
+    /// triplet (2/3) or dotted (3/2) feel
+    Fixed { den: u8, trip: bool, dot: bool },
+}
+
+impl NoteLen {
+    /// Resolve to ticks for the given doc/view state.
+    fn ticks(self, v: &EditorView) -> u64 {
+        match self {
+            Self::Grid => v.snap_ticks().max(1) as u64,
+            Self::LastUsed => v.last_note_len.max(1),
+            Self::Fixed { den, trip, dot } => {
+                let ppq = v.ppq().max(1);
+                let mut t = ppq * 4 / den.max(1) as u64;
+                if trip {
+                    t = t * 2 / 3;
+                }
+                if dot {
+                    t += t / 2;
+                }
+                t.max(1)
+            }
+        }
+    }
+
+    fn label(self) -> String {
+        match self {
+            Self::Grid => "Grid".to_string(),
+            Self::LastUsed => "Last used".to_string(),
+            Self::Fixed { den, trip, dot } => {
+                format!(
+                    "1/{}{}{}",
+                    den,
+                    if trip { "T" } else { "" },
+                    if dot { "." } else { "" }
+                )
+            }
+        }
+    }
+}
+
+/// New-note velocity (#153) — explicit fixed value or "last used".
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VelSrc {
+    /// reuse the velocity of the last inserted/edited note
+    LastUsed,
+    /// always this velocity
+    Fixed(u8),
+}
+
+impl VelSrc {
+    fn resolve(self, last: u8) -> u8 {
+        match self {
+            Self::LastUsed => last.clamp(1, 127),
+            Self::Fixed(v) => v.clamp(1, 127),
+        }
+    }
 }
 
 impl Default for LaneCfg {
@@ -538,8 +609,9 @@ struct EditorView {
     snap_idx: usize,
     /// on_ids swept by the erase tool during a drag; deleted as one tx
     erase_ids: BTreeSet<EventId>,
-    /// note clipboard (cut/copy/paste)
-    clipboard: Vec<ClipNote>,
+    /// event clipboard — mirrored to the OS clipboard on copy (#142);
+    /// kept in-process too so paste still works if OS access fails
+    clipboard: Option<Clip>,
     /// canvas bounds as painted last frame — for hit-testing
     roll_bounds: Rc<Cell<Bounds<Pixels>>>,
     /// piano-key strip bounds (the clickable keyboard left of the roll)
@@ -724,6 +796,21 @@ struct EditorView {
     monitor: crate::recording::MonMode,
     /// armed track's input channel filter — `None` = all channels (#159)
     rec_in_ch: Option<u8>,
+    /// new-note length source (#144): grid / last-used / fixed fraction —
+    /// an explicit state instead of the hidden max(snap, quarter) policy
+    note_len: NoteLen,
+    /// the last length actually used to draw/insert a note (for
+    /// NoteLen::LastUsed)
+    last_note_len: u64,
+    /// new-note velocity source (#153): fixed value or the last velocity
+    /// used — visible in Edit ▸ Insert Velocity
+    vel_src: VelSrc,
+    /// last velocity actually written (for VelSrc::LastUsed)
+    last_vel: u8,
+    /// quantize grid index into SNAPS — separate from draw snap (#139)
+    q_snap: usize,
+    /// quantize strength 0-100 — visible before applying (#139)
+    q_str: u32,
     /// reset-on-stop preference: full CC121/120 controller reset on
     /// transport stop — off means a normal stop only releases notes (#161)
     reset_on_stop: bool,
@@ -1045,7 +1132,7 @@ impl EditorView {
             snap_idx: 7, // 1/16
             erase_ids: BTreeSet::new(),
             edit_ch: HashMap::new(),
-            clipboard: Vec::new(),
+            clipboard: None,
             roll_bounds: Rc::new(Cell::new(Bounds::new(
                 point(px(0.0), px(0.0)),
                 size(px(0.0), px(0.0)),
@@ -1174,6 +1261,13 @@ impl EditorView {
             punch_in: None,
             punch_out: None,
             last_take: None,
+            note_len: NoteLen::Grid,
+            last_note_len: 120,
+            vel_src: VelSrc::LastUsed,
+            last_vel: 100,
+            q_snap: 7, // SNAPS "1/16" — the toolbar's historical default
+
+            q_str: 100,
             open_sub: None,
             show_events: true,
             audition: Audition::spawn(),
