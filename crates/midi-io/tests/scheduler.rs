@@ -36,10 +36,13 @@ impl Clock for FakeClock {
     fn now_us(&self) -> u64 {
         self.now.load(Relaxed)
     }
-    fn wait_until_us(&mut self, target_us: u64, stop: &AtomicBool) -> bool {
+    fn wait_until_us(&mut self, target_us: u64, stop: &AtomicBool, watch: &AtomicBool) -> bool {
         self.waits.push(target_us);
         if self.stop_on_wait == Some(self.waits.len()) || stop.load(Relaxed) {
             stop.store(true, Relaxed);
+            return false;
+        }
+        if watch.load(Relaxed) {
             return false;
         }
         self.now.store(target_us + self.overshoot, Relaxed);
@@ -131,14 +134,20 @@ fn run(
         .collect();
     let stop = AtomicBool::new(false);
     let pos = Arc::new(AtomicU64::new(0));
+    let watch = AtomicBool::new(false);
+    let (_tx, rx) = std::sync::mpsc::channel();
     run_schedule(
         &mut clock,
         &mut sinks,
-        &events,
+        events,
         start_us,
         loop_from_us,
+        None, // no explicit right locator — these tests use wrap-at-end
         &stop,
         &pos,
+        &watch,
+        &rx,
+        true, // panic-on-stop: the cleanup semantics these tests assert
     );
     Run { log, clock, pos }
 }
@@ -479,6 +488,8 @@ fn playback_start_sends_and_stops() {
         vec![(0, 0, on(60))],
         0,
         None,
+        None,
+        true, // this sink marks exit via panic()
     );
     // wait for the send — stop() landing before the thread's first pass
     // would race the event; the schedule drains on its own so this returns
@@ -545,6 +556,8 @@ fn hardware_wake_jitter() {
         events,
         0,
         None,
+        None,
+        false,
     );
     pb.stop();
     let log = log.lock().unwrap();
