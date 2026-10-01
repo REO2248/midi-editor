@@ -151,7 +151,12 @@ impl Render for EditorView {
         let doc_ui = self.doc_ui.clone();
         let n_diags = doc_ui.n_diags;
         let tempo0 = doc_ui.tempo0;
-        let sig = doc_ui.sig.clone();
+        // signature in force at the playhead on the viewed track — the
+        // file's real FF58 map, not the first signature in the file
+        let sig = self.doc(|d| {
+            let m = d.meter_map_for(self.sel_track).meter_at(playhead_tick);
+            format!("{}/{}", m.num, 1u32 << m.den_pow.min(15))
+        });
         let track_names = doc_ui.track_names.clone();
         let track_chs = doc_ui.track_chs.clone();
         let markers = &doc_ui.markers;
@@ -162,10 +167,13 @@ impl Render for EditorView {
         // explicit UI timing mode — metrical bar/beat or SMPTE timecode,
         // drawn straight from the SMF division (never a pretend PPQ)
         let td = self.td();
+        // position labels + bar/beat grid follow the viewed track's real
+        // FF58 meter map — format 2: that sequence's own signatures
+        let pos_fmt = self.doc(|d| d.position_format_for(self.sel_track));
         let (grid_minor, grid_major) = td.grid_ticks(self.zoom);
         let note_min = td.min_grid_ticks();
         let badge = td.badge();
-        let pos = td.format_tick(playhead_tick);
+        let pos = pos_fmt.fmt(playhead_tick);
 
         // playhead follow — suspended while a drag is live or the user just
         // scrolled manually (`follow_hold`)
@@ -253,6 +261,7 @@ impl Render for EditorView {
         let cursor_t = self.cursor_tick;
         let cursor_k = self.cursor_key;
         let cursor_len = self.cursor_insert_len();
+        let pos_fmt_roll = pos_fmt.clone();
 
         let roll = canvas(
             move |bounds, _window, _cx| {
@@ -295,23 +304,49 @@ impl Render for EditorView {
                         }),
                     ));
                 }
-                // beat/bar lines — quarter/bar for metrical, frame/second
-                // for SMPTE (minor lines collapse when < ~4px apart)
+                // beat/bar lines — real FF58 bar boundaries for metrical
+                // (bars are not a fixed stride once the meter changes),
+                // frame/second for SMPTE (minor lines collapse when
+                // < ~4px apart)
                 let tick0 = (scroll_x / zoom).max(0.0) as u64;
-                let tick1 = tick0 + (f32::from(w) / zoom) as u64 + grid_minor;
-                let mut t = tick0 / grid_minor * grid_minor;
-                while t <= tick1 {
-                    let x = bounds.origin.x + px(t as f32 * zoom - scroll_x);
-                    let strong = t.is_multiple_of(grid_major);
-                    window.paint_quad(fill(
-                        Bounds::new(point(x, bounds.origin.y), size(px(1.0), h)),
-                        rgb(if strong {
-                            theme::current().grid_bar
-                        } else {
-                            theme::current().border
-                        }),
-                    ));
-                    t += grid_minor;
+                match &pos_fmt_roll {
+                    PositionFormat::Bbt(mm) => {
+                        let tick1 = tick0 + (f32::from(w) / zoom) as u64 + mm.bar_ticks_at(tick0);
+                        // minor beat lines collapse into bar-only when
+                        // they'd draw too close — same rule as SMPTE
+                        let min_beat_px = mm.beat_ticks_of(mm.meter_at(tick0)) as f32 * zoom;
+                        for (t, down) in mm.beat_lines_between(tick0, tick1) {
+                            if !down && min_beat_px < 4.0 {
+                                continue;
+                            }
+                            let x = bounds.origin.x + px(t as f32 * zoom - scroll_x);
+                            window.paint_quad(fill(
+                                Bounds::new(point(x, bounds.origin.y), size(px(1.0), h)),
+                                rgb(if down {
+                                    theme::current().grid_bar
+                                } else {
+                                    theme::current().border
+                                }),
+                            ));
+                        }
+                    }
+                    PositionFormat::Smpte(_) => {
+                        let tick1 = tick0 + (f32::from(w) / zoom) as u64 + grid_minor;
+                        let mut t = tick0 / grid_minor * grid_minor;
+                        while t <= tick1 {
+                            let x = bounds.origin.x + px(t as f32 * zoom - scroll_x);
+                            let strong = t.is_multiple_of(grid_major);
+                            window.paint_quad(fill(
+                                Bounds::new(point(x, bounds.origin.y), size(px(1.0), h)),
+                                rgb(if strong {
+                                    theme::current().grid_bar
+                                } else {
+                                    theme::current().border
+                                }),
+                            ));
+                            t += grid_minor;
+                        }
+                    }
                 }
                 // notes — enter the sorted list by binary search. While a
                 // Move/Duplicate drag shifts notes, widen the window toward
@@ -1406,7 +1441,10 @@ impl Render for EditorView {
                                         "a11y.track_ch",
                                         &[(
                                             "ch",
-                                            (track_chs.get(i).copied().unwrap_or(0) + 1)
+                                            (self.edit_channel_of(
+                                                i,
+                                                track_chs.get(i).copied().unwrap_or(0),
+                                            ) + 1)
                                                 .to_string()
                                                 .as_str(),
                                         )],
@@ -1422,7 +1460,10 @@ impl Render for EditorView {
                                     }))
                                     .child(format!(
                                         "c{}",
-                                        track_chs.get(i).copied().unwrap_or(0) + 1
+                                        self.edit_channel_of(
+                                            i,
+                                            track_chs.get(i).copied().unwrap_or(0),
+                                        ) + 1
                                     )),
                             )
                     })),
@@ -1594,23 +1635,45 @@ impl Render for EditorView {
 
         let ruler_bounds_cell = self.ruler_bounds.clone();
         let ruler_play_tick = playhead_tick;
+        let pos_fmt_ruler = pos_fmt.clone();
         let ruler = canvas(
             move |bounds, _window, _cx| {
                 ruler_bounds_cell.set(bounds);
             },
             move |bounds, _state, window, _cx| {
                 let w = bounds.size.width;
-                // coarse ticks: one bar for metrical, one second for SMPTE
+                // coarse ticks: real FF58 bar lines for metrical (meter
+                // changes make bars variable), one second for SMPTE
                 let tick0 = (scroll_x / zoom).max(0.0) as u64;
-                let tick1 = tick0 + (f32::from(w) / zoom) as u64 + grid_major;
-                let mut t = tick0 / grid_major * grid_major;
-                while t <= tick1 {
-                    let x = bounds.origin.x + px(t as f32 * zoom - scroll_x);
-                    window.paint_quad(fill(
-                        Bounds::new(point(x, bounds.origin.y + px(12.0)), size(px(1.0), px(8.0))),
-                        rgb(theme::current().state_off),
-                    ));
-                    t += grid_major;
+                match &pos_fmt_ruler {
+                    PositionFormat::Bbt(mm) => {
+                        let tick1 = tick0 + (f32::from(w) / zoom) as u64 + mm.bar_ticks_at(tick0);
+                        for t in mm.bar_starts_between(tick0, tick1) {
+                            let x = bounds.origin.x + px(t as f32 * zoom - scroll_x);
+                            window.paint_quad(fill(
+                                Bounds::new(
+                                    point(x, bounds.origin.y + px(12.0)),
+                                    size(px(1.0), px(8.0)),
+                                ),
+                                rgb(theme::current().state_off),
+                            ));
+                        }
+                    }
+                    PositionFormat::Smpte(_) => {
+                        let tick1 = tick0 + (f32::from(w) / zoom) as u64 + grid_major;
+                        let mut t = tick0 / grid_major * grid_major;
+                        while t <= tick1 {
+                            let x = bounds.origin.x + px(t as f32 * zoom - scroll_x);
+                            window.paint_quad(fill(
+                                Bounds::new(
+                                    point(x, bounds.origin.y + px(12.0)),
+                                    size(px(1.0), px(8.0)),
+                                ),
+                                rgb(theme::current().state_off),
+                            ));
+                            t += grid_major;
+                        }
+                    }
                 }
                 // playhead marker
                 let hx = bounds.origin.x + px(ruler_play_tick as f32 * zoom - scroll_x);
@@ -1823,6 +1886,7 @@ impl Render for EditorView {
                     let track_names_a11y = track_names.clone();
                     let scale_a11y = window.scale_factor();
                     let ppq = self.ppq();
+                    let pos_a11y = self.doc(|d| d.position_format_for(self.sel_track));
                     div()
                         .id("piano-roll")
                         .test_support()
@@ -1843,6 +1907,7 @@ impl Render for EditorView {
                                 scroll_y,
                                 zoom,
                                 ppq,
+                                pos: pos_a11y,
                                 notes: notes_a11y,
                                 selection: selection_a11y,
                                 track_names: track_names_a11y,
@@ -2386,6 +2451,8 @@ impl Render for EditorView {
                     Self::mi_sub("e.len", t("edit.set_length"), Sub::LenSet, cx),
                     Self::mi_sub("e.velset", t("edit.set_velocity"), Sub::VelSet, cx),
                     Self::mi_sub("e.relset", t("edit.set_release"), Sub::RelSet, cx),
+                    Self::msep(),
+                    Self::mi_sub("e.alltrack", t("edit.apply_track"), Sub::AllTrack, cx),
                     Self::msep(),
                     self.mi_cmd("edit.vel_up", None, cx),
                     self.mi_cmd("edit.vel_dn", None, cx),
@@ -3051,15 +3118,22 @@ impl Render for EditorView {
                             .collect()
                     }
                     Sub::LenSet => {
-                        // metrical: note fractions; SMPTE: frame/second
-                        // spans — never a fake-PPQ musical grid
+                        // metrical: note fractions + a real bar at the
+                        // edit cursor's position in the meter map; SMPTE:
+                        // frame/second spans — never a fake-PPQ grid
                         let opts: Vec<(String, u64)> = match td {
                             TimeDisplay::Metrical { ppq } => vec![
                                 ("1/32".into(), ppq / 8),
                                 ("1/16".into(), ppq / 4),
                                 ("1/8".into(), ppq / 2),
                                 ("1/4".into(), ppq),
-                                ("1 bar".into(), ppq * 4),
+                                (
+                                    "1 bar".into(),
+                                    self.doc(|d| {
+                                        d.meter_map_for(self.sel_track)
+                                            .bar_ticks_at(self.cursor_tick)
+                                    }),
+                                ),
                             ],
                             TimeDisplay::Smpte { .. } => {
                                 let f = td.cell_ticks();
@@ -3176,6 +3250,79 @@ impl Render for EditorView {
                                                 d.set_release_velocity_ops(t, f, to, vel)
                                             },
                                         );
+                                    },
+                                )
+                            })
+                            .collect()
+                    }
+                    // Edit ▸ Apply to Entire Track — the explicit
+                    // whole-track scope (#131). Selection-scoped commands
+                    // no-op without a selection; these never need one.
+                    Sub::AllTrack => {
+                        type TrackOp =
+                            Box<dyn Fn(&mut Document, usize, u64, u64) -> Vec<Op> + Send>;
+                        let g = self.snap_ticks().max(self.td().min_grid_ticks() as i64) as u64;
+                        let ppq = self.ppq() as i64;
+                        let items: Vec<(String, TrackOp)> = vec![
+                            (
+                                format!("Quantize 100% ({})", t("edit.snap")),
+                                Box::new(move |d, tr, f, to| d.quantize_ops(tr, f, to, g, 100)),
+                            ),
+                            (
+                                t("edit.transpose_up").to_string(),
+                                Box::new(|d, tr, f, to| d.transpose_ops(tr, f, to, 1)),
+                            ),
+                            (
+                                t("edit.transpose_dn").to_string(),
+                                Box::new(|d, tr, f, to| d.transpose_ops(tr, f, to, -1)),
+                            ),
+                            (
+                                "+1 octave".to_string(),
+                                Box::new(|d, tr, f, to| d.transpose_ops(tr, f, to, 12)),
+                            ),
+                            (
+                                "-1 octave".to_string(),
+                                Box::new(|d, tr, f, to| d.transpose_ops(tr, f, to, -12)),
+                            ),
+                            (
+                                t("edit.vel_up").to_string(),
+                                Box::new(|d, tr, f, to| d.scale_velocity_ops(tr, f, to, 1.25)),
+                            ),
+                            (
+                                t("edit.vel_dn").to_string(),
+                                Box::new(|d, tr, f, to| d.scale_velocity_ops(tr, f, to, 0.8)),
+                            ),
+                            (
+                                t("edit.humanize").to_string(),
+                                Box::new(move |d, tr, f, to| {
+                                    d.humanize_ops(tr, f, to, ppq / 32, 5, d.revision())
+                                }),
+                            ),
+                            (
+                                format!("{}: touch (0 gap)", t("edit.legato")),
+                                Box::new(|d, tr, f, to| d.legato_ops(tr, f, to, 0)),
+                            ),
+                            (
+                                t("edit.fix_overlaps").to_string(),
+                                Box::new(|d, tr, f, to| d.fix_overlaps_ops(tr, f, to)),
+                            ),
+                            (
+                                t("edit.join").to_string(),
+                                Box::new(|d, tr, f, to| d.join_ops(tr, f, to)),
+                            ),
+                        ];
+                        items
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, (label, op))| {
+                                Self::mi_leaf(
+                                    ("allt", i),
+                                    label.clone(),
+                                    "",
+                                    None,
+                                    cx,
+                                    move |v, _e, _cx| {
+                                        v.apply_track_op(&label, |d, tr, f, to| op(d, tr, f, to));
                                     },
                                 )
                             })

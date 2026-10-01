@@ -590,15 +590,15 @@ impl EditorView {
                 let lane_events = lane_events.clone();
                 let notes = self.notes.clone();
                 let sel_track = lane_sel_track;
-                let ppq = self.ppq();
+                let pos = self.doc(|d| d.position_format_for(self.sel_track));
                 move |b| {
                     a11y::LaneA11y {
                         bounds: cell.get(),
                         scale: scale_factor,
                         scroll_x,
                         zoom,
-                        ppq,
                         mode,
+                        pos,
                         events: lane_events,
                         notes,
                         sel_track,

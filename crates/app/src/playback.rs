@@ -157,12 +157,29 @@ impl EditorView {
     }
 
     /// Move the playhead `bars` measures (used by the ruler/minimap
-    /// accessibility Increment/Decrement actions).
+    /// accessibility Increment/Decrement actions). Metrical docs walk the
+    /// real FF58 bar lines of the viewed track's meter map; SMPTE docs
+    /// step displayed seconds.
     pub(crate) fn seek_bars(&mut self, bars: i64, cx: &mut Context<Self>) {
-        let step = self.ppq() as i64 * 4;
-        let cur = self.doc(|d| d.tempo_map.us_to_tick(self.play_us)) as i64;
-        let tick = (cur + bars * step).max(0).min(self.doc_end_ticks() as i64);
-        self.play_us = self.doc(|d| d.tempo_map.tick_to_us(tick as u64));
+        let cur = self.doc(|d| d.tempo_map_for(self.sel_track).us_to_tick(self.play_us));
+        let tick = match self.td() {
+            TimeDisplay::Metrical { .. } => self.doc(|d| {
+                let mm = d.meter_map_for(self.sel_track);
+                if bars > 0 {
+                    (0..bars).fold(cur, |t, _| mm.next_bar_start(t))
+                } else if bars < 0 {
+                    (0..-bars).fold(cur, |t, _| mm.prev_bar_start(t))
+                } else {
+                    cur
+                }
+            }),
+            TimeDisplay::Smpte { .. } => {
+                let step = self.td().bar_ticks() as i64;
+                (cur as i64 + bars * step).max(0) as u64
+            }
+        };
+        let tick = tick.min(self.doc_end_ticks());
+        self.play_us = self.doc(|d| d.tempo_map_for(self.sel_track).tick_to_us(tick));
         cx.notify();
     }
 
@@ -312,19 +329,30 @@ impl EditorView {
                 .and_then(|(d, _)| sink_of.get(&d).copied())
                 .or_else(|| sink_of.values().next().copied());
             if let Some(s) = click_sink {
-                // one click per beat / per second — never a fake-PPQ beat
-                let click = self.td().click_ticks();
+                // clicks follow the FF58 map: one per `cc` clocks
+                // (24 = a quarter) with woodblock 76 on real bar lines —
+                // never a fake-PPQ beat or a hard-coded 4/4 accent.
+                let td = self.td();
+                let mm = self.doc(|d| d.meter_map_for(self.sel_track));
                 let end_us = events.iter().map(|e| e.0).max().unwrap_or(0);
-                let mut beat = 0u64;
+                let mut t = 0u64;
                 loop {
-                    let us = self.doc(|d| d.tempo_map_for(self.sel_track).tick_to_us(beat * click));
+                    let us = self.doc(|d| d.tempo_map_for(self.sel_track).tick_to_us(t));
                     if us > end_us {
                         break;
                     }
-                    let note = if beat.is_multiple_of(4) { 76 } else { 77 };
+                    let accent = match td {
+                        TimeDisplay::Metrical { .. } => mm.bar_start_tick(t) == t,
+                        // one click per displayed second — every click a bar
+                        TimeDisplay::Smpte { .. } => true,
+                    };
+                    let note = if accent { 76 } else { 77 };
                     events.push((us, s, vec![0x99, note, 110]));
                     events.push((us + 20_000, s, vec![0x99, note, 0]));
-                    beat += 1;
+                    t += match td {
+                        TimeDisplay::Metrical { .. } => mm.click_ticks_at(t),
+                        TimeDisplay::Smpte { .. } => td.click_ticks(),
+                    };
                 }
             }
         }

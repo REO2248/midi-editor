@@ -11,7 +11,7 @@
 use crate::geometry::{drag_window, tick_window};
 use crate::i18n::{t, tf};
 use crate::{DragMode, LaneMode, NOTE_H};
-use document::{EventId, Note};
+use document::{EventId, Note, PositionFormat};
 use gpui_kit::accesskit::{Node, Orientation, Rect, Role};
 use gpui_kit::{px, A11ySubtreeBuilder, Bounds, Pixels};
 use std::collections::BTreeSet;
@@ -30,19 +30,18 @@ pub(crate) fn note_name(key: i64) -> String {
     format!("{}{}", NAMES[(k % 12) as usize], k / 12 - 1)
 }
 
-/// `bar.beat.tick` position text, matching the transport LCD.
-pub(crate) fn pos_label(tick: u64, ppq: u64) -> String {
-    let ppq = ppq.max(1);
-    let bar = tick / (ppq * 4) + 1;
-    let beat = (tick % (ppq * 4)) / ppq + 1;
-    format!("{bar}.{beat}.{:>3}", tick % ppq)
+/// `bar.beat.tick` (or SMPTE timecode) position text — the same
+/// formatter the transport LCD uses, following the real FF58 map.
+pub(crate) fn pos_label(tick: u64, pos: &PositionFormat) -> String {
+    pos.fmt(tick)
 }
 
 /// Accessible name for a piano-roll note, e.g.
-/// "C4 at 3.1.000, 2.0 beats, velocity 96, Piano".
-pub(crate) fn note_label(n: &Note, ppq: u64, track_name: &str) -> String {
+/// "C4 at 3.1.000, 2.0 beats, velocity 96, Piano". Duration stays in
+/// quarter-note beats — a length, not a position under the meter map.
+pub(crate) fn note_label(n: &Note, ppq: u64, pos: &PositionFormat, track_name: &str) -> String {
     let key = note_name(n.key as i64);
-    let pos = pos_label(n.start_tick, ppq);
+    let pos = pos_label(n.start_tick, pos);
     let dur_ticks = (n.end_tick.unwrap_or(n.start_tick) as i64 - n.start_tick as i64).max(0);
     let dur = format!("{:.1}", dur_ticks as f64 / ppq.max(1) as f64);
     let vel = n.vel.to_string();
@@ -61,10 +60,15 @@ pub(crate) fn note_label(n: &Note, ppq: u64, track_name: &str) -> String {
 }
 
 /// Accessible name for a controller-lane point (CC / pitch bend).
-pub(crate) fn lane_point_label(mode: LaneMode, tick: u64, val: i32, ppq: u64) -> String {
+pub(crate) fn lane_point_label(
+    mode: LaneMode,
+    tick: u64,
+    val: i32,
+    pos: &PositionFormat,
+) -> String {
     let m = mode.label();
     let v = val.to_string();
-    let pos = pos_label(tick, ppq);
+    let pos = pos_label(tick, pos);
     tf(
         "a11y.lane_pt",
         &[
@@ -97,6 +101,8 @@ pub(crate) struct RollA11y {
     pub scroll_y: f32,
     pub zoom: f32,
     pub ppq: u64,
+    /// position formatter from the viewed track's meter map
+    pub pos: PositionFormat,
     pub notes: Arc<Vec<Note>>,
     pub selection: BTreeSet<EventId>,
     pub track_names: Vec<String>,
@@ -129,7 +135,7 @@ impl RollA11y {
             let mut node = Node::new(Role::Label);
             node.set_label(tf(
                 "a11y.playhead",
-                &[("pos", pos_label(self.playhead_tick, self.ppq).as_str())],
+                &[("pos", pos_label(self.playhead_tick, &self.pos).as_str())],
             ));
             node.set_bounds(rect(x, oy, 1.5, vh, scale));
             b.push_child(b.synthetic_node_id("playhead"), node);
@@ -209,7 +215,7 @@ impl RollA11y {
                 continue;
             }
             let mut node = Node::new(Role::ListBoxOption);
-            node.set_label(note_label(n, self.ppq, track_name(n.track)));
+            node.set_label(note_label(n, self.ppq, &self.pos, track_name(n.track)));
             node.set_selected(self.selection.contains(&n.on_id));
             node.set_bounds(rect(x, y + 1.0, wpx, NOTE_H - 2.0, scale));
             node.set_position_in_set(i + 1);
@@ -227,7 +233,7 @@ impl RollA11y {
                     scale,
                 );
                 let mut gnode = Node::new(Role::ListBoxOption);
-                gnode.set_label(note_label(n, self.ppq, track_name(n.track)));
+                gnode.set_label(note_label(n, self.ppq, &self.pos, track_name(n.track)));
                 gnode.set_selected(true);
                 gnode.set_bounds(grect);
                 b.push_child(b.synthetic_node_id(("ghost", n.on_id)), gnode);
@@ -243,8 +249,9 @@ pub(crate) struct LaneA11y {
     pub scale: f32,
     pub scroll_x: f32,
     pub zoom: f32,
-    pub ppq: u64,
     pub mode: LaneMode,
+    /// position formatter from the viewed track's meter map
+    pub pos: PositionFormat,
     /// (event id, tick, value 0..127 or 0..16383 for PB)
     pub events: Arc<Vec<(EventId, u64, i32, i32)>>,
     /// velocity mode: notes of the selected track supply the bars
@@ -303,7 +310,7 @@ impl LaneA11y {
                         &[
                             ("key", note_name(n.key as i64).as_str()),
                             ("vel", (vel * 127.0).round().to_string().as_str()),
-                            ("pos", pos_label(n.start_tick, self.ppq).as_str()),
+                            ("pos", pos_label(n.start_tick, &self.pos).as_str()),
                             (
                                 "track",
                                 self.track_names
@@ -336,7 +343,7 @@ impl LaneA11y {
                     point_node(
                         b,
                         *id,
-                        lane_point_label(self.mode, *tick, v, self.ppq),
+                        lane_point_label(self.mode, *tick, v, &self.pos),
                         v as f64,
                         x,
                         y,
@@ -376,17 +383,25 @@ mod tests {
         assert_eq!(note_name(61), "C#4");
     }
 
+    /// Default 4/4 @ 480ppq formatter, like a fixture document's map.
+    fn pos() -> PositionFormat {
+        PositionFormat::Bbt(document::MeterMap::build(
+            &[],
+            smf_core::Division::Metrical(480),
+        ))
+    }
+
     #[test]
     fn pos_label_matches_transport_format() {
-        assert_eq!(pos_label(0, 480), "1.1.  0");
-        assert_eq!(pos_label(480, 480), "1.2.  0");
-        assert_eq!(pos_label(1920, 480), "2.1.  0");
-        assert_eq!(pos_label(2050, 480), "2.1.130");
+        assert_eq!(pos_label(0, &pos()), "1.1.  0");
+        assert_eq!(pos_label(480, &pos()), "1.2.  0");
+        assert_eq!(pos_label(1920, &pos()), "2.1.  0");
+        assert_eq!(pos_label(2050, &pos()), "2.1.130");
     }
 
     #[test]
     fn note_label_describes_pitch_dur_vel_track() {
-        let s = note_label(&n(60, 480, Some(960), 96, 0), 480, "Piano");
+        let s = note_label(&n(60, 480, Some(960), 96, 0), 480, &pos(), "Piano");
         assert!(s.contains("C4"), "{s}");
         assert!(s.contains("1.2.  0"), "{s}");
         assert!(s.contains("1.0"), "{s}");
@@ -396,13 +411,16 @@ mod tests {
 
     #[test]
     fn dangling_note_says_so() {
-        let s = note_label(&n(60, 0, None, 80, 1), 480, "Drums");
-        assert_ne!(s, note_label(&n(60, 0, Some(480), 80, 1), 480, "Drums"));
+        let s = note_label(&n(60, 0, None, 80, 1), 480, &pos(), "Drums");
+        assert_ne!(
+            s,
+            note_label(&n(60, 0, Some(480), 80, 1), 480, &pos(), "Drums")
+        );
     }
 
     #[test]
     fn lane_point_label_has_mode_value_pos() {
-        let s = lane_point_label(LaneMode::CC(7), 960, 100, 480);
+        let s = lane_point_label(LaneMode::CC(7), 960, 100, &pos());
         assert!(s.contains("CC7"), "{s}");
         assert!(s.contains("100"), "{s}");
         assert!(s.contains("1.3.  0"), "{s}");
