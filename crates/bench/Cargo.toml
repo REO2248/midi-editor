@@ -1,0 +1,17 @@
+[package]
+name = "bench"
+edition.workspace = true
+license.workspace = true
+description = "Deterministic GUI-free benchmarks for large/pathological SMF files"
+
+[dependencies]
+smf-core.workspace = true
+document.workspace = true
+mcp-server.workspace = true
+rmcp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "midi-bench"
+path = "src/main.rs"

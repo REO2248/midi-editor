@@ -22,7 +22,180 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
-      - name: Test (non-UI crates)
-        run: cargo test -p smf-core -p document -p commands -p mcp-server --locked
+      - name: Test
+        run: cargo test -p smf-core -p document -p commands -p mcp-server -p midi-io -p midi-editor --locked
       - name: Build workspace (gpui app needs Windows)
         run: cargo build --workspace --locked
+
+  fuzz-smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Cache fuzz target
+        uses: actions/cache@v4
+        with:
+          path: fuzz/target
+          key: ${{ runner.os }}-fuzz-${{ hashFiles('fuzz/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-fuzz-
+      - name: Fuzz smoke (45s per target)
+        working-directory: fuzz
+        shell: pwsh
+        run: |
+          foreach ($t in 'parse_strict','parse_lenient','parse_write','write_parse','normalize_fixpoint') {
+            New-Item -ItemType Directory -Force "corpus/$t" | Out-Null
+            cargo fuzz run $t "corpus/$t" corpus/shared corpus/not_strict -- -max_total_time=45 -rss_limit_mb=2048
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+  coverage:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          # llvm-cov builds into target/llvm-cov-target, covered by `target`
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      # Every workspace crate except the gpui app (its code paths need a GPU
+      # session). src/bin/ files are excluded from the REPORT only: they are
+      # manual spike/ops tools with no unit tests, so counting them would just
+      # bury the signal. Everything else — including hardware-bound midi-io
+      # and output at whatever coverage they get — stays visible per file.
+      - name: Measure coverage
+        run: |
+          cargo llvm-cov --workspace --exclude midi-editor --locked --no-report
+          New-Item -ItemType Directory -Force target/coverage | Out-Null
+          cargo llvm-cov report --ignore-filename-regex "src[\\/]bin[\\/]" --lcov --output-path target/coverage/lcov.info
+          cargo llvm-cov report --ignore-filename-regex "src[\\/]bin[\\/]" --html --output-dir target/coverage/html
+          cargo llvm-cov report --ignore-filename-regex "src[\\/]bin[\\/]" --json --summary-only | Out-File -Encoding utf8 target/coverage/coverage.json
+          cargo llvm-cov report --ignore-filename-regex "src[\\/]bin[\\/]" --summary-only
+      # Fails the job when a floored crate drops under its floor — new code
+      # in a safety-critical crate cannot land completely untested.
+      - name: Enforce per-crate floors
+        run: ./scripts/check_coverage.ps1 target/coverage/coverage.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: target/coverage/
+  corpus:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      # committed fixtures must match the generator byte-for-byte
+      - name: Corpus fixtures are in sync with generator
+        run: cargo run -p document --bin corpus_gen --locked -- --check fixtures/corpus
+      # every fixture must satisfy its manifest.json expectations
+      - name: Verify corpus behavior against manifest
+        run: cargo run -p document --bin corpus_check --locked -- --verify fixtures/corpus
+      # committed interop matrix must be current
+      - name: Regenerate interop matrix
+        run: cargo run -p document --bin corpus_check --locked -- --matrix fixtures/corpus docs/interop-matrix.md
+      - name: Matrix is in sync
+        run: git diff --exit-code docs/interop-matrix.md
+  bench:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Build bench harness (release)
+        run: cargo build --release -p bench --locked
+      # --check fails the job on >3x machine-normalized regressions against
+      # crates/bench/baseline.json (see crates/bench/src/main.rs header).
+      - name: Run benchmarks
+        run: ./target/release/midi-bench.exe --check --out target/bench/results.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-results
+          path: target/bench/results.json
+  package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Build release workspace
+        run: cargo build --release --workspace --locked
+      # Assembles dist/ (midi-editor.exe + vst3-host helper/probe + icons +
+      # licenses), validates expected files + x64 PE architecture, and runs
+      # the packaged binary's --smoke mode. Fails the job on any gap.
+      - name: Assemble and validate dist
+        run: ./scripts/package_dist.ps1 -SkipBuild
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dist
+          path: dist/
+
+  lint:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      # Warning policy: every clippy/rustdoc warning is an error — the tree is
+      # clean today and stays clean; exceptions need an in-code allow + comment.
+      - name: Clippy (all warnings denied)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Public docs (all warnings denied)
+        run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+      - name: Dependency policy (advisories, licenses, bans, sources)
+        run: cargo deny check

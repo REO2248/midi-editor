@@ -3,21 +3,22 @@
 //! Private items are visible here because this is a child module of the
 //! crate root where EditorView is defined.
 
+use crate::a11y;
+use crate::cmd;
 use crate::geometry::{drag_window, tick_window, ZOOM_MAX, ZOOM_MIN};
-use crate::i18n::t;
+use crate::i18n::{t, tf};
 use crate::icons::icon;
+use crate::menu::{MenuRow, MENUS};
+use crate::theme::metrics;
 use crate::*;
+use gpui_kit::base::TestSupportExt;
 use gpui_kit::component::input::Input;
+use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
-use smf_core::EventKind;
 use std::any::Any;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-const BG_BAR: u32 = 0x0f0f15;
-const BG_PANEL: u32 = 0x17171d;
-const BG_RAISED: u32 = 0x20202c;
-const BORDER_C: u32 = 0x2a2a35;
 /// Linear blend of two 0xRRGGBB colors — ghost-track dimming.
 fn blend(c: u32, to: u32, f: f32) -> u32 {
     let r = (((c >> 16) & 0xFF) as f32 * (1.0 - f) + ((to >> 16) & 0xFF) as f32 * f) as u32;
@@ -26,13 +27,66 @@ fn blend(c: u32, to: u32, f: f32) -> u32 {
     (r << 16) | (g << 8) | b
 }
 
-const ACCENT: u32 = 0x9fd0ff;
+/// Per-key-group tint for the all-keys poly-AT lane (key/16 → index).
+pub(crate) const LANE_KEY_COLORS: [u32; 8] = [
+    0x4fd0ff, 0x8fd0a0, 0xe0b050, 0xd070e0, 0x70d0d0, 0xe0e070, 0xa090ff, 0xff9090,
+];
+
+/// Snap-menu label: metrical files subdivide a whole note, SMPTE files a
+/// second — "1/16" vs "1/16s" makes the redefined grid explicit instead
+/// of silently suggesting beats that don't exist. "off" stays bare.
+fn snap_label(label: &'static str, td: TimeDisplay) -> String {
+    if td.is_smpte() && label != "off" {
+        format!("{label}s")
+    } else {
+        label.to_string()
+    }
+}
 
 impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // the plugin editor lives in the helper subprocess's own window —
         // no native event queue to pump here
+        // focus-loss guarantee: deactivate = release preview notes (the
+        // worker's deadline cap is the backstop for a kill without repaint)
+        let active = window.is_window_active();
+        if self.win_active && !active {
+            self.audition_off();
+        }
+        self.win_active = active;
         self.refresh_derived();
+        let th = self.theme;
+        // chrome helpers (menus, chips, icon buttons) read the same palette
+        theme::set_current(th);
+        // a hidden region must never hold keyboard focus
+        self.repair_focus(window, cx);
+        // `sel_track` can outlive its track if an MCP edit removed it
+        let n_tracks = self.doc(|d| d.tracks.len());
+        if n_tracks > 0 {
+            self.sel_track = self.sel_track.min(n_tracks - 1);
+        }
+        let area = self.area(window, cx);
+        // remember the last working region — menu commands restore focus to it
+        if area != FocusArea::MenuBar {
+            self.last_area = area;
+        }
+        // menu models rebuild every frame while open; drop them when closed
+        if self.open_menu.is_none() {
+            self.menu_rows.clear();
+            self.sub_rows.clear();
+            self.menu_sel = None;
+            self.sub_sel = None;
+        }
+        // menu actions arrive without a Window — the dialog opens here
+        if let Some((tr, tick, mt, id)) = self.meta_pending.take() {
+            self.open_meta_edit(tr, tick, mt, id, window, cx);
+        }
+        // a closed meta dialog must hand keyboard focus back to the editor
+        // (Enter has no Window in the input subscription, so it's deferred)
+        if self.meta_refocus {
+            self.meta_refocus = false;
+            window.focus(&self.focus.clone(), cx);
+        }
         // keep both scroll axes inside the content (resizes, zooms, edits all
         // self-heal here) and edge-scroll while a drag is parked at a border;
         // `panning` keeps animation frames flowing only while it actually moves
@@ -58,13 +112,20 @@ impl Render for EditorView {
             loop_en,
             met_en,
             chsy_en,
+            sxp,
             muted_set,
             soloed_set,
             has_track_dest,
+            mcp_auth_mode,
+            mcp_auth_detail,
+            port_present,
         ) = {
             let sh = crate::lock_shared(&self.shared);
             (
-                sh.doc.tempo_map.us_to_tick(self.play_us),
+                // playhead ruler units come from the viewed sequence's map
+                sh.doc
+                    .tempo_map_for(self.sel_track)
+                    .us_to_tick(self.play_us),
                 sh.path
                     .as_ref()
                     .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
@@ -76,9 +137,13 @@ impl Render for EditorView {
                 sh.loop_enabled,
                 sh.metronome,
                 sh.chase_sysex,
+                sh.sysex_policy,
                 sh.muted.clone(),
                 sh.soloed.clone(),
                 sh.track_dest.contains_key(&self.sel_track),
+                sh.mcp_security.auth_mode,
+                sh.mcp_security.auth_detail.clone(),
+                sh.port_present.clone(),
             )
         };
         // revision-cached document chrome (markers, names, diagnostics, …) —
@@ -90,12 +155,29 @@ impl Render for EditorView {
         let track_names = doc_ui.track_names.clone();
         let track_chs = doc_ui.track_chs.clone();
         let markers = &doc_ui.markers;
-        let ppq = self.ppq();
-        let pos = {
-            let bar = playhead_tick / (ppq * 4) + 1;
-            let beat = (playhead_tick % (ppq * 4)) / ppq + 1;
-            format!("{bar}.{beat}.{:>3}", playhead_tick % ppq)
-        };
+        // SMF format 2: tracks are independent sequences — the app shows
+        // one at a time (the selected "track" IS the viewed sequence) and
+        // plays only it unless tracks are explicitly soloed
+        let (is_seq, n_tracks) = self.doc(|d| (d.is_sequential(), d.tracks.len()));
+        // explicit UI timing mode — metrical bar/beat or SMPTE timecode,
+        // drawn straight from the SMF division (never a pretend PPQ)
+        let td = self.td();
+        let (grid_minor, grid_major) = td.grid_ticks(self.zoom);
+        let note_min = td.min_grid_ticks();
+        let badge = td.badge();
+        let pos = td.format_tick(playhead_tick);
+
+        // playhead follow — suspended while a drag is live or the user just
+        // scrolled manually (`follow_hold`)
+        if self.playback.is_some()
+            && self.follow != Follow::Off
+            && self.drag.is_none()
+            && !self
+                .follow_hold
+                .is_some_and(|t| t > std::time::Instant::now())
+        {
+            self.follow_playhead(playhead_tick);
+        }
 
         // --- piano roll canvas -------------------------------------------------
         let notes = self.notes.clone();
@@ -112,6 +194,65 @@ impl Render for EditorView {
         let playing = self.playback.is_some();
         let play_x_tick = playhead_tick;
         let active_track = self.sel_track;
+        // visible row→key map + row height (vertical zoom / fold / drum)
+        let vis_keys = self.vis_keys.clone();
+        let row_of = self.row_of;
+        let note_h = self.note_h;
+        let scale_pcs = self.scale_pcs;
+
+        // piano-key strip: clickable/scrubbable keyboard that auditions the
+        // pitch through the selected track's routing (issue #39)
+        let kbd_bounds_cell = self.kbd_bounds.clone();
+        let scrub_key = self.scrub_key;
+        let kbd_keys = vis_keys.clone();
+        let strip_keys = vis_keys.clone();
+        let kbd = canvas(
+            move |bounds, _window, _cx| {
+                kbd_bounds_cell.set(bounds);
+            },
+            move |bounds, _state, window, _cx| {
+                let w = bounds.size.width;
+                let nrows = kbd_keys.len() as f32;
+                let r0 = (scroll_y / note_h).max(0.0) as i32;
+                let r1 =
+                    ((scroll_y + f32::from(bounds.size.height)) / note_h + 1.0).min(nrows) as i32;
+                for r in r0..r1 {
+                    let key = kbd_keys[r as usize];
+                    let black = matches!(key % 12, 1 | 3 | 6 | 8 | 10);
+                    let cur = scrub_key == Some(key);
+                    let y = bounds.origin.y + px(r as f32 * note_h - scroll_y);
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(bounds.origin.x, y),
+                            size(w, px((note_h - 1.0).max(1.0))),
+                        ),
+                        rgb(if cur {
+                            theme::current().accent
+                        } else if black {
+                            0x101016
+                        } else {
+                            0x2a2a34
+                        }),
+                    ));
+                    // C guide line across the strip, like the roll's rows
+                    if key.is_multiple_of(12) {
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                point(bounds.origin.x, y + px(note_h - 1.0)),
+                                size(w, px(1.0)),
+                            ),
+                            rgb(theme::current().bg_chip_hover),
+                        ));
+                    }
+                }
+            },
+        );
+        // keyboard edit cursor — only when the roll context owns focus and no
+        // note selection exists (a selection is itself the edit target)
+        let show_cursor = area == FocusArea::Roll && self.selection.is_empty();
+        let cursor_t = self.cursor_tick;
+        let cursor_k = self.cursor_key;
+        let cursor_len = self.cursor_insert_len();
 
         let roll = canvas(
             move |bounds, _window, _cx| {
@@ -124,35 +265,53 @@ impl Render for EditorView {
                 }
                 let w = bounds.size.width;
                 let h = bounds.size.height;
-                // key rows
-                let k0 = (scroll_y / NOTE_H).max(0.0) as i32;
-                let k1 = ((scroll_y + f32::from(h)) / NOTE_H + 1.0).min(128.0) as i32;
-                for k in k0..k1 {
-                    let black = matches!(k % 12, 1 | 3 | 6 | 8 | 10);
-                    let y = bounds.origin.y + px(k as f32 * NOTE_H - scroll_y);
-                    if black {
+                // key rows — `vis_keys` maps painted row → piano key (the
+                // identity map is all 128; fold/drum views shrink it)
+                let nrows = vis_keys.len() as f32;
+                let r0 = (scroll_y / note_h).max(0.0) as i32;
+                let r1 = ((scroll_y + f32::from(h)) / note_h + 1.0).min(nrows) as i32;
+                for r in r0..r1 {
+                    let key = vis_keys[r as usize];
+                    let black = matches!(key % 12, 1 | 3 | 6 | 8 | 10);
+                    let in_scale = scale_pcs.map(|p| p[(key % 12) as usize]).unwrap_or(false);
+                    let y = bounds.origin.y + px(r as f32 * note_h - scroll_y);
+                    if in_scale {
                         window.paint_quad(fill(
-                            Bounds::new(point(bounds.origin.x, y), size(w, px(NOTE_H))),
-                            rgb(0x1a1a21),
+                            Bounds::new(point(bounds.origin.x, y), size(w, px(note_h))),
+                            rgb(theme::current().scale_row),
+                        ));
+                    } else if black {
+                        window.paint_quad(fill(
+                            Bounds::new(point(bounds.origin.x, y), size(w, px(note_h))),
+                            rgb(theme::current().bg_key),
                         ));
                     }
                     window.paint_quad(fill(
                         Bounds::new(point(bounds.origin.x, y), size(w, px(1.0))),
-                        rgb(if k % 12 == 0 { 0x2e2e3a } else { 0x232329 }),
+                        rgb(if key.is_multiple_of(12) {
+                            theme::current().grid_oct
+                        } else {
+                            theme::current().grid_row
+                        }),
                     ));
                 }
-                // beat/bar lines
+                // beat/bar lines — quarter/bar for metrical, frame/second
+                // for SMPTE (minor lines collapse when < ~4px apart)
                 let tick0 = (scroll_x / zoom).max(0.0) as u64;
-                let tick1 = tick0 + (f32::from(w) / zoom) as u64 + ppq;
-                let mut t = tick0 / ppq * ppq;
+                let tick1 = tick0 + (f32::from(w) / zoom) as u64 + grid_minor;
+                let mut t = tick0 / grid_minor * grid_minor;
                 while t <= tick1 {
                     let x = bounds.origin.x + px(t as f32 * zoom - scroll_x);
-                    let bar = t.is_multiple_of(ppq * 4);
+                    let strong = t.is_multiple_of(grid_major);
                     window.paint_quad(fill(
                         Bounds::new(point(x, bounds.origin.y), size(px(1.0), h)),
-                        rgb(if bar { 0x3d3d52 } else { 0x2a2a35 }),
+                        rgb(if strong {
+                            theme::current().grid_bar
+                        } else {
+                            theme::current().border
+                        }),
                     ));
-                    t += ppq;
+                    t += grid_minor;
                 }
                 // notes — enter the sorted list by binary search. While a
                 // Move/Duplicate drag shifts notes, widen the window toward
@@ -170,7 +329,7 @@ impl Render for EditorView {
                         break;
                     }
                     let mut st = n.start_tick as i64;
-                    let mut en = n.end_tick.unwrap_or(n.start_tick + ppq / 4) as i64;
+                    let mut en = n.end_tick.unwrap_or(n.start_tick + note_min) as i64;
                     let mut key = n.key as i32;
                     let mut ghost_orig = false;
                     if let Some((mode, d_on, dtick, dkey)) = drag {
@@ -198,35 +357,46 @@ impl Render for EditorView {
                             as f32
                             * zoom)
                             .max(3.0);
-                        let oy = bounds.origin.y + px((127.0 - n.key as f32) * NOTE_H - scroll_y);
-                        window.paint_quad(fill(
-                            Bounds::new(point(ox, oy + px(1.0)), size(px(ow), px(NOTE_H - 2.0))),
-                            rgba(0x80808044),
-                        ));
+                        let orow = row_of[n.key as usize];
+                        if orow >= 0 {
+                            let oy = bounds.origin.y + px(orow as f32 * note_h - scroll_y);
+                            window.paint_quad(fill(
+                                Bounds::new(
+                                    point(ox, oy + px(1.0)),
+                                    size(px(ow), px(note_h - 2.0)),
+                                ),
+                                rgba(theme::current().ghost_fill),
+                            ));
+                        }
                     }
                     let x = bounds.origin.x + px(st as f32 * zoom - scroll_x);
                     let wpx = ((en - st).max(1) as f32 * zoom).max(3.0);
                     if x + px(wpx) < bounds.origin.x {
                         continue;
                     }
-                    let y = bounds.origin.y + px((127.0 - key as f32) * NOTE_H - scroll_y);
-                    if y < bounds.origin.y - px(NOTE_H) || y > bounds.origin.y + h {
+                    // folded-out keys (or a drag delta past the map) get no row
+                    let row = row_of[key.clamp(0, 127) as usize];
+                    if row < 0 {
+                        continue;
+                    }
+                    let y = bounds.origin.y + px(row as f32 * note_h - scroll_y);
+                    if y < bounds.origin.y - px(note_h) || y > bounds.origin.y + h {
                         continue;
                     }
                     let c = if selection.contains(&n.on_id) {
-                        SEL_COLOR
+                        theme::current().sel
                     } else if n.end_tick.is_none() {
                         DANGLING_COLOR
                     } else {
-                        let c = TRACK_COLORS[n.track % TRACK_COLORS.len()];
+                        let c = th.track_colors[n.track % th.track_colors.len()];
                         if n.track == active_track {
                             c
                         } else {
-                            blend(c, 0x12121a, 0.62)
+                            blend(c, theme::current().dim_target, 0.62)
                         }
                     };
                     window.paint_quad(fill(
-                        Bounds::new(point(x, y + px(1.0)), size(px(wpx), px(NOTE_H - 2.0))),
+                        Bounds::new(point(x, y + px(1.0)), size(px(wpx), px(note_h - 2.0))),
                         rgb(c),
                     ));
                 }
@@ -235,21 +405,58 @@ impl Render for EditorView {
                 if px_x >= bounds.origin.x && px_x <= bounds.origin.x + w {
                     window.paint_quad(fill(
                         Bounds::new(point(px_x, bounds.origin.y), size(px(1.5), h)),
-                        rgb(0x50ff9f),
+                        rgb(theme::current().ok),
                     ));
                 }
-                // marquee rubber band
+                // edit cursor — marks where Enter inserts / where keys edit;
+                // folded out keys (row -1) paint nothing
+                if show_cursor {
+                    let cur_row = if (0..=127).contains(&cursor_k) {
+                        row_of[cursor_k as usize]
+                    } else {
+                        -1
+                    };
+                    if cur_row >= 0 {
+                        let cx0 = bounds.origin.x + px(cursor_t as f32 * zoom - scroll_x);
+                        let cy0 =
+                            bounds.origin.y + px(cur_row as f32 * note_h - scroll_y) + px(1.0);
+                        let cw = (cursor_len as f32 * zoom).max(3.0);
+                        let ch = (note_h - 2.0).max(1.0);
+                        window.paint_quad(outline(
+                            Bounds::new(point(cx0, cy0), size(px(cw), px(ch))),
+                            rgb(theme::current().accent),
+                            BorderStyle::Solid,
+                        ));
+                        window.paint_quad(fill(
+                            Bounds::new(point(cx0 + px(cw) + px(1.0), cy0), size(px(1.5), px(ch))),
+                            rgb(theme::current().accent),
+                        ));
+                    }
+                }
+                // marquee rubber band — corners are keys from hit(); paint
+                // in row space so the band matches what commit_drag selects
                 if let Some((a_t, a_k, b_t, b_k)) = marquee {
-                    let (t0, t1) = (a_t.min(b_t), a_t.max(b_t));
-                    let (k0, k1) = (a_k.min(b_k), a_k.max(b_k));
-                    let x0 = bounds.origin.x + px(t0 as f32 * zoom - scroll_x);
-                    let x1 = bounds.origin.x + px(t1 as f32 * zoom - scroll_x);
-                    let y0 = bounds.origin.y + px((127.0 - k1 as f32) * NOTE_H - scroll_y);
-                    let y1 = bounds.origin.y + px((127.0 - k0 as f32) * NOTE_H - scroll_y);
-                    window.paint_quad(fill(
-                        Bounds::new(point(x0, y0), size(x1 - x0, y1 - y0)),
-                        rgba(0x4f8cff33),
-                    ));
+                    let row_at = |k: i32| -> i32 {
+                        if (0..=127).contains(&k) {
+                            row_of[k as usize]
+                        } else {
+                            -1
+                        }
+                    };
+                    let ra = row_at(a_k);
+                    let rb = row_at(b_k);
+                    if ra.max(rb) >= 0 {
+                        let (t0, t1) = (a_t.min(b_t), a_t.max(b_t));
+                        let (rt, rbm) = (ra.min(rb).max(0), ra.max(rb));
+                        let x0 = bounds.origin.x + px(t0 as f32 * zoom - scroll_x);
+                        let x1 = bounds.origin.x + px(t1 as f32 * zoom - scroll_x);
+                        let y0 = bounds.origin.y + px(rt as f32 * note_h - scroll_y);
+                        let y1 = bounds.origin.y + px((rbm + 1) as f32 * note_h - scroll_y);
+                        window.paint_quad(fill(
+                            Bounds::new(point(x0, y0), size(x1 - x0, y1 - y0)),
+                            rgba(theme::current().sel_fill),
+                        ));
+                    }
                 }
             },
         );
@@ -266,39 +473,76 @@ impl Render for EditorView {
 
         // --- menu bar -----------------------------------------------------------
         let open_menu = self.open_menu;
-        let menus: [(TopMenu, &str, f32); 7] = [
-            (TopMenu::File, "menu.file", 46.0),
-            (TopMenu::Edit, "menu.edit", 46.0),
-            (TopMenu::View, "menu.view", 52.0),
-            (TopMenu::Track, "menu.track", 58.0),
-            (TopMenu::Output, "menu.output", 62.0),
-            (TopMenu::Transport, "menu.transport", 90.0),
-            (TopMenu::Help, "menu.help", 50.0),
-        ];
+        let menu_focused = area == FocusArea::MenuBar;
         let mut menu_bar = div()
+            .id("menu-bar")
+            .test_support()
+            .role(Role::MenuBar)
+            .aria_label(t("a11y.menubar"))
             .flex()
             .items_center()
             .h(px(28.0))
             .pl_1()
             .pr_3()
-            .bg(rgb(BG_BAR))
+            .bg(rgb(theme::current().bg_bar))
             .border_b_1()
-            .border_color(rgb(BORDER_C))
-            .text_size(px(12.0))
+            .border_color(rgb(if menu_focused { th.accent } else { th.border }))
+            .text_size(px(metrics::TEXT_LG))
+            .track_focus(&self.menu_fh)
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+                // open menus are driven by the root handler
+                if this.open_menu.is_some() {
+                    return;
+                }
+                // region keys are bare keys only — chords bubble to root
+                if ev.keystroke.modifiers.control || ev.keystroke.modifiers.alt {
+                    return;
+                }
+                match ev.keystroke.key.as_str() {
+                    "left" | "right" => {
+                        let d: usize = if ev.keystroke.key == "left" {
+                            MENUS.len() - 1
+                        } else {
+                            1
+                        };
+                        this.menu_bar_sel = (this.menu_bar_sel + d) % MENUS.len();
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                    "down" | "enter" | " " | "space" => {
+                        let m = MENUS[this.menu_bar_sel.min(MENUS.len() - 1)].0;
+                        this.open_menu_at(m, cx);
+                        cx.stop_propagation();
+                    }
+                    "escape" => {
+                        w.focus(&this.roll_fh, cx);
+                        cx.stop_propagation();
+                    }
+                    _ => {}
+                }
+            }))
             .child(
                 div()
                     .w(px(96.0))
                     .px_2()
-                    .text_color(rgb(0x7a86a8))
+                    .text_color(rgb(theme::current().text_link))
                     .whitespace_nowrap()
                     .child(t("app.title")),
             );
         let mut mx = 96.0f32;
-        for (m, key, w) in menus {
+        for (i, (m, key, w)) in MENUS.iter().enumerate() {
+            let m = *m;
+            let key = *key;
+            let w = *w;
             let is_open = open_menu.map(|(mm, _)| mm) == Some(m);
+            let bar_sel = menu_focused && i == self.menu_bar_sel;
             menu_bar = menu_bar.child(
                 div()
                     .id(key)
+                    .test_support()
+                    .role(Role::MenuItem)
+                    .aria_label(t(key))
+                    .aria_expanded(is_open)
                     .w(px(w))
                     .h(px(22.0))
                     .flex()
@@ -306,13 +550,27 @@ impl Render for EditorView {
                     .justify_center()
                     .cursor_pointer()
                     .rounded_sm()
-                    .bg(if is_open { rgb(BG_RAISED) } else { rgb(BG_BAR) })
-                    .text_color(rgb(if is_open { 0xffffff } else { 0x9a9ab0 }))
-                    .hover(|s| s.bg(rgb(0x1d1d28)))
+                    .bg(if is_open || bar_sel {
+                        rgb(theme::current().bg_raised)
+                    } else {
+                        rgb(theme::current().bg_bar)
+                    })
+                    .text_color(rgb(if is_open || bar_sel {
+                        theme::current().text_bright
+                    } else {
+                        theme::current().icon_off
+                    }))
+                    .hover(|s| s.bg(rgb(theme::current().bg_menu_hover)))
                     .child(t(key))
-                    .on_click(cx.listener(move |v, _e, _w, cx| {
-                        v.open_menu = if is_open { None } else { Some((m, mx)) };
-                        v.open_sub = None;
+                    .on_click(cx.listener(move |v, _e, w, cx| {
+                        w.focus(&v.menu_fh, cx);
+                        v.menu_bar_sel = i;
+                        if is_open {
+                            v.open_menu = None;
+                            v.open_sub = None;
+                        } else {
+                            v.open_menu_at(m, cx);
+                        }
                         cx.notify();
                     }))
                     .on_mouse_move(cx.listener(move |v, _e, _w, cx| {
@@ -320,6 +578,9 @@ impl Render for EditorView {
                         if v.open_menu.is_some() && v.open_menu.map(|(mm, _)| mm) != Some(m) {
                             v.open_menu = Some((m, mx));
                             v.open_sub = None;
+                            v.menu_sel = None;
+                            v.sub_sel = None;
+                            v.menu_bar_sel = i;
                             cx.notify();
                         }
                     })),
@@ -328,41 +589,45 @@ impl Render for EditorView {
         }
         menu_bar = menu_bar.child(div().flex_1()).child(
             div()
-                .text_size(px(12.0))
-                .text_color(rgb(if dirty { 0xffd24f } else { 0x9a9ab0 }))
+                .text_size(px(metrics::TEXT_LG))
+                .text_color(rgb(if dirty { th.warn } else { th.icon_off }))
                 .whitespace_nowrap()
                 .child(format!("{title}{}", if dirty { " •" } else { "" })),
         );
 
         // --- transport / tool bar: icon groups, DAW style -------------------------
         let transport_bar = div()
+            .id("transport-bar")
+            .test_support()
+            .role(Role::Toolbar)
+            .aria_label(t("a11y.toolbar"))
             .flex()
             .items_center()
             .gap(px(2.0))
             .px_2()
             .h(px(40.0))
-            .bg(rgb(BG_PANEL))
+            .bg(rgb(theme::current().bg_panel))
             .border_b_1()
-            .border_color(rgb(BORDER_C))
+            .border_color(rgb(theme::current().border))
             // file ops
-            .child(Self::ibtn(
+            .child(Self::ibtn_w(
                 "i.new",
                 "note_add",
                 t("tip.new"),
                 false,
                 cx,
-                |v, _e, cx| {
-                    v.new_file(cx);
+                |v, w, cx| {
+                    v.confirm_discard_or_save(PendingAction::NewFile, w, cx);
                 },
             ))
-            .child(Self::ibtn(
+            .child(Self::ibtn_w(
                 "i.open",
                 "folder_open",
                 t("tip.open"),
                 false,
                 cx,
-                |v, _e, cx| {
-                    v.open_dialog(cx);
+                |v, w, cx| {
+                    v.confirm_discard_or_save(PendingAction::OpenDialog, w, cx);
                 },
             ))
             .child(Self::ibtn(
@@ -408,7 +673,7 @@ impl Render for EditorView {
                 },
                 t("tip.play"),
                 self.playback.is_some(),
-                0x4fd08c,
+                theme::current().ok,
                 cx,
                 |v, _e, cx| v.toggle_play(cx),
             ))
@@ -429,7 +694,7 @@ impl Render for EditorView {
                 "fiber_manual_record",
                 t("tip.rec"),
                 self.rec.is_some(),
-                0xff6a5a,
+                theme::current().danger,
                 cx,
                 |v, _e, _cx| v.toggle_record(),
             ))
@@ -438,7 +703,7 @@ impl Render for EditorView {
                 "loop",
                 t("tip.loop"),
                 loop_en,
-                0x9fd0ff,
+                theme::current().accent,
                 cx,
                 |v, _e, _cx| {
                     {
@@ -453,7 +718,7 @@ impl Render for EditorView {
                 "timer",
                 t("tip.met"),
                 met_en,
-                0x9fd0ff,
+                theme::current().accent,
                 cx,
                 |v, _e, _cx| {
                     {
@@ -467,34 +732,90 @@ impl Render for EditorView {
             // position + tempo + meter readouts (LCD style)
             .child(
                 div()
+                    .id("pos")
+                    .test_support()
+                    .role(Role::Label)
+                    .aria_label(tf("a11y.pos", &[("pos", pos.as_str())]))
                     .px_2()
                     .h(px(24.0))
                     .flex()
                     .items_center()
-                    .bg(rgb(0x0b0b11))
+                    .bg(rgb(theme::current().bg_input))
                     .border_1()
-                    .border_color(rgb(BORDER_C))
+                    .border_color(rgb(theme::current().border))
                     .rounded_sm()
-                    .text_color(rgb(0x8fd0a0))
-                    .text_size(px(12.0))
+                    .text_color(rgb(th.lcd))
+                    .text_size(px(metrics::TEXT_LG))
                     .font_family("Cascadia Mono")
                     .whitespace_nowrap()
                     .child(pos.clone()),
             )
+            // explicit timing-mode badge: ppq for metrical, fps for SMPTE
+            // — amber for SMPTE so a timecode file never masquerades as a
+            // musical grid
             .child(
                 div()
-                    .id("bpm")
                     .px_2()
                     .h(px(24.0))
                     .flex()
                     .items_center()
-                    .bg(rgb(0x0b0b11))
+                    .bg(rgb(theme::current().bg_input))
                     .border_1()
-                    .border_color(rgb(BORDER_C))
+                    .border_color(rgb(theme::current().border))
+                    .rounded_sm()
+                    .text_color(rgb(if td.is_smpte() {
+                        theme::current().warn_alt
+                    } else {
+                        theme::current().accent
+                    }))
+                    .text_size(px(11.0))
+                    .font_family("Cascadia Mono")
+                    .whitespace_nowrap()
+                    .child(badge.clone()),
+            )
+            .child(
+                div()
+                    .id("bpm")
+                    .test_support()
+                    .role(Role::SpinButton)
+                    .aria_label(tf(
+                        "a11y.tempo",
+                        &[("bpm", format!("{tempo0:.0}").as_str())],
+                    ))
+                    .aria_numeric_value(tempo0)
+                    .aria_min_numeric_value(10.0)
+                    .aria_max_numeric_value(400.0)
+                    .on_a11y_action(AccessibleAction::Increment, {
+                        let this = cx.entity().downgrade();
+                        move |_, _, cx| {
+                            this.update(cx, |this, cx| {
+                                this.bump_tempo(1.0);
+                                cx.notify();
+                            })
+                            .ok();
+                        }
+                    })
+                    .on_a11y_action(AccessibleAction::Decrement, {
+                        let this = cx.entity().downgrade();
+                        move |_, _, cx| {
+                            this.update(cx, |this, cx| {
+                                this.bump_tempo(-1.0);
+                                cx.notify();
+                            })
+                            .ok();
+                        }
+                    })
+                    .px_2()
+                    .h(px(24.0))
+                    .flex()
+                    .items_center()
+                    .bg(rgb(theme::current().bg_input))
+                    .border_1()
+                    .border_color(rgb(theme::current().border))
                     .rounded_sm()
                     .cursor_pointer()
-                    .text_color(rgb(0x8fd0a0))
-                    .text_size(px(12.0))
+                    .text_color(rgb(th.lcd))
+                    .text_size(px(metrics::TEXT_LG))
                     .font_family("Cascadia Mono")
                     .whitespace_nowrap()
                     .tooltip(move |_w, cx| cx.new(|_| Tip(t("tip.tempo").into())).into())
@@ -511,9 +832,26 @@ impl Render for EditorView {
                         }),
                     ),
             )
-            .child(Self::chip("sig", sig.clone(), cx, |v, _e, cx| {
-                v.cycle_time_sig();
-                cx.notify();
+            .child(Self::chip(
+                "sig",
+                sig.clone(),
+                tf("a11y.sig", &[("sig", sig.as_str())]),
+                cx,
+                |v, _e, cx| {
+                    v.cycle_time_sig();
+                    cx.notify();
+                },
+            ))
+            // format-2 marker: the viewed sequence and the total — the
+            // mode is explicit in chrome, never implicit in the file
+            .children(is_seq.then(|| {
+                let i = (self.sel_track + 1).to_string();
+                let n = n_tracks.to_string();
+                let label = tf("chip.seq", &[("i", i.as_str()), ("n", n.as_str())]);
+                Self::chip("seq", label.clone(), label, cx, move |v, _e, cx| {
+                    v.select_track((v.sel_track + 1) % n_tracks.max(1), cx);
+                    cx.notify();
+                })
             }))
             .child(Self::vsep())
             // edit tools
@@ -522,7 +860,7 @@ impl Render for EditorView {
                 "arrow_selector_tool",
                 t("tip.sel"),
                 self.tool == Tool::Select,
-                ACCENT,
+                theme::current().accent,
                 cx,
                 |v, _e, cx| v.set_tool(Tool::Select, cx),
             ))
@@ -531,7 +869,7 @@ impl Render for EditorView {
                 "edit",
                 t("tip.draw"),
                 self.tool == Tool::Draw,
-                ACCENT,
+                theme::current().accent,
                 cx,
                 |v, _e, cx| v.set_tool(Tool::Draw, cx),
             ))
@@ -540,15 +878,39 @@ impl Render for EditorView {
                 "ink_eraser",
                 t("tip.erase"),
                 self.tool == Tool::Erase,
-                ACCENT,
+                theme::current().accent,
                 cx,
                 |v, _e, cx| v.set_tool(Tool::Erase, cx),
             ))
             .child(Self::vsep())
-            // snap grid cycle: off / 1 / 1/2 / 1/4 / 1/8 / 1/16 / 1/32
+            // snap grid cycle: off / 1 / 1/2 / 1/4 / 1/8 / 1/16 / 1/32 —
+            // for SMPTE files the fractions are seconds ("1/16s" ≈ 62ms)
             .child(
                 div()
                     .id("snap")
+                    .test_support()
+                    .role(Role::SpinButton)
+                    .aria_label(tf("a11y.snap", &[("grid", SNAPS[self.snap_idx].2)]))
+                    .aria_numeric_value(self.snap_idx as f64)
+                    .aria_min_numeric_value(0.0)
+                    .aria_max_numeric_value((SNAPS.len() - 1) as f64)
+                    .on_a11y_action(AccessibleAction::Increment, {
+                        let this = cx.entity().downgrade();
+                        move |_, _, cx| {
+                            this.update(cx, |this, cx| this.cycle_snap(cx)).ok();
+                        }
+                    })
+                    .on_a11y_action(AccessibleAction::Decrement, {
+                        let this = cx.entity().downgrade();
+                        move |_, _, cx| {
+                            this.update(cx, |this, cx| {
+                                this.snap_idx = (this.snap_idx + SNAPS.len() - 1) % SNAPS.len();
+                                this.persist();
+                                cx.notify();
+                            })
+                            .ok();
+                        }
+                    })
                     .h(px(26.0))
                     .pl_1()
                     .pr_2()
@@ -556,40 +918,40 @@ impl Render for EditorView {
                     .items_center()
                     .rounded_sm()
                     .bg(rgb(if SNAPS[self.snap_idx].0 > 0 {
-                        BG_RAISED
+                        theme::current().bg_raised
                     } else {
-                        0x141419
+                        theme::current().bg_off
                     }))
                     .border_1()
                     .border_color(rgb(if SNAPS[self.snap_idx].0 > 0 {
-                        0x3d5a75
+                        theme::current().accent_edge
                     } else {
-                        BORDER_C
+                        theme::current().border
                     }))
                     .cursor_pointer()
-                    .hover(|s| s.bg(rgb(0x2f2f42)))
+                    .hover(|s| s.bg(rgb(theme::current().bg_hover)))
                     .tooltip(move |_w, cx| cx.new(|_| Tip(t("tip.snap").into())).into())
                     .child(icon(
                         "grid_on",
                         15.0,
                         if SNAPS[self.snap_idx].0 > 0 {
-                            ACCENT
+                            theme::current().accent
                         } else {
-                            0x55556a
+                            theme::current().state_off
                         },
                     ))
                     .child(
                         div()
                             .pl_1()
-                            .text_size(px(11.0))
+                            .text_size(px(metrics::TEXT_MD))
                             .font_family("Cascadia Mono")
                             .text_color(rgb(if SNAPS[self.snap_idx].0 > 0 {
-                                0xd8d8e0
+                                theme::current().text
                             } else {
-                                0x55556a
+                                theme::current().state_off
                             }))
                             .whitespace_nowrap()
-                            .child(SNAPS[self.snap_idx].2),
+                            .child(snap_label(SNAPS[self.snap_idx].2, td)),
                     )
                     .on_click(cx.listener(|v, _e, _w, cx| v.cycle_snap(cx))),
             )
@@ -598,11 +960,15 @@ impl Render for EditorView {
             .child(Self::ibtn(
                 "i.quant",
                 "compress",
-                t("tip.quantize"),
+                t(if td.is_smpte() {
+                    "tip.quantize_smpte"
+                } else {
+                    "tip.quantize"
+                }),
                 false,
                 cx,
                 |v, _e, cx| {
-                    let g = v.snap_ticks().max(v.ppq() as i64 / 4) as u64;
+                    let g = v.snap_ticks().max(v.td().min_grid_ticks() as i64) as u64;
                     v.apply_region_op("quantize", move |d, tr, f, to| {
                         d.quantize_ops(tr, f, to, g, 100)
                     });
@@ -679,14 +1045,40 @@ impl Render for EditorView {
                 })
             }));
         // --- event list: right-docked panel -------------------------------------
+        let events_focused = area == FocusArea::Events;
         let events_panel = div()
+            .id("events-panel")
+            .test_support()
+            .role(Role::Region)
+            .aria_label(t("a11y.events_list"))
             .w(px(340.0))
             .h_full()
             .flex()
             .flex_col()
-            .bg(rgb(BG_PANEL))
+            .bg(rgb(theme::current().bg_panel))
             .border_l_1()
-            .border_color(rgb(BORDER_C))
+            .border_color(rgb(if events_focused {
+                theme::current().accent
+            } else {
+                theme::current().border
+            }))
+            .track_focus(&self.events_fh)
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| {
+                if this.open_menu.is_some() {
+                    return;
+                }
+                match ev.keystroke.key.as_str() {
+                    "up" => this.ev_step(-1, cx),
+                    "down" => this.ev_step(1, cx),
+                    "pageup" => this.ev_step(-20, cx),
+                    "pagedown" => this.ev_step(20, cx),
+                    "home" => this.ev_step(i64::MIN, cx),
+                    "end" => this.ev_step(i64::MAX, cx),
+                    "enter" => this.ev_activate(cx),
+                    _ => return,
+                }
+                cx.stop_propagation();
+            }))
             .child(
                 div()
                     .flex()
@@ -694,18 +1086,32 @@ impl Render for EditorView {
                     .px_2()
                     .h(px(26.0))
                     .border_b_1()
-                    .border_color(rgb(BORDER_C))
-                    .text_size(px(11.0))
-                    .text_color(rgb(0x77778a))
-                    .child(format!("{} ({})", t("events.header"), self.events.len()))
+                    .border_color(rgb(th.border))
+                    .text_size(px(metrics::TEXT_MD))
+                    .text_color(rgb(th.text_muted))
+                    .child(format!(
+                        "{} ({}){}",
+                        t("events.header"),
+                        self.events.len(),
+                        self.doc_ui
+                            .mode_hint
+                            .map(|m| format!(" [{}]", m.label()))
+                            .unwrap_or_default(),
+                    ))
                     .child(div().flex_1())
                     .children((n_diags > 0).then(|| {
                         div()
                             .id("fix-diags")
+                            .test_support()
+                            .role(Role::Button)
+                            .aria_label(tf(
+                                "a11y.fix_diags",
+                                &[("n", n_diags.to_string().as_str())],
+                            ))
                             .ml_2()
                             .px_1()
-                            .text_size(px(10.0))
-                            .text_color(rgb(0xffb454))
+                            .text_size(px(metrics::TEXT_SM))
+                            .text_color(rgb(th.warn_alt))
                             .cursor_pointer()
                             .child(format!("{} {} [fix]", n_diags, t("events.issues")))
                             .on_click(cx.listener(|v, _e, _w, cx| {
@@ -723,34 +1129,129 @@ impl Render for EditorView {
             )
             .child({
                 let events = self.events.clone();
-                uniform_list("events", events.len(), move |range, _w, _cx| {
-                    range
-                        .map(|i| {
-                            div()
-                                .h(px(18.0))
-                                .px_2()
-                                .text_size(px(11.0))
-                                .font_family("Cascadia Mono")
-                                .text_color(rgb(0xb8b8c8))
-                                .child(events[i].clone())
+                let refs = self.event_refs.clone();
+                let sel = self.sel_events.clone();
+                let ev_sel = self.ev_sel;
+                let ev_focused = area == FocusArea::Events;
+                let view = cx.entity();
+                div()
+                    .id("events-list")
+                    .test_support()
+                    .role(Role::List)
+                    .aria_label(t("a11y.events_list"))
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .child(
+                        uniform_list("events", events.len(), move |range, _w, _cx| {
+                            range
+                                .map(|i| {
+                                    let selected = refs[i]
+                                        .map(|(_, _, id)| sel.contains(&id))
+                                        .unwrap_or(false);
+                                    let cur = i == ev_sel;
+                                    let view = view.clone();
+                                    div()
+                                        .id(("ev", i))
+                                        .test_support()
+                                        .role(Role::ListItem)
+                                        .aria_label(events[i].text.clone())
+                                        .h(px(18.0))
+                                        .px_2()
+                                        .text_size(px(metrics::TEXT_MD))
+                                        .font_family("Cascadia Mono")
+                                        .text_color(if selected || cur {
+                                            rgb(theme::current().text_bright)
+                                        } else {
+                                            rgb(th.events_text)
+                                        })
+                                        .bg(if selected {
+                                            rgba(theme::current().sel_fill)
+                                        } else if cur && ev_focused {
+                                            rgba(theme::current().hover_wash)
+                                        } else {
+                                            rgba(0x00000000)
+                                        })
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(rgba(theme::current().hover_wash)))
+                                        .child(events[i].text.clone())
+                                        .on_mouse_down(MouseButton::Left, move |ev, w, cx| {
+                                            view.update(cx, |this, cx| {
+                                                this.ev_row_click(
+                                                    i,
+                                                    ev.modifiers.control,
+                                                    ev.modifiers.shift,
+                                                    ev.click_count == 2,
+                                                    cx,
+                                                );
+                                                w.focus(&this.events_fh, cx);
+                                            });
+                                        })
+                                })
+                                .collect()
                         })
-                        .collect()
-                })
-                .h_full()
-                .flex_1()
-            });
+                        .h_full()
+                        .track_scroll(&self.events_scroll),
+                    )
+            })
+            .child(self.prop_panel(cx));
 
         let body = div().flex().flex_1().min_h(px(0.0));
 
         // --- track column: select / mute / solo -------------------------------
+        let tracks_focused = area == FocusArea::Tracks;
         let track_col = div()
+            .id("track-col")
+            .test_support()
             .w(px(150.0))
             .h_full()
             .flex()
             .flex_col()
-            .bg(rgb(0x1b1b24))
+            .bg(rgb(theme::current().bg_row))
             .border_r_1()
-            .border_color(rgb(BORDER_C))
+            .border_color(rgb(if tracks_focused {
+                theme::current().accent
+            } else {
+                theme::current().border
+            }))
+            .track_focus(&self.tracks_fh)
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+                if this.open_menu.is_some() {
+                    return;
+                }
+                // the rename input inside this column owns its keys; Enter /
+                // Escape are handled at the root
+                if this.input.read(cx).focus_handle(cx).is_focused(w) {
+                    return;
+                }
+                let i = this.sel_track;
+                // bare keys only — Ctrl/Alt chords (Ctrl+S/C/V…) must reach
+                // the global handler, not toggle solo/channel/etc.
+                if ev.keystroke.modifiers.control || ev.keystroke.modifiers.alt {
+                    return;
+                }
+                match ev.keystroke.key.as_str() {
+                    "up" => this.track_step(-1, cx),
+                    "down" => this.track_step(1, cx),
+                    "home" => {
+                        this.sel_track = 0;
+                        cx.notify();
+                    }
+                    "end" => {
+                        let n = this.doc(|d| d.tracks.len());
+                        if n > 0 {
+                            this.sel_track = n - 1;
+                        }
+                        cx.notify();
+                    }
+                    "m" => this.toggle_mute(i),
+                    "s" => this.toggle_solo(i),
+                    "c" => this.cycle_chan(i),
+                    "enter" | "f2" => this.focus_rename(w, cx),
+                    _ => return,
+                }
+                cx.notify();
+                cx.stop_propagation();
+            }))
             .child(
                 div()
                     .px_2()
@@ -758,15 +1259,22 @@ impl Render for EditorView {
                     .flex()
                     .items_center()
                     .border_b_1()
-                    .border_color(rgb(BORDER_C))
-                    .text_size(px(11.0))
-                    .text_color(rgb(0x77778a))
-                    .child(t("tracks.header")),
+                    .border_color(rgb(th.border))
+                    .text_size(px(metrics::TEXT_MD))
+                    .text_color(rgb(th.text_muted))
+                    .child(t(if is_seq {
+                        "tracks.header_seq"
+                    } else {
+                        "tracks.header"
+                    })),
             )
             .child(
                 // scrollable when a file has more tracks than fit the panel
                 div()
                     .id("track-list")
+                    .test_support()
+                    .role(Role::List)
+                    .aria_label(t("tracks.header"))
                     .flex_1()
                     .min_h(px(0.0))
                     .overflow_y_scroll()
@@ -774,23 +1282,52 @@ impl Render for EditorView {
                         let sel = self.sel_track == i;
                         let muted = muted_set.contains(&i);
                         let soloed = soloed_set.contains(&i);
-                        let color = TRACK_COLORS[i % TRACK_COLORS.len()];
+                        let color = th.track_colors[i % th.track_colors.len()];
+                        // screen-reader description: channel + mute/solo state
+                        let mut desc = tf(
+                            "a11y.ch",
+                            &[(
+                                "ch",
+                                (track_chs.get(i).copied().unwrap_or(0) + 1)
+                                    .to_string()
+                                    .as_str(),
+                            )],
+                        );
+                        for (on, key) in [(muted, "a11y.muted"), (soloed, "a11y.soloed")] {
+                            if on {
+                                desc.push_str(", ");
+                                desc.push_str(t(key));
+                            }
+                        }
                         div()
                             .id(("track", i))
+                            .test_support()
+                            .role(Role::ListBoxOption)
+                            .aria_label(name.to_string())
+                            .aria_selected(sel)
+                            .aria_description(desc)
+                            .aria_position_in_set(i + 1)
+                            .aria_size_of_set(track_names.len())
                             .flex()
                             .flex_row()
                             .items_center()
                             .h(px(22.0))
                             .px_1()
                             .cursor_pointer()
-                            .bg(if sel { rgb(0x2a2a3a) } else { rgb(0x1b1b24) })
-                            .hover(|s| s.bg(rgb(0x252532)))
-                            .on_click(cx.listener(move |v, _e, _w, cx| {
-                                v.sel_track = i;
-                                cx.notify();
+                            .bg(if sel {
+                                rgb(theme::current().bg_row_sel)
+                            } else {
+                                rgb(theme::current().bg_row)
+                            })
+                            .hover(|s| s.bg(rgb(theme::current().bg_row_hover)))
+                            .on_click(cx.listener(move |v, _e, w, cx| {
+                                // format 2: this click also picks the
+                                // sequence being viewed/played
+                                v.select_track(i, cx);
+                                w.focus(&v.tracks_fh, cx);
                             }))
                             .child(div().w(px(10.0)).h(px(10.0)).rounded_sm().bg(rgb(if muted {
-                                0x555560
+                                theme::current().swatch_off
                             } else {
                                 color
                             })))
@@ -798,26 +1335,38 @@ impl Render for EditorView {
                                 div()
                                     .flex_1()
                                     .px_1()
-                                    .text_size(px(11.0))
-                                    .text_color(rgb(if muted { 0x707080 } else { 0xd8d8e0 }))
+                                    .text_size(px(metrics::TEXT_MD))
+                                    .text_color(rgb(if muted {
+                                        th.text_muted_name
+                                    } else {
+                                        th.text
+                                    }))
+                                    .when(muted, |s| s.italic())
                                     .overflow_hidden()
                                     .child(name.to_string()),
                             )
                             .child(
                                 div()
                                     .id(("mute", i))
+                                    .test_support()
+                                    .role(Role::CheckBox)
+                                    .aria_label(tf("a11y.mute", &[("track", name.as_str())]))
+                                    .aria_toggled(if muted {
+                                        Toggled::True
+                                    } else {
+                                        Toggled::False
+                                    })
                                     .px_1()
                                     .text_size(px(9.0))
-                                    .text_color(rgb(if muted { 0xffb454 } else { 0x707080 }))
-                                    .on_click(cx.listener(move |v, _e: &ClickEvent, _w, cx| {
+                                    .text_color(rgb(if muted {
+                                        theme::current().warn_alt
+                                    } else {
+                                        theme::current().text_muted_name
+                                    }))
+                                    .on_click(cx.listener(move |v, _e: &ClickEvent, w, cx| {
                                         cx.stop_propagation();
-                                        {
-                                            let mut sh = crate::lock_shared(&v.shared);
-                                            if !sh.muted.remove(&i) {
-                                                sh.muted.insert(i);
-                                            }
-                                        }
-                                        v.persist();
+                                        v.toggle_mute(i);
+                                        w.focus(&v.tracks_fh, cx);
                                         cx.notify();
                                     }))
                                     .child("M"),
@@ -825,18 +1374,25 @@ impl Render for EditorView {
                             .child(
                                 div()
                                     .id(("solo", i))
+                                    .test_support()
+                                    .role(Role::CheckBox)
+                                    .aria_label(tf("a11y.solo", &[("track", name.as_str())]))
+                                    .aria_toggled(if soloed {
+                                        Toggled::True
+                                    } else {
+                                        Toggled::False
+                                    })
                                     .px_1()
                                     .text_size(px(9.0))
-                                    .text_color(rgb(if soloed { 0xffd24f } else { 0x707080 }))
-                                    .on_click(cx.listener(move |v, _e: &ClickEvent, _w, cx| {
+                                    .text_color(rgb(if soloed {
+                                        theme::current().warn
+                                    } else {
+                                        theme::current().text_muted_name
+                                    }))
+                                    .on_click(cx.listener(move |v, _e: &ClickEvent, w, cx| {
                                         cx.stop_propagation();
-                                        {
-                                            let mut sh = crate::lock_shared(&v.shared);
-                                            if !sh.soloed.remove(&i) {
-                                                sh.soloed.insert(i);
-                                            }
-                                        }
-                                        v.persist();
+                                        v.toggle_solo(i);
+                                        w.focus(&v.tracks_fh, cx);
                                         cx.notify();
                                     }))
                                     .child("S"),
@@ -844,22 +1400,24 @@ impl Render for EditorView {
                             .child(
                                 div()
                                     .id(("ch", i))
+                                    .test_support()
+                                    .role(Role::Button)
+                                    .aria_label(tf(
+                                        "a11y.track_ch",
+                                        &[(
+                                            "ch",
+                                            (track_chs.get(i).copied().unwrap_or(0) + 1)
+                                                .to_string()
+                                                .as_str(),
+                                        )],
+                                    ))
                                     .px_1()
                                     .text_size(px(9.0))
-                                    .text_color(rgb(0x7070a0))
-                                    .on_click(cx.listener(move |v, _e: &ClickEvent, _w, cx| {
+                                    .text_color(rgb(theme::current().ch_text))
+                                    .on_click(cx.listener(move |v, _e: &ClickEvent, w, cx| {
                                         cx.stop_propagation();
-                                        let ops = {
-                                            let mut sh = crate::lock_shared(&v.shared);
-                                            let cur = sh
-                                                .doc
-                                                .tracks
-                                                .get(i)
-                                                .map(|t| t.out_channel)
-                                                .unwrap_or(0);
-                                            sh.doc.set_track_channel_ops(i, (cur + 1) % 16)
-                                        };
-                                        v.apply_tx("set track channel", ops);
+                                        v.cycle_chan(i);
+                                        w.focus(&v.tracks_fh, cx);
                                         cx.notify();
                                     }))
                                     .child(format!(
@@ -878,126 +1436,97 @@ impl Render for EditorView {
                     .px_1()
                     .h(px(30.0))
                     .border_t_1()
-                    .border_color(rgb(BORDER_C))
+                    .border_color(rgb(theme::current().border))
                     .child(div().flex_1().min_w(px(0.0)).child(Input::new(&self.input)))
-                    .child(Self::chip("rename", "rename", cx, |v, _e, cx| {
-                        let name = v.input.read(cx).value().to_string();
-                        let ops = {
-                            let mut sh = crate::lock_shared(&v.shared);
-                            sh.doc.set_track_name_ops(v.sel_track, &name)
-                        };
-                        v.apply_tx("set track name", ops);
-                        cx.notify();
-                    })),
+                    .child(Self::chip(
+                        "rename",
+                        "rename",
+                        t("a11y.rename"),
+                        cx,
+                        |v, _e, cx| {
+                            v.apply_rename(cx);
+                            cx.notify();
+                        },
+                    )),
             );
 
-        // velocity / CC / pitch-bend lane (selected track only)
-        let lane_sel_track = self.sel_track;
-        let lane_mode = self.lane_mode;
-        // control events of the selected track matching the lane mode:
-        // (event id, tick, value 0..127 or 0..16383 for PB) — cached on
-        // (revision, track, mode) so playhead animation is allocation-free
-        let lane_events = self.lane_events_cached();
-        let lane_bounds_cell = self.lane_bounds.clone();
-        let lane = canvas(
-            move |bounds, _window, _cx| {
-                lane_bounds_cell.set(bounds);
-            },
-            {
-                let lane_notes = self.notes.clone();
-                let lane_selection = self.selection.clone();
-                let lane_events = lane_events.clone();
-                let drag_v = drag;
-                move |bounds, _state, window, _cx| {
-                    let h: f32 = bounds.size.height.into();
-                    let vrange = if lane_mode == LaneMode::PitchBend {
-                        16383.0
-                    } else {
-                        127.0
-                    };
-                    match lane_mode {
-                        LaneMode::Velocity => {
-                            for n in lane_notes.iter().filter(|n| n.track == lane_sel_track) {
-                                let x = bounds.origin.x + px(n.start_tick as f32 * zoom - scroll_x);
-                                if x < bounds.origin.x || x > bounds.origin.x + bounds.size.width {
-                                    continue;
-                                }
-                                let mut vel = n.vel as f32 / 127.0;
-                                if let Some((DragMode::Velocity, d_on, _, dkey)) = drag_v {
-                                    if d_on == n.on_id {
-                                        vel = (dkey as f32 / 127.0).clamp(0.0, 1.0);
-                                    }
-                                }
-                                let bh = px((h - 6.0) * vel);
-                                let y = bounds.origin.y + px(h) - bh - px(3.0);
-                                let c = if lane_selection.contains(&n.on_id) {
-                                    SEL_COLOR
-                                } else {
-                                    TRACK_COLORS[n.track % TRACK_COLORS.len()]
-                                };
-                                window.paint_quad(fill(
-                                    Bounds::new(point(x, y), size(px(2.0), bh)),
-                                    rgb(c),
-                                ));
-                            }
-                        }
-                        _ => {
-                            // stepped automation line: dot + run to next point
-                            let mut prev: Option<(Pixels, Pixels)> = None;
-                            for (id, tick, val) in lane_events.iter() {
-                                let mut v = *val;
-                                if let Some((DragMode::LaneEvent, d_on, _, dkey)) = drag_v {
-                                    if d_on == *id {
-                                        v = dkey.clamp(0, vrange as i32);
-                                    }
-                                }
-                                let x = bounds.origin.x + px(*tick as f32 * zoom - scroll_x);
-                                let y = bounds.origin.y
-                                    + px((h - 4.0) * (1.0 - v as f32 / vrange) + 2.0);
-                                if let Some((px_, py_)) = prev {
-                                    // horizontal run at previous level, then
-                                    // a vertical connector at this event's x
-                                    window.paint_quad(fill(
-                                        Bounds::new(point(px_, py_), size(x - px_, px(1.0))),
-                                        rgba(0x4fd0ff88),
-                                    ));
-                                    window.paint_quad(fill(
-                                        Bounds::new(
-                                            point(x, y.min(py_)),
-                                            size(px(1.0), (y - py_).abs().max(px(1.0))),
-                                        ),
-                                        rgba(0x4fd0ff88),
-                                    ));
-                                }
-                                window.paint_quad(fill(
-                                    Bounds::new(
-                                        point(x - px(2.0), y - px(2.0)),
-                                        size(px(4.0), px(4.0)),
-                                    ),
-                                    rgb(0x4fd0ff),
-                                ));
-                                prev = Some((x, y));
-                            }
-                            // drag insert ghost
-                            if let Some((DragMode::LaneEvent, 0, a_tick, dkey)) = drag_v {
-                                let x = bounds.origin.x + px(a_tick as f32 * zoom - scroll_x);
-                                let y = bounds.origin.y
-                                    + px((h - 4.0)
-                                        * (1.0 - dkey.clamp(0, vrange as i32) as f32 / vrange)
-                                        + 2.0);
-                                window.paint_quad(fill(
-                                    Bounds::new(
-                                        point(x - px(2.0), y - px(2.0)),
-                                        size(px(4.0), px(4.0)),
-                                    ),
-                                    rgb(SEL_COLOR),
-                                ));
-                            }
-                        }
-                    }
+        // stacked controller lanes: each panel has a header strip (mode
+        // chip, key filter, add/remove, collapse — and the resize handle)
+        // plus a body canvas; lanes share the selection, playhead and
+        // scroll so a drag or the cursor lines up across them
+        let lane_panels: Vec<AnyElement> = {
+            let lanes = self.lanes.clone();
+            let scale_a11y = window.scale_factor();
+            lanes
+                .iter()
+                .enumerate()
+                .map(|(li, cfg)| {
+                    self.lane_panel(
+                        li,
+                        *cfg,
+                        area,
+                        play_x_tick,
+                        playing,
+                        scroll_x,
+                        zoom,
+                        track_names.clone(),
+                        scale_a11y,
+                        &mut *cx,
+                    )
+                    .into_any_element()
+                })
+                .collect()
+        };
+        // the stack is one focus region — clicks pick `lane_focus`, the
+        // shared lane_fh keeps Tab traversal and these keys stable
+        let lanes_stack = div()
+            .id("lanes")
+            .test_support()
+            .role(Role::Group)
+            .aria_label(tf(
+                "a11y.lane",
+                &[("mode", self.lane_mode().label().as_str())],
+            ))
+            .w_full()
+            .flex_col()
+            .bg(rgb(theme::current().bg_lane))
+            .border_t_1()
+            .border_color(rgb(if area == FocusArea::Lane {
+                theme::current().accent
+            } else {
+                theme::current().border
+            }))
+            .track_focus(&self.lane_fh)
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| {
+                if this.open_menu.is_some() {
+                    return;
                 }
-            },
-        );
+                // bare keys only — Ctrl/Alt chords belong to the global
+                // handler (Ctrl+V must paste, not cycle)
+                if ev.keystroke.modifiers.control || ev.keystroke.modifiers.alt {
+                    return;
+                }
+                let shift = ev.keystroke.modifiers.shift;
+                match (shift, ev.keystroke.key.as_str()) {
+                    // left/right share the roll's edit cursor
+                    (false, "left") => this.cursor_move(-this.snap_ticks(), 0, cx),
+                    (false, "right") => this.cursor_move(this.snap_ticks(), 0, cx),
+                    (true, "left") => this.cursor_move(-1, 0, cx),
+                    (true, "right") => this.cursor_move(1, 0, cx),
+                    // up/down edit velocities of selected notes
+                    (false, "up") => this.nudge_vel(8, cx),
+                    (false, "down") => this.nudge_vel(-8, cx),
+                    (true, "up") => this.nudge_vel(1, cx),
+                    (true, "down") => this.nudge_vel(-1, cx),
+                    (false, "v") => {
+                        let m = this.lane_mode().cycle();
+                        this.set_lane(m, cx);
+                    }
+                    _ => return,
+                }
+                cx.stop_propagation();
+            }))
+            .children(lane_panels);
 
         // seek ruler: bar ticks/numbers, click positions the playhead
         // minimap: whole-song overview with viewport rectangle
@@ -1005,7 +1534,7 @@ impl Render for EditorView {
         let mini_notes = self.notes.clone();
         let mini_active = self.sel_track;
         let roll_bounds_cell = self.roll_bounds.clone();
-        let song_end = doc_ui.song_end.max(ppq * 16);
+        let song_end = self.doc_end_ticks();
         let mini_play = play_x_tick;
         let minimap = canvas(
             move |b, _w, _cx| mini_bounds_cell.set(b),
@@ -1026,11 +1555,11 @@ impl Render for EditorView {
                     let nw = ((n.end_tick.unwrap_or(n.start_tick) - n.start_tick).max(1) as f32
                         * sx)
                         .max(1.5);
-                    let c = TRACK_COLORS[n.track % TRACK_COLORS.len()];
+                    let c = th.track_colors[n.track % th.track_colors.len()];
                     let c = if n.track == mini_active {
                         c
                     } else {
-                        blend(c, 0x111118, 0.55)
+                        blend(c, theme::current().mini_dim, 0.55)
                     };
                     window.paint_quad(fill(
                         Bounds::new(point(x, y), size(px(nw), px((h / 64.0).max(1.2)))),
@@ -1044,21 +1573,21 @@ impl Render for EditorView {
                 let vw = px((vw_ticks * sx).max(6.0));
                 window.paint_quad(fill(
                     Bounds::new(point(vx, bounds.origin.y), size(vw, px(h))),
-                    rgba(0x9fd0ff1c),
+                    rgba(theme::current().viewport_fill),
                 ));
                 window.paint_quad(fill(
                     Bounds::new(point(vx, bounds.origin.y), size(vw, px(1.0))),
-                    rgb(0x4f7fb0),
+                    rgb(theme::current().accent_dim),
                 ));
                 window.paint_quad(fill(
                     Bounds::new(point(vx, bounds.origin.y + px(h - 1.0)), size(vw, px(1.0))),
-                    rgb(0x4f7fb0),
+                    rgb(theme::current().accent_dim),
                 ));
                 // playhead
                 let pxx = bounds.origin.x + px(mini_play as f32 * sx);
                 window.paint_quad(fill(
                     Bounds::new(point(pxx, bounds.origin.y), size(px(1.0), px(h))),
-                    rgb(0x50ff9f),
+                    rgb(theme::current().ok),
                 ));
             },
         );
@@ -1071,16 +1600,17 @@ impl Render for EditorView {
             },
             move |bounds, _state, window, _cx| {
                 let w = bounds.size.width;
+                // coarse ticks: one bar for metrical, one second for SMPTE
                 let tick0 = (scroll_x / zoom).max(0.0) as u64;
-                let tick1 = tick0 + (f32::from(w) / zoom) as u64 + ppq * 4;
-                let mut t = tick0 / (ppq * 4) * (ppq * 4);
+                let tick1 = tick0 + (f32::from(w) / zoom) as u64 + grid_major;
+                let mut t = tick0 / grid_major * grid_major;
                 while t <= tick1 {
                     let x = bounds.origin.x + px(t as f32 * zoom - scroll_x);
                     window.paint_quad(fill(
                         Bounds::new(point(x, bounds.origin.y + px(12.0)), size(px(1.0), px(8.0))),
-                        rgb(0x55556a),
+                        rgb(theme::current().state_off),
                     ));
-                    t += ppq * 4;
+                    t += grid_major;
                 }
                 // playhead marker
                 let hx = bounds.origin.x + px(ruler_play_tick as f32 * zoom - scroll_x);
@@ -1090,7 +1620,7 @@ impl Render for EditorView {
                             point(hx - px(2.0), bounds.origin.y),
                             size(px(4.0), px(12.0)),
                         ),
-                        rgb(0x50ff9f),
+                        rgb(theme::current().ok),
                     ));
                 }
             },
@@ -1098,6 +1628,8 @@ impl Render for EditorView {
 
         let body = body.child(track_col).child(
             div()
+                .id("timeline")
+                .test_support()
                 .flex_1()
                 .h_full()
                 .flex()
@@ -1106,34 +1638,67 @@ impl Render for EditorView {
                 // minimap, lane) — the strips share the same scroll offset
                 .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _w, cx| {
                     let d = ev.delta.pixel_delta(px(20.0));
-                    if ev.modifiers.control {
+                    if ev.modifiers.control && ev.modifiers.shift {
+                        // vertical zoom around the cursor: the row under it
+                        // stays put (same anchor math as the horizontal zoom)
+                        let b = this.roll_bounds.get();
+                        let off = (f32::from(ev.position.y) - f32::from(b.origin.y))
+                            .clamp(0.0, f32::from(b.size.height));
+                        let anchor_row = (off + this.scroll_y) / this.note_h;
+                        this.note_h = (this.note_h * (1.0 - d.y.to_f64() as f32 * 0.002))
+                            .clamp(NOTE_H_MIN, NOTE_H_MAX);
+                        this.scroll_y = (anchor_row * this.note_h - off).max(0.0);
+                    } else if ev.modifiers.control {
                         // zoom around the cursor: the tick under it stays put
                         let b = this.roll_bounds.get();
                         let off = (f32::from(ev.position.x) - f32::from(b.origin.x))
                             .clamp(0.0, f32::from(b.size.width));
                         let anchor_tick = (off + this.scroll_x) / this.zoom;
-                        this.zoom =
-                            (this.zoom * (1.0 - d.y.to_f64() as f32 * 0.002)).clamp(ZOOM_MIN, ZOOM_MAX);
+                        this.zoom = (this.zoom * (1.0 - d.y.to_f64() as f32 * 0.002))
+                            .clamp(ZOOM_MIN, ZOOM_MAX);
                         this.scroll_x = (anchor_tick * this.zoom - off).max(0.0);
                     } else {
                         this.scroll_x = (this.scroll_x + d.x.to_f64() as f32).max(0.0);
                         this.scroll_y = (this.scroll_y + d.y.to_f64() as f32).max(0.0);
+                        // manual pan pauses playhead-follow briefly
+                        this.follow_hold = Some(std::time::Instant::now() + FOLLOW_HOLD);
                     }
                     this.clamp_scroll();
                     cx.notify();
                 }))
                 .child(
                     div()
+                        .id("minimap")
+                        .test_support()
+                        .role(Role::Slider)
+                        .aria_label(t("a11y.minimap"))
+                        .aria_numeric_value(playhead_tick as f64)
+                        .aria_min_numeric_value(0.0)
+                        .aria_max_numeric_value(song_end as f64)
+                        .aria_orientation(Orientation::Horizontal)
+                        .on_a11y_action(AccessibleAction::Increment, {
+                            let this = cx.entity().downgrade();
+                            move |_, _, cx| {
+                                this.update(cx, |this, cx| this.seek_bars(1, cx)).ok();
+                            }
+                        })
+                        .on_a11y_action(AccessibleAction::Decrement, {
+                            let this = cx.entity().downgrade();
+                            move |_, _, cx| {
+                                this.update(cx, |this, cx| this.seek_bars(-1, cx)).ok();
+                            }
+                        })
                         .h(px(20.0))
                         .w_full()
-                        .bg(rgb(0x111118))
+                        .bg(rgb(theme::current().bg_canvas))
                         .border_b_1()
-                        .border_color(rgb(BORDER_C))
+                        .border_color(rgb(theme::current().border))
                         .cursor_pointer()
                         .child(minimap.size_full())
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
+                            cx.listener(|this, ev: &MouseDownEvent, w, cx| {
+                                w.focus(&this.roll_fh, cx);
                                 this.seek_minimap(f32::from(ev.position.x));
                                 cx.notify();
                             }),
@@ -1150,16 +1715,37 @@ impl Render for EditorView {
                 )
                 .child(
                     div()
+                        .id("ruler")
+                        .test_support()
+                        .role(Role::Slider)
+                        .aria_label(t("a11y.ruler"))
+                        .aria_numeric_value(playhead_tick as f64)
+                        .aria_min_numeric_value(0.0)
+                        .aria_max_numeric_value(song_end as f64)
+                        .aria_orientation(Orientation::Horizontal)
+                        .on_a11y_action(AccessibleAction::Increment, {
+                            let this = cx.entity().downgrade();
+                            move |_, _, cx| {
+                                this.update(cx, |this, cx| this.seek_bars(1, cx)).ok();
+                            }
+                        })
+                        .on_a11y_action(AccessibleAction::Decrement, {
+                            let this = cx.entity().downgrade();
+                            move |_, _, cx| {
+                                this.update(cx, |this, cx| this.seek_bars(-1, cx)).ok();
+                            }
+                        })
                         .h(px(26.0))
                         .w_full()
-                        .bg(rgb(0x17171d))
+                        .bg(rgb(theme::current().bg_panel))
                         .border_b_1()
-                        .border_color(rgb(0x2a2a35))
+                        .border_color(rgb(theme::current().border))
                         .cursor_pointer()
                         .child(ruler.size_full())
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
+                            cx.listener(|this, ev: &MouseDownEvent, w, cx| {
+                                w.focus(&this.roll_fh, cx);
                                 let b = this.ruler_bounds.get();
                                 let x = f32::from(ev.position.x) - f32::from(b.origin.x);
                                 let tick = ((x + this.scroll_x) / this.zoom).max(0.0) as u64;
@@ -1184,307 +1770,402 @@ impl Render for EditorView {
                             cx.notify();
                         })),
                 )
-                // marker/lyric strip — meta 0x06/0x05 shown at their tick
+                // marker/lyric strip — meta 0x06/0x05 shown at their tick;
+                // click selects + seeks (then `e` edits, `Del` removes)
                 .child(
                     div()
                         .h(px(14.0))
                         .w_full()
                         .relative()
                         .overflow_hidden()
-                        .bg(rgb(0x17171d))
-                        .children(markers.iter().filter_map(|(tk, txt)| {
-                            let x = *tk as f32 * zoom - scroll_x;
-                            (x > -80.0).then(|| {
-                                div()
-                                    .absolute()
-                                    .left(px(x))
-                                    .top(px(0.0))
-                                    .text_size(px(9.0))
-                                    .text_color(rgb(0x9fd0ff))
-                                    .whitespace_nowrap()
-                                    .child(txt.clone())
-                            })
-                        })),
+                        .bg(rgb(theme::current().bg_panel))
+                        .children(markers.iter().enumerate().filter_map(
+                            |(i, (tk, id, ti, txt))| {
+                                let (tk, id, ti) = (*tk, *id, *ti);
+                                let x = tk as f32 * zoom - scroll_x;
+                                let sel = self.meta_sel == Some((ti, id));
+                                (x > -80.0).then(|| {
+                                    div()
+                                        .id(("mark", i))
+                                        .absolute()
+                                        .left(px(x))
+                                        .top(px(0.0))
+                                        .text_size(px(9.0))
+                                        .text_color(if sel {
+                                            rgb(theme::current().text_bright)
+                                        } else {
+                                            rgb(theme::current().accent)
+                                        })
+                                        .whitespace_nowrap()
+                                        .cursor_pointer()
+                                        .child(txt.clone())
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(
+                                                move |this, ev: &MouseDownEvent, _w, cx| {
+                                                    cx.stop_propagation();
+                                                    this.meta_sel = Some((ti, id));
+                                                    this.seek_to_tick(tk, false, cx);
+                                                    this.mouse_pos = Some(ev.position);
+                                                },
+                                            ),
+                                        )
+                                })
+                            },
+                        )),
                 )
-                .child(
+                .child({
+                    // a11y snapshot inputs for the piano-roll synthetic
+                    // subtree (note/selection/playhead/marquee nodes)
+                    let roll_bounds_a11y = self.roll_bounds.clone();
+                    let notes_a11y = self.notes.clone();
+                    let selection_a11y = self.selection.clone();
+                    let track_names_a11y = track_names.clone();
+                    let scale_a11y = window.scale_factor();
+                    let ppq = self.ppq();
                     div()
+                        .id("piano-roll")
+                        .test_support()
+                        .role(Role::Group)
+                        .aria_label(t("a11y.piano_roll"))
+                        .aria_description(tf(
+                            "a11y.roll_desc",
+                            &[
+                                ("n", self.notes.len().to_string().as_str()),
+                                ("sel", self.selection.len().to_string().as_str()),
+                            ],
+                        ))
+                        .a11y_synthetic_children(move |b| {
+                            a11y::RollA11y {
+                                bounds: roll_bounds_a11y.get(),
+                                scale: scale_a11y,
+                                scroll_x,
+                                scroll_y,
+                                zoom,
+                                ppq,
+                                notes: notes_a11y,
+                                selection: selection_a11y,
+                                track_names: track_names_a11y,
+                                drag,
+                                marquee,
+                                playhead_tick,
+                            }
+                            .build(b);
+                        })
                         .flex_1()
+                        // a bare div is display:block — flex_row alone
+                        // leaves children stacked vertically (rolled the
+                        // canvas below the fold); display:flex is required
+                        .flex()
+                        .flex_row()
                         .relative()
                         .overflow_hidden()
-                        .child(roll.size_full())
-                        .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, ev: &MouseDownEvent, w, cx| {
-                        w.focus(&this.focus, cx);
-                        this.mouse_pos = Some(ev.position);
-                        let shift = ev.modifiers.shift;
-                        // erase tool: any note under the cursor joins the stroke
-                        if this.tool == Tool::Erase {
-                            if let Some(n) = this
-                                .note_at(ev.position)
-                                .or_else(|| this.edge_at(ev.position))
-                            {
-                                this.erase_ids.insert(n.on_id);
-                                this.sel_track = n.track;
-                            }
-                            this.drag = Some(Drag {
-                                mode: DragMode::Erase,
-                                on_id: 0,
-                                off_id: None,
-                                track: 0,
-                                orig_start: 0,
-                                orig_end: None,
-                                orig_key: 0,
-                                dtick: 0,
-                                dkey: 0,
-                                a_tick: 0,
-                                a_key: 0,
-                                b_tick: 0,
-                                b_key: 0,
-                            });
-                            cx.notify();
-                            return;
-                        }
-                        if let Some(n) = this.edge_at(ev.position) {
-                            this.sel_track = n.track;
-                            this.drag = Some(Drag {
-                                mode: DragMode::Resize,
-                                on_id: n.on_id,
-                                off_id: n.off_id,
-                                track: n.track,
-                                orig_start: n.start_tick,
-                                orig_end: n.end_tick,
-                                orig_key: n.key,
-                                dtick: 0,
-                                dkey: 0,
-                                a_tick: 0,
-                                a_key: 0,
-                                b_tick: 0,
-                                b_key: 0,
-                            });
-                        } else if let Some(n) = this.note_at(ev.position) {
-                            if shift {
-                                if !this.selection.remove(&n.on_id) {
-                                    this.selection.insert(n.on_id);
-                                }
-                            } else if !this.selection.contains(&n.on_id) {
-                                this.selection = BTreeSet::from([n.on_id]);
-                            }
-                            this.sel_track = n.track;
-                            this.drag = Some(Drag {
-                                mode: if ev.modifiers.alt {
-                                    DragMode::Duplicate
-                                } else {
-                                    DragMode::Move
-                                },
-                                on_id: n.on_id,
-                                off_id: n.off_id,
-                                track: n.track,
-                                orig_start: n.start_tick,
-                                orig_end: n.end_tick,
-                                orig_key: n.key,
-                                dtick: 0,
-                                dkey: 0,
-                                a_tick: 0,
-                                a_key: 0,
-                                b_tick: 0,
-                                b_key: 0,
-                            });
-                        } else {
-                            let (tick, key) = this.hit(ev.position);
-                            if (0..=127).contains(&key) {
-                                if !shift {
-                                    this.selection.clear();
-                                }
-                                // becomes a marquee on drag; a click without
-                                // drag inserts a note at the anchor
-                                this.drag = Some(Drag {
-                                    mode: DragMode::Marquee,
-                                    on_id: 0,
-                                    off_id: None,
-                                    track: 0,
-                                    orig_start: 0,
-                                    orig_end: None,
-                                    orig_key: 0,
-                                    dtick: 0,
-                                    dkey: 0,
-                                    a_tick: tick,
-                                    a_key: key,
-                                    b_tick: tick,
-                                    b_key: key,
-                                });
-                            }
-                        }
-                        cx.notify();
-                    }),
-                )
-                .on_mouse_up(
-                    MouseButton::Left,
-                    cx.listener(|this, _ev: &MouseUpEvent, _w, cx| {
-                        // draw-tool marquee → insert lives in commit_drag
-                        this.commit_drag(cx);
-                    }),
-                )
-                // a release over the ruler/lane/track column must still commit
-                // — GPUI only fires on_mouse_up for the hovered element
-                .on_mouse_up_out(
-                    MouseButton::Left,
-                    cx.listener(|this, _ev: &MouseUpEvent, _w, cx| {
-                        this.commit_drag(cx);
-                    }),
-                )
-                )
-                .child(
-                    div()
-                        .h(px(56.0))
-                        .w_full()
-                        .bg(rgb(0x14141a))
-                        .border_t_1()
-                        .border_color(rgb(0x2a2a35))
-                        .relative()
-                        .child(lane.size_full())
+                        // piano-key strip — click or scrub to audition the
+                        // pitch through the selected track's routing
                         .child(
-                            // lane-mode chip: Vel -> CC1 -> CC7 -> CC10 ->
-                            // CC11 -> CC64 -> PB -> Vel
                             div()
-                                .id("lane-mode")
-                                .absolute()
-                                .top(px(2.0))
-                                .right(px(4.0))
-                                .px_1()
-                                .rounded_sm()
-                                .bg(rgb(0x2a2a35))
+                                .w(px(48.0))
+                                .h_full()
+                                .relative()
+                                .overflow_hidden()
+                                .bg(rgb(theme::current().bg_panel))
+                                .border_r_1()
+                                .border_color(rgb(theme::current().border))
                                 .cursor_pointer()
-                                .hover(|s| s.bg(rgb(0x3a3a48)))
-                                .text_size(px(9.0))
-                                .text_color(rgb(0x9fd0ff))
-                                .child(lane_mode.label())
-                                .on_click(cx.listener(|v, _e: &ClickEvent, _w, cx| {
+                                .child(kbd.size_full())
+                                .children((0..strip_keys.len() as i32).filter_map(|r| {
+                                    let k = strip_keys[r as usize];
+                                    if !k.is_multiple_of(12) {
+                                        return None;
+                                    }
+                                    let y = r as f32 * note_h - scroll_y + (note_h - 8.0) / 2.0;
+                                    (y > -12.0).then(|| {
+                                        div()
+                                            .absolute()
+                                            .right(px(2.0))
+                                            .top(px(y))
+                                            .text_size(px(7.0))
+                                            .text_color(rgb(theme::current().text_dim))
+                                            .child(format!("C{}", k as i32 / 12 - 1))
+                                    })
+                                }))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, ev: &MouseDownEvent, w, cx| {
+                                        cx.stop_propagation();
+                                        w.focus(&this.roll_fh, cx);
+                                        this.mouse_pos = Some(ev.position);
+                                        if let Some(k) = this.kbd_key(ev.position) {
+                                            let ch = this.sel_track_ch();
+                                            let tr = this.sel_track;
+                                            let vel = this.aud_vel;
+                                            let at =
+                                                this.doc(|d| d.tempo_map.us_to_tick(this.play_us));
+                                            this.scrub_key = Some(k);
+                                            this.audition_strike(tr, ch, k, vel, at);
+                                            cx.notify();
+                                        }
+                                    }),
+                                )
+                                .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
+                                    if this.scrub_key.is_none() {
+                                        return;
+                                    }
                                     cx.stop_propagation();
-                                    v.lane_mode = v.lane_mode.cycle();
-                                    v.persist();
-                                    cx.notify();
-                                })),
+                                    if ev.pressed_button != Some(MouseButton::Left) {
+                                        this.audition_off();
+                                        cx.notify();
+                                        return;
+                                    }
+                                    if let Some(k) = this.kbd_key(ev.position) {
+                                        if this.scrub_key != Some(k) {
+                                            this.scrub_key = Some(k);
+                                            let ch = this.sel_track_ch();
+                                            let tr = this.sel_track;
+                                            let vel = this.aud_vel;
+                                            let at =
+                                                this.doc(|d| d.tempo_map.us_to_tick(this.play_us));
+                                            this.audition_strike(tr, ch, k, vel, at);
+                                        }
+                                        cx.notify();
+                                    }
+                                }))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _ev: &MouseUpEvent, _w, cx| {
+                                        if this.scrub_key.is_some() {
+                                            this.audition_off();
+                                            cx.notify();
+                                        }
+                                    }),
+                                )
+                                .on_mouse_up_out(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _ev: &MouseUpEvent, _w, cx| {
+                                        if this.scrub_key.is_some() {
+                                            this.audition_off();
+                                            cx.notify();
+                                        }
+                                    }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .h_full()
+                                .relative()
+                                .overflow_hidden()
+                                .border_1()
+                                .border_color(if area == FocusArea::Roll {
+                                    rgb(theme::current().accent)
+                                } else {
+                                    rgba(0x00000000)
+                                })
+                                .track_focus(&self.roll_fh)
+                                .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| {
+                                    if this.open_menu.is_some() {
+                                        return;
+                                    }
+                                    if ev.keystroke.key == "enter" {
+                                        this.cursor_activate(cx);
+                                        cx.stop_propagation();
+                                    }
+                                }))
+                                .child(roll.size_full())
+                                // drum view: GM names on the folded rows'
+                                // left edge
+                                .children(if self.drum {
+                                    let h = f32::from(self.roll_bounds.get().size.height);
+                                    let r0 = (self.scroll_y / self.note_h).max(0.0) as i32;
+                                    let r1 = ((self.scroll_y + h) / self.note_h + 1.0)
+                                        .min(self.vis_keys.len() as f32)
+                                        as i32;
+                                    (r0..r1)
+                                        .map(|r| {
+                                            let key = self.vis_keys[r as usize];
+                                            let y = r as f32 * self.note_h - self.scroll_y
+                                                + (self.note_h - 8.0) / 2.0;
+                                            div()
+                                                .absolute()
+                                                .left(px(2.0))
+                                                .top(px(y))
+                                                .text_size(px(8.0))
+                                                .text_color(rgb(theme::current().text))
+                                                .whitespace_nowrap()
+                                                .child(
+                                                    drum_name(key)
+                                                        .map(|s| s.to_string())
+                                                        .unwrap_or_else(|| key.to_string()),
+                                                )
+                                        })
+                                        .collect::<Vec<_>>()
+                                } else {
+                                    Vec::new()
+                                }),
                         )
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
+                            cx.listener(|this, ev: &MouseDownEvent, w, cx| {
+                                w.focus(&this.roll_fh, cx);
                                 this.mouse_pos = Some(ev.position);
-                                let b = this.lane_bounds.get();
-                                let x = f32::from(ev.position.x) - f32::from(b.origin.x);
-                                let y = f32::from(ev.position.y) - f32::from(b.origin.y);
-                                let tick = ((x + this.scroll_x) / this.zoom).max(0.0) as u64;
-                                let h = f32::from(b.size.height);
-                                match this.lane_mode {
-                                    LaneMode::Velocity => {
-                                        let vel =
-                                            ((1.0 - y / h) * 127.0) as i32;
-                                        // the note bar under the cursor (within
-                                        // ~6px) — a click on empty lane space
-                                        // must not edit some distant note
-                                        let bar_dx = |n: &document::Note| {
-                                            n.start_tick as f32 * this.zoom - x
-                                        };
-                                        if let Some(n) = this
-                                            .notes
-                                            .iter()
-                                            .filter(|n| n.track == this.sel_track)
-                                            .min_by(|a, b| {
-                                                bar_dx(a).abs().total_cmp(&bar_dx(b).abs())
-                                            })
-                                            .filter(|n| bar_dx(n).abs() <= 6.0)
-                                        {
-                                            this.selection = BTreeSet::from([n.on_id]);
-                                            this.drag = Some(Drag {
-                                                mode: DragMode::Velocity,
-                                                on_id: n.on_id,
-                                                off_id: n.off_id,
-                                                track: n.track,
-                                                orig_start: n.start_tick,
-                                                orig_end: n.end_tick,
-                                                orig_key: n.key,
-                                                dtick: 0,
-                                                dkey: vel.clamp(1, 127),
-                                                a_tick: 0,
-                                                a_key: 0,
-                                                b_tick: 0,
-                                                b_key: 0,
-                                            });
-                                        }
+                                let shift = ev.modifiers.shift;
+                                // erase tool: any note under the cursor joins the stroke
+                                if this.tool == Tool::Erase {
+                                    if let Some(n) = this
+                                        .note_at(ev.position)
+                                        .or_else(|| this.edge_at(ev.position))
+                                    {
+                                        this.erase_ids.insert(n.on_id);
+                                        this.sel_track = n.track;
                                     }
-                                    mode => {
-                                        // CC/PB: grab the nearest lane event
-                                        // within ~10px, else insert a new one
-                                        // at the click and drag it
-                                        let vrange = if mode == LaneMode::PitchBend {
-                                            16383.0
+                                    this.drag = Some(Drag {
+                                        mode: DragMode::Erase,
+                                        on_id: 0,
+                                        off_id: None,
+                                        track: 0,
+                                        orig_start: 0,
+                                        orig_end: None,
+                                        orig_key: 0,
+                                        dtick: 0,
+                                        dkey: 0,
+                                        a_tick: 0,
+                                        a_key: 0,
+                                        b_tick: 0,
+                                        b_key: 0,
+                                        aud_vel: 0,
+                                        aud_ch: 0,
+                                        lane: 0,
+                                    });
+                                    cx.notify();
+                                    return;
+                                }
+                                if let Some(n) = this.edge_at(ev.position) {
+                                    this.sel_track = n.track;
+                                    this.audition_strike(
+                                        n.track,
+                                        n.channel,
+                                        n.key,
+                                        n.vel,
+                                        n.start_tick,
+                                    );
+                                    this.drag = Some(Drag {
+                                        mode: DragMode::Resize,
+                                        on_id: n.on_id,
+                                        off_id: n.off_id,
+                                        track: n.track,
+                                        orig_start: n.start_tick,
+                                        orig_end: n.end_tick,
+                                        orig_key: n.key,
+                                        dtick: 0,
+                                        dkey: 0,
+                                        a_tick: 0,
+                                        a_key: 0,
+                                        b_tick: 0,
+                                        b_key: 0,
+                                        aud_vel: n.vel,
+                                        aud_ch: n.channel,
+                                        lane: 0,
+                                    });
+                                } else if let Some(n) = this.note_at(ev.position) {
+                                    if shift {
+                                        if !this.selection.remove(&n.on_id) {
+                                            this.selection.insert(n.on_id);
+                                        }
+                                    } else if !this.selection.contains(&n.on_id) {
+                                        this.selection = BTreeSet::from([n.on_id]);
+                                    }
+                                    this.sel_track = n.track;
+                                    this.audition_strike(
+                                        n.track,
+                                        n.channel,
+                                        n.key,
+                                        n.vel,
+                                        n.start_tick,
+                                    );
+                                    this.sel_events.clear();
+                                    this.drag = Some(Drag {
+                                        mode: if ev.modifiers.alt {
+                                            DragMode::Duplicate
                                         } else {
-                                            127.0
-                                        };
-                                        let val =
-                                            ((1.0 - y / h) * vrange) as i32;
-                                        let tr = this.sel_track;
-                                        let found = {
-                                            let sh = crate::lock_shared(&this.shared);
-                                            sh.doc.tracks.get(tr).and_then(|t| {
-                                                t.events
-                                                    .iter()
-                                                    .filter(|e| {
-                                                        matches!(e.kind,
-                                                            EventKind::Channel { status, data, .. }
-                                                            if match mode {
-                                                                LaneMode::CC(cc) => status & 0xF0 == 0xB0 && data[0] == cc,
-                                                                LaneMode::PitchBend => status & 0xF0 == 0xE0,
-                                                                LaneMode::Velocity => false,
-                                                            })
-                                                    })
-                                                    .min_by_key(|e| {
-                                                        (e.tick as i64 - tick as i64).abs()
-                                                    })
-                                                    .filter(|e| {
-                                                        ((e.tick as f32 - tick as f32) * this.zoom)
-                                                            .abs()
-                                                            <= 10.0
-                                                    })
-                                                    .map(|e| e.id)
-                                            })
-                                        };
+                                            DragMode::Move
+                                        },
+                                        on_id: n.on_id,
+                                        off_id: n.off_id,
+                                        track: n.track,
+                                        orig_start: n.start_tick,
+                                        lane: 0,
+                                        orig_end: n.end_tick,
+                                        orig_key: n.key,
+                                        dtick: 0,
+                                        dkey: 0,
+                                        a_tick: 0,
+                                        a_key: 0,
+                                        b_tick: 0,
+                                        b_key: 0,
+                                        aud_vel: n.vel,
+                                        aud_ch: n.channel,
+                                    });
+                                } else {
+                                    let (tick, key) = this.hit(ev.position);
+                                    if (0..=127).contains(&key) {
+                                        if !shift {
+                                            this.selection.clear();
+                                        }
+                                        // draw tool auditions the pitch under the
+                                        // anchor; scrub changes preview on update_drag
+                                        let aud_ch = this.sel_track_ch();
+                                        let aud_vel = this.aud_vel;
+                                        if this.tool == Tool::Draw {
+                                            this.audition_strike(
+                                                this.sel_track,
+                                                aud_ch,
+                                                key as u8,
+                                                aud_vel,
+                                                tick.max(0) as u64,
+                                            );
+                                        }
+                                        // becomes a marquee on drag; a click without
+                                        // drag inserts a note at the anchor
                                         this.drag = Some(Drag {
-                                            mode: DragMode::LaneEvent,
-                                            on_id: found.unwrap_or(0),
+                                            mode: DragMode::Marquee,
+                                            on_id: 0,
                                             off_id: None,
-                                            track: tr,
+                                            track: this.sel_track,
                                             orig_start: 0,
                                             orig_end: None,
                                             orig_key: 0,
                                             dtick: 0,
-                                            dkey: val.clamp(0, vrange as i32),
-                                            a_tick: tick as i64,
-                                            a_key: 0,
-                                            b_tick: 0,
-                                            b_key: 0,
+                                            dkey: 0,
+                                            a_tick: tick,
+                                            a_key: key,
+                                            b_tick: tick,
+                                            b_key: key,
+                                            aud_vel,
+                                            aud_ch,
+                                            lane: 0,
                                         });
                                     }
                                 }
                                 cx.notify();
                             }),
                         )
-                        // drag deltas are forwarded by the root mouse-move
-                        // listener, so a lane drag keeps tracking even when
-                        // the cursor crosses into the ruler or roll
                         .on_mouse_up(
                             MouseButton::Left,
                             cx.listener(|this, _ev: &MouseUpEvent, _w, cx| {
-                                this.commit_drag(cx)
+                                // draw-tool marquee → insert lives in commit_drag
+                                this.commit_drag(cx);
                             }),
                         )
+                        // a release over the ruler/lane/track column must still commit
+                        // — GPUI only fires on_mouse_up for the hovered element
                         .on_mouse_up_out(
                             MouseButton::Left,
                             cx.listener(|this, _ev: &MouseUpEvent, _w, cx| {
-                                this.commit_drag(cx)
+                                this.commit_drag(cx);
                             }),
-                        ),
-                ),
+                        )
+                })
+                .child(lanes_stack),
         );
         let body = body.children(self.show_events.then_some(events_panel));
 
@@ -1499,20 +2180,31 @@ impl Render for EditorView {
                 .map(|(n, _)| n.clone())
                 .unwrap_or_default();
             let (badge, color, tip) = match self.plugin_state.get(&eff_dest) {
-                Some(PluginState::Ready { .. }) => {
-                    ("●", 0x8fd0a0, t("plugin.state_ready").to_string())
-                }
-                Some(PluginState::Loading { .. }) => {
-                    ("◌ …", 0xe0b050, t("plugin.state_loading").to_string())
-                }
+                Some(PluginState::Ready { .. }) => (
+                    "●",
+                    theme::current().lcd,
+                    t("plugin.state_ready").to_string(),
+                ),
+                Some(PluginState::Loading { .. }) => (
+                    "◌ …",
+                    theme::current().warn,
+                    t("plugin.state_loading").to_string(),
+                ),
                 Some(PluginState::Failed { phase, msg, .. }) => {
-                    ("✕", 0xe06060, format!("{phase}: {msg}"))
+                    ("✕", theme::current().danger, format!("{phase}: {msg}"))
                 }
-                _ => ("", 0x77778a, t("plugin.state_idle").to_string()),
+                _ => (
+                    "",
+                    theme::current().text_muted,
+                    t("plugin.state_idle").to_string(),
+                ),
             };
             Some(
                 div()
                     .id("plugin-chip")
+                    .test_support()
+                    .role(Role::Button)
+                    .aria_label(format!("{name}, {tip}"))
                     .px_1()
                     .rounded_sm()
                     .cursor_pointer()
@@ -1531,31 +2223,94 @@ impl Render for EditorView {
             None
         };
         let status_bar = div()
+            .id("status-bar")
+            .test_support()
+            .role(Role::ContentInfo)
+            .aria_label(t("a11y.status"))
             .flex()
             .items_center()
             .gap_2()
             .px_2()
-            .h(px(24.0))
-            .bg(rgb(BG_BAR))
+            .h(px(metrics::MENU_ROW))
+            .bg(rgb(th.bg_bar))
             .border_t_1()
-            .border_color(rgb(BORDER_C))
-            .text_size(px(11.0))
+            .border_color(rgb(th.border))
+            .text_size(px(metrics::TEXT_MD))
             .child(
+                // live region: UIA announces aria_label changes politely —
+                // `status` only changes on real events, so no flooding
                 div()
+                    .id("status")
+                    .test_support()
+                    .role(Role::Status)
+                    .aria_label(self.status.to_string())
+                    .a11y_synthetic_children(|b| {
+                        b.parent_node().set_live(accesskit::Live::Polite);
+                    })
                     .flex_1()
                     .min_w(px(0.0))
                     .overflow_hidden()
                     .whitespace_nowrap()
-                    .text_color(rgb(0x77778a))
+                    .text_color(rgb(theme::current().text_muted))
                     .child(format!("{}", self.status)),
             )
             .children(plugin_chip)
-            .child(Self::chip("st-lane", lane_mode.label(), cx, |v, _e, cx| {
-                v.set_lane(v.lane_mode.cycle(), cx);
-            }))
+            // MCP auth posture — an unauthenticated endpoint must be visible
+            .child({
+                let (label, color) = match mcp_auth_mode {
+                    mcp_server::McpAuthMode::Bearer => (t("status.mcp_auth"), theme::current().lcd),
+                    mcp_server::McpAuthMode::Open => {
+                        (t("status.mcp_open"), theme::current().danger)
+                    }
+                    mcp_server::McpAuthMode::Stdio => {
+                        (t("status.mcp_off"), theme::current().text_muted)
+                    }
+                };
+                div()
+                    .id("mcp-auth-chip")
+                    .px_1()
+                    .text_color(rgb(color))
+                    .child(label)
+                    .tooltip(move |_w, cx| {
+                        let tip = mcp_auth_detail.clone();
+                        cx.new(|_| Tip(tip.into())).into()
+                    })
+            })
+            .child(
+                div()
+                    .text_color(rgb(theme::current().text_muted))
+                    .whitespace_nowrap()
+                    .child(format!("{}: {}", t("focus.label"), t(area.key()))),
+            )
+            .child(
+                // live monitor scale — proves PerMonitorV2 at runtime (a
+                // bitmap-stretched app would always report 100%)
+                div()
+                    .text_color(rgb(theme::current().text_muted))
+                    .whitespace_nowrap()
+                    .child(format!(
+                        "{}: {}%",
+                        t("ui.scale"),
+                        (window.scale_factor() * 100.0).round() as i32
+                    )),
+            )
+            .child(Self::chip(
+                "st-lane",
+                self.lane_mode().label(),
+                tf(
+                    "a11y.lane_mode",
+                    &[("mode", self.lane_mode().label().as_str())],
+                ),
+                cx,
+                |v, _e, cx| {
+                    let m = v.lane_mode().cycle();
+                    v.set_lane(m, cx);
+                },
+            ))
             .child(Self::chip(
                 "st-enc",
                 format!("enc {enc_label}"),
+                tf("a11y.enc", &[("enc", enc_label.as_str())]),
                 cx,
                 |v, _e, cx| {
                     let next = match v.enc_override {
@@ -1573,7 +2328,11 @@ impl Render for EditorView {
             ))
             .child(
                 div()
-                    .text_color(rgb(0x77778a))
+                    .id("status-pos")
+                    .test_support()
+                    .role(Role::Label)
+                    .aria_label(tf("a11y.pos", &[("pos", pos.as_str())]))
+                    .text_color(rgb(theme::current().text_muted))
                     .font_family("Cascadia Mono")
                     .whitespace_nowrap()
                     .child(format!("{pos}  {}", {
@@ -1588,304 +2347,153 @@ impl Render for EditorView {
 
         // --- open menu dropdown --------------------------------------------------
         let menu_layer = self.open_menu.map(|(m, mx)| {
-            let items: Vec<AnyElement> = match m {
+            let items: Vec<MenuRow> = match m {
                 TopMenu::File => vec![
-                    Self::mi("f.new", t("menu.new"), "", None, cx, |v, _e, cx| {
-                        v.new_file(cx);
-                    })
-                    .into_any_element(),
-                    Self::mi("f.open", t("menu.open"), "Ctrl+O", None, cx, |v, _e, cx| {
-                        v.open_dialog(cx);
-                    })
-                    .into_any_element(),
-                    Self::mi_sub("f.recent", t("menu.recent"), Sub::Recent, cx).into_any_element(),
-                    Self::msep().into_any_element(),
-                    Self::mi("f.save", t("menu.save"), "Ctrl+S", None, cx, |v, _e, cx| {
-                        v.save(cx);
-                    })
-                    .into_any_element(),
-                    Self::mi("f.savas", t("menu.save_as"), "", None, cx, |v, _e, cx| {
-                        v.save_as(cx);
-                    })
-                    .into_any_element(),
+                    self.mi_cmd("file.new", None, cx),
+                    self.mi_cmd("file.open", None, cx),
+                    Self::mi_sub("f.recent", t("menu.recent"), Sub::Recent, cx),
+                    Self::msep(),
+                    self.mi_cmd("file.save", None, cx),
+                    self.mi_cmd("file.save_as", None, cx),
                 ],
                 TopMenu::Edit => vec![
-                    Self::mi("e.undo", t("menu.undo"), "Ctrl+Z", None, cx, |v, _e, cx| {
-                        v.undo(cx);
-                    })
-                    .into_any_element(),
-                    Self::mi("e.redo", t("menu.redo"), "Ctrl+Y", None, cx, |v, _e, cx| {
-                        v.redo(cx);
-                    })
-                    .into_any_element(),
-                    Self::msep().into_any_element(),
-                    Self::mi(
-                        "e.selall",
-                        t("menu.select_all"),
-                        "Ctrl+A",
-                        None,
-                        cx,
-                        |v, _e, cx| {
-                            v.select_all(cx);
-                        },
-                    )
-                    .into_any_element(),
-                    Self::msep().into_any_element(),
-                    Self::mi("e.cut", t("edit.cut"), "Ctrl+X", None, cx, |v, _e, cx| {
-                        v.copy_selected(true, cx);
-                    })
-                    .into_any_element(),
-                    Self::mi("e.copy", t("edit.copy"), "Ctrl+C", None, cx, |v, _e, cx| {
-                        v.copy_selected(false, cx);
-                    })
-                    .into_any_element(),
-                    Self::mi(
-                        "e.paste",
-                        t("edit.paste"),
-                        "Ctrl+V",
-                        None,
-                        cx,
-                        |v, _e, cx| {
-                            v.paste(cx);
-                        },
-                    )
-                    .into_any_element(),
-                    Self::mi(
-                        "e.dup",
-                        t("edit.duplicate"),
-                        "Ctrl+D",
-                        None,
-                        cx,
-                        |v, _e, cx| {
-                            v.duplicate_selected(cx);
-                        },
-                    )
-                    .into_any_element(),
-                    Self::mi("e.del", t("menu.delete"), "Del", None, cx, |v, _e, cx| {
-                        v.delete_selected(cx);
-                    })
-                    .into_any_element(),
-                    Self::msep().into_any_element(),
-                    Self::mi_sub("e.tool", t("edit.tool"), Sub::Tool, cx).into_any_element(),
-                    Self::mi_sub("e.snap", t("edit.snap"), Sub::Snap, cx).into_any_element(),
-                    Self::msep().into_any_element(),
-                    Self::mi_sub("e.quant", t("edit.quantize"), Sub::Quant, cx).into_any_element(),
-                    Self::mi(
-                        "e.trup",
-                        t("edit.transpose_up"),
-                        "",
-                        None,
-                        cx,
-                        |v, _e, _cx| {
-                            v.apply_region_op("transpose +1", |d, t, f, to| {
-                                d.transpose_ops(t, f, to, 1)
-                            });
-                        },
-                    )
-                    .into_any_element(),
-                    Self::mi(
-                        "e.trdn",
-                        t("edit.transpose_dn"),
-                        "",
-                        None,
-                        cx,
-                        |v, _e, _cx| {
-                            v.apply_region_op("transpose -1", |d, t, f, to| {
-                                d.transpose_ops(t, f, to, -1)
-                            });
-                        },
-                    )
-                    .into_any_element(),
-                    Self::mi_sub("e.oct", t("edit.octave"), Sub::Oct, cx).into_any_element(),
-                    Self::msep().into_any_element(),
-                    Self::mi("e.human", t("edit.humanize"), "", None, cx, |v, _e, _cx| {
-                        v.apply_region_op("humanize", |d, t, f, to| {
-                            d.humanize_ops(t, f, to, 12, 8)
-                        });
-                    })
-                    .into_any_element(),
-                    Self::mi("e.legato", t("edit.legato"), "", None, cx, |v, _e, _cx| {
-                        v.apply_region_op("legato", |d, t, f, to| d.legato_ops(t, f, to));
-                    })
-                    .into_any_element(),
-                    Self::mi_sub("e.len", t("edit.set_length"), Sub::LenSet, cx).into_any_element(),
-                    Self::mi_sub("e.velset", t("edit.set_velocity"), Sub::VelSet, cx)
-                        .into_any_element(),
-                    Self::msep().into_any_element(),
-                    Self::mi("e.velup", t("edit.vel_up"), "", None, cx, |v, _e, _cx| {
-                        v.apply_region_op("vel ×1.25", |d, t, f, to| {
-                            d.scale_velocity_ops(t, f, to, 1.25)
-                        });
-                    })
-                    .into_any_element(),
-                    Self::mi("e.veldn", t("edit.vel_dn"), "", None, cx, |v, _e, _cx| {
-                        v.apply_region_op("vel ×0.8", |d, t, f, to| {
-                            d.scale_velocity_ops(t, f, to, 0.8)
-                        });
-                    })
-                    .into_any_element(),
+                    self.mi_cmd("edit.undo", None, cx),
+                    self.mi_cmd("edit.redo", None, cx),
+                    Self::msep(),
+                    self.mi_cmd("edit.select_all", None, cx),
+                    Self::msep(),
+                    self.mi_cmd("edit.cut", None, cx),
+                    self.mi_cmd("edit.copy", None, cx),
+                    self.mi_cmd("edit.paste", None, cx),
+                    self.mi_cmd("edit.duplicate", None, cx),
+                    self.mi_cmd("edit.delete", None, cx),
+                    Self::mi_sub("e.meta", t("edit.meta"), Sub::Meta, cx),
+                    Self::msep(),
+                    Self::mi_sub("e.tool", t("edit.tool"), Sub::Tool, cx),
+                    Self::mi_sub("e.snap", t("edit.snap"), Sub::Snap, cx),
+                    Self::msep(),
+                    Self::mi_sub("e.quant", t("edit.quantize"), Sub::Quant, cx),
+                    self.mi_cmd("edit.transpose_up", None, cx),
+                    self.mi_cmd("edit.transpose_dn", None, cx),
+                    Self::mi_sub("e.oct", t("edit.octave"), Sub::Oct, cx),
+                    Self::msep(),
+                    self.mi_cmd("edit.humanize", None, cx),
+                    self.mi_cmd("edit.split", None, cx),
+                    Self::mi_sub("e.swing", t("edit.swing"), Sub::Swing, cx),
+                    self.mi_cmd("edit.join", None, cx),
+                    self.mi_cmd("edit.fix_overlaps", None, cx),
+                    Self::mi_sub("e.legato", t("edit.legato"), Sub::LegatoGap, cx),
+                    Self::mi_sub("e.len", t("edit.set_length"), Sub::LenSet, cx),
+                    Self::mi_sub("e.velset", t("edit.set_velocity"), Sub::VelSet, cx),
+                    Self::mi_sub("e.relset", t("edit.set_release"), Sub::RelSet, cx),
+                    Self::msep(),
+                    self.mi_cmd("edit.vel_up", None, cx),
+                    self.mi_cmd("edit.vel_dn", None, cx),
                 ],
                 TopMenu::View => vec![
-                    Self::mi(
-                        "v.events",
-                        t("view.events"),
-                        "",
-                        Some(self.show_events),
+                    self.mi_cmd("view.events", Some(self.show_events), cx),
+                    Self::mi_sub("v.theme", t("view.theme"), Sub::Theme, cx),
+                    self.mi_cmd(
+                        "view.hc",
+                        Some(self.theme == theme::Theme::high_contrast()),
                         cx,
-                        |v, _e, _cx| {
-                            v.show_events = !v.show_events;
-                            v.persist();
-                        },
-                    )
-                    .into_any_element(),
-                    Self::msep().into_any_element(),
-                    Self::mi(
-                        "v.zin",
-                        t("view.zoom_in"),
-                        "Ctrl+=",
-                        None,
+                    ),
+                    Self::msep(),
+                    self.mi_cmd("view.zoom_in", None, cx),
+                    self.mi_cmd("view.zoom_out", None, cx),
+                    self.mi_cmd("view.zoom_reset", None, cx),
+                    Self::msep(),
+                    self.mi_cmd("view.follow_off", Some(self.follow == Follow::Off), cx),
+                    self.mi_cmd("view.follow_page", Some(self.follow == Follow::Page), cx),
+                    self.mi_cmd(
+                        "view.follow_smooth",
+                        Some(self.follow == Follow::Smooth),
                         cx,
-                        |v, _e, cx| {
-                            v.zoom_by(1.3, cx);
-                        },
-                    )
-                    .into_any_element(),
-                    Self::mi(
-                        "v.zout",
-                        t("view.zoom_out"),
-                        "Ctrl+-",
-                        None,
-                        cx,
-                        |v, _e, cx| {
-                            v.zoom_by(1.0 / 1.3, cx);
-                        },
-                    )
-                    .into_any_element(),
-                    Self::mi(
-                        "v.z0",
-                        t("view.zoom_reset"),
-                        "Ctrl+0",
-                        None,
-                        cx,
-                        |v, _e, cx| {
-                            v.zoom_set(0.08, cx);
-                        },
-                    )
-                    .into_any_element(),
-                    Self::msep().into_any_element(),
-                    Self::mi_sub("v.lane", t("view.lane"), Sub::Lane, cx).into_any_element(),
-                    Self::mi_sub("v.enc", t("view.encoding"), Sub::Enc, cx).into_any_element(),
+                    ),
+                    Self::msep(),
+                    self.mi_cmd("view.zoom_sel", None, cx),
+                    self.mi_cmd("view.zoom_song", None, cx),
+                    Self::msep(),
+                    self.mi_cmd("view.go_playhead", None, cx),
+                    self.mi_cmd("view.marker_prev", None, cx),
+                    self.mi_cmd("view.marker_next", None, cx),
+                    self.mi_cmd("view.event_prev", None, cx),
+                    self.mi_cmd("view.event_next", None, cx),
+                    Self::msep(),
+                    Self::mi_sub("v.rowh", t("view.row_height"), Sub::RowH, cx),
+                    self.mi_cmd("view.fold", Some(self.fold), cx),
+                    self.mi_cmd("view.drum", Some(self.drum), cx),
+                    Self::mi_sub("v.scale", t("view.scale"), Sub::Scale, cx),
+                    Self::msep(),
+                    Self::mi_sub("v.lane", t("view.lane"), Sub::Lane, cx),
+                    Self::mi_sub("v.enc", t("view.encoding"), Sub::Enc, cx),
                 ],
                 TopMenu::Track => {
                     let mut items = vec![
-                        Self::mi("t.rename", t("track.rename"), "", None, cx, |v, w, cx| {
-                            v.focus_rename(w, cx);
-                        })
-                        .into_any_element(),
-                        Self::msep().into_any_element(),
-                        Self::mi(
-                            "t.mute",
-                            t("track.mute"),
-                            "",
-                            Some(muted_set.contains(&self.sel_track)),
-                            cx,
-                            |v, _e, _cx| {
-                                let t = v.sel_track;
-                                {
-                                    let mut sh = crate::lock_shared(&v.shared);
-                                    if !sh.muted.remove(&t) {
-                                        sh.muted.insert(t);
-                                    }
-                                }
-                                v.persist();
-                            },
-                        )
-                        .into_any_element(),
-                        Self::mi(
-                            "t.solo",
-                            t("track.solo"),
-                            "",
-                            Some(soloed_set.contains(&self.sel_track)),
-                            cx,
-                            |v, _e, _cx| {
-                                let t = v.sel_track;
-                                {
-                                    let mut sh = crate::lock_shared(&v.shared);
-                                    if !sh.soloed.remove(&t) {
-                                        sh.soloed.insert(t);
-                                    }
-                                }
-                                v.persist();
-                            },
-                        )
-                        .into_any_element(),
-                        Self::msep().into_any_element(),
-                        Self::mi_sub("t.chan", t("track.channel"), Sub::Chan, cx)
-                            .into_any_element(),
-                        Self::mi_sub("t.dest", t("track.dest"), Sub::Dest, cx).into_any_element(),
+                        self.mi_cmd("track.rename", None, cx),
+                        Self::msep(),
+                        self.mi_cmd("track.mute", Some(muted_set.contains(&self.sel_track)), cx),
+                        self.mi_cmd("track.solo", Some(soloed_set.contains(&self.sel_track)), cx),
+                        Self::msep(),
+                        Self::mi_sub("t.chan", t("track.channel"), Sub::Chan, cx),
+                        Self::mi_sub("t.dest", t("track.dest"), Sub::Dest, cx),
                     ];
                     if sel_is_plugin {
-                        items.push(Self::msep().into_any_element());
-                        items.push(
-                            Self::mi(
-                                "t.gui",
-                                t("track.plugin_gui"),
-                                "",
-                                None,
-                                cx,
-                                |v, _e, _cx| {
-                                    v.open_plugin_gui();
-                                },
-                            )
-                            .into_any_element(),
-                        );
+                        items.push(Self::msep());
+                        items.push(self.mi_cmd("track.plugin_gui", None, cx));
                     }
                     items
                 }
                 TopMenu::Output => {
                     let mut items = vec![
-                        Self::mi_sub("o.def", t("output.default_dest"), Sub::DefDest, cx)
-                            .into_any_element(),
-                        Self::mi_sub("o.in", t("output.midi_in"), Sub::InPort, cx)
-                            .into_any_element(),
-                        Self::msep().into_any_element(),
+                        Self::mi_sub("o.def", t("output.default_dest"), Sub::DefDest, cx),
+                        Self::mi_sub("o.in", t("output.midi_in"), Sub::InPort, cx),
+                        Self::msep(),
                     ];
                     if sel_is_plugin {
-                        items.push(
-                            Self::mi(
-                                "o.gui",
-                                if self.plugin_window.is_some() {
-                                    t("output.editor_close")
-                                } else {
-                                    t("output.editor_open")
-                                },
-                                "",
-                                Some(self.plugin_window.is_some()),
-                                cx,
-                                |v, _e, _cx| v.open_plugin_gui(),
-                            )
-                            .into_any_element(),
-                        );
+                        items.push(Self::mi(
+                            "o.gui",
+                            if self.plugin_window.is_some() {
+                                t("output.editor_close")
+                            } else {
+                                t("output.editor_open")
+                            },
+                            self.keys.shortcut_label("track.plugin_gui"),
+                            Some(self.plugin_window.is_some()),
+                            cx,
+                            |v, _e, _cx| v.open_plugin_gui(),
+                        ));
                     }
                     if sel_plugin_failed {
-                        items.push(
-                            Self::mi("o.retry", t("output.retry"), "", None, cx, |v, _e, _cx| {
+                        items.push(Self::mi(
+                            "o.retry",
+                            t("output.retry"),
+                            self.keys.shortcut_label("output.retry"),
+                            None,
+                            cx,
+                            |v, _e, _cx| {
                                 let d = crate::lock_shared(&v.shared).dest_of(v.sel_track);
                                 v.ensure_plugin(d, true);
-                            })
-                            .into_any_element(),
-                        );
+                            },
+                        ));
                     }
                     items.extend([
-                        Self::msep().into_any_element(),
-                        Self::mi("o.rescan", t("output.rescan"), "", None, cx, |v, _e, cx| {
-                            v.rescan_plugins();
-                            cx.notify();
-                        })
-                        .into_any_element(),
+                        Self::msep(),
+                        self.mi_cmd("output.rescan", None, cx),
                         Self::mi(
-                            "o.status",
-                            t("output.host_status"),
+                            "o.rescan_all",
+                            t("output.rescan_all"),
+                            "",
+                            None,
+                            cx,
+                            |v, _e, cx| {
+                                v.rescan_plugins(crate::ScanMode::All);
+                                cx.notify();
+                            },
+                        ),
+                        Self::mi(
+                            "o.audio",
+                            t("output.audio_settings"),
                             "",
                             None,
                             cx,
@@ -1893,126 +2501,157 @@ impl Render for EditorView {
                                 v.show_output_status = true;
                                 cx.notify();
                             },
-                        )
-                        .into_any_element(),
+                        ),
+                        self.mi_cmd("output.host_status", None, cx),
                     ]);
                     items
                 }
                 TopMenu::Transport => vec![
+                    self.mi_cmd("transport.play_stop", Some(self.playback.is_some()), cx),
+                    self.mi_cmd("transport.record", Some(self.rec.is_some()), cx),
+                    self.mi_cmd("transport.loop", Some(loop_en), cx),
+                    self.mi_cmd("transport.met", Some(met_en), cx),
+                    self.mi_cmd("transport.chase_sysex", Some(chsy_en), cx),
                     Self::mi(
-                        "tr.play",
-                        t("transport.play_stop"),
-                        "Space",
-                        Some(self.playback.is_some()),
+                        "tr.sxp",
+                        tf(
+                            "transport.sysex_pol",
+                            &[(
+                                "mode",
+                                t(match sxp {
+                                    midi_io::SysexPolicy::Serialize => "transport.sysex_ser",
+                                    midi_io::SysexPolicy::Background => "transport.sysex_bg",
+                                    midi_io::SysexPolicy::Skip => "transport.sysex_skip",
+                                }),
+                            )],
+                        ),
+                        "",
+                        None,
                         cx,
-                        |v, _e, cx| {
-                            v.toggle_play(cx);
+                        |v, _e, _cx| {
+                            {
+                                let mut sh = crate::lock_shared(&v.shared);
+                                sh.sysex_policy = sh.sysex_policy.cycle();
+                            }
+                            v.persist();
                         },
-                    )
-                    .into_any_element(),
+                    ),
                     Self::mi(
-                        "tr.rec",
-                        t("transport.record"),
+                        "tr.mode",
+                        tf(
+                            "transport.rec_mode",
+                            &[(
+                                "mode",
+                                t(match self.rec_mode {
+                                    RecMode::Overdub => "transport.rec_overdub",
+                                    RecMode::Replace => "transport.rec_replace",
+                                }),
+                            )],
+                        ),
+                        "",
+                        None,
+                        cx,
+                        |v, _e, _cx| {
+                            v.rec_mode = match v.rec_mode {
+                                RecMode::Overdub => RecMode::Replace,
+                                RecMode::Replace => RecMode::Overdub,
+                            };
+                            v.persist();
+                        },
+                    ),
+                    Self::mi(
+                        "tr.pin",
+                        tf(
+                            "transport.punch_in",
+                            &[("t", playhead_tick.to_string().as_str())],
+                        ),
+                        "",
+                        Some(self.punch_in.is_some()),
+                        cx,
+                        |v, _e, _cx| {
+                            v.punch_in = Some(v.playhead_tick());
+                            v.persist();
+                        },
+                    ),
+                    Self::mi(
+                        "tr.pout",
+                        tf(
+                            "transport.punch_out",
+                            &[("t", playhead_tick.to_string().as_str())],
+                        ),
+                        "",
+                        Some(self.punch_out.is_some()),
+                        cx,
+                        |v, _e, _cx| {
+                            v.punch_out = Some(v.playhead_tick());
+                            v.persist();
+                        },
+                    ),
+                    Self::mi(
+                        "tr.pclr",
+                        match self.punch_range() {
+                            Some((a, b)) => tf(
+                                "transport.punch_clear",
+                                &[("a", a.to_string().as_str()), ("b", b.to_string().as_str())],
+                            ),
+                            None => tf("transport.punch_clear", &[("a", "-"), ("b", "-")]),
+                        },
+                        "",
+                        None,
+                        cx,
+                        |v, _e, _cx| {
+                            v.punch_in = None;
+                            v.punch_out = None;
+                            v.persist();
+                        },
+                    ),
+                    Self::mi(
+                        "tr.rtake",
+                        t("transport.discard_take"),
                         "",
                         Some(self.rec.is_some()),
                         cx,
                         |v, _e, _cx| {
-                            v.toggle_record();
+                            v.discard_record();
                         },
-                    )
-                    .into_any_element(),
+                    ),
                     Self::mi(
-                        "tr.loop",
-                        t("transport.loop"),
+                        "tr.qtake",
+                        t("transport.quant_take"),
                         "",
-                        Some(loop_en),
+                        Some(self.last_take.is_some()),
                         cx,
                         |v, _e, _cx| {
-                            {
-                                let mut sh = crate::lock_shared(&v.shared);
-                                sh.loop_enabled = !sh.loop_enabled;
-                            }
-                            v.persist();
+                            v.quantize_last_take();
                         },
-                    )
-                    .into_any_element(),
-                    Self::mi(
-                        "tr.met",
-                        t("transport.met"),
-                        "",
-                        Some(met_en),
-                        cx,
-                        |v, _e, _cx| {
-                            {
-                                let mut sh = crate::lock_shared(&v.shared);
-                                sh.metronome = !sh.metronome;
-                            }
-                            v.persist();
-                        },
-                    )
-                    .into_any_element(),
-                    Self::mi(
-                        "tr.chsy",
-                        t("transport.chase_sysex"),
-                        "",
-                        Some(chsy_en),
-                        cx,
-                        |v, _e, _cx| {
-                            {
-                                let mut sh = crate::lock_shared(&v.shared);
-                                sh.chase_sysex = !sh.chase_sysex;
-                            }
-                            v.persist();
-                        },
-                    )
-                    .into_any_element(),
-                    Self::mi(
-                        "tr.cin",
-                        t("transport.count_in"),
-                        "",
-                        Some(self.count_in),
-                        cx,
-                        |v, _e, _cx| {
-                            v.count_in = !v.count_in;
-                            v.save_global();
-                        },
-                    )
-                    .into_any_element(),
+                    ),
+                    self.mi_cmd("transport.count_in", Some(self.count_in), cx),
+                    Self::msep(),
+                    self.mi_cmd("transport.audition", Some(self.aud_enabled), cx),
+                    Self::mi_sub("tr.audv", t("transport.aud_vel"), Sub::AudVel, cx),
+                    Self::mi_sub("tr.audd", t("transport.aud_dur"), Sub::AudDur, cx),
                 ],
                 TopMenu::Help => vec![
-                    Self::mi(
-                        "h.keys",
-                        t("help.shortcuts"),
-                        "F1",
-                        None,
-                        cx,
-                        |v, _e, cx| {
-                            v.help_open = !v.help_open;
-                            cx.notify();
-                        },
-                    )
-                    .into_any_element(),
-                    Self::mi("h.about", t("help.about"), "", None, cx, |v, _e, _cx| {
-                        v.status = concat!(
-                            "midi-editor ",
-                            env!("CARGO_PKG_VERSION"),
-                            " — pure-SMF editor"
-                        )
-                        .into();
-                    })
-                    .into_any_element(),
-                    Self::mi("h.mcp", t("help.mcp"), "", None, cx, |v, _e, _cx| {
-                        v.status =
-                            "MCP: http://127.0.0.1:7878/mcp (mcp-bridge for stdio clients)".into();
-                    })
-                    .into_any_element(),
+                    self.mi_cmd("app.palette", None, cx),
+                    self.mi_cmd("app.keys", None, cx),
+                    Self::msep(),
+                    self.mi_cmd("help.shortcuts", None, cx),
+                    self.mi_cmd("help.about", None, cx),
+                    self.mi_cmd("help.mcp", None, cx),
+                    self.mi_cmd("help.logs", None, cx),
+                    self.mi_cmd("help.diag", None, cx),
                 ],
             };
+            // keep the last-rendered model for keyboard navigation
+            self.menu_rows = items.clone();
             // dropdown panel under the clicked label
             let popup_max_h = (f32::from(window.viewport_size().height) - 40.0).max(120.0);
-            let popup_h = (items.len() as f32 * 24.0 + 16.0).min(popup_max_h);
+            let popup_h = (items.len() as f32 * metrics::MENU_ROW + 16.0).min(popup_max_h);
             let popup = div()
                 .id("menu-popup")
+                .test_support()
+                .role(Role::Menu)
+                .aria_label(t(m.key()))
                 .absolute()
                 .top(px(0.0))
                 .left(px(mx))
@@ -2023,12 +2662,17 @@ impl Render for EditorView {
                 .flex()
                 .flex_col()
                 .py_1()
-                .bg(rgb(BG_RAISED))
+                .bg(rgb(theme::current().bg_raised))
                 .border_1()
-                .border_color(rgb(BORDER_C))
+                .border_color(rgb(theme::current().border))
                 .rounded_md()
                 .shadow_lg()
-                .children(items)
+                .children(
+                    items
+                        .iter()
+                        .enumerate()
+                        .map(|(i, r)| Self::row_el(r, i, self.menu_sel == Some(i), false, cx)),
+                )
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|_v, _e, _w, cx| cx.stop_propagation()),
@@ -2036,7 +2680,7 @@ impl Render for EditorView {
             // cascading submenu (also inside the overlay so clicks elsewhere close all)
             let sub_popup = self.open_sub.map(|(s, y)| {
                 let x2 = mx + 208.0;
-                let rows: Vec<AnyElement> = match s {
+                let rows: Vec<MenuRow> = match s {
                     Sub::Chan => (0u8..16)
                         .map(|ch| {
                             let cur = track_chs.get(self.sel_track).copied().unwrap_or(0);
@@ -2052,15 +2696,16 @@ impl Render for EditorView {
                                         let mut sh = crate::lock_shared(&v.shared);
                                         sh.doc.set_track_channel_ops(tr, ch)
                                     };
+                                    v.audition_off();
                                     v.apply_tx("set track channel", ops);
                                 },
                             )
-                            .into_any_element()
                         })
                         .collect(),
                     Sub::Dest => self.dest_rows(
                         DestPick::Track,
                         &dests,
+                        &port_present,
                         eff_dest,
                         def_dest,
                         has_track_dest,
@@ -2069,6 +2714,7 @@ impl Render for EditorView {
                     Sub::DefDest => self.dest_rows(
                         DestPick::Default,
                         &dests,
+                        &port_present,
                         eff_dest,
                         def_dest,
                         has_track_dest,
@@ -2076,7 +2722,7 @@ impl Render for EditorView {
                     ),
                     Sub::InPort => {
                         let ports = midi_io::list_inputs().unwrap_or_default();
-                        let mut rows: Vec<AnyElement> = vec![Self::mi_leaf(
+                        let mut rows: Vec<MenuRow> = vec![Self::mi_leaf(
                             "in.default",
                             t("output.first_input"),
                             "",
@@ -2086,8 +2732,7 @@ impl Render for EditorView {
                                 v.midi_in = "".into();
                                 v.save_global();
                             },
-                        )
-                        .into_any_element()];
+                        )];
                         rows.extend(ports.iter().enumerate().map(|(i, p)| {
                             let name = p.name.clone();
                             Self::mi_leaf(
@@ -2101,34 +2746,43 @@ impl Render for EditorView {
                                     v.save_global();
                                 },
                             )
-                            .into_any_element()
                         }));
                         if ports.is_empty() {
-                            rows.push(
-                                Self::mi_leaf(
-                                    "in.none",
-                                    t("output.no_inputs"),
-                                    "",
-                                    None,
-                                    cx,
-                                    |_, _, _| {},
-                                )
-                                .into_any_element(),
-                            );
+                            rows.push(Self::mi_dis(
+                                "in.none",
+                                t("output.no_inputs"),
+                                "",
+                                None,
+                                cx,
+                                |_, _, _| {},
+                            ));
                         }
+                        // manual input-latency compensation, cycles presets
+                        rows.push(Self::mi_leaf(
+                            "in.lat",
+                            tf(
+                                "output.in_latency",
+                                &[("ms", self.in_latency_ms.to_string().as_str())],
+                            ),
+                            "",
+                            None,
+                            cx,
+                            |v, _e, _cx| {
+                                const STEPS: [u64; 7] = [0, 1, 2, 5, 10, 20, 50];
+                                let i = STEPS
+                                    .iter()
+                                    .position(|&s| s == v.in_latency_ms)
+                                    .unwrap_or(0);
+                                v.in_latency_ms = STEPS[(i + 1) % STEPS.len()];
+                                v.save_global();
+                            },
+                        ));
                         rows
                     }
                     Sub::Lane => {
-                        const LANES: [LaneMode; 7] = [
-                            LaneMode::Velocity,
-                            LaneMode::CC(1),
-                            LaneMode::CC(7),
-                            LaneMode::CC(10),
-                            LaneMode::CC(11),
-                            LaneMode::CC(64),
-                            LaneMode::PitchBend,
-                        ];
-                        LANES
+                        // mode picks apply to the focused lane; the
+                        // add/remove items manage the stack itself
+                        let mut rows: Vec<MenuRow> = LANE_MODES
                             .iter()
                             .enumerate()
                             .map(|(i, lm)| {
@@ -2136,34 +2790,178 @@ impl Render for EditorView {
                                     ("lane", i),
                                     lm.label(),
                                     "",
-                                    Some(self.lane_mode == *lm),
+                                    Some(self.lane_mode() == *lm),
                                     cx,
                                     move |v, _e, cx| v.set_lane(*lm, cx),
                                 )
-                                .into_any_element()
+                            })
+                            .collect();
+                        rows.push(Self::msep());
+                        rows.push(Self::mi_leaf(
+                            "lane-add",
+                            t("view.lane.add"),
+                            "",
+                            None,
+                            cx,
+                            |v, _e, cx| v.add_lane(cx),
+                        ));
+                        rows.push(Self::mi_leaf(
+                            "lane-del",
+                            t("view.lane.remove"),
+                            "",
+                            None,
+                            cx,
+                            |v, _e, cx| v.remove_lane(cx),
+                        ));
+                        rows
+                    }
+                    Sub::Meta => {
+                        // insert at the playhead, conductor track — editing
+                        // existing metas happens via strip/event-list clicks
+                        const METAS: [u8; 7] = [0x06, 0x05, 0x07, 0x01, 0x02, 0x04, 0x59];
+                        METAS
+                            .iter()
+                            .enumerate()
+                            .map(|(i, mt)| {
+                                let mt = *mt;
+                                Self::mi_leaf(
+                                    ("meta", i),
+                                    t(EditorView::meta_type_label(mt)),
+                                    "",
+                                    None,
+                                    cx,
+                                    move |v, _e, cx| {
+                                        let tick = v.doc(|d| d.tempo_map.us_to_tick(v.play_us));
+                                        // no Window in menu callbacks —
+                                        // render opens + focuses next frame
+                                        v.meta_pending = Some((0, tick, mt, 0));
+                                        cx.notify();
+                                    },
+                                )
                             })
                             .collect()
                     }
                     Sub::Tool => {
                         let opts = [
-                            ("1", Tool::Select, "tool.select"),
-                            ("2", Tool::Draw, "tool.draw"),
-                            ("3", Tool::Erase, "tool.erase"),
+                            (Tool::Select, "tool.select"),
+                            (Tool::Draw, "tool.draw"),
+                            (Tool::Erase, "tool.erase"),
                         ];
                         opts.into_iter()
                             .enumerate()
-                            .map(|(i, (key, tool, label))| {
+                            .map(|(i, (tool, label))| {
                                 Self::mi_leaf(
                                     ("tool", i),
                                     t(label),
-                                    key,
+                                    self.keys.shortcut_label(label),
                                     Some(self.tool == tool),
                                     cx,
                                     move |v, _e, cx| v.set_tool(tool, cx),
                                 )
-                                .into_any_element()
                             })
                             .collect()
+                    }
+                    Sub::RowH => {
+                        // taller / shorter / reset + absolute presets — the
+                        // wheel does Ctrl+Shift vertical zoom too
+                        let mut rows = vec![
+                            Self::mi_leaf(
+                                "rowh.up",
+                                t("view.row_taller"),
+                                "Ctrl+Shift+Wheel",
+                                None,
+                                cx,
+                                |v, _e, cx| v.vzoom_by(1.25, cx),
+                            ),
+                            Self::mi_leaf(
+                                "rowh.dn",
+                                t("view.row_shorter"),
+                                "",
+                                None,
+                                cx,
+                                |v, _e, cx| v.vzoom_by(1.0 / 1.25, cx),
+                            ),
+                            Self::mi_leaf(
+                                "rowh.reset",
+                                t("view.row_reset"),
+                                "",
+                                Some((self.note_h - NOTE_H).abs() < 0.5),
+                                cx,
+                                |v, _e, cx| {
+                                    v.vzoom_set(
+                                        NOTE_H,
+                                        f32::from(v.roll_bounds.get().size.height) / 2.0,
+                                        cx,
+                                    );
+                                },
+                            ),
+                            Self::msep(),
+                        ];
+                        for (i, h) in [8.0f32, 13.0, 18.0, 26.0, 34.0].iter().enumerate() {
+                            let h = *h;
+                            rows.push(Self::mi_leaf(
+                                ("rowh.preset", i),
+                                format!("{h}px"),
+                                "",
+                                Some((self.note_h - h).abs() < 0.5),
+                                cx,
+                                move |v, _e, cx| {
+                                    v.vzoom_set(
+                                        h,
+                                        f32::from(v.roll_bounds.get().size.height) / 2.0,
+                                        cx,
+                                    );
+                                },
+                            ));
+                        }
+                        rows
+                    }
+                    Sub::Scale => {
+                        const PC_NAMES: [&str; 12] = [
+                            "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+                        ];
+                        let mut rows = vec![
+                            Self::mi_leaf(
+                                "scale.off",
+                                t("view.scale_off"),
+                                "",
+                                Some(self.scale_sel == -1),
+                                cx,
+                                |v, _e, cx| v.set_scale(-1, false, cx),
+                            ),
+                            Self::mi_leaf(
+                                "scale.auto",
+                                t("view.scale_auto"),
+                                "",
+                                Some(self.scale_sel == -2),
+                                cx,
+                                |v, _e, cx| v.set_scale(-2, false, cx),
+                            ),
+                            Self::msep(),
+                            Self::mi_leaf(
+                                "scale.minor",
+                                t("view.scale_minor"),
+                                "",
+                                Some(self.scale_minor),
+                                cx,
+                                |v, _e, cx| {
+                                    let sel = if v.scale_sel >= 0 { v.scale_sel } else { 0 };
+                                    v.set_scale(sel, !v.scale_minor, cx);
+                                },
+                            ),
+                            Self::msep(),
+                        ];
+                        for (i, name) in PC_NAMES.iter().enumerate() {
+                            rows.push(Self::mi_leaf(
+                                ("scale.root", i),
+                                *name,
+                                "",
+                                Some(self.scale_sel == i as i8),
+                                cx,
+                                move |v, _e, cx| v.set_scale(i as i8, v.scale_minor, cx),
+                            ));
+                        }
+                        rows
                     }
                     Sub::Snap => SNAPS
                         .iter()
@@ -2171,26 +2969,24 @@ impl Render for EditorView {
                         .map(|(i, (_div, _trip, label))| {
                             Self::mi_leaf(
                                 ("snap", i),
-                                *label,
+                                snap_label(label, td),
                                 "",
                                 Some(self.snap_idx == i),
                                 cx,
                                 move |v, _e, cx| v.set_snap(i, cx),
                             )
-                            .into_any_element()
                         })
                         .collect(),
                     Sub::Recent => {
                         if self.recent.is_empty() {
-                            vec![Self::mi_leaf(
+                            vec![Self::mi_dis(
                                 "recent.empty",
                                 t("menu.recent_empty"),
                                 "",
                                 None,
                                 cx,
                                 |_v, _e, _cx| {},
-                            )
-                            .into_any_element()]
+                            )]
                         } else {
                             self.recent
                                 .iter()
@@ -2208,17 +3004,20 @@ impl Render for EditorView {
                                         "",
                                         None,
                                         cx,
-                                        move |v, _e, cx| {
-                                            v.open(path.clone(), cx);
+                                        move |v, w, cx| {
+                                            v.confirm_discard_or_save(
+                                                PendingAction::OpenPath(path.clone()),
+                                                w,
+                                                cx,
+                                            );
                                         },
                                     )
-                                    .into_any_element()
                                 })
                                 .collect()
                         }
                     }
                     Sub::Quant => {
-                        let g = self.snap_ticks().max(self.ppq() as i64 / 4) as u64;
+                        let g = self.snap_ticks().max(self.td().min_grid_ticks() as i64) as u64;
                         [("100%", 100u32), ("75%", 75), ("50%", 50)]
                             .into_iter()
                             .enumerate()
@@ -2235,7 +3034,6 @@ impl Render for EditorView {
                                         });
                                     },
                                 )
-                                .into_any_element()
                             })
                             .collect()
                     }
@@ -2249,19 +3047,32 @@ impl Render for EditorView {
                                         d.transpose_ops(t, f, to, st)
                                     });
                                 })
-                                .into_any_element()
                             })
                             .collect()
                     }
                     Sub::LenSet => {
-                        let ppq = self.ppq();
-                        let opts: [(&str, u64); 5] = [
-                            ("1/32", ppq / 8),
-                            ("1/16", ppq / 4),
-                            ("1/8", ppq / 2),
-                            ("1/4", ppq),
-                            ("1 bar", ppq * 4),
-                        ];
+                        // metrical: note fractions; SMPTE: frame/second
+                        // spans — never a fake-PPQ musical grid
+                        let opts: Vec<(String, u64)> = match td {
+                            TimeDisplay::Metrical { ppq } => vec![
+                                ("1/32".into(), ppq / 8),
+                                ("1/16".into(), ppq / 4),
+                                ("1/8".into(), ppq / 2),
+                                ("1/4".into(), ppq),
+                                ("1 bar".into(), ppq * 4),
+                            ],
+                            TimeDisplay::Smpte { .. } => {
+                                let f = td.cell_ticks();
+                                let s = td.bar_ticks();
+                                vec![
+                                    ("1 frame".into(), f),
+                                    ("5 frames".into(), f * 5),
+                                    ("10 frames".into(), f * 10),
+                                    ("1 s".into(), s),
+                                    ("5 s".into(), s * 5),
+                                ]
+                            }
+                        };
                         opts.into_iter()
                             .enumerate()
                             .map(|(i, (label, ticks))| {
@@ -2270,7 +3081,48 @@ impl Render for EditorView {
                                         d.set_length_ops(t, f, to, ticks)
                                     });
                                 })
-                                .into_any_element()
+                            })
+                            .collect()
+                    }
+                    Sub::LegatoGap => {
+                        // gap in ticks relative to ppq: 0 touches the next
+                        // note, >0 leaves space, <0 overlaps into it
+                        let ppq = self.ppq() as i64;
+                        let opts: [(&str, i64); 4] = [
+                            ("touch (0 gap)", 0),
+                            ("gap 1/32", ppq / 8),
+                            ("gap 1/16", ppq / 4),
+                            ("overlap 1/32", -(ppq / 8)),
+                        ];
+                        opts.into_iter()
+                            .enumerate()
+                            .map(|(i, (label, gap))| {
+                                Self::mi_leaf(("leg", i), label, "", None, cx, move |v, _e, _cx| {
+                                    v.apply_region_op("legato", move |d, t, f, to| {
+                                        d.legato_ops(t, f, to, gap)
+                                    });
+                                })
+                            })
+                            .collect()
+                    }
+                    Sub::Swing => {
+                        // swing grid = 16th note; amount = % of one cell the
+                        // off-beat shifts later
+                        let grid = self.ppq() / 4;
+                        let opts: [(&str, u32); 4] = [
+                            ("swing 50%", 50),
+                            ("swing 66%", 66),
+                            ("swing 75%", 75),
+                            ("swing 100%", 100),
+                        ];
+                        opts.into_iter()
+                            .enumerate()
+                            .map(|(i, (label, amount))| {
+                                Self::mi_leaf(("swg", i), label, "", None, cx, move |v, _e, _cx| {
+                                    v.apply_region_op("swing", move |d, t, f, to| {
+                                        d.swing_ops(t, f, to, grid, amount)
+                                    });
+                                })
                             })
                             .collect()
                     }
@@ -2296,10 +3148,93 @@ impl Render for EditorView {
                                         });
                                     },
                                 )
-                                .into_any_element()
                             })
                             .collect()
                     }
+                    // release velocity lives on the note-OFF — a nonzero
+                    // value upgrades a 0x90-vel0 off to a real 0x80
+                    Sub::RelSet => {
+                        let opts = [
+                            ("zero (0)", 0u8),
+                            ("soft (32)", 32),
+                            ("medium (64)", 64),
+                            ("hard (100)", 100),
+                        ];
+                        opts.into_iter()
+                            .enumerate()
+                            .map(|(i, (label, vel))| {
+                                Self::mi_leaf(
+                                    ("rset", i),
+                                    label,
+                                    "",
+                                    None,
+                                    cx,
+                                    move |v, _e, _cx| {
+                                        v.apply_region_op(
+                                            "set release velocity",
+                                            move |d, t, f, to| {
+                                                d.set_release_velocity_ops(t, f, to, vel)
+                                            },
+                                        );
+                                    },
+                                )
+                            })
+                            .collect()
+                    }
+                    Sub::Theme => {
+                        let opts = [
+                            ("theme.system", theme::ThemeMode::System),
+                            ("theme.dark", theme::ThemeMode::Dark),
+                            ("theme.light", theme::ThemeMode::Light),
+                        ];
+                        opts.into_iter()
+                            .enumerate()
+                            .map(|(i, (key, mode))| {
+                                Self::mi_leaf(
+                                    ("theme", i),
+                                    t(key),
+                                    "",
+                                    Some(self.theme_mode == mode),
+                                    cx,
+                                    move |v, _e, cx| v.set_theme_mode(mode, cx),
+                                )
+                            })
+                            .collect()
+                    }
+                    Sub::AudVel => [64u8, 80, 100, 112, 127]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, vel)| {
+                            Self::mi_leaf(
+                                ("audv", i),
+                                format!("{vel}"),
+                                "",
+                                Some(self.aud_vel == vel),
+                                cx,
+                                move |v, _e, _cx| {
+                                    v.aud_vel = vel;
+                                    v.save_global();
+                                },
+                            )
+                        })
+                        .collect(),
+                    Sub::AudDur => [150u64, 300, 500, 1000]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, ms)| {
+                            Self::mi_leaf(
+                                ("audd", i),
+                                format!("{ms} ms"),
+                                "",
+                                Some(self.aud_ms == ms),
+                                cx,
+                                move |v, _e, _cx| {
+                                    v.aud_ms = ms;
+                                    v.save_global();
+                                },
+                            )
+                        })
+                        .collect(),
                     Sub::Enc => {
                         let opts: [(Option<smf_core::TextEncoding>, &str); 4] = [
                             (None, "auto"),
@@ -2318,18 +3253,21 @@ impl Render for EditorView {
                                     cx,
                                     move |v, _e, cx| v.set_enc(e, cx),
                                 )
-                                .into_any_element()
                             })
                             .collect()
                     }
                 };
+                self.sub_rows = rows.clone();
                 let vh = f32::from(window.viewport_size().height);
-                let desired = rows.len() as f32 * 24.0 + 16.0;
+                let desired = rows.len() as f32 * metrics::MENU_ROW + 16.0;
                 let max_h = (vh - 40.0).max(120.0);
                 let h = desired.min(max_h);
                 let top = (y - 30.0).clamp(0.0, (vh - h - 8.0).max(0.0));
                 div()
                     .id("sub-popup")
+                    .test_support()
+                    .role(Role::Menu)
+                    .aria_label(t("a11y.submenu"))
                     .absolute()
                     .top(px(top))
                     .left(px(x2))
@@ -2340,12 +3278,16 @@ impl Render for EditorView {
                     .flex()
                     .flex_col()
                     .py_1()
-                    .bg(rgb(BG_RAISED))
+                    .bg(rgb(theme::current().bg_raised))
                     .border_1()
-                    .border_color(rgb(BORDER_C))
+                    .border_color(rgb(theme::current().border))
                     .rounded_md()
                     .shadow_lg()
-                    .children(rows)
+                    .children(
+                        rows.iter()
+                            .enumerate()
+                            .map(|(i, r)| Self::row_el(r, i, self.sub_sel == Some(i), true, cx)),
+                    )
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|_v, _e, _w, cx| cx.stop_propagation()),
@@ -2353,6 +3295,7 @@ impl Render for EditorView {
             });
             div()
                 .id("menu-overlay")
+                .test_support()
                 .absolute()
                 .top(px(28.0))
                 .left(px(0.0))
@@ -2373,41 +3316,151 @@ impl Render for EditorView {
                 .children(sub_popup)
         });
 
-        // shortcuts overlay (F1 / Help > Keyboard Shortcuts)
+        // shortcuts overlay (F1 / Help > Keyboard Shortcuts) — command rows are
+        // derived from the registry + keymap so the panel always shows the
+        // actual active bindings, including user overrides
         let help_layer = self.help_open.then(|| {
-            const ROWS: [(&str, &str); 21] = [
-                ("Space", "Play / stop"),
-                ("F1", "This panel"),
-                ("Esc", "Close menus / clear selection"),
-                ("Ctrl+N / O / S", "New / Open / Save"),
-                ("Ctrl+Z / Y", "Undo / redo"),
-                ("Ctrl+A", "Select all notes"),
-                ("Ctrl+X / C / V", "Cut / copy / paste"),
-                ("Ctrl+D", "Duplicate selection"),
-                ("Del", "Delete selection"),
-                ("1 / 2 / 3", "Select / draw / erase tool"),
-                ("← →", "Nudge by grid step"),
-                ("Shift+← →", "Nudge by 1 tick"),
-                ("↑ ↓", "Transpose by semitone"),
-                ("Shift+↑ ↓", "Transpose by octave"),
-                ("Alt+drag note", "Duplicate note(s)"),
-                ("Right-edge drag", "Resize note"),
-                ("Click ruler", "Seek playhead"),
-                ("Double-click ruler", "Play from here"),
-                ("Click minimap", "Jump to position"),
-                ("Ctrl+wheel", "Zoom timeline"),
-                ("Drag .mid file", "Drop to open"),
-            ];
+            let row = |k: String, v: SharedString| {
+                div()
+                    .flex()
+                    .h(px(20.0))
+                    .items_center()
+                    .child(
+                        div()
+                            .w(px(150.0))
+                            .font_family("Cascadia Mono")
+                            .text_color(rgb(theme::current().lcd))
+                            .child(k),
+                    )
+                    .child(div().text_color(rgb(theme::current().text)).child(v))
+                    .into_any_element()
+            };
+            let cmd_rows: Vec<AnyElement> = cmd::COMMANDS
+                .iter()
+                .filter_map(|c| {
+                    let s = self.keys.shortcut_label(c.id);
+                    if s.is_empty() {
+                        None
+                    } else {
+                        Some(row(s.to_string(), cmd::label(c)))
+                    }
+                })
+                .collect();
+            // mouse-only gestures — not keyboard bindings
+            let gesture_rows: Vec<AnyElement> = [
+                (t("help.g_dup"), "Alt+drag note"),
+                (t("help.g_resize"), "Right-edge drag"),
+                (t("help.g_seek"), "Click ruler"),
+                (t("help.g_playfrom"), "Double-click ruler"),
+                (t("help.g_minimap"), "Click minimap"),
+                (t("help.g_zoom"), "Ctrl+wheel"),
+                (t("help.g_drop"), "Drag .mid file"),
+                (t("help.g_marker_click"), "Click marker"),
+                (t("help.g_marker_nav"), "[ / ]"),
+                (t("help.g_meta_edit"), "M / E"),
+            ]
+            .into_iter()
+            .map(|(desc, gesture)| row(gesture.to_string(), desc.into()))
+            .collect();
+            // region-scoped navigation — handled by focused regions, not the
+            // global keymap, so they stay an explicit list
+            let region_rows: Vec<AnyElement> = [
+                (t("help.n_regions"), "Tab / Shift+Tab"),
+                (t("help.n_menubar"), "F10"),
+                (t("help.n_menus"), "← → ↑ ↓ (menus)"),
+                (t("help.n_tracks"), "↑ ↓ · M / S / C · Enter / F2 (tracks)"),
+                (t("help.n_events"), "↑ ↓ + Enter (event list)"),
+                (t("help.n_lane"), "↑ ↓ (lane)"),
+            ]
+            .into_iter()
+            .map(|(desc, keys)| row(keys.to_string(), desc.into()))
+            .collect();
             let panel = div()
                 .id("help-panel")
+                .test_support()
+                .role(Role::Dialog)
+                .aria_label(t("help.shortcuts"))
+                .flex()
+                .flex_col()
+                .w(px(440.0))
+                .max_h(px(560.0))
+                .overflow_y_scroll()
+                .py_2()
+                .px_3()
+                .bg(rgb(theme::current().bg_raised))
+                .border_1()
+                .border_color(rgb(theme::current().border_strong))
+                .rounded_lg()
+                .shadow_lg()
+                .text_size(px(metrics::TEXT_LG))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_v, _e, _w, cx| cx.stop_propagation()),
+                )
+                .child(
+                    div()
+                        .text_size(px(14.0))
+                        .text_color(rgb(theme::current().accent))
+                        .pb_2()
+                        .child(t("help.shortcuts")),
+                )
+                .children(cmd_rows)
+                .child(
+                    div()
+                        .pt_2()
+                        .pb_1()
+                        .text_color(rgb(theme::current().accent))
+                        .child(t("help.regions")),
+                )
+                .children(region_rows)
+                .child(
+                    div()
+                        .pt_2()
+                        .pb_1()
+                        .text_color(rgb(theme::current().accent))
+                        .child(t("help.gestures")),
+                )
+                .children(gesture_rows);
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgba(theme::current().scrim))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|v, _e, _w, cx| {
+                        v.help_open = false;
+                        cx.notify();
+                    }),
+                )
+                .child(panel)
+        });
+
+        // meta edit dialog — title = type label, hint shows write encoding
+        let meta_layer = self.meta_edit.map(|me| {
+            let enc = self
+                .enc_override
+                .map(|e| e.label())
+                .unwrap_or("utf8")
+                .to_string();
+            let hint = if me.meta_type == 0x59 {
+                "e.g. -3 minor · eb major · f#m".to_string()
+            } else {
+                tf("meta.hint", &[("enc", &enc)])
+            };
+            let panel = div()
+                .id("meta-panel")
                 .flex()
                 .flex_col()
                 .w(px(420.0))
                 .py_2()
                 .px_3()
-                .bg(rgb(0x20202c))
+                .gap_1()
+                .bg(rgb(theme::current().bg_raised))
                 .border_1()
-                .border_color(rgb(0x3c3c4a))
+                .border_color(rgb(theme::current().border_strong))
                 .rounded_lg()
                 .shadow_lg()
                 .text_size(px(12.0))
@@ -2418,35 +3471,29 @@ impl Render for EditorView {
                 .child(
                     div()
                         .text_size(px(14.0))
-                        .text_color(rgb(0x9fd0ff))
+                        .text_color(rgb(theme::current().accent))
                         .pb_2()
-                        .child(t("help.shortcuts")),
+                        .child(t(EditorView::meta_type_label(me.meta_type))),
                 )
-                .children(ROWS.iter().map(|(k, v)| {
+                .child(Input::new(&self.meta_input).w_full())
+                .child(
                     div()
-                        .flex()
-                        .h(px(20.0))
-                        .items_center()
-                        .child(
-                            div()
-                                .w(px(150.0))
-                                .font_family("Cascadia Mono")
-                                .text_color(rgb(0x8fd0a0))
-                                .child(*k),
-                        )
-                        .child(div().text_color(rgb(0xd8d8e0)).child(*v))
-                }));
+                        .text_size(px(10.0))
+                        .text_color(rgb(theme::current().text_muted))
+                        .child(hint),
+                );
             div()
                 .absolute()
                 .inset_0()
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(rgba(0x00000066))
+                .bg(rgba(theme::current().scrim))
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|v, _e, _w, cx| {
-                        v.help_open = false;
+                    cx.listener(|v, _e, w, cx| {
+                        v.meta_edit = None;
+                        w.focus(&v.focus.clone(), cx);
                         cx.notify();
                     }),
                 )
@@ -2463,15 +3510,19 @@ impl Render for EditorView {
                 let mut row = div().flex().flex_col().gap_1().child(
                     div().flex().gap_1().child(format!("{label}:")).child(
                         div()
-                            .text_color(rgb(if path.is_some() { 0xd8d8e0 } else { 0xe06060 }))
+                            .text_color(rgb(if path.is_some() {
+                                theme::current().text
+                            } else {
+                                theme::current().danger
+                            }))
                             .child(value),
                     ),
                 );
                 if path.is_none() {
                     row = row.child(
                         div()
-                            .text_size(px(11.0))
-                            .text_color(rgb(0x9999aa))
+                            .text_size(px(metrics::TEXT_MD))
+                            .text_color(rgb(th.text_dim))
                             .child(hint),
                     );
                 }
@@ -2480,12 +3531,22 @@ impl Render for EditorView {
             let scan = if self.scan_rx.is_some() {
                 t("status.scanning").to_string()
             } else {
-                let n = self.plugin_meta.len();
+                let n = self.plugin_meta.len().to_string();
+                let c = self.scan_cached.to_string();
+                let to = self.probe_timeout_secs.to_string();
                 let mode = match self.scan_probe_used {
                     Some(true) => t("output.probe_used"),
                     _ => t("output.probe_unused"),
                 };
-                format!("{n} plugins, {mode}")
+                tf(
+                    "output.scan_summary",
+                    &[
+                        ("n", n.as_str()),
+                        ("c", c.as_str()),
+                        ("mode", mode),
+                        ("timeout", to.as_str()),
+                    ],
+                )
             };
             let mut rows: Vec<AnyElement> = vec![
                 diag_row(
@@ -2499,28 +3560,171 @@ impl Render for EditorView {
                     t("output.helper_hint").into(),
                 ),
                 div()
-                    .child(format!(
-                        "{}: {}",
-                        t("output.audio"),
-                        diag.audio_device.clone().unwrap_or_else(|e| e)
-                    ))
-                    .into_any_element(),
-                div()
                     .child(format!("{}: {}", t("output.scan"), scan))
                     .into_any_element(),
             ];
+            // Audio settings: the persisted selection (device/rate/buffer)
+            // every plugin stream is opened with; picking a value reopens
+            // live instances onto it. The resolved per-stream device shows
+            // on each plugin row below — a selected device that disappears
+            // falls back to the system default there.
+            rows.push(
+                div()
+                    .h(px(1.0))
+                    .mx_2()
+                    .my_1()
+                    .bg(rgb(th.border))
+                    .into_any_element(),
+            );
+            rows.push(
+                div()
+                    .h(px(metrics::MENU_HEAD))
+                    .px_2()
+                    .mx_1()
+                    .text_size(px(metrics::TEXT_XS))
+                    .text_color(rgb(th.text_head))
+                    .child(t("output.cat_audio"))
+                    .into_any_element(),
+            );
+            let mut dev_picks: Vec<(usize, String, Option<String>)> =
+                vec![(0, t("audio.sys_default").to_string(), None)];
+            dev_picks.extend(
+                self.audio_devices
+                    .iter()
+                    .enumerate()
+                    .map(|(i, n)| (i + 1, n.clone(), Some(n.clone()))),
+            );
+            for (i, label, dev) in dev_picks {
+                let current = self.audio_sel.device == dev;
+                rows.push(
+                    div()
+                        .id(("audio-dev", i))
+                        .px_1()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(theme::current().border)))
+                        .text_color(rgb(if current {
+                            theme::current().accent
+                        } else {
+                            theme::current().text
+                        }))
+                        .child(format!(
+                            "{}: {}{}",
+                            t("audio.device"),
+                            label,
+                            if current { "  ✓" } else { "" }
+                        ))
+                        .on_click(cx.listener(move |v, _e, _w, cx| {
+                            let mut sel = v.audio_sel.clone();
+                            sel.device = dev.clone();
+                            v.apply_audio_selection(sel);
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                );
+            }
+            // sample-rate / buffer-size option chips
+            let cur_sr = self.audio_sel.sample_rate.unwrap_or(44100.0) as u32;
+            let cur_bs = self.audio_sel.buffer_size.unwrap_or(512);
+            let mut sr_row = div()
+                .flex()
+                .gap_1()
+                .items_center()
+                .child(format!("{}:", t("audio.rate")));
+            for (i, o) in [44100u32, 48000, 96000].iter().enumerate() {
+                let o = *o;
+                sr_row = sr_row.child(
+                    div()
+                        .id(("audio-sr", i))
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .bg(rgb(if o == cur_sr {
+                            theme::current().accent_bg
+                        } else {
+                            theme::current().bg_chip
+                        }))
+                        .hover(|s| s.bg(rgb(theme::current().bg_chip_hover)))
+                        .text_color(rgb(if o == cur_sr {
+                            theme::current().text_bright
+                        } else {
+                            theme::current().accent
+                        }))
+                        .text_size(px(11.0))
+                        .child(o.to_string())
+                        .on_click(cx.listener(move |v, _e, _w, cx| {
+                            let mut sel = v.audio_sel.clone();
+                            sel.sample_rate = Some(o as f64);
+                            v.apply_audio_selection(sel);
+                            cx.notify();
+                        })),
+                );
+            }
+            rows.push(sr_row.into_any_element());
+            let mut bs_row = div()
+                .flex()
+                .gap_1()
+                .items_center()
+                .child(format!("{}:", t("audio.buffer")));
+            for (i, o) in [256u32, 512, 1024, 2048].iter().enumerate() {
+                let o = *o;
+                bs_row = bs_row.child(
+                    div()
+                        .id(("audio-bs", i))
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .bg(rgb(if o == cur_bs {
+                            theme::current().accent_bg
+                        } else {
+                            theme::current().bg_chip
+                        }))
+                        .hover(|s| s.bg(rgb(theme::current().bg_chip_hover)))
+                        .text_color(rgb(if o == cur_bs {
+                            theme::current().text_bright
+                        } else {
+                            theme::current().accent
+                        }))
+                        .text_size(px(11.0))
+                        .child(format!("{} smp", o))
+                        .on_click(cx.listener(move |v, _e, _w, cx| {
+                            let mut sel = v.audio_sel.clone();
+                            sel.buffer_size = Some(o);
+                            v.apply_audio_selection(sel);
+                            cx.notify();
+                        })),
+                );
+            }
+            rows.push(bs_row.into_any_element());
             if let Some(note) = &self.scan_note {
                 rows.push(
                     div()
-                        .text_color(rgb(0x9999aa))
+                        .text_color(rgb(theme::current().text_dim))
                         .child(note.clone())
                         .into_any_element(),
                 );
             }
-            rows.push(Self::msep().into_any_element());
-            rows.push(Self::mhead(t("output.cat_vst3")).into_any_element());
+            rows.push(
+                div()
+                    .h(px(1.0))
+                    .mx_2()
+                    .my_1()
+                    .bg(rgb(theme::current().border))
+                    .into_any_element(),
+            );
+            rows.push(
+                div()
+                    .h(px(18.0))
+                    .px_2()
+                    .mx_1()
+                    .text_size(px(9.5))
+                    .text_color(rgb(theme::current().text_head))
+                    .child(t("output.cat_vst3"))
+                    .into_any_element(),
+            );
             for (i, (name, dest)) in dests.iter().enumerate() {
-                let output::Destination::Plugin { plugin_path } = dest else {
+                let output::Destination::Plugin { plugin_path, .. } = dest else {
                     continue;
                 };
                 let vendor = self
@@ -2528,13 +3732,49 @@ impl Render for EditorView {
                     .get(plugin_path)
                     .map(|p| p.vendor.clone())
                     .unwrap_or_default();
-                let (state, color, retry, detail) = match self.plugin_state.get(&i) {
+                let (state, color, retry, detail, audio) = match self.plugin_state.get(&i) {
                     Some(PluginState::Ready { .. }) => {
-                        (t("plugin.state_ready"), 0x8fd0a0, false, None)
+                        let slot = self.plugin_slots.get(&i);
+                        let detail = slot.map(|slot| {
+                            let n = slot.latency.samples().to_string();
+                            let ms = format!("{:.1}", slot.latency.as_us() as f64 / 1000.0);
+                            crate::i18n::tf(
+                                "plugin.latency",
+                                &[("n", n.as_str()), ("ms", ms.as_str())],
+                            )
+                        });
+                        let audio = slot.map(|s| {
+                            let a = s.audio_diag();
+                            let dev = a
+                                .device
+                                .unwrap_or_else(|| t("audio.sys_default").to_string());
+                            let ok = a.stream_error.is_none();
+                            let state = a
+                                .stream_error
+                                .unwrap_or_else(|| t("audio.stream_ok").to_string());
+                            (
+                                format!(
+                                    "{} Hz · {} smp · {} · {}",
+                                    a.sample_rate as u32, a.block_size, dev, state
+                                ),
+                                ok,
+                            )
+                        });
+                        (
+                            t("plugin.state_ready"),
+                            theme::current().lcd,
+                            false,
+                            detail,
+                            audio,
+                        )
                     }
-                    Some(PluginState::Loading { .. }) => {
-                        (t("plugin.state_loading"), 0xe0b050, false, None)
-                    }
+                    Some(PluginState::Loading { .. }) => (
+                        t("plugin.state_loading"),
+                        theme::current().warn,
+                        false,
+                        None,
+                        None,
+                    ),
                     Some(PluginState::Failed { phase, msg, .. }) => {
                         let phase = match *phase {
                             "host" => t("plugin.phase_host"),
@@ -2543,15 +3783,25 @@ impl Render for EditorView {
                         };
                         (
                             t("plugin.state_failed"),
-                            0xe06060,
+                            theme::current().danger,
                             true,
                             Some(format!("{phase}: {msg}")),
+                            None,
                         )
                     }
-                    _ => (t("plugin.state_idle"), 0x77778a, false, None),
+                    _ => (
+                        t("plugin.state_idle"),
+                        theme::current().text_muted,
+                        false,
+                        None,
+                        None,
+                    ),
                 };
                 let mut row = div()
                     .id(("output-status", i))
+                    .test_support()
+                    .role(Role::ListItem)
+                    .aria_label(format!("{name} {state}"))
                     .flex()
                     .flex_col()
                     .gap_1()
@@ -2562,14 +3812,32 @@ impl Render for EditorView {
                             .gap_1()
                             .items_center()
                             .child(format!("{}  {}", name, state))
-                            .child(div().text_color(rgb(0x888899)).child(vendor)),
+                            .child(
+                                div()
+                                    .text_color(rgb(theme::current().text_muted))
+                                    .child(vendor),
+                            ),
                     );
                 if let Some(detail) = detail {
                     row = row.child(
                         div()
-                            .text_size(px(11.0))
-                            .text_color(rgb(0x9999aa))
+                            .text_size(px(metrics::TEXT_MD))
+                            .text_color(rgb(th.text_dim))
                             .child(detail),
+                    );
+                }
+                // active stream configuration (resolved device, rate, block
+                // size, stream state) — red when the stream last errored
+                if let Some((line, ok)) = audio {
+                    row = row.child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(if ok {
+                                theme::current().text_dim
+                            } else {
+                                theme::current().danger
+                            }))
+                            .child(line),
                     );
                 }
                 rows.push(
@@ -2582,24 +3850,79 @@ impl Render for EditorView {
                     .into_any_element(),
                 );
             }
+            // quarantine: bundles the cache recorded as crash/timeout and
+            // skipped this scan — each row force-retries that one plugin
+            if !self.quarantined.is_empty() {
+                rows.push(
+                    div()
+                        .h(px(metrics::MENU_HEAD))
+                        .px_2()
+                        .mx_1()
+                        .text_size(px(metrics::TEXT_XS))
+                        .text_color(rgb(th.text_head))
+                        .child(t("output.quarantined_short"))
+                        .into_any_element(),
+                );
+            }
+            for (i, (path, reason)) in self.quarantined.iter().enumerate() {
+                let name = path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let path = path.clone();
+                rows.push(
+                    div()
+                        .id(("output-quarantine", i))
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .text_color(rgb(theme::current().warn))
+                        .child(
+                            div()
+                                .flex()
+                                .gap_1()
+                                .items_center()
+                                .child(format!("{}  {}", name, t("plugin.state_failed")))
+                                .child(
+                                    div()
+                                        .text_color(rgb(theme::current().text_muted))
+                                        .child(t("output.quarantined_short").to_string()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(rgb(theme::current().text_dim))
+                                .child(format!("{} — {}", reason, t("output.click_rescan"))),
+                        )
+                        .on_click(cx.listener(move |v, _e, _w, cx| {
+                            v.rescan_plugins(crate::ScanMode::Retry(path.clone()));
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                );
+            }
             let panel_content_h = 24.0 + rows.len() as f32 * 26.0 + 32.0 + 32.0;
             let panel = div()
                 .id("output-status-panel")
+                .test_support()
+                .role(Role::Dialog)
+                .aria_label(t("output.host_status"))
                 .w(px(520.0))
                 .flex()
                 .flex_col()
                 .gap_1()
                 .p_3()
-                .bg(rgb(0x20202c))
+                .bg(rgb(theme::current().bg_raised))
                 .border_1()
-                .border_color(rgb(0x3c3c4a))
+                .border_color(rgb(theme::current().border_strong))
                 .rounded_lg()
                 .shadow_lg()
-                .text_size(px(12.0))
+                .text_size(px(metrics::TEXT_LG))
                 .child(
                     div()
                         .text_size(px(14.0))
-                        .text_color(rgb(0x9fd0ff))
+                        .text_color(rgb(theme::current().accent))
                         .child(t("output.status_title")),
                 )
                 .children(rows)
@@ -2612,14 +3935,16 @@ impl Render for EditorView {
                         .child(Self::chip(
                             "status.rescan",
                             t("output.rescan"),
+                            t("output.rescan"),
                             cx,
                             |v, _e, cx| {
-                                v.rescan_plugins();
+                                v.rescan_plugins(crate::ScanMode::Changed);
                                 cx.notify();
                             },
                         ))
                         .child(Self::chip(
                             "status.close",
+                            t("output.close"),
                             t("output.close"),
                             cx,
                             |v, _e, cx| {
@@ -2643,7 +3968,7 @@ impl Render for EditorView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(rgba(0x00000066))
+                .bg(rgba(theme::current().scrim))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|v, _e, _w, cx| {
@@ -2654,13 +3979,162 @@ impl Render for EditorView {
                 .child(panel)
         });
 
+        // command palette / keybindings overlay (Ctrl+Shift+P, Help menu)
+        let palette_layer = self.palette.as_ref().map(|p| {
+            let keys_mode = p.mode == PaletteMode::Keys;
+            let capturing = p.capture;
+            let rows = self.palette_rows(cx);
+            let list_rows: Vec<AnyElement> = if rows.is_empty() {
+                vec![div()
+                    .px_2()
+                    .py_1()
+                    .text_color(rgb(theme::current().text_dim))
+                    .child(t("ui.no_matches"))
+                    .into_any_element()]
+            } else {
+                rows.iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        let sel = i == p.sel;
+                        let right: SharedString = if keys_mode && capturing == Some(c.id) {
+                            t("ui.keys_capture").into()
+                        } else {
+                            self.keys.shortcut_label(c.id).into()
+                        };
+                        let overridden = keys_mode && !self.keys.is_default(c.id);
+                        div()
+                            .id(("pal", i))
+                            .flex()
+                            .items_center()
+                            .h(px(26.0))
+                            .px_2()
+                            .mx_1()
+                            .rounded_sm()
+                            .when(sel, |d| d.bg(rgb(theme::current().accent_bg)))
+                            .text_size(px(12.0))
+                            .text_color(rgb(if sel {
+                                theme::current().text_bright
+                            } else {
+                                theme::current().text
+                            }))
+                            .child(div().flex_1().whitespace_nowrap().child(cmd::label(c)))
+                            .when(overridden, |d| {
+                                d.child(div().text_color(rgb(theme::current().warn)).child("●"))
+                            })
+                            .child(
+                                div()
+                                    .pl_2()
+                                    .font_family("Cascadia Mono")
+                                    .text_size(px(10.0))
+                                    .text_color(rgb(if sel {
+                                        theme::current().text_bright
+                                    } else {
+                                        theme::current().text_faint
+                                    }))
+                                    .child(right),
+                            )
+                            .on_mouse_move(cx.listener(move |v, _e: &MouseMoveEvent, _w, cx| {
+                                if let Some(p) = v.palette.as_mut() {
+                                    if p.sel != i {
+                                        p.sel = i;
+                                        cx.notify();
+                                    }
+                                }
+                            }))
+                            .on_click(cx.listener(move |v, _e, w, cx| {
+                                cx.stop_propagation();
+                                if let Some(p) = v.palette.as_mut() {
+                                    p.sel = i;
+                                }
+                                v.palette_activate(w, cx);
+                                cx.notify();
+                            }))
+                            .into_any_element()
+                    })
+                    .collect()
+            };
+            let title = if keys_mode {
+                t("ui.keys")
+            } else {
+                t("ui.palette")
+            };
+            let hint = if keys_mode {
+                t("ui.keys_hint")
+            } else {
+                t("ui.palette_hint")
+            };
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .justify_center()
+                .bg(rgba(theme::current().scrim))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|v, _e, _w, cx| {
+                        v.close_palette(cx);
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .id("palette-panel")
+                        .mt(px(96.0))
+                        .flex()
+                        .flex_col()
+                        .w(px(520.0))
+                        .h(px(420.0))
+                        .bg(rgb(theme::current().bg_raised))
+                        .border_1()
+                        .border_color(rgb(theme::current().border_strong))
+                        .rounded_lg()
+                        .shadow_lg()
+                        .text_size(px(12.0))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_v, _e, _w, cx| cx.stop_propagation()),
+                        )
+                        .child(
+                            div().flex().items_center().px_3().pt_2().pb_1().child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .text_color(rgb(theme::current().accent))
+                                    .child(title),
+                            ),
+                        )
+                        .child(div().px_2().pb_1().child(Input::new(&p.input)))
+                        .child(
+                            div()
+                                .id("pal-scroll")
+                                .flex_1()
+                                .overflow_y_scroll()
+                                .py_1()
+                                .children(list_rows),
+                        )
+                        .child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .border_t_1()
+                                .border_color(rgb(theme::current().border_strong))
+                                .text_size(px(10.0))
+                                .text_color(rgb(theme::current().text_faint))
+                                .child(hint),
+                        ),
+                )
+        });
+
         div()
+            .id("editor")
+            .test_support()
+            .role(Role::Application)
+            .aria_label(t("a11y.editor"))
             .flex()
             .flex_col()
             .relative()
             .size_full()
-            .bg(rgb(0x1b1b22))
-            .text_color(rgb(0xd8d8e0))
+            .bg(rgb(theme::current().bg_root))
+            .text_color(rgb(theme::current().text))
             .key_context("editor")
             .track_focus(&self.focus)
             // Drag follow-through at the window level: GPUI only delivers
@@ -2680,63 +4154,118 @@ impl Render for EditorView {
                 cx.notify();
             }))
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
-                // typing in the track-name field must not trigger editor keys
-                if this.input.read(cx).focus_handle(cx).is_focused(w) {
+                let k = ev.keystroke.key.as_str();
+                // meta dialog swallows keys (typing must not trigger editor
+                // keys); Enter applies, Esc cancels
+                if this.meta_edit.is_some() {
+                    if let (false, "escape") = (ev.keystroke.modifiers.control, k) {
+                        this.meta_edit = None;
+                        let f = this.focus.clone();
+                        w.focus(&f, cx);
+                        cx.notify();
+                    }
                     return;
                 }
-                let k = ev.keystroke.key.as_str();
                 let ctrl = ev.keystroke.modifiers.control;
                 let shift = ev.keystroke.modifiers.shift;
+                // the rename input owns its keys: Enter commits, Escape and
+                // Tab move focus back out
+                if this.input.read(cx).focus_handle(cx).is_focused(w) {
+                    match (ctrl, k) {
+                        (false, "enter") => this.commit_rename(w, cx),
+                        (false, "escape") => w.focus(&this.tracks_fh, cx),
+                        (false, "tab") => {
+                            if shift {
+                                w.focus_prev(cx);
+                            } else {
+                                w.focus_next(cx);
+                            }
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+                // the inspector's value field owns its keys too — typing a
+                // number must not hit tool/clipboard commands
+                if this.prop_input.read(cx).focus_handle(cx).is_focused(w) {
+                    return;
+                }
+                // palette/keys overlay owns every key while open
+                if this.palette.is_some() {
+                    this.palette_key(ev, w, cx);
+                    return;
+                }
+                // while a menu is open, menu navigation owns arrows/enter/
+                // escape; other chords (Ctrl+S …) still work
+                if this.open_menu.is_some() && this.menu_key(ev, w, cx) {
+                    return;
+                }
+                // modal overlays swallow Tab — focus must never move behind
+                // them where the ring can't be seen (Esc closes them)
+                if !ctrl && k == "tab" {
+                    if this.help_open || this.show_output_status {
+                        return;
+                    }
+                    if shift {
+                        w.focus_prev(cx);
+                    } else {
+                        w.focus_next(cx);
+                    }
+                    return;
+                }
+                if !ctrl && k == "f10" {
+                    this.menu_bar_sel = 0;
+                    w.focus(&this.menu_fh, cx);
+                    return;
+                }
                 let st = {
                     let s = this.snap_ticks();
                     if s > 0 {
                         s
                     } else {
-                        this.ppq() as i64 / 8
+                        this.td().nudge_ticks() as i64
                     }
                 };
-                match (ctrl, shift, k) {
-                    (true, false, "z") => this.undo(cx),
-                    (true, false, "y") | (true, true, "z") => this.redo(cx),
-                    (true, false, "s") => this.save(cx),
-                    (true, false, "o") => this.open_dialog(cx),
-                    (true, false, "n") => this.new_file(cx),
-                    (true, false, "a") => this.select_all(cx),
-                    (true, false, "=") | (true, false, "+") => this.zoom_by(1.3, cx),
-                    (true, false, "-") => this.zoom_by(1.0 / 1.3, cx),
-                    (true, false, "0") => this.zoom_set(0.08, cx),
-                    (false, false, "escape") => {
-                        this.open_menu = None;
-                        this.open_sub = None;
-                        this.help_open = false;
-                        this.show_output_status = false;
-                        this.selection.clear();
-                        cx.notify();
+                if k == "escape" && !ctrl {
+                    // dismiss overlays + clear selection — modal, not a
+                    // registry command
+                    this.open_menu = None;
+                    this.open_sub = None;
+                    this.help_open = false;
+                    this.show_output_status = false;
+                    this.selection.clear();
+                    this.sel_events.clear();
+                    this.meta_sel = None;
+                    cx.notify();
+                    return;
+                }
+                // arrows/edit keys act on the roll only while the roll
+                // context (its handle or the root fallback) owns focus —
+                // tracks/lane/events have their own bindings
+                if !ctrl
+                    && matches!(k, "left" | "right" | "up" | "down" | "enter")
+                    && (this.roll_fh.contains_focused(w, cx) || this.focus.is_focused(w))
+                {
+                    match (shift, k) {
+                        (false, "left") => this.roll_arrow(-st, 0, cx),
+                        (false, "right") => this.roll_arrow(st, 0, cx),
+                        (true, "left") => this.roll_arrow(-1, 0, cx),
+                        (true, "right") => this.roll_arrow(1, 0, cx),
+                        (false, "up") => this.roll_arrow(0, 1, cx),
+                        (false, "down") => this.roll_arrow(0, -1, cx),
+                        (true, "up") => this.roll_arrow(0, 12, cx),
+                        (true, "down") => this.roll_arrow(0, -12, cx),
+                        (false, "enter") => this.cursor_activate(cx),
+                        _ => {}
                     }
-                    (true, false, "x") => this.copy_selected(true, cx),
-                    (true, false, "c") => this.copy_selected(false, cx),
-                    (true, false, "v") => this.paste(cx),
-                    (true, false, "d") => this.duplicate_selected(cx),
-                    (false, false, "left") => this.nudge(-st, 0, cx),
-                    (false, false, "right") => this.nudge(st, 0, cx),
-                    (false, true, "left") => this.nudge(-1, 0, cx),
-                    (false, true, "right") => this.nudge(1, 0, cx),
-                    (false, false, "up") => this.nudge(0, 1, cx),
-                    (false, false, "down") => this.nudge(0, -1, cx),
-                    (false, true, "up") => this.nudge(0, 12, cx),
-                    (false, true, "down") => this.nudge(0, -12, cx),
-                    (false, false, "f1") => {
-                        this.help_open = !this.help_open;
-                        cx.notify();
+                    return;
+                }
+                // everything else is a registry command: the keymap (defaults
+                // + user overrides) maps the keystroke to a canonical action
+                if let Some(c) = this.keys.command_at(&cmd::describe(&ev.keystroke)) {
+                    if c.enabled.map(|f| f(this)).unwrap_or(true) {
+                        (c.act)(this, w, cx);
                     }
-                    (false, false, "delete") | (false, false, "backspace") => {
-                        this.delete_selected(cx)
-                    }
-                    (false, false, "1") => this.set_tool(Tool::Select, cx),
-                    (false, false, "2") => this.set_tool(Tool::Draw, cx),
-                    (false, false, "3") => this.set_tool(Tool::Erase, cx),
-                    (false, false, " ") => this.toggle_play(cx),
-                    _ => {}
                 }
             }))
             .child(menu_bar)
@@ -2745,461 +4274,23 @@ impl Render for EditorView {
             .child(status_bar)
             .children(menu_layer)
             .children(help_layer)
+            .children(meta_layer)
             .children(output_status)
+            .children(palette_layer)
             // drag a .mid file anywhere to open it
             .can_drop(|drag: &dyn Any, _w, _cx| drag.is::<ExternalPaths>())
-            .drag_over::<ExternalPaths>(|s, _p, _w, _cx| s.bg(rgb(0x16202e)))
-            .on_drop(cx.listener(|v, paths: &ExternalPaths, _w, cx| {
+            .drag_over::<ExternalPaths>(|s, _p, _w, _cx| s.bg(rgb(theme::current().accent_drop)))
+            .on_drop(cx.listener(|v, paths: &ExternalPaths, w, cx| {
                 if let Some(p) = paths.paths().iter().find(|p| {
                     matches!(
                         p.extension().and_then(|e| e.to_str()),
                         Some("mid") | Some("smf") | Some("midi")
                     )
                 }) {
-                    v.open(p.clone(), cx);
+                    v.confirm_discard_or_save(PendingAction::OpenPath(p.clone()), w, cx);
                 }
             }))
     }
 }
 
 // --- menubar helpers -----------------------------------------------------------
-
-impl EditorView {
-    fn mhead(label: impl Into<SharedString>) -> Div {
-        div()
-            .h(px(18.0))
-            .px_2()
-            .mx_1()
-            .text_size(px(9.5))
-            .text_color(rgb(0x7a7a90))
-            .child(label.into())
-    }
-
-    fn dest_rows(
-        &self,
-        kind: DestPick,
-        dests: &[(String, midi_io::Destination)],
-        eff_dest: usize,
-        def_dest: usize,
-        has_track_dest: bool,
-        cx: &mut Context<Self>,
-    ) -> Vec<AnyElement> {
-        let mut rows = Vec::new();
-        if kind == DestPick::Track {
-            rows.push(
-                Self::mi_leaf(
-                    "dest.default",
-                    t("track.default_dest"),
-                    "",
-                    Some(!has_track_dest),
-                    cx,
-                    |v, _e, _cx| {
-                        crate::lock_shared(&v.shared)
-                            .track_dest
-                            .remove(&v.sel_track);
-                        v.persist();
-                    },
-                )
-                .into_any_element(),
-            );
-            rows.push(Self::msep().into_any_element());
-        }
-        rows.push(Self::mhead(t("output.cat_midi")).into_any_element());
-        let midi: Vec<(usize, String)> = dests
-            .iter()
-            .enumerate()
-            .filter_map(|(i, (name, d))| {
-                matches!(d, output::Destination::MidiPort { .. }).then_some((i, name.clone()))
-            })
-            .collect();
-        if midi.is_empty() {
-            rows.push(
-                Self::mi_leaf(
-                    "dest.noports",
-                    t("output.no_ports"),
-                    "",
-                    None,
-                    cx,
-                    |_v, _e, _cx| {},
-                )
-                .into_any_element(),
-            );
-        } else {
-            for (i, label) in midi {
-                let selected = if kind == DestPick::Track {
-                    has_track_dest && eff_dest == i
-                } else {
-                    def_dest == i
-                };
-                rows.push(
-                    Self::mi_leaf(
-                        ("dest", i),
-                        label,
-                        "",
-                        Some(selected),
-                        cx,
-                        move |v, _e, _cx| {
-                            let mut sh = crate::lock_shared(&v.shared);
-                            if kind == DestPick::Track {
-                                sh.track_dest.insert(v.sel_track, i);
-                            } else {
-                                sh.default_dest = i;
-                            }
-                            drop(sh);
-                            v.persist();
-                        },
-                    )
-                    .into_any_element(),
-                );
-            }
-        }
-        rows.push(Self::msep().into_any_element());
-        let plugins: Vec<(usize, String, String, String)> = dests
-            .iter()
-            .enumerate()
-            .filter_map(|(i, (name, d))| {
-                let output::Destination::Plugin { plugin_path } = d else {
-                    return None;
-                };
-                let vendor = self
-                    .plugin_meta
-                    .get(plugin_path)
-                    .map(|p| p.vendor.clone())
-                    .unwrap_or_default();
-                Some((i, name.clone(), plugin_path.clone(), vendor))
-            })
-            .collect();
-        let mut vendors = std::collections::BTreeSet::new();
-        for (_, _, _, vendor) in &plugins {
-            if !vendor.is_empty() {
-                vendors.insert(vendor.clone());
-            }
-        }
-        rows.push(
-            Self::mhead(format!("{} ({})", t("output.cat_vst3"), plugins.len())).into_any_element(),
-        );
-        if plugins.is_empty() {
-            if self.scan_rx.is_some() {
-                rows.push(
-                    Self::mi_leaf(
-                        "dest.scanning",
-                        t("status.scanning"),
-                        "",
-                        None,
-                        cx,
-                        |_v, _e, _cx| {},
-                    )
-                    .into_any_element(),
-                );
-            } else {
-                rows.push(
-                    Self::mi_leaf(
-                        "dest.noplugins",
-                        t("output.no_plugins"),
-                        "",
-                        None,
-                        cx,
-                        |_v, _e, _cx| {},
-                    )
-                    .into_any_element(),
-                );
-            }
-        } else {
-            let mut plugins = plugins;
-            plugins.sort_by(|a, b| {
-                if vendors.len() >= 2 {
-                    a.3.cmp(&b.3).then(a.1.cmp(&b.1))
-                } else {
-                    a.1.cmp(&b.1)
-                }
-            });
-            let mut last_vendor = String::new();
-            for (i, label, path, vendor) in plugins {
-                if vendors.len() >= 2 && vendor != last_vendor {
-                    last_vendor = vendor.clone();
-                    rows.push(Self::mhead(format!("  {vendor}")).into_any_element());
-                }
-                let (badge, color) = match self.plugin_state.get(&i) {
-                    Some(PluginState::Ready { .. }) => ("●", Some(0x8fd0a0)),
-                    Some(PluginState::Loading { .. }) => ("◌ …", Some(0xe0b050)),
-                    Some(PluginState::Failed { .. }) => ("✕", Some(0xe06060)),
-                    _ => ("", None),
-                };
-                let detail = match self.plugin_state.get(&i) {
-                    Some(PluginState::Failed { phase, msg, .. }) => {
-                        let phase = match *phase {
-                            "host" => t("plugin.phase_host"),
-                            "audio" => t("plugin.phase_audio"),
-                            _ => t("plugin.phase_load"),
-                        };
-                        Some(format!("{phase}: {msg}"))
-                    }
-                    _ => None,
-                };
-                let selected = if kind == DestPick::Track {
-                    has_track_dest && eff_dest == i
-                } else {
-                    def_dest == i
-                };
-                let path2 = path.clone();
-                let row = Self::mi_inner(
-                    ("plugin", i),
-                    label,
-                    badge,
-                    color,
-                    Some(selected),
-                    false,
-                    cx,
-                    move |v, _e, _cx| {
-                        let mut sh = crate::lock_shared(&v.shared);
-                        if kind == DestPick::Track {
-                            sh.track_dest.insert(v.sel_track, i);
-                        } else {
-                            sh.default_dest = i;
-                        }
-                        drop(sh);
-                        v.persist();
-                        v.ensure_plugin(i, true);
-                        let _ = path2;
-                    },
-                );
-                let row = if let Some(detail) = detail {
-                    row.tooltip(move |_w, cx| {
-                        let detail = detail.clone();
-                        cx.new(|_| Tip(detail.into())).into()
-                    })
-                } else {
-                    row
-                };
-                rows.push(row.into_any_element());
-            }
-        }
-        rows
-    }
-
-    /// One dropdown row: optional check glyph, label, right-aligned shortcut.
-    /// Clicking closes the whole menu and runs `f`. Dropdown rows clear the
-    /// open cascade on hover; submenu leaf rows (`mi_leaf`) must NOT clear it,
-    /// or hovering a submenu item unmounts its own submenu before the click.
-    #[allow(clippy::too_many_arguments)] // GPUI builder plumbing, not logic
-    fn mi_inner(
-        id: impl Into<ElementId>,
-        label: impl Into<SharedString>,
-        shortcut: impl Into<SharedString>,
-        badge_color: Option<u32>,
-        check: Option<bool>,
-        clears_sub: bool,
-        cx: &mut Context<Self>,
-        f: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
-    ) -> Stateful<Div> {
-        div()
-            .id(id)
-            .flex()
-            .items_center()
-            .h(px(24.0))
-            .px_2()
-            .mx_1()
-            .rounded_sm()
-            .cursor_pointer()
-            .hover(|s| s.bg(rgb(0x2f2f42)))
-            .text_size(px(12.0))
-            .text_color(rgb(0xd8d8e0))
-            .whitespace_nowrap()
-            .child(
-                div()
-                    .w(px(14.0))
-                    .text_size(px(10.0))
-                    .text_color(rgb(0x8fd0a0))
-                    .child(if check == Some(true) { "✓" } else { "" }),
-            )
-            .child(div().flex_1().child(label.into()))
-            .child(
-                div()
-                    .pl_2()
-                    .text_color(rgb(badge_color.unwrap_or(0x666677)))
-                    .text_size(px(10.0))
-                    .child(shortcut.into()),
-            )
-            .on_mouse_move(cx.listener(move |v, _e: &MouseMoveEvent, _w, cx| {
-                // leaving a submenu parent closes the cascade
-                if clears_sub && v.open_sub.is_some() {
-                    v.open_sub = None;
-                    cx.notify();
-                }
-            }))
-            .on_click(cx.listener(move |v, e, w, cx| {
-                cx.stop_propagation();
-                v.open_menu = None;
-                v.open_sub = None;
-                let _ = e;
-                f(v, w, cx);
-                cx.notify();
-            }))
-    }
-
-    /// Dropdown row — clears the open cascade when hovered.
-    fn mi(
-        id: impl Into<ElementId>,
-        label: impl Into<SharedString>,
-        shortcut: &'static str,
-        check: Option<bool>,
-        cx: &mut Context<Self>,
-        f: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
-    ) -> Stateful<Div> {
-        Self::mi_inner(id, label, shortcut, None, check, true, cx, f)
-    }
-
-    /// Submenu leaf row — must not clear the cascade it lives in.
-    fn mi_leaf(
-        id: impl Into<ElementId>,
-        label: impl Into<SharedString>,
-        shortcut: &'static str,
-        check: Option<bool>,
-        cx: &mut Context<Self>,
-        f: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
-    ) -> Stateful<Div> {
-        Self::mi_inner(id, label, shortcut, None, check, false, cx, f)
-    }
-
-    /// Dropdown row that cascades: hovering opens its submenu at the row's y.
-    fn mi_sub(
-        id: &'static str,
-        label: &'static str,
-        sub: Sub,
-        cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
-        div()
-            .id(id)
-            .flex()
-            .items_center()
-            .h(px(24.0))
-            .px_2()
-            .mx_1()
-            .rounded_sm()
-            .cursor_pointer()
-            .hover(|s| s.bg(rgb(0x2f2f42)))
-            .text_size(px(12.0))
-            .text_color(rgb(0xd8d8e0))
-            .whitespace_nowrap()
-            .child(div().w(px(14.0)))
-            .child(div().flex_1().child(label))
-            .child(
-                div()
-                    .pl_2()
-                    .text_color(rgb(0x666677))
-                    .text_size(px(10.0))
-                    .child("▸"),
-            )
-            .on_mouse_move(cx.listener(move |v, e: &MouseMoveEvent, _w, cx| {
-                // Only hover-open when no cascade is up: once one is open, a
-                // diagonal cursor path toward a submenu item would cross the
-                // sibling rows and replace the submenu mid-flight (classic
-                // "safe triangle" problem). Siblings still switch via click.
-                let y = f32::from(e.position.y);
-                if v.open_sub.is_none() {
-                    v.open_sub = Some((sub, y));
-                    cx.notify();
-                }
-            }))
-            .on_click(cx.listener(move |v, e: &ClickEvent, _w, cx| {
-                cx.stop_propagation();
-                v.open_sub = Some((sub, f32::from(e.position().y)));
-                cx.notify();
-            }))
-    }
-
-    /// Dropdown separator line.
-    fn msep() -> Div {
-        div().h(px(1.0)).mx_2().my_1().bg(rgb(0x2a2a35))
-    }
-}
-
-// --- toolbar helpers -------------------------------------------------------------
-
-/// Tooltip bubble view.
-struct Tip(SharedString);
-
-impl Render for Tip {
-    fn render(&mut self, _w: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .px_2()
-            .py_1()
-            .bg(rgb(0x26262e))
-            .border_1()
-            .border_color(rgb(0x3c3c4a))
-            .rounded_md()
-            .shadow_lg()
-            .text_size(px(11.0))
-            .text_color(rgb(0xd8d8e0))
-            .whitespace_nowrap()
-            .child(self.0.clone())
-    }
-}
-
-impl EditorView {
-    /// 1px vertical separator between toolbar icon groups.
-    fn vsep() -> Div {
-        div().w(px(1.0)).h(px(20.0)).mx_1().bg(rgb(0x2a2a35))
-    }
-
-    /// Icon button: 26px square, tooltip, neutral gray icon.
-    fn ibtn(
-        id: &'static str,
-        ic: &'static str,
-        tip: &'static str,
-        on: bool,
-        cx: &mut Context<Self>,
-        f: impl Fn(&mut Self, &ClickEvent, &mut Context<Self>) + 'static,
-    ) -> Stateful<Div> {
-        div()
-            .id(id)
-            .w(px(26.0))
-            .h(px(26.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_sm()
-            .cursor_pointer()
-            .bg(if on { rgb(0x2b3d4f) } else { rgb(BG_PANEL) })
-            .border_1()
-            .border_color(if on { rgb(0x3d5a75) } else { rgb(BG_PANEL) })
-            .hover(|s| s.bg(rgb(0x2f2f42)))
-            .tooltip(move |_w, cx| cx.new(|_| Tip(tip.into())).into())
-            .child(icon(ic, 16.0, if on { ACCENT } else { 0x9a9ab0 }))
-            .on_click(cx.listener(move |v, e, _w, cx| {
-                f(v, e, cx);
-                cx.notify();
-            }))
-    }
-
-    /// Icon button whose active state gets a custom accent color.
-    fn ibtn_c(
-        id: &'static str,
-        ic: &'static str,
-        tip: &'static str,
-        on: bool,
-        accent: u32,
-        cx: &mut Context<Self>,
-        f: impl Fn(&mut Self, &ClickEvent, &mut Context<Self>) + 'static,
-    ) -> Stateful<Div> {
-        div()
-            .id(id)
-            .w(px(26.0))
-            .h(px(26.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_sm()
-            .cursor_pointer()
-            .bg(if on { rgb(0x2b3d4f) } else { rgb(BG_PANEL) })
-            .border_1()
-            .border_color(if on { rgb(0x3d5a75) } else { rgb(BG_PANEL) })
-            .hover(|s| s.bg(rgb(0x2f2f42)))
-            .tooltip(move |_w, cx| cx.new(|_| Tip(tip.into())).into())
-            .child(icon(ic, 16.0, if on { accent } else { 0x9a9ab0 }))
-            .on_click(cx.listener(move |v, e, _w, cx| {
-                f(v, e, cx);
-                cx.notify();
-            }))
-    }
-}

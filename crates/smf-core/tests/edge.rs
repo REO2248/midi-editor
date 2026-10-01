@@ -23,7 +23,12 @@ fn mtrk(body: &[u8]) -> Vec<u8> {
 }
 
 fn rt(parsed: &File) -> Vec<u8> {
-    write(parsed.format, parsed.division, &parsed.tracks, WriteOptions::default())
+    write(
+        parsed.format,
+        parsed.division,
+        &parsed.tracks,
+        WriteOptions::default(),
+    )
 }
 
 fn converges(bytes: &[u8]) {
@@ -38,11 +43,16 @@ fn converges(bytes: &[u8]) {
 fn smpte_division_roundtrip() {
     // 0xE7 = -25 fps, 0x28 = 40 ticks/frame
     let mut f = header(1, 0xE728, 1);
-    f.extend(mtrk(&[0x00, 0x90, 0x3C, 0x64, 0x28, 0x80, 0x3C, 0x00, 0x00, 0xFF, 0x2F, 0x00]));
+    f.extend(mtrk(&[
+        0x00, 0x90, 0x3C, 0x64, 0x28, 0x80, 0x3C, 0x00, 0x00, 0xFF, 0x2F, 0x00,
+    ]));
     let parsed = parse(&f).unwrap();
     assert!(matches!(
         parsed.division,
-        Division::Smpte { fps: 25, ticks_per_frame: 40 }
+        Division::Smpte {
+            fps: 25,
+            ticks_per_frame: 40
+        }
     ));
     assert_eq!(rt(&parsed), f, "SMPTE file must round-trip byte-exact");
 }
@@ -126,8 +136,18 @@ fn missing_eot_gets_added_and_converges() {
     converges(&f);
     // re-parse finds the EOT
     let f2 = parse(&out).unwrap();
-    let last = f2.tracks[0].events.iter().max_by_key(|e| (e.tick, e.seq)).unwrap();
-    assert!(matches!(last.kind, EventKind::Meta { meta_type: 0x2F, .. }));
+    let last = f2.tracks[0]
+        .events
+        .iter()
+        .max_by_key(|e| (e.tick, e.seq))
+        .unwrap();
+    assert!(matches!(
+        last.kind,
+        EventKind::Meta {
+            meta_type: 0x2F,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -154,7 +174,9 @@ fn junk_chunk_warns_but_survives() {
 #[test]
 fn truncated_file_never_panics() {
     let mut t = Vec::new();
-    t.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64, 0x60, 0x80, 0x3C, 0x00, 0x00, 0xFF, 0x2F, 0x00]);
+    t.extend_from_slice(&[
+        0x00, 0x90, 0x3C, 0x64, 0x60, 0x80, 0x3C, 0x00, 0x00, 0xFF, 0x2F, 0x00,
+    ]);
     let mut f = header(0, 480, 1);
     f.extend(mtrk(&t));
     for cut in (1..f.len()).rev() {
@@ -260,8 +282,14 @@ fn text_encodings_survive_through_fixpoint() {
     f.extend(mtrk(&t));
     let parsed = parse(&f).unwrap();
     assert_eq!(rt(&parsed), f);
-    assert_eq!(decode_text(&match &parsed.tracks[0].events[0].kind {
-        EventKind::Meta { data, .. } => data.clone(),
-        _ => panic!(),
-    }, Some(TextEncoding::ShiftJis)), "テスト");
+    assert_eq!(
+        decode_text(
+            &match &parsed.tracks[0].events[0].kind {
+                EventKind::Meta { data, .. } => data.clone(),
+                _ => panic!(),
+            },
+            Some(TextEncoding::ShiftJis)
+        ),
+        "テスト"
+    );
 }

@@ -1,6 +1,7 @@
 [package]
 name = "commands"
 edition.workspace = true
+version.workspace = true
 license.workspace = true
 description = "Edit commands and undo stack over document Transactions"
 
@@ -8,3 +9,6 @@ description = "Edit commands and undo stack over document Transactions"
 document.workspace = true
 smf-core.workspace = true
 bytes.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

@@ -3,3 +3,6 @@
 *.log
 .DS_Store
 Thumbs.db
+crates/mcp-server/tests/schema_snapshot.actual.json
+/mutants-*/
+/dist

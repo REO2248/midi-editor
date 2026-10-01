@@ -9,13 +9,12 @@
 //! and serves it directly over stdio — no app needed. Edits stay in memory;
 //! `save` writes the file.
 
-use mcp_server::{Shared, SharedDoc};
+use mcp_server::SharedDoc;
 use rmcp::model::*;
 use rmcp::service::{Peer, RequestContext, RoleClient, ServiceExt};
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
 struct ForwardService {
@@ -26,7 +25,7 @@ struct ForwardService {
 impl ServerHandler for ForwardService {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("mcp-bridge", env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new("mcp-bridge", env!("BUILD_IDENTITY")))
             .with_instructions(format!("stdio bridge -> {}", self.upstream_name))
     }
 
@@ -58,12 +57,10 @@ impl ServerHandler for ForwardService {
     }
 }
 
+/// Standalone `--file` mode uses the same persistence core as the app:
+/// parse via `service::load_document`, save via `service::save_document`.
 fn load_file(path: &std::path::Path) -> anyhow::Result<SharedDoc> {
-    let bytes = std::fs::read(path)?;
-    let file = smf_core::parse(&bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut sh = Shared::new(document::Document::from_file(file));
-    sh.path = Some(path.to_path_buf());
-    Ok(Arc::new(Mutex::new(sh)))
+    Ok(mcp_server::service::open_shared(path)?)
 }
 
 #[tokio::main]
@@ -79,6 +76,10 @@ async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--version" | "-V" => {
+                println!("mcp-bridge {}", env!("BUILD_IDENTITY"));
+                return Ok(());
+            }
             "--url" => url = args.next().unwrap_or(url),
             // an empty bearer token is never valid — a missing value must
             // fail loudly, not silently send "Bearer "
@@ -89,6 +90,13 @@ async fn main() -> anyhow::Result<()> {
             "--file" => file = args.next().map(PathBuf::from),
             _ => {}
         }
+    }
+
+    // discover the app's auto-provisioned token file so spawned stdio
+    // clients need no configuration — the file lives in the same user's
+    // private config dir, so only same-user processes can read it anyway
+    if token.is_none() {
+        token = mcp_server::read_stored_token();
     }
 
     if let Some(f) = file {

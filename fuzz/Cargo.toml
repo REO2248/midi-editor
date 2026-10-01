@@ -1,0 +1,57 @@
+[package]
+name = "midi-editor-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "midi_editor_fuzz"
+path = "src/lib.rs"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+bytes = "1"
+smf-core = { path = "../crates/smf-core" }
+document = { path = "../crates/document" }
+
+# Prevent this from being pulled into the parent workspace.
+[workspace]
+
+[[bin]]
+name = "parse_strict"
+path = "fuzz_targets/parse_strict.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "parse_lenient"
+path = "fuzz_targets/parse_lenient.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "parse_write"
+path = "fuzz_targets/parse_write.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "write_parse"
+path = "fuzz_targets/write_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "normalize_fixpoint"
+path = "fuzz_targets/normalize_fixpoint.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "gen_corpus"
+path = "src/bin/gen_corpus.rs"

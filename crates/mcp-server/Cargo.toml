@@ -1,8 +1,13 @@
 [package]
 name = "mcp-server"
 edition.workspace = true
+version.workspace = true
 license.workspace = true
 description = "Embedded MCP server over the shared document transaction path"
+
+[[bin]]
+name = "mcp-bridge"
+path = "src/bin/mcp_bridge.rs"
 
 [dependencies]
 rmcp = { workspace = true, features = ["client", "server", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "macros", "schemars"] }
@@ -16,6 +21,9 @@ midi-io.workspace = true
 bytes.workspace = true
 commands.workspace = true
 smf-core.workspace = true
+persist.workspace = true
+thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+getrandom.workspace = true

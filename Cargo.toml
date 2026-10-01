@@ -6,6 +6,7 @@ members = ["crates/*"]
 edition = "2021"
 license = "MIT OR Apache-2.0"
 rust-version = "1.85"
+version = "0.1.0"
 
 [workspace.dependencies]
 # local crates
@@ -15,6 +16,7 @@ commands = { path = "crates/commands" }
 midi-io = { path = "crates/midi-io" }
 output = { path = "crates/output" }
 mcp-server = { path = "crates/mcp-server" }
+persist = { path = "crates/persist" }
 
 anyhow = "1"
 thiserror = "2"
@@ -24,6 +26,7 @@ bytes = "1"
 encoding_rs = "0.8"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+tracing-appender = "0.2"
 
 # MIDI / SMF
 midly = "0.5"
@@ -39,9 +42,13 @@ gpui-kit = "0.6"
 
 # MCP server
 rmcp = { version = "3.4", features = ["client", "server", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "macros", "schemars"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "io-util"] }
 axum = "0.8"
 http = "1"
+getrandom = "0.4"
+
+# testing
+proptest = "1"
 
 [profile.dev]
 # faster link times during spike work

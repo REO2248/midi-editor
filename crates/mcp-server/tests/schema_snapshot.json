@@ -1,0 +1,1269 @@
+{
+  "mcp_surface_version": 1,
+  "tools": [
+    {
+      "deprecated": null,
+      "description": "Append a track (with optional name). Args: name?. Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "add_track",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Atomic edit as one undo step. Optional base_revision: when given it must match document_summary.revision (optimistic concurrency). dry_run:true returns the op breakdown without applying. ops: insert_note {track,key,vel,start,dur,channel,off_vel?,off_form?} | insert_events {track,events:[{tick,seq,kind:{channel|meta|sysex_hex}}]} | remove_events {ids} | move_note {on_id,dtick,dkey,dur_dtick} | set_tempo {tick,bpm}",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "dry_run": {
+            "type": "boolean"
+          },
+          "label": {
+            "type": "string"
+          },
+          "ops": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "name": "apply_patch",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Open a named checkpoint: every later edit tool stages on a private document copy (reads see staged state) until commit_transaction folds them into ONE undo step or rollback_transaction discards them. One open batch at a time; ~5min idle auto-rollback keeps abandoned sessions from pinning the document. Args: label?.",
+      "input_schema": {
+        "properties": {
+          "label": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "begin_transaction",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "All transactions committed after `revision` plus their merged change summary — verify an edit's effect without re-querying the document. `truncated` when the bounded history no longer reaches that far back.",
+      "input_schema": {
+        "properties": {
+          "revision": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "changes_since_revision",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Fold the open transaction's staged ops into a single undo step labelled with the checkpoint name. dry_run:true validates the merged ops against the committed document without applying and keeps the transaction open. Errors with stale_base when the document changed since begin (concurrent edit) — the batch stays open for rollback/re-plan.",
+      "input_schema": {
+        "properties": {
+          "dry_run": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "name": "commit_transaction",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Delete channel events in [from,to) (notes delete whole). Args: track, from, to. Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "from": {
+            "type": "integer"
+          },
+          "to": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "delete_range",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Import-quality findings over the raw event layer: dangling noteOn, zero-length notes, missing End-of-Track, tempo events outside the conductor track, overlapping (retriggered) noteOns. Each has code/track/tick/event_id + detail. Note pairing is deterministic LIFO per (channel,key); overlapping-noteon marks where that choice was ambiguous.",
+      "input_schema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "diagnostics",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "JSON summary: format/division, per-track names+counts, note count, duration, revision, dirty flag",
+      "input_schema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "document_summary",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Copy channel events in [from,to) to start at `to`. Args: track, from, to. Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "from": {
+            "type": "integer"
+          },
+          "to": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "duplicate_range",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Editor capabilities contract: semver, commit/build id, MCP surface version, supported SMF features, destination kinds, live-feature flags (transport/undo/dry_run/base_revision), and the per-tool version/deprecation table. Call first for feature detection.",
+      "input_schema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "editor_info",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Shorten notes overlapping the next same-pitch+channel note so they end at its start; event ids are preserved. Args: track?, from?, to?. Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "from": {
+            "type": "integer"
+          },
+          "to": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "fix_overlaps",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "List aftertouch (channel pressure 0xD0 / poly key pressure 0xA0) events. Args: track?, channel?, kind? (channel|poly, default both), key? (poly only).",
+      "input_schema": {
+        "properties": {
+          "channel": {
+            "type": "integer"
+          },
+          "key": {
+            "type": "integer"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "get_aftertouch",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Latest controller value per (track, channel, cc) — the current CC state. Args: track?, channel?, cc?, limit?, cursor?, fields?. Returns cc + next_cursor + revision.",
+      "input_schema": {
+        "properties": {
+          "cc": {
+            "type": "integer"
+          },
+          "channel": {
+            "type": "integer"
+          },
+          "cursor": {
+            "type": "string"
+          },
+          "fields": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "get_cc",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Instrument context: detected synth mode (gm1/gm2/gs/xg from reset SysEx) + every program change with effective bank MSB/LSB and friendly name (GM table; GS/XG drum kits on channel 10). Names are display-only — unknown banks return null names and stay numeric. No args.",
+      "input_schema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "get_instruments",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Meta events (names, markers, lyrics, text, tempo, time-sig) with text decoded (UTF-8/SJIS), track-major order. Args: track?, meta_type? (hex int), limit?, cursor?, fields? (omit data_hex to slim rows). Returns meta + next_cursor + revision.",
+      "input_schema": {
+        "properties": {
+          "cursor": {
+            "type": "string"
+          },
+          "fields": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "meta_type": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "get_meta",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Semantic view of RPN/NRPN writes: [{track, channel, kind, param_msb, param_lsb, param14, name, tick, data_msb, data_lsb, value, ids}] — raw CC events are unchanged. Args: track?, channel?, kind? (\"rpn\"|\"nrpn\"), param_msb?, param_lsb?.",
+      "input_schema": {
+        "properties": {
+          "channel": {
+            "type": "integer"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "param_lsb": {
+            "type": "integer"
+          },
+          "param_msb": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "get_rpn",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Tempo breakpoints: [{tick, us_per_quarter, bpm, cumulative_us}] + ppq (null for SMPTE — fps/ticks_per_frame are reported instead). Format-2 files report per-sequence maps (each track is an independent timeline). Read before editing tempo or converting ticks<->time.",
+      "input_schema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "get_tempo_map",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Deterministic seeded jitter on note starts and velocities. Args: track?, from?, to?, timing (max |tick|), vel (max |dv|), seed (integer; same seed+settings = identical output, recorded in the tx label), dry_run?. Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "dry_run": {
+            "type": "boolean"
+          },
+          "from": {
+            "type": "integer"
+          },
+          "seed": {
+            "type": "integer"
+          },
+          "timing": {
+            "type": "integer"
+          },
+          "to": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          },
+          "vel": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "humanize",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Merge runs of same-pitch+channel notes that overlap or touch: the earliest NoteOn survives, the NoteOff moves to the run's end, interior events are removed. Args: track?, from?, to?. Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "from": {
+            "type": "integer"
+          },
+          "to": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "join_notes",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Extend each note's end toward the next same-pitch+channel note's start. Args: track?, from?, to?, gap? (ticks; 0 = touch, >0 leaves a gap, <0 overlaps). Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "from": {
+            "type": "integer"
+          },
+          "gap": {
+            "type": "integer"
+          },
+          "to": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "legato",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Output routing: catalog [{index, label, kind, port_name|plugin_path}], default_dest, per-track overrides, mute/solo.",
+      "input_schema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "list_destinations",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Enumerate real MIDI outputs/inputs on this machine (WinMM): [{index, name}]. Use names in set_track_destination.",
+      "input_schema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "list_midi_ports",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Paired note view (NoteOn+NoteOff). Args: track?, from_tick?, to_tick?, limit? (default 500, max 10000), cursor?, fields? (row key allowlist). Returns notes + next_cursor + revision; a stale cursor returns a structured restart hint.",
+      "input_schema": {
+        "properties": {
+          "cursor": {
+            "type": "string"
+          },
+          "fields": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "from_tick": {
+            "type": "integer"
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "to_tick": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "list_notes",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Resolve import-quality findings as one undo step. Args: codes? (array of diagnostic codes; omitted = fix all). Returns resolved/failed counts. overlapping-noteon is reported but never auto-resolved — ambiguous performance data is preserved.",
+      "input_schema": {
+        "properties": {
+          "codes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "name": "normalize",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Snap note onsets to a grid (duration preserved). Args: track? (all when omitted), from?, to?, grid? (ticks, default ppq/4 metrical / one frame SMPTE), strength? (0-100, default 100). Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "from": {
+            "type": "integer"
+          },
+          "grid": {
+            "type": "integer"
+          },
+          "strength": {
+            "type": "integer"
+          },
+          "to": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "quantize",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Raw SMF events (id, tick, seq, kind, raw_hex) in chronological (tick, seq, track, id) order. Args: track?, from_tick?, to_tick?, limit? (default 500, max 10000), cursor?, fields? (omit e.g. raw_hex to slim rows), offset? (legacy). Returns events + next_cursor + revision.",
+      "input_schema": {
+        "properties": {
+          "cursor": {
+            "type": "string"
+          },
+          "fields": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "from_tick": {
+            "type": "integer"
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "offset": {
+            "type": "integer"
+          },
+          "to_tick": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "query_events",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Replay the last undone transaction",
+      "input_schema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "redo",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Delete events by id (lane/event-list deletes). Args: ids: [event-id]. Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "ids": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "name": "remove_events",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Delete one meta event by id. Args: track, id. Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "remove_meta",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Remove a track entirely. Args: track. Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "remove_track",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Discard the open transaction. The committed document is left exactly as it was at begin_transaction (byte-for-byte) — staged ops never touched it.",
+      "input_schema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "rollback_transaction",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Serialize the document to SMF and write it. Args: path? (defaults to the document's open path; an explicit path must be under the document's directory — or MIDI_MCP_ALLOWED_ROOTS / MIDI_MCP_STDIO_ALLOWED_ROOTS)",
+      "input_schema": {
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "save",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Multiply note velocities. Args: track?, from?, to?, factor (e.g. 1.2 = +20%). Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "factor": {
+            "type": "number"
+          },
+          "from": {
+            "type": "integer"
+          },
+          "to": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "scale_velocity",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Insert controller events. Args: track, channel? (default track channel), points: [{tick, cc, value}] — or scalar {tick, cc, value}. Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "cc": {
+            "type": "integer"
+          },
+          "channel": {
+            "type": "integer"
+          },
+          "points": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "tick": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          },
+          "value": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "set_cc",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Retarget all channel events in range to one channel. Args: track, from?, to?, channel (1-16). Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "channel": {
+            "type": "integer"
+          },
+          "from": {
+            "type": "integer"
+          },
+          "to": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "set_channel",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Insert channel-pressure (aftertouch 0xD0) events. Args: track, channel? (default track channel), points: [{tick, value}] — or scalar {tick, value}. Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "channel": {
+            "type": "integer"
+          },
+          "points": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "tick": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          },
+          "value": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "set_channel_pressure",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Set the song key signature (FF59). Args: sf (-7..7, negative = flats), mi (0 major / 1 minor), tick? (0). Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "mi": {
+            "type": "integer"
+          },
+          "sf": {
+            "type": "integer"
+          },
+          "tick": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "set_key_signature",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Set every note starting in range to exactly `ticks` long. Args: track?, from?, to?, ticks (required). Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "from": {
+            "type": "integer"
+          },
+          "ticks": {
+            "type": "integer"
+          },
+          "to": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "set_length",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Create/update a text meta (0x01-0x0F: text, copyright, track/instrument name, lyric, marker, cue). Args: track? (0), tick, meta_type (1-15), text, id? (event id to overwrite), enc? (utf8|sjis|latin1, default utf8). Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "enc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "meta_type": {
+            "type": "integer"
+          },
+          "text": {
+            "type": "string"
+          },
+          "tick": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "set_meta",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Insert a pitch-bend event. Args: track, tick, value (0..16383, 8192=center), channel?. Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "channel": {
+            "type": "integer"
+          },
+          "tick": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          },
+          "value": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "set_pitch_bend",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Insert polyphonic key-pressure (aftertouch 0xA0) events. Args: track, channel? (default track channel), key? (default 60), points: [{tick, key, value}] — or scalar {tick, key, value}. Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "channel": {
+            "type": "integer"
+          },
+          "key": {
+            "type": "integer"
+          },
+          "points": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "tick": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          },
+          "value": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "set_poly_pressure",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Program change (with optional bank CC0/CC32) on a track. Args: track, tick, program (0-127), channel? (default track channel), bank_msb?, bank_lsb?. Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "bank_lsb": {
+            "type": "integer"
+          },
+          "bank_msb": {
+            "type": "integer"
+          },
+          "base_revision": {
+            "type": "integer"
+          },
+          "channel": {
+            "type": "integer"
+          },
+          "program": {
+            "type": "integer"
+          },
+          "tick": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "set_program",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Set note-OFF (release) velocities. Args: track?, from?, to?, vel (0-127). vel>0 upgrades NoteOn-vel0 offs to real 0x80 note-offs; vel=0 keeps the stored form. Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "from": {
+            "type": "integer"
+          },
+          "to": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          },
+          "vel": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "set_release_velocity",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Write a full RPN/NRPN sequence in valid order (selector MSB, selector LSB, data MSB, optional data LSB). Args: track, tick, kind? (\"rpn\"|\"nrpn\", default rpn), param_msb, param_lsb (0x7F/0x7F = null reset, no data written), data_msb, data_lsb?, channel?. Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "channel": {
+            "type": "integer"
+          },
+          "data_lsb": {
+            "type": "integer"
+          },
+          "data_msb": {
+            "type": "integer"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "param_lsb": {
+            "type": "integer"
+          },
+          "param_msb": {
+            "type": "integer"
+          },
+          "tick": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "set_rpn",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Set/replace tempo at a tick. Args: tick, bpm, track? (default 0 = conductor; for format-2 files pass the sequence's track). Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "bpm": {
+            "type": "number"
+          },
+          "tick": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "set_tempo",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Set/replace time signature at a tick. Args: tick, num (beats/bar), den (beat value 4=quarter,8=eighth), track? (default 0; pass the sequence's track for format-2). Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "den": {
+            "type": "integer"
+          },
+          "num": {
+            "type": "integer"
+          },
+          "tick": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "set_time_signature",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Set the track's default channel (FF20 meta). Args: track, channel (1-16). Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "channel": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "set_track_channel",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Route a track to an output. Args: track, destination: {\"midi_port\":\"<name>\"} | {\"vst3\":\"<bundle path>\"} | \"default\" (inherit). Unknown destinations are remembered and fail at play time.",
+      "input_schema": {
+        "properties": {
+          "destination": {},
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "set_track_destination",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Set track name (UTF-8 meta 0x03). Args: track, name. Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "set_track_name",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Split every note spanning `at` into two at that tick. Args: track?, from?, to? (scope = notes starting in range), at (tick, required). Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "at": {
+            "type": "integer"
+          },
+          "base_revision": {
+            "type": "integer"
+          },
+          "from": {
+            "type": "integer"
+          },
+          "to": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "split",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Swing: shift notes landing on odd `grid` cells later by `amount`% of a cell. Args: track?, from?, to?, grid (ticks, required), amount 0-100, dry_run? (preview summary without applying). Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "amount": {
+            "type": "integer"
+          },
+          "base_revision": {
+            "type": "integer"
+          },
+          "dry_run": {
+            "type": "boolean"
+          },
+          "from": {
+            "type": "integer"
+          },
+          "grid": {
+            "type": "integer"
+          },
+          "to": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "swing",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Bounded log of committed transactions (cap 64, newest first): {revision, base_revision, label, origin (gui|mcp), kind (commit|undo|redo), summary}. Args: limit? (default 20).",
+      "input_schema": {
+        "properties": {
+          "limit": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "transaction_history",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Open-transaction state: label, base/staged revisions, staged op count, age and time until auto-rollback.",
+      "input_schema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "transaction_status",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Ask the GUI transport: {action: \"play\"|\"stop\"|\"seek\", tick?}. Only works while the app is running.",
+      "input_schema": {
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "tick": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "transport",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Shift note pitch. Args: track?, from?, to?, semitones (+/-). Notes leaving 0..127 are skipped. Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "from": {
+            "type": "integer"
+          },
+          "semitones": {
+            "type": "integer"
+          },
+          "to": {
+            "type": "integer"
+          },
+          "track": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "transpose",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Revert the last transaction (shared with GUI edits)",
+      "input_schema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "undo",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Retarget an existing RPN/NRPN entry to a new parameter number (selectors rewritten, data preserved). Args: id, param_msb, param_lsb. Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "param_lsb": {
+            "type": "integer"
+          },
+          "param_msb": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "update_rpn_param",
+      "version": 1
+    },
+    {
+      "deprecated": null,
+      "description": "Rewrite the data-entry of an existing RPN/NRPN entry (selector order preserved). Args: id (any event id from get_rpn ids), data_msb, data_lsb? (omit = 7-bit, drops the LSB event). Optional base_revision.",
+      "input_schema": {
+        "properties": {
+          "base_revision": {
+            "type": "integer"
+          },
+          "data_lsb": {
+            "type": "integer"
+          },
+          "data_msb": {
+            "type": "integer"
+          },
+          "id": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "update_rpn_value",
+      "version": 1
+    }
+  ]
+}

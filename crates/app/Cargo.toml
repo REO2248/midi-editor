@@ -1,7 +1,9 @@
 [package]
 name = "midi-editor"
 edition.workspace = true
+version.workspace = true
 license.workspace = true
+authors = ["REO2248"]
 description = "Pure-SMF MIDI editor — gpui app"
 
 [dependencies]
@@ -12,15 +14,25 @@ commands.workspace = true
 midi-io.workspace = true
 output.workspace = true
 mcp-server.workspace = true
+persist.workspace = true
 vst3-host.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 bytes.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+tracing-appender.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
 
+[dev-dependencies]
+# turns `TestSupportExt::test_support()` on: elements opted in via
+# `.test_support()` expose role/label/state snapshots in test windows.
+gpui-kit = { workspace = true, features = ["test-support"] }
+
+[build-dependencies]
+# embeds icon + VERSIONINFO into midi-editor.exe (Windows only)
+embed-resource = "3"
 [[bin]]
 name = "midi-editor"
 path = "src/main.rs"

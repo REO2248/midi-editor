@@ -1,0 +1,67 @@
+# Dependency policy for the midi-editor workspace — enforced by `cargo deny check` in CI.
+#
+# Exceptions below must carry a rationale and a review note. Review at each
+# release cut or whenever the lockfile dependency set changes materially;
+# remove entries that are no longer needed rather than letting them ossify.
+
+[advisories]
+# RustSec advisory database (default URL kept explicit so a mirror can be
+# swapped in one place). Vulnerabilities and unsound crates fail the check;
+# yanked crates warn only — a yank alone does not force a lockfile update.
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "warn"
+# Documented exceptions — all are `unmaintained` notices (not vulnerabilities)
+# on transitive deps of the gpui UI stack. No safe upgrade exists until gpui
+# itself migrates; they are re-reviewed each release (see file header).
+ignore = [
+    # instant 0.1.13 via gpui-base / notify-types — no safe upgrade available.
+    "RUSTSEC-2024-0384",
+    # paste 1.0.15 via gpui-component / metal / pulp — archived upstream.
+    "RUSTSEC-2024-0436",
+    # rustls-pemfile 2.2.0 via gpui-pre-reqwest — needs a reqwest update.
+    "RUSTSEC-2025-0134",
+    # ttf-parser 0.25.1 via fontdb/cosmic-text/usvg in the gpui font stack.
+    "RUSTSEC-2026-0192",
+    # rustybuzz 0.20.1 via usvg in the gpui font stack.
+    "RUSTSEC-2026-0206",
+]
+
+[licenses]
+# The workspace ships `MIT OR Apache-2.0`; dependencies are restricted to
+# permissive licenses compatible with that (no copyleft in the dependency
+# tree). Add a license only with a documented rationale comment.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "0BSD",            # enum-iterator/-derive (gpui-component) — OSI-approved public domain equivalent
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "bzip2-1.0.6",     # libbz2-rs-sys (gpui-pre-http-client) — permissive BSD-style
+    "CC0-1.0",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",       # midly — direct dep of smf-core, public domain
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Duplicate crate versions warn rather than fail: the tree is shared with a
+# large UI stack (gpui) where upstream deps legitimately pin different semver
+# ranges. A warning still surfaces in CI logs for review.
+multiple-versions = "warn"
+# Registry `version = "*"` deps warn rather than fail: the workspace's own
+# crates are path deps with no version constraint, which this check also
+# counts, and gpui's dep tree contains wildcard entries we cannot fix here.
+# Warnings still surface in CI logs for review.
+wildcards = "warn"
+highlight = "all"
+
+[sources]
+# crates.io is the only permitted registry; no unknown git or registry sources.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

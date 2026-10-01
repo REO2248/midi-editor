@@ -14,7 +14,21 @@ Japanese is supported through the same i18n table.
 - `crates/midi-io`: MIDI ports, playback scheduling, and recording.
 - `crates/output`: VST3 discovery, isolated playback host, and audio output.
 - `crates/app`: GPUI editor; rendering is in `render.rs`, strings in `i18n.rs`.
-- `crates/mcp-server`: MCP reads, edits, transport, and stdio bridge.
+- `crates/mcp-server`: MCP reads, edits, transport, and stdio bridge. The
+  tool surface is contract-versioned: `editor_info` reports
+  `MCP_SURFACE_VERSION` plus per-tool `version`/`deprecated` metadata, and
+  `tests/schema_snapshot.json` fails CI on any surface diff. On an
+  intentional schema change bump the tool's `version` (and
+  `MCP_SURFACE_VERSION` when breaking), then regenerate the snapshot with
+  `MCP_UPDATE_SCHEMA_SNAPSHOT=1 cargo test -p mcp-server --test schema_snapshot`.
+  `begin_transaction`/`commit_transaction`/`rollback_transaction` stage edits
+  on a private document clone; reads inside a batch see the staged copy via
+  `Shared::view()`, and `Shared::apply_or_stage` routes every edit tool.
+  `Shared::history`/`last_mcp_tx` record every committed transaction for
+  `transaction_history`/`changes_since_revision` and the GUI status line.
+  `list_notes`/`query_events`/`get_meta`/`get_cc` paginate via
+  `{revision}.key…` cursors (see `cursor_arg`) — a cursor minted at another
+  revision is a `stale_cursor` error, never a wrong page.
 
 ## Invariants
 
