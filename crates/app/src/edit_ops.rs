@@ -72,7 +72,8 @@ pub(crate) enum PropTarget {
 pub(crate) fn prop_field_label(f: PropField, ev: Option<&DocEvent>) -> SharedString {
     let key = match f {
         PropField::Tick => "prop.tick",
-        PropField::Channel | PropField::NoteChannel | PropField::TrackChannel => "prop.channel",
+        PropField::Channel | PropField::NoteChannel => "prop.channel",
+        PropField::TrackChannel => "prop.chan_prefix",
         PropField::MetaType => "prop.meta_type",
         PropField::HexData => "prop.hex_data",
         PropField::NoteStart => "prop.start",
@@ -311,6 +312,19 @@ pub(crate) fn edit_event_field(
         Some(e) => e.clone(),
         None => return Err(format!("event not found: track {ti} index {ei}")),
     };
+    // End-of-Track is the structural terminator: only its position is
+    // user-editable (an intentional silent tail). The document keeps it
+    // last; kind/payload edits would corrupt the structure.
+    if matches!(
+        ev.kind,
+        EventKind::Meta {
+            meta_type: 0x2F,
+            ..
+        }
+    ) && field != PropField::Tick
+    {
+        return Err("End-of-Track is structural — only its tick may be edited".into());
+    }
     let mk = |after: DocEvent| {
         vec![Op::UpdateEvent {
             track: ti,
@@ -699,7 +713,7 @@ impl EditorView {
             });
             rows.push(PropRow {
                 field: Some(PropField::TrackChannel),
-                label: t("prop.channel").into(),
+                label: t("prop.chan_prefix").into(),
                 value: (tr.out_channel + 1).to_string(),
                 warn: false,
             });
@@ -784,34 +798,56 @@ impl EditorView {
     }
 
     /// Run a semantic region transform (`Document` *_ops generator) on the
-    /// selection's range — or the whole selected track when nothing is
-    /// selected. The same generators power the MCP tools, so GUI and AI edits
+    /// selection's range. With no selection this is a no-op — selection-
+    /// scoped commands never silently retarget the whole track (#131); the
+    /// explicit whole-track path is `apply_track_op`.
+    /// The same generators power the MCP tools, so GUI and AI edits
     /// share semantics and undo.
     pub(crate) fn apply_region_op(
         &mut self,
         label: &str,
         f: impl Fn(&mut Document, usize, u64, u64) -> Vec<Op>,
     ) {
-        let (tracks, from, to) = if self.selection.is_empty() {
-            (vec![self.sel_track], 0, u64::MAX)
-        } else {
-            let mut tracks = BTreeSet::new();
-            let (mut lo, mut hi) = (u64::MAX, 0u64);
-            for n in self.notes.iter() {
-                if self.selection.contains(&n.on_id) {
-                    tracks.insert(n.track);
-                    lo = lo.min(n.start_tick);
-                    hi = hi.max(n.end_tick.unwrap_or(n.start_tick));
-                }
+        if self.selection.is_empty() {
+            self.status = t("status.nosel").into();
+            return;
+        }
+        let mut tracks = BTreeSet::new();
+        let (mut lo, mut hi) = (u64::MAX, 0u64);
+        for n in self.notes.iter() {
+            if self.selection.contains(&n.on_id) {
+                tracks.insert(n.track);
+                lo = lo.min(n.start_tick);
+                hi = hi.max(n.end_tick.unwrap_or(n.start_tick));
             }
-            (tracks.into_iter().collect::<Vec<_>>(), lo, hi + 1)
-        };
+        }
+        let (tracks, from, to) = (tracks.into_iter().collect::<Vec<_>>(), lo, hi + 1);
         let ops = {
             let mut sh = lock_shared(&self.shared);
             tracks
                 .into_iter()
                 .flat_map(|t| f(&mut sh.doc, t, from, to))
                 .collect::<Vec<_>>()
+        };
+        if ops.is_empty() {
+            self.status = format!("{label}: nothing to change").into();
+        } else {
+            self.apply_tx(label, ops);
+            self.status = label.to_string().into();
+        }
+    }
+
+    /// Explicit whole-track transform — the "Apply to Entire Track" menu.
+    /// Equivalent to Select-All-then-transform, but names its scope so a
+    /// user who means "the whole track" doesn't have to select anything.
+    pub(crate) fn apply_track_op(
+        &mut self,
+        label: &str,
+        f: impl Fn(&mut Document, usize, u64, u64) -> Vec<Op>,
+    ) {
+        let ops = {
+            let mut sh = lock_shared(&self.shared);
+            f(&mut sh.doc, self.sel_track, 0, u64::MAX)
         };
         if ops.is_empty() {
             self.status = format!("{label}: nothing to change").into();
@@ -882,7 +918,7 @@ impl EditorView {
                     EventKind::Meta {
                         meta_type: 0x58,
                         data,
-                    } if data.len() >= 2 => Some((data[0], 1u8 << data[1])),
+                    } if data.len() >= 2 => Some((data[0], (1u32 << data[1].min(15)) as u8)),
                     _ => None,
                 })
             })
@@ -905,10 +941,16 @@ impl EditorView {
     }
 
     pub(crate) fn insert_note_len(&mut self, tick: u64, key: u8, len: u64, cx: &mut Context<Self>) {
-        let (on_id, off_id, track) = {
+        let (on_id, off_id, track, ch) = {
             let mut sh = lock_shared(&self.shared);
             let track = self.sel_track.min(sh.doc.tracks.len().saturating_sub(1));
-            (sh.doc.alloc_event_id(), sh.doc.alloc_event_id(), track)
+            let prefix = sh.doc.tracks.get(track).map(|t| t.out_channel).unwrap_or(0);
+            (
+                sh.doc.alloc_event_id(),
+                sh.doc.alloc_event_id(),
+                track,
+                self.edit_channel_of(track, prefix),
+            )
         };
         let tick = self.snap_down(tick as i64).max(0) as u64;
         let on = DocEvent {
@@ -917,7 +959,7 @@ impl EditorView {
             seq: u32::MAX / 2,
             raw_body: None,
             kind: EventKind::Channel {
-                status: 0x90,
+                status: 0x90 | ch,
                 data: [key, 100],
                 len: 2,
             },
@@ -928,7 +970,7 @@ impl EditorView {
             seq: u32::MAX / 2,
             raw_body: None,
             kind: EventKind::Channel {
-                status: 0x80,
+                status: 0x80 | ch,
                 data: [key, 0],
                 len: 2,
             },
@@ -1701,7 +1743,7 @@ impl EditorView {
                 let cfg = self.lanes.get(d.lane).copied().unwrap_or_default();
                 let lane_mode = cfg.mode;
                 if d.on_id == 0 {
-                    let ch = track_events.out_channel & 0x0F;
+                    let ch = self.edit_channel_of(d.track, track_events.out_channel);
                     let (status, data, len) = match lane_mode {
                         LaneMode::CC(cc) => (0xB0 | ch, [cc, d.dkey.clamp(0, 127) as u8], 2u8),
                         LaneMode::PitchBend => {

@@ -209,6 +209,7 @@ fn dump(window: &Window, v: &EditorView) -> String {
             Sub::Scale => "Scale",
             Sub::LegatoGap => "LegatoGap",
             Sub::Swing => "Swing",
+            Sub::AllTrack => "AllTrack",
             Sub::Meta => "Meta",
         })
         .unwrap_or("-");
@@ -604,6 +605,47 @@ fn lane_chip_cycles_modes(cx: &mut TestAppContext) {
         assert_eq!(view.read(cx).lane_mode(), LaneMode::Velocity);
         w.click("st-lane", cx);
         assert_eq!(view.read(cx).lane_mode(), LaneMode::CC(1));
+    })
+    .unwrap();
+}
+
+/// #131: a selection-scoped transform with an empty selection must not
+/// touch the document; the explicit whole-track op still works.
+#[gpui_kit::test]
+fn region_op_requires_selection(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, fixture_doc());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        view.update(cx, |v, _| {
+            let rev0 = crate::lock_shared(&v.shared).doc.revision();
+            v.selection.clear();
+            v.apply_region_op("transpose", |d, t, f, to| d.transpose_ops(t, f, to, 1));
+            assert_eq!(
+                crate::lock_shared(&v.shared).doc.revision(),
+                rev0,
+                "empty-selection transpose mutated the document"
+            );
+            assert!(!v.status.is_empty(), "no-selection op gave no status");
+            // single-note selection → applies to its track/range only
+            let on_id = v
+                .notes
+                .iter()
+                .find(|n| n.track == 1)
+                .expect("fixture track-1 note")
+                .on_id;
+            v.selection.insert(on_id);
+            v.apply_region_op("transpose", |d, t, f, to| d.transpose_ops(t, f, to, 1));
+            let rev1 = crate::lock_shared(&v.shared).doc.revision();
+            assert!(rev1 > rev0, "selected-note transpose did nothing");
+            // explicit whole-track path works regardless of selection
+            v.selection.clear();
+            v.apply_track_op("transpose", |d, t, f, to| d.transpose_ops(t, f, to, -1));
+            assert!(
+                crate::lock_shared(&v.shared).doc.revision() > rev1,
+                "whole-track op did nothing"
+            );
+        });
     })
     .unwrap();
 }
