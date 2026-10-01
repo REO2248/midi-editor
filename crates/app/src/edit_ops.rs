@@ -118,6 +118,51 @@ pub(crate) fn hex_of(data: &[u8]) -> String {
         .join(" ")
 }
 
+/// Tempo event (0x51) at an exact tick — (id, bpm) when one exists (#133).
+pub(crate) fn tempo_event_at(d: &Document, track: usize, tick: u64) -> Option<(EventId, f64)> {
+    d.tracks
+        .get(track)?
+        .events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::Meta {
+                meta_type: 0x51,
+                data,
+            } if e.tick == tick && data.len() >= 3 => {
+                let mpq = ((data[0] as u32) << 16) | ((data[1] as u32) << 8) | data[2] as u32;
+                Some((e.id, 60_000_000.0 / mpq.max(1) as f64))
+            }
+            _ => None,
+        })
+}
+
+/// Signature event (0x58) at an exact tick — (id, numerator, denominator).
+pub(crate) fn sig_event_at(d: &Document, track: usize, tick: u64) -> Option<(EventId, u8, u8)> {
+    d.tracks
+        .get(track)?
+        .events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::Meta {
+                meta_type: 0x58,
+                data,
+            } if e.tick == tick && data.len() >= 2 => Some((e.id, data[0], 1u8 << data[1].min(7))),
+            _ => None,
+        })
+}
+
+/// BPM in force at `tick` — the last tempo point at or before it (SMF
+/// default 120 when the track carries none).
+pub(crate) fn tempo_bpm_at(d: &Document, track: usize, tick: u64) -> f64 {
+    d.tempo_map_for(track)
+        .points()
+        .iter()
+        .rev()
+        .find(|(t, _, _)| *t <= tick)
+        .map(|(_, mpq, _)| 60_000_000.0 / *mpq as f64)
+        .unwrap_or(120.0)
+}
+
 /// Per-kind inspector rows for one event. Editable rows carry `Some(field)`;
 /// `warn` flags byte-level edits (malformed bytes can corrupt the event).
 pub(crate) fn event_prop_rows(e: &DocEvent) -> Vec<PropRow> {
@@ -890,48 +935,82 @@ impl EditorView {
         cx.notify();
     }
 
-    /// Set the tick-0 tempo to current bpm + delta (via the shared op layer).
+    /// Nudge the tempo at the playhead — bumps the point in force there
+    /// (writing a new tempo event at the playhead tick when none exists),
+    /// never silently rewriting tick 0 (#133).
     pub(crate) fn bump_tempo(&mut self, delta: f64) {
         let tr = self.tempo_track();
-        let cur = self.doc(|d| {
-            d.tempo_map_for(tr)
-                .points()
-                .first()
-                .map(|(_, mpq, _)| 60_000_000.0 / *mpq as f64)
-                .unwrap_or(120.0)
-        });
+        let tick = self.doc(|d| d.tempo_map.us_to_tick(self.play_us));
+        let cur = self.doc(|d| tempo_bpm_at(d, tr, tick));
         let ops = {
             let mut sh = lock_shared(&self.shared);
             sh.doc
-                .set_tempo_ops(tr, 0, (cur + delta).clamp(10.0, 400.0))
+                .set_tempo_ops(tr, tick, (cur + delta).clamp(10.0, 400.0))
         };
         self.apply_tx("set tempo", ops);
     }
 
-    /// Cycle the tick-0 time signature through common meters.
+    /// Cycle the signature in force at the playhead through common meters —
+    /// writes at the playhead tick, preserving the stored cc/bb bytes on an
+    /// existing event (#133).
     pub(crate) fn cycle_time_sig(&mut self) {
         const SIGS: [(u8, u8); 6] = [(4, 4), (3, 4), (2, 4), (5, 4), (6, 8), (7, 8)];
         let tr = self.tempo_track();
+        let tick = self.doc(|d| d.tempo_map.us_to_tick(self.play_us));
         let cur = self.doc(|d| {
-            d.tracks.get(tr).and_then(|t| {
-                t.events.iter().find_map(|e| match &e.kind {
-                    EventKind::Meta {
-                        meta_type: 0x58,
-                        data,
-                    } if data.len() >= 2 => Some((data[0], (1u32 << data[1].min(15)) as u8)),
-                    _ => None,
-                })
-            })
+            let m = d.meter_map_for(tr).meter_at(tick);
+            (m.num, (1u32 << m.den_pow.min(15)) as u8)
         });
-        let next = match cur.and_then(|c| SIGS.iter().position(|s| *s == c)) {
+        let next = match SIGS.iter().position(|s| *s == cur) {
             Some(i) => SIGS[(i + 1) % SIGS.len()],
             None => SIGS[1],
         };
         let ops = {
             let mut sh = lock_shared(&self.shared);
-            sh.doc.set_time_sig_ops(tr, 0, next.0, next.1)
+            sh.doc.set_time_sig_ops(tr, tick, next.0, next.1)
         };
         self.apply_tx("set time signature", ops);
+    }
+
+    /// Tempo/signature edit dialog at the playhead tick — a matching event
+    /// there is edited in place; otherwise a new one is inserted prefilled
+    /// with the value in force (#133).
+    pub(crate) fn open_tempo_sig_edit(
+        &mut self,
+        meta_type: u8,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tr = self.tempo_track();
+        let tick = self.doc(|d| d.tempo_map.us_to_tick(self.play_us));
+        let id = self.doc(|d| match meta_type {
+            0x51 => tempo_event_at(d, tr, tick).map(|(id, _)| id),
+            0x58 => sig_event_at(d, tr, tick).map(|(id, _, _)| id),
+            _ => None,
+        });
+        self.open_meta_edit(tr, tick, meta_type, id.unwrap_or(0), window, cx);
+    }
+
+    /// Delete the tempo/signature event at the playhead tick (#133).
+    pub(crate) fn delete_tempo_sig(&mut self, meta_type: u8, cx: &mut Context<Self>) {
+        let tr = self.tempo_track();
+        let tick = self.doc(|d| d.tempo_map.us_to_tick(self.play_us));
+        let id = self.doc(|d| match meta_type {
+            0x51 => tempo_event_at(d, tr, tick).map(|(id, _)| id),
+            0x58 => sig_event_at(d, tr, tick).map(|(id, _, _)| id),
+            _ => None,
+        });
+        match id {
+            Some(id) => {
+                let ops = {
+                    let mut sh = lock_shared(&self.shared);
+                    sh.doc.remove_meta_ops(tr, id)
+                };
+                self.apply_tx("delete meta", ops);
+            }
+            None => self.status = t("status.meta_none").into(),
+        }
+        cx.notify();
     }
 
     #[allow(dead_code)]
@@ -1223,6 +1302,12 @@ impl EditorView {
                                 data[0] as i8,
                                 if data[1] == 1 { "minor" } else { "major" }
                             ))
+                        } else if meta_type == 0x51 && data.len() >= 3 {
+                            let mpq =
+                                ((data[0] as u32) << 16) | ((data[1] as u32) << 8) | data[2] as u32;
+                            Some(format!("{:.2}", 60_000_000.0 / mpq.max(1) as f64))
+                        } else if meta_type == 0x58 && data.len() >= 2 {
+                            Some(format!("{}/{}", data[0], 1u32 << data[1].min(7)))
                         } else {
                             Some(smf_core::decode_text(data, None))
                         }
@@ -1231,7 +1316,16 @@ impl EditorView {
                 })
                 .unwrap_or_default()
         } else {
-            String::new()
+            // a fresh tempo/signature event pre-fills the value in force at
+            // the insertion tick, not a blank or the tick-0 default (#133)
+            match meta_type {
+                0x51 => format!("{:.2}", tempo_bpm_at(&sh.doc, track, tick)),
+                0x58 => {
+                    let m = sh.doc.meter_map_for(track).meter_at(tick);
+                    format!("{}/{}", m.num, 1u32 << m.den_pow.min(7))
+                }
+                _ => String::new(),
+            }
         };
         drop(sh);
         self.meta_input.update(cx, |i, cx| {
@@ -1262,6 +1356,35 @@ impl EditorView {
                     None => {
                         self.meta_edit = Some(me);
                         self.status = t("status.keysig_parse").into();
+                        cx.notify();
+                        return;
+                    }
+                }
+            } else if me.meta_type == 0x51 {
+                // numeric BPM — writes the tempo map at the dialog's tick
+                match text.trim().parse::<f64>() {
+                    Ok(bpm) if (10.0..=400.0).contains(&bpm) => {
+                        sh.doc.set_tempo_ops(me.track, me.tick, bpm)
+                    }
+                    _ => {
+                        self.meta_edit = Some(me);
+                        self.status = t("status.tempo_parse").into();
+                        cx.notify();
+                        return;
+                    }
+                }
+            } else if me.meta_type == 0x58 {
+                // "n/d" — numerator and denominator value; cc/bb preserved
+                let parse = text.trim().split_once('/').and_then(|(n, d)| {
+                    Some((n.trim().parse::<u8>().ok()?, d.trim().parse::<u8>().ok()?))
+                });
+                match parse {
+                    Some((n, d)) if n >= 1 && d >= 1 => {
+                        sh.doc.set_time_sig_ops(me.track, me.tick, n, d)
+                    }
+                    _ => {
+                        self.meta_edit = Some(me);
+                        self.status = t("status.sig_parse").into();
                         cx.notify();
                         return;
                     }
@@ -1313,6 +1436,8 @@ impl EditorView {
             0x05 => "meta.lyric",
             0x06 => "meta.marker",
             0x07 => "meta.cue",
+            0x51 => "meta.tempo",
+            0x58 => "meta.timesig",
             0x59 => "meta.keysig",
             _ => "meta.text",
         }

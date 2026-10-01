@@ -895,7 +895,7 @@ impl EditorView {
             hd.probe,
             dests,
             mcp_auth,
-            self.count_in,
+            self.count_in_bars,
             self.midi_in,
         );
         let dir = diagnostics::app_data_dir().join("diagnostics");

@@ -750,6 +750,19 @@ pub static COMMANDS: &[Command] = &[
         v.persist();
         v.refresh_live_schedule();
     }),
+    // tempo / signature edits at the playhead (#133) — the dialog inserts a
+    // new event prefilled with the value in force, or edits the existing
+    // event at that tick; delete removes it
+    cmd!("tempo.edit", "tempo.edit", &[], None, |v, w, cx| v
+        .open_tempo_sig_edit(0x51, w, cx)),
+    cmd!("tempo.delete", "tempo.delete", &[], None, |v, _w, cx| {
+        v.delete_tempo_sig(0x51, cx)
+    }),
+    cmd!("sig.edit", "sig.edit", &[], None, |v, w, cx| v
+        .open_tempo_sig_edit(0x58, w, cx)),
+    cmd!("sig.delete", "sig.delete", &[], None, |v, _w, cx| {
+        v.delete_tempo_sig(0x58, cx)
+    }),
     cmd!("transport.met", "transport.met", &[], None, |v, _w, _cx| {
         {
             let mut sh = crate::lock_shared(&v.shared);
@@ -778,7 +791,9 @@ pub static COMMANDS: &[Command] = &[
         &[],
         None,
         |v, _w, _cx| {
-            v.count_in = !v.count_in;
+            const BARS: [u8; 4] = [0, 1, 2, 4];
+            let i = BARS.iter().position(|&b| b == v.count_in_bars).unwrap_or(0);
+            v.count_in_bars = BARS[(i + 1) % BARS.len()];
             v.save_global();
         }
     ),

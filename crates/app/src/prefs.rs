@@ -57,6 +57,10 @@ pub(crate) struct GlobalPrefs {
     /// sweep instead of notes-off only (#161)
     #[serde(default)]
     pub(crate) reset_on_stop: bool,
+    /// count-in length in bars: 0 = off, 1/2/4 = bars (#137). When absent,
+    /// the legacy `count_in` bool maps to 1/0 bars.
+    #[serde(default)]
+    pub(crate) count_in_bars: Option<u8>,
     /// return-to-start-on-stop (Cubase preference): a transport stop moves
     /// the play point back to where the pass began. None (older files) =
     /// on, the DAW-conventional default (#156).
@@ -83,6 +87,7 @@ impl Default for GlobalPrefs {
             keymap: HashMap::new(),
             reset_on_stop: false,
             return_to_start_on_stop: None,
+            count_in_bars: None,
         }
     }
 }
@@ -149,6 +154,9 @@ pub(crate) struct Prefs {
     pub(crate) soloed: Vec<usize>,
     #[serde(default)]
     pub(crate) metronome: bool,
+    /// explicit metronome click destination identity — None = follow the
+    /// document default destination (#137)
+    pub(crate) met_dest: Option<output::Destination>,
     #[serde(default)]
     pub(crate) loop_enabled: bool,
     /// explicit loop locators in ticks — None = unset (#130); absent in
@@ -207,6 +215,7 @@ impl Default for Prefs {
             muted: Vec::new(),
             soloed: Vec::new(),
             metronome: false,
+            met_dest: None,
             loop_enabled: false,
             loop_start: None,
             loop_end: None,
@@ -369,6 +378,7 @@ impl EditorView {
             .iter()
             .map(|(t, d)| (*t, self.resolve_dest(d)))
             .collect();
+        let met_dest = p.met_dest.as_ref().map(|d| self.resolve_dest(d));
         {
             let mut sh = lock_shared(&self.shared);
             for (t, d) in overrides {
@@ -377,6 +387,7 @@ impl EditorView {
             sh.muted = p.muted.into_iter().collect();
             sh.soloed = p.soloed.into_iter().collect();
             sh.metronome = p.metronome;
+            sh.met_dest = met_dest;
             sh.loop_enabled = p.loop_enabled;
             sh.loop_start = p.loop_start;
             sh.loop_end = p.loop_end;
@@ -524,9 +535,12 @@ impl EditorView {
         GlobalPrefs {
             version: <GlobalPrefs as persist::json::Versioned>::VERSION,
             recent: self.recent.iter().map(|r| r.to_string()).collect(),
-            count_in: self.count_in,
+            // legacy bool kept for older builds reading the same file —
+            // `count_in_bars` is authoritative (#137)
+            count_in: self.count_in_bars > 0,
             midi_in: self.midi_in.to_string(),
             in_latency_ms: self.in_latency_ms,
+            count_in_bars: Some(self.count_in_bars),
             audio_device: self.audio_sel.device.clone(),
             sample_rate: self.audio_sel.sample_rate,
             buffer_size: self.audio_sel.buffer_size,
@@ -559,6 +573,9 @@ impl EditorView {
             muted: sh.muted.iter().copied().collect(),
             soloed: sh.soloed.iter().copied().collect(),
             metronome: sh.metronome,
+            met_dest: sh
+                .met_dest
+                .and_then(|d| sh.dests.get(d).map(|(_, dest)| dest.clone())),
             loop_enabled: sh.loop_enabled,
             loop_start: sh.loop_start,
             loop_end: sh.loop_end,

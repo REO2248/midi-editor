@@ -122,6 +122,14 @@ pub(crate) struct LiveCtx {
     muted: HashSet<usize>,
     soloed: HashSet<usize>,
     metronome: bool,
+    /// explicit click destination index into `dests`; `None` follows the
+    /// document default destination (#137)
+    met_dest: Option<usize>,
+    /// document default destination index — metronome fallback target
+    default_dest: usize,
+    /// count-in lead-in µs for this pass — clicks always sound inside it
+    /// even when the metronome toggle is off (#137); 0 = no count-in
+    countin_us: u64,
     loop_enabled: bool,
     /// explicit loop locators in ticks (#130) — both  = unset
     loop_start: Option<u64>,
@@ -290,6 +298,11 @@ impl EditorView {
             muted: sh.muted.clone(),
             soloed: sh.soloed.clone(),
             metronome: sh.metronome,
+            met_dest: sh.met_dest,
+            default_dest: sh.default_dest,
+            // set only on the initial pass in start_playback — a mid-run
+            // refresh keeps click generation for the metronome only
+            countin_us: 0,
             loop_enabled: sh.loop_enabled,
             loop_start: sh.loop_start,
             loop_end: sh.loop_end,
@@ -317,11 +330,17 @@ impl EditorView {
     fn needed_dests(&self, ctx: &LiveCtx) -> BTreeSet<usize> {
         let audible = self.live_audible(ctx);
         let dest_of = |t: usize| ctx.dest_of_track.get(&t).copied().unwrap_or(0);
-        self.doc(|d| d.timeline_tagged())
+        let mut needed: BTreeSet<usize> = self
+            .doc(|d| d.timeline_tagged())
             .into_iter()
             .filter(|(_, tr, _)| audible(*tr))
             .map(|(_, tr, _)| dest_of(tr))
-            .collect()
+            .collect();
+        // the click destination gets a sink even when no track routes to it
+        if ctx.metronome || ctx.countin_us > 0 {
+            needed.insert(ctx.met_dest.unwrap_or(ctx.default_dest));
+        }
+        needed
     }
 
     /// Open one sink per needed destination. `loading` collects dest names
@@ -421,22 +440,23 @@ impl EditorView {
         let mut events: Vec<(u64, usize, Vec<u8>)> =
             route_events(self.doc(|d| d.timeline_sysex()), &audible, dest_of, sink_of);
         events.extend(route_events(tagged, &audible, dest_of, sink_of));
-        if ctx.metronome {
-            // prefer a plain MIDI port for clicks; fall back to any sink
-            let click_sink = ctx
-                .dests
-                .iter()
-                .enumerate()
-                .find(|(_, (_, d))| matches!(d, output::Destination::MidiPort { .. }))
-                .and_then(|(d, _)| sink_of.get(&d).copied())
-                .or_else(|| sink_of.values().next().copied());
+        if ctx.metronome || ctx.countin_us > 0 {
+            // explicit click destination (#137): the configured metronome
+            // output else the document default — never "first open port"
+            let click_d = ctx.met_dest.unwrap_or(ctx.default_dest);
+            let click_sink = sink_of.get(&click_d).copied();
             if let Some(s) = click_sink {
                 // clicks follow the FF58 map: one per `cc` clocks
                 // (24 = a quarter) with woodblock 76 on real bar lines —
-                // never a fake-PPQ beat or a hard-coded 4/4 accent.
+                // never a fake-PPQ beat or a hard-coded 4/4 accent. With
+                // the metronome off they cover only the count-in window.
                 let td = self.td();
                 let mm = self.doc(|d| d.meter_map_for(self.sel_track));
-                let end_us = events.iter().map(|e| e.0).max().unwrap_or(0);
+                let end_us = if ctx.metronome {
+                    events.iter().map(|e| e.0).max().unwrap_or(0)
+                } else {
+                    start_us + ctx.countin_us
+                };
                 let mut t = 0u64;
                 loop {
                     let us = self.doc(|d| d.tempo_map_for(self.sel_track).tick_to_us(t));
@@ -621,11 +641,14 @@ impl EditorView {
         self.sysex_stats.clear();
         // the point this pass began — Return-to-Start / stop-return anchor
         self.play_start_us = self.play_us;
-        let ctx = self.live_ctx();
+        let mut ctx = self.live_ctx();
         if ctx.dests.is_empty() {
             self.status = t("status.no_port").into();
             return;
         }
+        // record arm with a count-in: the pass carries the lead-in length so
+        // click generation covers it on the click destination (#137)
+        ctx.countin_us = self.rec.as_ref().map(|r| r.cin_us).unwrap_or(0);
         let needed = self.needed_dests(&ctx);
         let (sinks, sink_of, transport_of, loading) = self.open_sinks(&ctx, &needed);
         if !loading.is_empty() {

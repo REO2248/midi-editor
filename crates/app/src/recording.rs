@@ -16,13 +16,20 @@ impl EditorView {
         }
         let buf = std::sync::Arc::new(Mutex::new(Vec::new()));
         let buf2 = buf.clone();
-        // optional count-in: one real bar under the viewed track's FF58
-        // map for metrical, one displayed second for SMPTE
-        let cin_us = if self.count_in {
+        // optional count-in (#137): N real bars under the viewed track's
+        // FF58 map for metrical, N displayed seconds for SMPTE
+        let cin_us = if self.count_in_bars > 0 {
             self.doc(|d| {
                 let ticks = match d.time_display() {
-                    TimeDisplay::Metrical { .. } => d.meter_map_for(self.sel_track).bar_ticks_at(0),
-                    TimeDisplay::Smpte { .. } => self.td().bar_ticks(),
+                    TimeDisplay::Metrical { .. } => {
+                        let mm = d.meter_map_for(self.sel_track);
+                        let mut t = 0u64;
+                        for _ in 0..self.count_in_bars {
+                            t += mm.bar_ticks_at(t);
+                        }
+                        t
+                    }
+                    TimeDisplay::Smpte { .. } => self.td().bar_ticks() * self.count_in_bars as u64,
                 };
                 d.tempo_map_for(self.sel_track).tick_to_us(ticks)
             })

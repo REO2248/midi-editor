@@ -154,7 +154,12 @@ impl Render for EditorView {
         // rebuilt on edits only, never per animation frame
         let doc_ui = self.doc_ui.clone();
         let n_diags = doc_ui.n_diags;
-        let tempo0 = doc_ui.tempo0;
+        // tempo in force at the playhead on the conductor track (#133) —
+        // not the tick-0 tempo
+        let tempo0 = {
+            let tr = self.tempo_track();
+            self.doc(|d| crate::edit_ops::tempo_bpm_at(d, tr, d.tempo_map.us_to_tick(self.play_us)))
+        };
         // signature in force at the playhead on the viewed track — the
         // file's real FF58 map, not the first signature in the file
         let sig = self.doc(|d| {
@@ -2692,7 +2697,12 @@ impl Render for EditorView {
                     self.mi_cmd("loop.set_end", None, cx),
                     self.mi_cmd("loop.set_selection", None, cx),
                     self.mi_cmd("loop.clear", None, cx),
+                    self.mi_cmd("tempo.edit", None, cx),
+                    self.mi_cmd("tempo.delete", None, cx),
+                    self.mi_cmd("sig.edit", None, cx),
+                    self.mi_cmd("sig.delete", None, cx),
                     self.mi_cmd("transport.met", Some(met_en), cx),
+                    Self::mi_sub("tr.metdest", t("transport.met_dest"), Sub::MetDest, cx),
                     self.mi_cmd("transport.chase_sysex", Some(chsy_en), cx),
                     Self::mi(
                         "tr.sxp",
@@ -2807,7 +2817,7 @@ impl Render for EditorView {
                             v.quantize_last_take();
                         },
                     ),
-                    self.mi_cmd("transport.count_in", Some(self.count_in), cx),
+                    Self::mi_sub("tr.countin", t("transport.count_in"), Sub::CountIn, cx),
                     self.mi_cmd("transport.panic", None, cx),
                     self.mi_cmd("transport.reset_on_stop", Some(self.reset_on_stop), cx),
                     Self::msep(),
@@ -2904,6 +2914,35 @@ impl Render for EditorView {
                         has_track_dest,
                         cx,
                     ),
+                    Sub::MetDest => self.dest_rows(
+                        DestPick::Metronome,
+                        &dests,
+                        &port_present,
+                        eff_dest,
+                        def_dest,
+                        has_track_dest,
+                        cx,
+                    ),
+                    Sub::CountIn => [0u8, 1, 2, 4]
+                        .iter()
+                        .map(|&b| {
+                            let label: SharedString = match b {
+                                0 => t("countin.off").into(),
+                                _ => tf("countin.bars", &[("n", b.to_string().as_str())]).into(),
+                            };
+                            Self::mi_leaf(
+                                ("countin", b as usize),
+                                label,
+                                "",
+                                Some(self.count_in_bars == b),
+                                cx,
+                                move |v, _e, _cx| {
+                                    v.count_in_bars = b;
+                                    v.save_global();
+                                },
+                            )
+                        })
+                        .collect(),
                     Sub::InPort => {
                         let ports = midi_io::list_inputs().unwrap_or_default();
                         let mut rows: Vec<MenuRow> = vec![Self::mi_leaf(

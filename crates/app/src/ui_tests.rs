@@ -211,6 +211,8 @@ fn dump(window: &Window, v: &EditorView) -> String {
             Sub::Swing => "Swing",
             Sub::AllTrack => "AllTrack",
             Sub::Meta => "Meta",
+            Sub::MetDest => "MetDest",
+            Sub::CountIn => "CountIn",
         })
         .unwrap_or("-");
     let _ = writeln!(
@@ -681,6 +683,78 @@ fn note_drag_moves_note(cx: &mut TestAppContext) {
         });
         let after = after.expect("moved note missing from document");
         assert!(after > before, "drag did not move the note's start tick");
+    })
+    .unwrap();
+}
+
+// --- #133: playhead-aware tempo / signature controls ------------------------
+
+/// Tempo bump at the playhead writes a tempo event at the playhead tick and
+/// leaves the tick-0 tempo untouched.
+#[gpui_kit::test]
+fn tempo_bump_writes_at_playhead(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, fixture_doc());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        view.update(cx, |v, _cx| {
+            v.play_us = v.doc(|d| d.tempo_map.tick_to_us(480));
+            v.bump_tempo(1.0);
+            let sh = crate::lock_shared(&v.shared);
+            assert!(
+                crate::edit_ops::tempo_event_at(&sh.doc, 0, 480).is_some(),
+                "no tempo event written at the playhead tick"
+            );
+            assert!(
+                (crate::edit_ops::tempo_bpm_at(&sh.doc, 0, 0) - 120.0).abs() < 0.01,
+                "tick-0 tempo was rewritten"
+            );
+            let (_, bpm) = crate::edit_ops::tempo_event_at(&sh.doc, 0, 480).unwrap();
+            assert!((bpm - 121.0).abs() < 0.5);
+        });
+    })
+    .unwrap();
+}
+
+/// Signature cycle at the playhead inserts a signature event there without
+/// touching the file's tick-0 signature.
+#[gpui_kit::test]
+fn sig_cycle_writes_at_playhead(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, fixture_doc());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        view.update(cx, |v, _cx| {
+            v.play_us = v.doc(|d| d.tempo_map.tick_to_us(960));
+            v.cycle_time_sig();
+            let sh = crate::lock_shared(&v.shared);
+            let (_, num, den) = crate::edit_ops::sig_event_at(&sh.doc, 0, 960)
+                .expect("no signature event at the playhead tick");
+            assert_eq!((num, den), (3, 4));
+            // tick-0 4/4 is still in force before the playhead
+            let m = sh.doc.meter_map_for(0).meter_at(0);
+            assert_eq!((m.num, 1u32 << m.den_pow), (4, 4));
+        });
+    })
+    .unwrap();
+}
+
+/// `delete_tempo_sig` removes the event at the playhead tick; earlier events
+/// stay in force so the map falls back correctly.
+#[gpui_kit::test]
+fn tempo_delete_at_playhead(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, fixture_doc());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        view.update(cx, |v, cx| {
+            v.play_us = v.doc(|d| d.tempo_map.tick_to_us(480));
+            v.bump_tempo(1.0);
+            v.delete_tempo_sig(0x51, cx);
+            let sh = crate::lock_shared(&v.shared);
+            assert!(crate::edit_ops::tempo_event_at(&sh.doc, 0, 480).is_none());
+            assert!((crate::edit_ops::tempo_bpm_at(&sh.doc, 0, 480) - 120.0).abs() < 0.01);
+        });
     })
     .unwrap();
 }

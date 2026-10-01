@@ -205,12 +205,18 @@ enum Sub {
     /// Edit → apply a transform to the entire selected track (#131)
     AllTrack,
     Meta,
+    /// Transport → metronome click destination (#137)
+    MetDest,
+    /// Transport → count-in length
+    CountIn,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum DestPick {
     Track,
     Default,
+    /// metronome click destination (#137)
+    Metronome,
 }
 
 /// How the timeline tracks the playhead while the transport runs.
@@ -392,7 +398,6 @@ struct DocUi {
     n_diags: usize,
     track_names: Vec<String>,
     track_chs: Vec<u8>,
-    tempo0: f64,
     /// detected GM/GS/XG reset SysEx — a display hint for patch naming
     mode_hint: Option<smf_core::ModeHint>,
     /// last tick with a note — the scrollable extent of the timeline
@@ -428,12 +433,6 @@ impl DocUi {
             }
         }
         markers.sort_unstable();
-        let tempo0 = doc
-            .tempo_map_for(seq_sel.unwrap_or(0))
-            .points()
-            .first()
-            .map(|(_, mpq, _)| 60_000_000.0 / *mpq as f64)
-            .unwrap_or(120.0);
         let track_names = doc
             .tracks
             .iter()
@@ -451,7 +450,6 @@ impl DocUi {
             markers,
             track_names,
             track_chs,
-            tempo0,
             mode_hint: doc.synth_mode(),
             song_end: notes
                 .iter()
@@ -717,7 +715,7 @@ struct EditorView {
     /// editor keys (Del, arrows) keep working after commit
     meta_refocus: bool,
     /// one-bar count-in before MIDI recording starts (global pref)
-    count_in: bool,
+    count_in_bars: u8,
     /// reset-on-stop preference: full CC121/120 controller reset on
     /// transport stop — off means a normal stop only releases notes (#161)
     reset_on_stop: bool,
@@ -1139,7 +1137,12 @@ impl EditorView {
             meta_sel: None,
             meta_pending: None,
             meta_refocus: false,
-            count_in: g.count_in,
+            // legacy `count_in: true` migrates to 1 bar; explicit
+            // `count_in_bars` wins when present (#137)
+            count_in_bars: g
+                .count_in_bars
+                .unwrap_or(if g.count_in { 1 } else { 0 })
+                .min(4),
             reset_on_stop: g.reset_on_stop,
             recent: g.recent.iter().map(|p| p.as_str().into()).collect(),
             midi_in: g.midi_in.clone().into(),

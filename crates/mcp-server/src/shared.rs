@@ -29,6 +29,9 @@ pub struct Shared {
     pub muted: HashSet<usize>,
     pub soloed: HashSet<usize>,
     pub metronome: bool,
+    /// explicit metronome click destination — index into `dests`, `None` =
+    /// follow `default_dest`. Never auto-picks a port (#137).
+    pub met_dest: Option<usize>,
     pub loop_enabled: bool,
     /// explicit loop locators in ticks — `None` = unset (#130). `Some` +
     /// `loop_enabled` wraps playback at the right locator back to the left;
@@ -179,6 +182,7 @@ impl Shared {
             muted: HashSet::new(),
             soloed: HashSet::new(),
             metronome: false,
+            met_dest: None,
             loop_enabled: false,
             loop_start: None,
             loop_end: None,
