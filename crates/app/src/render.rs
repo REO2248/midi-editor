@@ -1181,9 +1181,14 @@ impl Render for EditorView {
                     .text_size(px(metrics::TEXT_MD))
                     .text_color(rgb(th.text_muted))
                     .child(format!(
-                        "{} ({}){}",
+                        "{} ({}){}{}",
                         t("events.header"),
                         self.events.len(),
+                        if self.ev_filter.is_active() {
+                            format!(" [{}]", t("events.filtered"))
+                        } else {
+                            String::new()
+                        },
                         self.doc_ui
                             .mode_hint
                             .map(|m| format!(" [{}]", m.label()))
@@ -2067,6 +2072,7 @@ impl Render for EditorView {
                     let scale_a11y = window.scale_factor();
                     let ppq = self.ppq();
                     let pos_a11y = self.doc(|d| d.position_format_for(self.sel_track));
+                    let mc_off = self.mc_off();
                     div()
                         .id("piano-roll")
                         .test_support()
@@ -2082,6 +2088,7 @@ impl Render for EditorView {
                         .a11y_synthetic_children(move |b| {
                             a11y::RollA11y {
                                 bounds: roll_bounds_a11y.get(),
+                                mc_off,
                                 scale: scale_a11y,
                                 scroll_x,
                                 scroll_y,
@@ -2131,7 +2138,10 @@ impl Render for EditorView {
                                             .top(px(y))
                                             .text_size(px(7.0))
                                             .text_color(rgb(theme::current().text_dim))
-                                            .child(format!("C{}", k as i32 / 12 - 1))
+                                            .child(format!(
+                                                "C{}",
+                                                k as i32 / 12 - 1 + self.mc_off() as i32
+                                            ))
                                     })
                                 }))
                                 .on_mouse_down(
@@ -2641,6 +2651,9 @@ impl Render for EditorView {
                 ],
                 TopMenu::View => vec![
                     self.mi_cmd("view.events", Some(self.show_events), cx),
+                    Self::mi_sub("v.evftype", t("view.ev_ftype"), Sub::EvFType, cx),
+                    Self::mi_sub("v.evfchan", t("view.ev_fchan"), Sub::EvFChan, cx),
+                    Self::mi_sub("v.midc", t("view.middle_c"), Sub::MidC, cx),
                     Self::mi_sub("v.theme", t("view.theme"), Sub::Theme, cx),
                     self.mi_cmd(
                         "view.hc",
@@ -3497,6 +3510,67 @@ impl Render for EditorView {
                         ));
                         rows
                     }
+                    Sub::EvFType => {
+                        let mut rows = vec![Self::mi_leaf(
+                            "evf.all",
+                            t("evf.all"),
+                            "",
+                            Some(self.ev_filter.kinds.is_empty()),
+                            cx,
+                            |v, _e, cx| {
+                                v.ev_filter.kinds.clear();
+                                cx.notify();
+                            },
+                        )];
+                        rows.extend(EvKind::ALL.iter().enumerate().map(|(i, &k)| {
+                            let on = self.ev_filter.kinds.is_empty()
+                                || self.ev_filter.kinds.contains(&k);
+                            Self::mi_leaf(
+                                ("evf", i),
+                                t(k.i18n()),
+                                "",
+                                Some(on),
+                                cx,
+                                move |v, _e, cx| v.toggle_ev_kind(k, cx),
+                            )
+                        }));
+                        rows
+                    }
+                    Sub::EvFChan => {
+                        let mut rows = vec![Self::mi_leaf(
+                            "evc.all",
+                            t("evf.all"),
+                            "",
+                            Some(self.ev_filter.chan.is_none()),
+                            cx,
+                            |v, _e, cx| v.set_ev_chan(None, cx),
+                        )];
+                        rows.extend((0u8..16).enumerate().map(|(i, c)| {
+                            Self::mi_leaf(
+                                ("evc", i),
+                                format!("ch {}", c + 1),
+                                "",
+                                Some(self.ev_filter.chan == Some(c)),
+                                cx,
+                                move |v, _e, cx| v.set_ev_chan(Some(c), cx),
+                            )
+                        }));
+                        rows
+                    }
+                    Sub::MidC => [3u8, 4, 5]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, mc)| {
+                            Self::mi_leaf(
+                                ("midc", i),
+                                format!("C{mc}"),
+                                "",
+                                Some(self.middle_c == mc),
+                                cx,
+                                move |v, _e, cx| v.set_middle_c(mc, cx),
+                            )
+                        })
+                        .collect(),
                     Sub::LenSet => {
                         // metrical: note fractions + a real bar at the
                         // edit cursor's position in the meter map; SMPTE:

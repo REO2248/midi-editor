@@ -148,6 +148,98 @@ struct EvRow {
     text: SharedString,
 }
 
+/// Event-list type buckets for the filter bar (#145). `Escape` system
+/// messages ride the SysEx bucket; EOT/meta all land under Meta.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum EvKind {
+    Note,
+    PolyAT,
+    ChanAT,
+    CC,
+    Prog,
+    Pitch,
+    SysEx,
+    Meta,
+}
+
+impl EvKind {
+    const ALL: [EvKind; 8] = [
+        EvKind::Note,
+        EvKind::PolyAT,
+        EvKind::ChanAT,
+        EvKind::CC,
+        EvKind::Prog,
+        EvKind::Pitch,
+        EvKind::SysEx,
+        EvKind::Meta,
+    ];
+
+    fn of(k: &EventKind) -> Self {
+        match k {
+            EventKind::Channel { status, .. } => match status & 0xF0 {
+                0x80 | 0x90 => EvKind::Note,
+                0xA0 => EvKind::PolyAT,
+                0xB0 => EvKind::CC,
+                0xC0 => EvKind::Prog,
+                0xD0 => EvKind::ChanAT,
+                _ => EvKind::Pitch,
+            },
+            EventKind::Meta { .. } => EvKind::Meta,
+            _ => EvKind::SysEx,
+        }
+    }
+
+    fn i18n(self) -> &'static str {
+        match self {
+            EvKind::Note => "evf.note",
+            EvKind::PolyAT => "evf.polyat",
+            EvKind::ChanAT => "evf.chanat",
+            EvKind::CC => "evf.cc",
+            EvKind::Prog => "evf.prog",
+            EvKind::Pitch => "evf.pitch",
+            EvKind::SysEx => "evf.sysex",
+            EvKind::Meta => "evf.meta",
+        }
+    }
+}
+
+/// Event list display filter (#145/#146): kind checkboxes plus a channel
+/// restriction. Kind filtering is exact; the channel filter only applies
+/// to channel-voice events (meta/SysEx have no channel).
+#[derive(Clone, Default, PartialEq)]
+struct EvFilter {
+    /// empty = every kind shown (all-checked is normalized back to empty)
+    kinds: BTreeSet<EvKind>,
+    /// None = all channels; Some(0-15) = channel-voice events on that ch
+    chan: Option<u8>,
+}
+
+impl EvFilter {
+    fn key(&self) -> u64 {
+        let mut bits = 0u64;
+        for k in &self.kinds {
+            bits |= 1 << (*k as u64);
+        }
+        (bits << 8) | self.chan.map(|c| c as u64 + 1).unwrap_or(0)
+    }
+
+    fn is_active(&self) -> bool {
+        !self.kinds.is_empty() || self.chan.is_some()
+    }
+
+    fn accepts(&self, e: &EventKind) -> bool {
+        if !self.kinds.is_empty() && !self.kinds.contains(&EvKind::of(e)) {
+            return false;
+        }
+        if let Some(c) = self.chan {
+            if let EventKind::Channel { status, .. } = e {
+                return status & 0x0F == c;
+            }
+        }
+        true
+    }
+}
+
 /// Menubar dropdown that is currently open.
 #[derive(Clone, Copy, PartialEq)]
 enum TopMenu {
@@ -215,6 +307,12 @@ enum Sub {
     NoteLen,
     /// Edit → new-note velocity picker (#153)
     InsVel,
+    /// View → event-list type filter (#145)
+    EvFType,
+    /// View → event-list channel filter (#146)
+    EvFChan,
+    /// View → middle-C octave naming (#164)
+    MidC,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -550,8 +648,12 @@ struct EditorView {
     doc_epoch: u64,
     notes_key: (u64, u64),
     notes: Arc<Vec<Note>>,
-    ev_key: (u64, u64, usize),
+    ev_key: (u64, u64, usize, u64),
     events: Arc<Vec<EvRow>>,
+    /// event-list type/channel display filter (#145/#146)
+    ev_filter: EvFilter,
+    /// middle-C octave naming preference 3/4/5 (#164) — display only
+    middle_c: u8,
     /// Document-derived UI data (markers, track names, diagnostics count…).
     /// Rebuilt only when the document key or encoding hint changes — render
     /// runs at animation-frame rate during playback and must not rescan
@@ -1101,7 +1203,9 @@ impl EditorView {
             doc_epoch: 0,
             notes_key: (u64::MAX, u64::MAX),
             notes: Arc::new(vec![]),
-            ev_key: (u64::MAX, u64::MAX, usize::MAX),
+            ev_key: (u64::MAX, u64::MAX, usize::MAX, u64::MAX),
+            ev_filter: EvFilter::default(),
+            middle_c: g.middle_c.unwrap_or(4).clamp(3, 5),
             events: Arc::new(vec![]),
             doc_ui: Arc::new(DocUi::default()),
             doc_ui_key: (u64::MAX, u64::MAX, usize::MAX),
@@ -1332,6 +1436,37 @@ impl EditorView {
         self.save_global();
     }
 
+    /// Octave-number shift for display labels (#164): middle-C 4 → 0.
+    pub(crate) fn mc_off(&self) -> i64 {
+        self.middle_c as i64 - 4
+    }
+
+    pub(crate) fn set_middle_c(&mut self, mc: u8, cx: &mut Context<Self>) {
+        self.middle_c = mc.clamp(3, 5);
+        self.save_global();
+        cx.notify();
+    }
+
+    /// Event-list kind toggle (#145): empty set = all kinds; filling all
+    /// eight collapses back to empty so the filter reads "All".
+    pub(crate) fn toggle_ev_kind(&mut self, k: EvKind, cx: &mut Context<Self>) {
+        let f = &mut self.ev_filter.kinds;
+        if f.is_empty() || !f.remove(&k) {
+            f.insert(k);
+        }
+        if self.ev_filter.kinds.len() == EvKind::ALL.len() {
+            self.ev_filter.kinds.clear();
+        }
+        cx.notify();
+    }
+
+    /// Event-list channel display filter (#146). Display only — the edit
+    /// channel stays the track's `edit_ch` from #129.
+    pub(crate) fn set_ev_chan(&mut self, c: Option<u8>, cx: &mut Context<Self>) {
+        self.ev_filter.chan = c.filter(|c| *c < 16);
+        cx.notify();
+    }
+
     pub(crate) fn on_sys_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let dark = matches!(
             window.appearance(),
@@ -1429,31 +1564,33 @@ impl EditorView {
         } else {
             usize::MAX
         };
-        let vkey = (key.0, key.1, seq_sel);
+        let vkey = (key.0, key.1, seq_sel, self.ev_filter.key());
         if self.ev_key != vkey {
             let (rows, refs) = self.build_event_rows(&sh.doc);
             self.events = Arc::new(rows);
             self.event_refs = Arc::new(refs);
-            // drop event-list selections that no longer exist
-            let ids: BTreeSet<EventId> = self
-                .event_refs
+            // drop event-list selections that left the document — a row
+            // hidden by the display filter keeps its selection (#145)
+            let ids: BTreeSet<EventId> = sh
+                .doc
+                .tracks
                 .iter()
-                .flatten()
-                .map(|&(_, _, id)| id)
+                .flat_map(|tr| tr.events.iter().map(|e| e.id))
                 .collect();
             self.sel_events.retain(|id| ids.contains(id));
             // the row count changes with edits — keep the selection valid
             self.ev_sel = self.ev_sel.min(self.events.len().saturating_sub(1));
             self.ev_key = vkey;
         }
-        if self.doc_ui_key != vkey || self.doc_ui_enc != self.enc_override {
+        let dkey = (vkey.0, vkey.1, vkey.2);
+        if self.doc_ui_key != dkey || self.doc_ui_enc != self.enc_override {
             self.doc_ui = Arc::new(DocUi::build(
                 &sh.doc,
                 &self.notes,
                 self.enc_override,
                 (seq_sel != usize::MAX).then_some(seq_sel),
             ));
-            self.doc_ui_key = vkey;
+            self.doc_ui_key = dkey;
             self.doc_ui_enc = self.enc_override;
         }
         // view-derived state: the visible row map (fold/drum), the key
@@ -1710,6 +1847,9 @@ impl EditorView {
                 continue; // a format-2 event list shows one sequence
             }
             for (ei, e) in tr.events.iter().enumerate() {
+                if !self.ev_filter.accepts(&e.kind) {
+                    continue;
+                }
                 // bar.beat.tick under the real FF58 map for metrical,
                 // hh:mm:ss.ff timecode for SMPTE — position labels
                 // always match the file's timing

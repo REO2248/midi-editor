@@ -448,7 +448,7 @@ impl EditorView {
 
     pub(crate) fn set_enc(&mut self, enc: Option<smf_core::TextEncoding>, cx: &mut Context<Self>) {
         self.enc_override = enc;
-        self.ev_key = (u64::MAX, u64::MAX, usize::MAX); // force event-row rebuild
+        self.ev_key = (u64::MAX, u64::MAX, usize::MAX, u64::MAX); // force event-row rebuild
         self.refresh_derived();
         self.persist();
         cx.notify();

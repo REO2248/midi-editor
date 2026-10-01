@@ -21,13 +21,19 @@ use std::sync::Arc;
 /// frame, so unbounded children would hurt the very users it helps.
 const MAX_NODES: usize = 600;
 
-/// Pitch name with octave: 60 -> "C4", 69 -> "A4".
+/// Pitch name with octave: 60 -> "C4", 69 -> "A4" (middle C = C4).
 pub(crate) fn note_name(key: i64) -> String {
+    note_name_mc(key, 0)
+}
+
+/// `off` shifts the printed octave — the middle-C preference (#164).
+/// Display only; the key number is untouched.
+pub(crate) fn note_name_mc(key: i64, off: i64) -> String {
     const NAMES: [&str; 12] = [
         "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
     ];
     let k = key.clamp(0, 127);
-    format!("{}{}", NAMES[(k % 12) as usize], k / 12 - 1)
+    format!("{}{}", NAMES[(k % 12) as usize], k / 12 - 1 + off)
 }
 
 /// `bar.beat.tick` (or SMPTE timecode) position text — the same
@@ -39,8 +45,14 @@ pub(crate) fn pos_label(tick: u64, pos: &PositionFormat) -> String {
 /// Accessible name for a piano-roll note, e.g.
 /// "C4 at 3.1.000, 2.0 beats, velocity 96, Piano". Duration stays in
 /// quarter-note beats — a length, not a position under the meter map.
-pub(crate) fn note_label(n: &Note, ppq: u64, pos: &PositionFormat, track_name: &str) -> String {
-    let key = note_name(n.key as i64);
+pub(crate) fn note_label(
+    n: &Note,
+    ppq: u64,
+    pos: &PositionFormat,
+    track_name: &str,
+    mc_off: i64,
+) -> String {
+    let key = note_name_mc(n.key as i64, mc_off);
     let pos = pos_label(n.start_tick, pos);
     let dur_ticks = (n.end_tick.unwrap_or(n.start_tick) as i64 - n.start_tick as i64).max(0);
     let dur = format!("{:.1}", dur_ticks as f64 / ppq.max(1) as f64);
@@ -108,6 +120,8 @@ pub(crate) struct RollA11y {
     pub track_names: Vec<String>,
     /// (mode, on_id, dtick, dkey) of an in-flight drag — positions move live
     pub drag: Option<(DragMode, EventId, i64, i32)>,
+    /// middle-C display offset (#164)
+    pub mc_off: i64,
     /// marquee corners (tick, key) while rubber-banding
     pub marquee: Option<(i64, i32, i64, i32)>,
     pub playhead_tick: u64,
@@ -215,7 +229,13 @@ impl RollA11y {
                 continue;
             }
             let mut node = Node::new(Role::ListBoxOption);
-            node.set_label(note_label(n, self.ppq, &self.pos, track_name(n.track)));
+            node.set_label(note_label(
+                n,
+                self.ppq,
+                &self.pos,
+                track_name(n.track),
+                self.mc_off,
+            ));
             node.set_selected(self.selection.contains(&n.on_id));
             node.set_bounds(rect(x, y + 1.0, wpx, NOTE_H - 2.0, scale));
             node.set_position_in_set(i + 1);
@@ -233,7 +253,13 @@ impl RollA11y {
                     scale,
                 );
                 let mut gnode = Node::new(Role::ListBoxOption);
-                gnode.set_label(note_label(n, self.ppq, &self.pos, track_name(n.track)));
+                gnode.set_label(note_label(
+                    n,
+                    self.ppq,
+                    &self.pos,
+                    track_name(n.track),
+                    self.mc_off,
+                ));
                 gnode.set_selected(true);
                 gnode.set_bounds(grect);
                 b.push_child(b.synthetic_node_id(("ghost", n.on_id)), gnode);
@@ -259,6 +285,8 @@ pub(crate) struct LaneA11y {
     pub sel_track: usize,
     pub track_names: Vec<String>,
     pub drag: Option<(DragMode, EventId, i64, i32)>,
+    /// middle-C display offset (#164)
+    pub mc_off: i64,
 }
 
 impl LaneA11y {
@@ -308,7 +336,7 @@ impl LaneA11y {
                     let label = tf(
                         "a11y.vel_pt",
                         &[
-                            ("key", note_name(n.key as i64).as_str()),
+                            ("key", note_name_mc(n.key as i64, self.mc_off).as_str()),
                             ("vel", (vel * 127.0).round().to_string().as_str()),
                             ("pos", pos_label(n.start_tick, &self.pos).as_str()),
                             (
@@ -401,7 +429,7 @@ mod tests {
 
     #[test]
     fn note_label_describes_pitch_dur_vel_track() {
-        let s = note_label(&n(60, 480, Some(960), 96, 0), 480, &pos(), "Piano");
+        let s = note_label(&n(60, 480, Some(960), 96, 0), 480, &pos(), "Piano", 0);
         assert!(s.contains("C4"), "{s}");
         assert!(s.contains("1.2.  0"), "{s}");
         assert!(s.contains("1.0"), "{s}");
@@ -411,10 +439,10 @@ mod tests {
 
     #[test]
     fn dangling_note_says_so() {
-        let s = note_label(&n(60, 0, None, 80, 1), 480, &pos(), "Drums");
+        let s = note_label(&n(60, 0, None, 80, 1), 480, &pos(), "Drums", 0);
         assert_ne!(
             s,
-            note_label(&n(60, 0, Some(480), 80, 1), 480, &pos(), "Drums")
+            note_label(&n(60, 0, Some(480), 80, 1), 480, &pos(), "Drums", 0)
         );
     }
 

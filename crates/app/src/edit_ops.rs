@@ -854,8 +854,14 @@ impl EditorView {
             if self.selection.len() == 1 {
                 let on_id = *self.selection.iter().next().unwrap();
                 if let Some(n) = d.notes().into_iter().find(|n| n.on_id == on_id) {
+                    // inspector echoes the chosen octave convention (#164)
+                    let k = format!(
+                        "{} ({})",
+                        n.key,
+                        a11y::note_name(n.key as i64 + self.mc_off() * 12)
+                    );
                     return (
-                        tf("prop.note_title", &[("k", &n.key.to_string())]).into(),
+                        tf("prop.note_title", &[("k", &k)]).into(),
                         note_prop_rows(&n, d),
                     );
                 }

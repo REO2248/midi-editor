@@ -616,9 +616,11 @@ impl EditorView {
                 let notes = self.notes.clone();
                 let sel_track = lane_sel_track;
                 let pos = self.doc(|d| d.position_format_for(self.sel_track));
+                let mc_off = self.mc_off();
                 move |b| {
                     a11y::LaneA11y {
                         bounds: cell.get(),
+                        mc_off,
                         scale: scale_factor,
                         scroll_x,
                         zoom,

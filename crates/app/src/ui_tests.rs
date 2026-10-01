@@ -16,7 +16,9 @@
 //! `main()`, and every test pins `i18n::set_test_lang` on its own thread
 //! so locales can't bleed between parallel tests.
 
-use crate::{empty_doc, EditorView, LaneMode, PluginState, Sub, Tool, TopMenu, NOTE_H};
+use crate::{
+    a11y, empty_doc, EditorView, EvKind, LaneMode, PluginState, Sub, Tool, TopMenu, NOTE_H,
+};
 use document::Document;
 use gpui_kit::component::input::InputState;
 use gpui_kit::component::Root;
@@ -196,6 +198,9 @@ fn dump(window: &Window, v: &EditorView) -> String {
             Sub::VelSet => "VelSet",
             Sub::Chan => "Chan",
             Sub::Dest => "Dest",
+            Sub::EvFType => "EvFType",
+            Sub::EvFChan => "EvFChan",
+            Sub::MidC => "MidC",
             Sub::DefDest => "DefDest",
             Sub::InPort => "InPort",
             Sub::Lane => "Lane",
@@ -757,6 +762,79 @@ fn tempo_delete_at_playhead(cx: &mut TestAppContext) {
             let sh = crate::lock_shared(&v.shared);
             assert!(crate::edit_ops::tempo_event_at(&sh.doc, 0, 480).is_none());
             assert!((crate::edit_ops::tempo_bpm_at(&sh.doc, 0, 480) - 120.0).abs() < 0.01);
+        });
+    })
+    .unwrap();
+}
+
+/// #145 — event-list type + channel filters rebuild the row set while
+/// keeping hidden selections alive.
+#[gpui_kit::test]
+fn event_list_filters_by_kind_and_channel(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, fixture_doc());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        view.update(cx, |v, cx| {
+            let all = v.events.len();
+            assert!(all > 0);
+
+            // kind filter: notes only
+            v.toggle_ev_kind(EvKind::Note, cx);
+            v.refresh_derived();
+            let notes = v.events.len();
+            assert!(notes > 0 && notes < all, "notes {notes} < all {all}");
+            assert!(v.event_refs.iter().flatten().all(|&(ti, ei, _)| {
+                let d = v.doc(|d| d.tracks[ti].events[ei].kind.clone());
+                matches!(d, EventKind::Channel { status, .. } if status & 0xF0 == 0x80 || status & 0xF0 == 0x90)
+            }));
+
+            // channel filter narrows further
+            v.set_ev_chan(Some(0), cx);
+            v.refresh_derived();
+            let ch1 = v.events.len();
+            assert!(ch1 <= notes, "ch {ch1} <= notes {notes}");
+            assert!(v.event_refs.iter().flatten().all(|&(ti, ei, _)| {
+                let d = v.doc(|d| d.tracks[ti].events[ei].kind.clone());
+                matches!(d, EventKind::Channel { status, .. } if status & 0x0F == 0)
+            }));
+
+            // select a visible row, then hide its kind — selection survives
+            if let Some((_, _, id)) = v.event_refs.iter().flatten().next().copied() {
+                v.sel_events.insert(id);
+                v.ev_filter.kinds.insert(EvKind::CC); // still filtering
+                v.ev_filter.kinds.remove(&EvKind::Note); // notes now hidden
+                v.refresh_derived();
+                assert!(v.sel_events.contains(&id), "hidden row keeps selection");
+            }
+
+            // reset restores all rows
+            v.ev_filter.kinds.clear();
+            v.set_ev_chan(None, cx);
+            v.refresh_derived();
+            assert_eq!(v.events.len(), all);
+        });
+    })
+    .unwrap();
+}
+
+/// #164 — the middle-C preference shifts printed octave numbers only.
+#[gpui_kit::test]
+fn middle_c_preference_shifts_octave_labels(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, fixture_doc());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        view.update(cx, |v, cx| {
+            assert_eq!(v.middle_c, 4);
+            assert_eq!(a11y::note_name_mc(60, v.mc_off()), "C4");
+            v.set_middle_c(3, cx);
+            assert_eq!(a11y::note_name_mc(60, v.mc_off()), "C3");
+            v.set_middle_c(5, cx);
+            assert_eq!(a11y::note_name_mc(60, v.mc_off()), "C5");
+            // clamps out-of-range values rather than panicking
+            v.set_middle_c(9, cx);
+            assert_eq!(v.middle_c, 5);
         });
     })
     .unwrap();

@@ -69,6 +69,9 @@ pub(crate) struct GlobalPrefs {
     /// the play point back to where the pass began. None (older files) =
     /// on, the DAW-conventional default (#156).
     pub(crate) return_to_start_on_stop: Option<bool>,
+    /// middle-C octave naming preference: 3, 4, or 5; absent = 4 (#164).
+    /// Display-only — MIDI data is never renumbered.
+    pub(crate) middle_c: Option<u8>,
 }
 
 impl Default for GlobalPrefs {
@@ -93,6 +96,7 @@ impl Default for GlobalPrefs {
             return_to_start_on_stop: None,
             count_in_bars: None,
             monitor: None,
+            middle_c: None,
             rec_in_ch: None,
         }
     }
@@ -561,6 +565,7 @@ impl EditorView {
             keymap: self.keys.overrides.clone(),
             reset_on_stop: self.reset_on_stop,
             return_to_start_on_stop: Some(self.return_to_start_on_stop),
+            middle_c: Some(self.middle_c),
         }
         .save();
     }
