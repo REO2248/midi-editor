@@ -87,6 +87,13 @@ fn snap_label(label: &'static str, td: TimeDisplay) -> String {
 
 impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // native title bar follows the document (#163) — writes only on
+        // change so frames don't syscall
+        let title = self.window_title();
+        if title != self.last_title {
+            window.set_window_title(&title);
+            self.last_title = title;
+        }
         // the plugin editor lives in the helper subprocess's own window —
         // no native event queue to pump here
         // focus-loss guarantee: deactivate = release preview notes (the
@@ -4882,12 +4889,7 @@ impl Render for EditorView {
             .can_drop(|drag: &dyn Any, _w, _cx| drag.is::<ExternalPaths>())
             .drag_over::<ExternalPaths>(|s, _p, _w, _cx| s.bg(rgb(theme::current().accent_drop)))
             .on_drop(cx.listener(|v, paths: &ExternalPaths, w, cx| {
-                if let Some(p) = paths.paths().iter().find(|p| {
-                    matches!(
-                        p.extension().and_then(|e| e.to_str()),
-                        Some("mid") | Some("smf") | Some("midi")
-                    )
-                }) {
+                if let Some(p) = paths.paths().iter().find(|p| crate::is_midi_path(p)) {
                     v.confirm_discard_or_save(PendingAction::OpenPath(p.clone()), w, cx);
                 }
             }))

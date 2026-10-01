@@ -72,6 +72,9 @@ pub(crate) struct GlobalPrefs {
     /// middle-C octave naming preference: 3, 4, or 5; absent = 4 (#164).
     /// Display-only — MIDI data is never renumbered.
     pub(crate) middle_c: Option<u8>,
+    /// last folder a document was opened from / saved into (#158) — the
+    /// file dialog's fallback start directory
+    pub(crate) last_dir: Option<String>,
 }
 
 impl Default for GlobalPrefs {
@@ -97,6 +100,7 @@ impl Default for GlobalPrefs {
             count_in_bars: None,
             monitor: None,
             middle_c: None,
+            last_dir: None,
             rec_in_ch: None,
         }
     }
@@ -566,6 +570,7 @@ impl EditorView {
             reset_on_stop: self.reset_on_stop,
             return_to_start_on_stop: Some(self.return_to_start_on_stop),
             middle_c: Some(self.middle_c),
+            last_dir: self.last_dir.as_ref().map(|p| p.display().to_string()),
         }
         .save();
     }

@@ -10,6 +10,7 @@ mod cmd;
 mod diagnostics;
 mod docevents;
 mod edit_ops;
+mod filedlg;
 mod geometry;
 mod guard;
 mod i18n;
@@ -139,6 +140,21 @@ impl FocusArea {
             FocusArea::Events => "focus.events",
         }
     }
+}
+
+/// MIDI file recognition (#157): extension check is case-insensitive and
+/// accepts the usual family — .mid / .midi / .smf (and .kar, common on
+/// karaoke SMF files).
+pub(crate) fn is_midi_path(p: &std::path::Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            matches!(
+                e.to_ascii_lowercase().as_str(),
+                "mid" | "midi" | "smf" | "kar"
+            )
+        })
+        .unwrap_or(false)
 }
 
 /// One event-list row: display text plus the event's tick for seek-on-Enter.
@@ -622,12 +638,25 @@ impl DocUi {
             track_names,
             track_chs,
             mode_hint: doc.synth_mode(),
-            song_end: notes
+            // #138 — timeline extent follows the document's last event of
+            // ANY kind (a trailing marker/EOT/CC tail is content too), not
+            // just the last note end
+            song_end: doc
+                .tracks
                 .iter()
-                .filter(|n| seq_sel.is_none_or(|i| n.track == i))
-                .map(|n| n.end_tick.unwrap_or(n.start_tick))
+                .enumerate()
+                .filter(|(i, _)| seq_sel.is_none_or(|s| *i == s))
+                .flat_map(|(_, t)| t.events.iter().map(|e| e.tick))
                 .max()
-                .unwrap_or(0),
+                .unwrap_or(0)
+                .max(
+                    notes
+                        .iter()
+                        .filter(|n| seq_sel.is_none_or(|i| n.track == i))
+                        .map(|n| n.end_tick.unwrap_or(n.start_tick))
+                        .max()
+                        .unwrap_or(0),
+                ),
         }
     }
 }
@@ -652,6 +681,14 @@ struct EditorView {
     events: Arc<Vec<EvRow>>,
     /// event-list type/channel display filter (#145/#146)
     ev_filter: EvFilter,
+    /// folder the file dialogs fall back to when no document is open
+    /// (#158); persisted in global prefs
+    last_dir: Option<std::path::PathBuf>,
+    /// in-flight native file dialog (#158): (receiver, is_save)
+    dlg_rx: Option<(std::sync::mpsc::Receiver<Option<std::path::PathBuf>>, bool)>,
+    /// last caption written to the native title bar (#163) — set only
+    /// when it changes, so render doesn't syscall every frame
+    last_title: String,
     /// middle-C octave naming preference 3/4/5 (#164) — display only
     middle_c: u8,
     /// Document-derived UI data (markers, track names, diagnostics count…).
@@ -1205,6 +1242,9 @@ impl EditorView {
             notes: Arc::new(vec![]),
             ev_key: (u64::MAX, u64::MAX, usize::MAX, u64::MAX),
             ev_filter: EvFilter::default(),
+            last_dir: g.last_dir.as_ref().map(std::path::PathBuf::from),
+            dlg_rx: None,
+            last_title: String::new(),
             middle_c: g.middle_c.unwrap_or(4).clamp(3, 5),
             events: Arc::new(vec![]),
             doc_ui: Arc::new(DocUi::default()),
@@ -1434,6 +1474,20 @@ impl EditorView {
         self.theme_mode = mode;
         self.apply_theme(cx);
         self.save_global();
+    }
+
+    /// Native title-bar caption (#163): `song.mid — midi-editor` with a
+    /// trailing `*` while the document is dirty — what Alt-Tab and the
+    /// taskbar show.
+    pub(crate) fn window_title(&self) -> String {
+        let sh = lock_shared(&self.shared);
+        let name = sh
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| t("doc.untitled").to_string());
+        let dirty = sh.doc.revision() != sh.saved_revision;
+        format!("{}{} — midi-editor", name, if dirty { "*" } else { "" })
     }
 
     /// Octave-number shift for display labels (#164): middle-C 4 → 0.
@@ -2184,8 +2238,8 @@ fn spawn_mcp(
 #[cfg(test)]
 mod tests {
     use crate::{
-        assemble_events, empty_doc, file_arg_from, plugin_plan, route_events, track_audible,
-        GlobalPrefs, PluginPlan, PluginState, Prefs,
+        assemble_events, empty_doc, file_arg_from, is_midi_path, plugin_plan, route_events,
+        track_audible, GlobalPrefs, PluginPlan, PluginState, Prefs,
     };
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
@@ -2199,6 +2253,20 @@ mod tests {
     #[test]
     pub(crate) fn fresh_documents_share_revision_zero() {
         assert_eq!(empty_doc().revision(), empty_doc().revision());
+    }
+
+    /// #157 — extension recognition ignores case and covers the whole
+    /// SMF family; anything else is not a MIDI file.
+    #[test]
+    pub(crate) fn midi_extension_is_case_insensitive() {
+        for p in [
+            "a.mid", "B.MID", "c.Midi", "d.smf", "e.SMF", "f.midi", "g.kar",
+        ] {
+            assert!(is_midi_path(Path::new(p)), "{p}");
+        }
+        for p in ["a.txt", "b.mid.txt", "noext", ".midignore"] {
+            assert!(!is_midi_path(Path::new(p)), "{p}");
+        }
     }
 
     pub(crate) fn testdir(name: &str) -> std::path::PathBuf {

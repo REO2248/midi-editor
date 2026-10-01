@@ -242,8 +242,13 @@ pub static COMMANDS: &[Command] = &[
     }),
     cmd!("file.save", "menu.save", &["ctrl+s"], None, |v, _w, cx| v
         .save(cx)),
-    cmd!("file.save_as", "menu.save_as", &[], None, |v, _w, cx| v
-        .save_as(cx)),
+    cmd!(
+        "file.save_as",
+        "menu.save_as",
+        &["ctrl+shift+s"],
+        None,
+        |v, _w, cx| { v.save_as(cx) }
+    ),
     // edit
     cmd!(
         "edit.undo",

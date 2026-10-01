@@ -1551,3 +1551,64 @@ fn swing_amount_zero_is_noop_and_hundred_clamps() {
     apply(&mut d, ops);
     assert_eq!(notes_on(&d, 0)[0].start_tick, 240 + 239);
 }
+
+/// #162 — the Format-0 split offers ops only for genuinely multichannel
+/// files, routes each channel to its own Format-1 track, and keeps the
+/// meta/EOT shell in track 0.
+#[test]
+fn split_fmt0_by_channel_ops() {
+    let meta = |tick: u64, ty: u8, data: &[u8]| smf_core::Event {
+        tick,
+        seq: 0,
+        raw_body: None,
+        kind: EventKind::Meta {
+            meta_type: ty,
+            data: data.to_vec().into(),
+        },
+    };
+    let fmt0 = |events: Vec<smf_core::Event>| {
+        Document::from_file(smf_core::File {
+            format: 0,
+            division: Division::Metrical(480),
+            tracks: vec![smf_core::Track { events }],
+            warnings: vec![],
+        })
+    };
+
+    // single-channel fmt0: no conversion offered
+    let d = fmt0(vec![chan(0, 0x90, 60, 100)]);
+    assert!(d.split_fmt0_by_channel_ops().is_empty());
+
+    // multichannel fmt0: conductor + one track per channel
+    let mut d = fmt0(vec![
+        meta(0, 0x51, &[0x07, 0xA1, 0x20]),
+        chan(0, 0x90, 60, 100),
+        chan(0, 0x91, 64, 100),
+        meta(960, 0x2F, &[]),
+    ]);
+    let ops = d.split_fmt0_by_channel_ops();
+    assert!(!ops.is_empty());
+    let tx = apply(&mut d, ops);
+    assert_eq!(d.format, 1);
+    assert_eq!(d.tracks.len(), 3);
+    // conductor keeps only non-channel events (tempo + EOT)
+    assert!(d.tracks[0]
+        .events
+        .iter()
+        .all(|e| matches!(e.kind, EventKind::Meta { .. })));
+    assert!(d.tracks[1]
+        .events
+        .iter()
+        .all(|e| matches!(e.kind, EventKind::Channel { status, .. } if status & 0x0F == 0)));
+    assert!(d.tracks[2]
+        .events
+        .iter()
+        .all(|e| matches!(e.kind, EventKind::Channel { status, .. } if status & 0x0F == 1)));
+    assert_eq!(d.tracks[1].out_channel, 0);
+    assert_eq!(d.tracks[2].out_channel, 1);
+    // undo restores the single-track format-0 document
+    d.revert(&tx);
+    assert_eq!(d.format, 0);
+    assert_eq!(d.tracks.len(), 1);
+    assert_eq!(d.tracks[0].events.len(), 4);
+}

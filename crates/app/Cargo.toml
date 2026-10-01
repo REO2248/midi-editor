@@ -24,6 +24,20 @@ tracing.workspace = true
 tracing-appender.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
+# HWND for parenting the native file dialogs (#158)
+raw-window-handle = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+# common-item dialogs (IFileOpenDialog/IFileSaveDialog) — gpui's prompt
+# API exposes no type filter list, so Open/Save-As call COM directly to
+# offer "MIDI files" + "All files" like a real Windows document app
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_System_LibraryLoader",
+] }
 
 [dev-dependencies]
 # turns `TestSupportExt::test_support()` on: elements opted in via

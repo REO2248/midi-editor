@@ -839,3 +839,85 @@ fn middle_c_preference_shifts_octave_labels(cx: &mut TestAppContext) {
     })
     .unwrap();
 }
+
+/// #138 — timeline extent follows the last event of any kind: a trailing
+/// marker/meta past the last note must stretch the song end, and a pure
+/// EOT tail counts too.
+#[gpui_kit::test]
+fn song_extent_includes_meta_and_eot_tails(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, fixture_doc());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        view.update(cx, |v, _cx| {
+            let before = v.doc_end_ticks();
+            // append a marker way past the last note end
+            let (max, id) = {
+                let mut sh = crate::lock_shared(&v.shared);
+                (
+                    sh.doc
+                        .tracks
+                        .iter()
+                        .flat_map(|t| t.events.iter().map(|e| e.tick))
+                        .max()
+                        .unwrap_or(0),
+                    sh.doc.alloc_event_id(),
+                )
+            };
+            let tail = document::Event {
+                id,
+                tick: max + 96 * 480,
+                seq: 0,
+                raw_body: None,
+                kind: smf_core::EventKind::Meta {
+                    meta_type: 0x06,
+                    data: b"tail".to_vec().into(),
+                },
+            };
+            v.apply_tx(
+                "append marker",
+                vec![document::Op::InsertEvents {
+                    track: 1,
+                    events: vec![tail],
+                }],
+            );
+            let after = v.doc_end_ticks();
+            assert!(after > before, "extent {before} -> {after}");
+        });
+    })
+    .unwrap();
+}
+
+/// #163 — the native caption is `name — midi-editor` and gains the dirty
+/// marker only while there are unsaved edits.
+#[gpui_kit::test]
+fn window_title_tracks_document_state(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, fixture_doc());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        view.update(cx, |v, _cx| {
+            // no backing path: untitled, and a fresh doc starts clean
+            let t = v.window_title();
+            assert!(t.ends_with(" — midi-editor"), "{t}");
+            assert!(!t.contains('*'), "{t}");
+        });
+        // an edit flips the dirty marker on
+        view.update(cx, |v, _cx| {
+            v.apply_tx(
+                "rename",
+                vec![document::Op::UpdateTrack {
+                    index: 0,
+                    before: v.doc(|d| d.tracks[0].clone()),
+                    after: {
+                        let mut t = v.doc(|d| d.tracks[0].clone());
+                        t.name = Some(b"X".to_vec().into());
+                        t
+                    },
+                }],
+            );
+            assert!(v.window_title().contains('*'));
+        });
+    })
+    .unwrap();
+}

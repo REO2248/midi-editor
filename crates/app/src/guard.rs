@@ -156,25 +156,52 @@ impl EditorView {
             SaveOutcome::Saved => true,
             SaveOutcome::Failed => false,
             SaveOutcome::NeedsPath => {
-                let Ok(rx) = cx.update(|_w, app| {
-                    app.prompt_for_new_path(
-                        &std::env::current_dir().unwrap_or_default(),
-                        Some("untitled.mid"),
-                    )
-                }) else {
+                let Some(path) = Self::pick_save_path(&this, cx).await else {
                     return false;
                 };
-                let picked = rx.await.ok().and_then(|r| r.ok()).flatten();
-                let Some(path) = picked else {
-                    return false;
-                };
-                this.update(cx, |v, cx| {
-                    lock_shared(&v.shared).path = Some(path);
-                    matches!(v.save_for_guard(cx), SaveOutcome::Saved)
-                })
-                .unwrap_or(false)
+                this.update(cx, |v, cx| v.try_save_to(&path, cx))
+                    .unwrap_or(false)
             }
         }
+    }
+
+    /// The guard's Save-As pick (#158): the native filtered dialog on
+    /// Windows, the gpui prompt elsewhere.
+    #[cfg(windows)]
+    async fn pick_save_path(
+        this: &WeakEntity<EditorView>,
+        cx: &mut AsyncWindowContext,
+    ) -> Option<std::path::PathBuf> {
+        let (dir, name) = this
+            .update(cx, |v, _cx| v.save_dialog_start())
+            .unwrap_or_else(|_| {
+                (
+                    std::env::current_dir().unwrap_or_default(),
+                    "untitled.mid".into(),
+                )
+            });
+        let hwnd = this.update(cx, |v, cx| v.dialog_hwnd(cx)).unwrap_or(0);
+        let rx = crate::filedlg::save_path(hwnd, dir, name);
+        crate::filedlg::result(rx, cx.background_executor().clone()).await
+    }
+
+    #[cfg(not(windows))]
+    async fn pick_save_path(
+        this: &WeakEntity<EditorView>,
+        cx: &mut AsyncWindowContext,
+    ) -> Option<std::path::PathBuf> {
+        let (dir, name) = this
+            .update(cx, |v, _cx| v.save_dialog_start())
+            .unwrap_or_else(|_| {
+                (
+                    std::env::current_dir().unwrap_or_default(),
+                    "untitled.mid".into(),
+                )
+            });
+        let Ok(rx) = cx.update(|_w, app| app.prompt_for_new_path(&dir, Some(&name))) else {
+            return None;
+        };
+        rx.await.ok().and_then(|r| r.ok()).flatten()
     }
 
     /// Run the gated action after the guard passed. `CloseWindow` latches

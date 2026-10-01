@@ -1603,3 +1603,76 @@ impl Document {
         )
     }
 }
+
+impl Document {
+    /// #162 — explicit Format 0 → Format 1 conversion splitting channel
+    /// events into one track per used channel. Non-channel content (tempo,
+    /// signatures, text, SysEx, EOT) stays in track 0 — it is never
+    /// duplicated or moved. Returns empty unless the document is format 0
+    /// with more than one channel in use, so accidental single-channel
+    /// files never get spurious tracks.
+    pub fn split_fmt0_by_channel_ops(&self) -> Vec<Op> {
+        if self.format != 0 || self.tracks.len() != 1 {
+            return Vec::new();
+        }
+        let tr = &self.tracks[0];
+        let chans: std::collections::BTreeSet<u8> = tr
+            .events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::Channel { status, .. } => Some(status & 0x0F),
+                _ => None,
+            })
+            .collect();
+        if chans.len() <= 1 {
+            return Vec::new();
+        }
+        let mut ops = vec![Op::SetFormat {
+            before: 0,
+            after: 1,
+        }];
+        let removed: Vec<(usize, Event)> = tr
+            .events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e.kind, EventKind::Channel { .. }))
+            .map(|(i, e)| (i, e.clone()))
+            .collect();
+        ops.push(Op::RemoveEvents { track: 0, removed });
+        for ch in chans {
+            let events: Vec<Event> = tr
+                .events
+                .iter()
+                .filter(
+                    |e| matches!(&e.kind, EventKind::Channel { status, .. } if status & 0x0F == ch),
+                )
+                .cloned()
+                .collect();
+            ops.push(Op::InsertTrack {
+                index: usize::MAX,
+                track: Track {
+                    name: Some(format!("Channel {}", ch + 1).into_bytes().into()),
+                    out_port: tr.out_port,
+                    out_channel: ch,
+                    events,
+                },
+            });
+        }
+        ops
+    }
+}
+
+impl Document {
+    /// Channels (0-15) present in the document's channel events — the
+    /// basis of the Format-0 multichannel import check (#162).
+    pub fn channels_used(&self) -> std::collections::BTreeSet<u8> {
+        self.tracks
+            .iter()
+            .flat_map(|t| t.events.iter())
+            .filter_map(|e| match &e.kind {
+                EventKind::Channel { status, .. } => Some(status & 0x0F),
+                _ => None,
+            })
+            .collect()
+    }
+}
