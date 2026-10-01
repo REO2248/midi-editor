@@ -55,7 +55,7 @@ use i18n::{t, tf};
 use menu::{menu_x, next_selectable, row_y, MenuRow, MENUS};
 
 use commands::UndoStack;
-use document::{Document, Event as DocEvent, EventId, Note, Op, TimeDisplay};
+use document::{Document, Event as DocEvent, EventId, Note, Op, PositionFormat, TimeDisplay};
 use gpui_kit::base::{ObservedElement, TestSupportExt};
 use gpui_kit::component::input::InputState;
 use gpui_kit::component::Root;
@@ -195,6 +195,8 @@ enum Sub {
     LegatoGap,
     /// Edit → swing amount presets
     Swing,
+    /// Edit → apply a transform to the entire selected track (#131)
+    AllTrack,
     Meta,
 }
 
@@ -383,7 +385,6 @@ struct DocUi {
     n_diags: usize,
     track_names: Vec<String>,
     track_chs: Vec<u8>,
-    sig: String,
     tempo0: f64,
     /// detected GM/GS/XG reset SysEx — a display hint for patch naming
     mode_hint: Option<smf_core::ModeHint>,
@@ -394,7 +395,7 @@ struct DocUi {
 impl DocUi {
     /// `notes` is the already-derived note view for this revision (passed in
     /// so the pairing pass runs once per revision, not once per consumer).
-    /// `seq_sel` scopes markers/tempo/sig/song-end to one sequence for
+    /// `seq_sel` scopes markers/tempo/song-end to one sequence for
     /// format-2 documents (None = whole document, formats 0/1).
     pub(crate) fn build(
         doc: &Document,
@@ -403,10 +404,6 @@ impl DocUi {
         seq_sel: Option<usize>,
     ) -> Self {
         let hint = enc_override.or_else(|| doc.text_encoding_hint());
-        let scan: &[document::Track] = match seq_sel.and_then(|i| doc.tracks.get(i)) {
-            Some(t) => std::slice::from_ref(t),
-            None => &doc.tracks,
-        };
         // meta 0x06/0x05 markers, from any track, at their tick
         let mut markers = Vec::new();
         for (ti, t) in doc.tracks.iter().enumerate() {
@@ -430,18 +427,6 @@ impl DocUi {
             .first()
             .map(|(_, mpq, _)| 60_000_000.0 / *mpq as f64)
             .unwrap_or(120.0);
-        let sig = scan
-            .first()
-            .and_then(|t| {
-                t.events.iter().find_map(|e| match &e.kind {
-                    EventKind::Meta {
-                        meta_type: 0x58,
-                        data,
-                    } if data.len() >= 2 => Some(format!("{}/{}", data[0], 1u8 << data[1])),
-                    _ => None,
-                })
-            })
-            .unwrap_or_else(|| "4/4".into());
         let track_names = doc
             .tracks
             .iter()
@@ -459,7 +444,6 @@ impl DocUi {
             markers,
             track_names,
             track_chs,
-            sig,
             tempo0,
             mode_hint: doc.synth_mode(),
             song_end: notes
@@ -532,6 +516,10 @@ struct EditorView {
     /// active so edge auto-scroll can keep the drag deltas current
     mouse_pos: Option<Point<Pixels>>,
     sel_track: usize,
+    /// insert/edit channel per track — pure editor state (sidecar), never
+    /// an SMF event. Absent entries fall back to the track's `FF 20`
+    /// channel prefix. Per-event channels rule playback as always.
+    edit_ch: HashMap<usize, u8>,
     /// selected note `on_id`s (marquee multi-select)
     selection: BTreeSet<EventId>,
     drag: Option<Drag>,
@@ -1021,6 +1009,7 @@ impl EditorView {
             tool: Tool::Select,
             snap_idx: 7, // 1/16
             erase_ids: BTreeSet::new(),
+            edit_ch: HashMap::new(),
             clipboard: Vec::new(),
             roll_bounds: Rc::new(Cell::new(Bounds::new(
                 point(px(0.0), px(0.0)),
@@ -1468,11 +1457,17 @@ impl EditorView {
     /// longer, and sizing the view by them would lie about this one's end.
     /// At least four coarse cells (bars / seconds) past the content.
     pub(crate) fn doc_end_ticks(&self) -> u64 {
+        // at least four coarse cells: real bars under the viewed track's
+        // meter map for metrical, displayed seconds for SMPTE
+        let min_extent = self.doc(|d| match d.time_display() {
+            TimeDisplay::Metrical { .. } => d.meter_map_for(self.sel_track).bar_ticks_at(0) * 4,
+            TimeDisplay::Smpte { .. } => d.time_display().bar_ticks() * 4,
+        });
         if self.is_seq() {
             self.doc(|d| d.track_end_tick(self.sel_track))
-                .max(self.td().bar_ticks() * 4)
+                .max(min_extent)
         } else {
-            self.doc_ui.song_end.max(self.td().bar_ticks() * 4)
+            self.doc_ui.song_end.max(min_extent)
         }
     }
 
@@ -1532,7 +1527,6 @@ impl EditorView {
     }
 
     pub(crate) fn build_event_rows(&self, doc: &Document) -> EvRowOut {
-        let td = doc.time_display();
         let seq = doc.is_sequential();
         let hint = self.enc_override.or(doc.text_encoding_hint());
         let rpn_tags = Self::rpn_row_tags(doc);
@@ -1568,9 +1562,10 @@ impl EditorView {
                 continue; // a format-2 event list shows one sequence
             }
             for (ei, e) in tr.events.iter().enumerate() {
-                // bar.beat.tick for metrical, hh:mm:ss.ff timecode for
-                // SMPTE — position labels always match the file's timing
-                let pos = td.format_tick(e.tick);
+                // bar.beat.tick under the real FF58 map for metrical,
+                // hh:mm:ss.ff timecode for SMPTE — position labels
+                // always match the file's timing
+                let pos = doc.format_position_for(ti, e.tick);
                 let body = match &e.kind {
                     EventKind::Channel { status, data, .. } => {
                         let ch = (status & 0x0F) + 1;
@@ -2425,21 +2420,62 @@ mod tests {
             EventKind::Channel { data, .. } => assert_eq!(*data, [0x7F, 0x7F]),
             _ => panic!(),
         }
-        // meta type accepts 0x hex
+        // meta type accepts 0x hex (sequencer-specific — structural
+        // types like 0x2F End-of-Track are covered below)
         let (_, ei_m) = super::find_event(&d, id_meta).unwrap();
-        let ops = edit_event_field(&mut d, 0, ei_m, PropField::MetaType, "0x2F").unwrap();
+        let ops = edit_event_field(&mut d, 0, ei_m, PropField::MetaType, "0x7F").unwrap();
         apply(&mut d, ops);
+        let (_, ei_m) = super::find_event(&d, id_meta).unwrap();
         match &d.tracks[0].events[ei_m].kind {
-            EventKind::Meta { meta_type, .. } => assert_eq!(*meta_type, 0x2F),
+            EventKind::Meta { meta_type, .. } => assert_eq!(*meta_type, 0x7F),
             _ => panic!(),
         }
         // hex payload replaces the data bytes
         let ops = edit_event_field(&mut d, 0, ei_m, PropField::HexData, "03 12 ff").unwrap();
         apply(&mut d, ops);
+        let (_, ei_m) = super::find_event(&d, id_meta).unwrap();
         match &d.tracks[0].events[ei_m].kind {
             EventKind::Meta { data, .. } => assert_eq!(&data[..], &[0x03, 0x12, 0xff]),
             _ => panic!(),
         }
+        // converting an event to End-of-Track collapses to a single
+        // terminator at the track end — exactly one EOT survives, its
+        // payload is no longer field-editable
+        let ops = edit_event_field(&mut d, 0, ei_m, PropField::MetaType, "0x2F").unwrap();
+        apply(&mut d, ops);
+        let n_eot = d.tracks[0]
+            .events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    EventKind::Meta {
+                        meta_type: 0x2F,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(n_eot, 1, "exactly one End-of-Track survives");
+        let ei_m = d.tracks[0]
+            .events
+            .iter()
+            .position(|e| {
+                matches!(
+                    e.kind,
+                    EventKind::Meta {
+                        meta_type: 0x2F,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert_eq!(ei_m, d.tracks[0].events.len() - 1, "EOT not at track end");
+        assert!(edit_event_field(&mut d, 0, ei_m, PropField::HexData, "00").is_err());
+        // its tick stays editable (intentional silent tail)
+        assert!(!edit_event_field(&mut d, 0, ei_m, PropField::Tick, "960")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

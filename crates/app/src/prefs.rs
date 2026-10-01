@@ -176,6 +176,10 @@ pub(crate) struct Prefs {
     pub(crate) scale_minor: Option<bool>,
     /// None in old sidecars = keep the default (page)
     pub(crate) follow: Option<String>,
+    /// per-track insert/edit channel (editor state; `FF 20` prefix is the
+    /// fallback when a track has no entry). New in v2 sidecars.
+    #[serde(default)]
+    pub(crate) edit_ch: HashMap<usize, u8>,
 }
 
 impl Default for Prefs {
@@ -210,6 +214,7 @@ impl Default for Prefs {
             follow: None,
             poly_key: None,
             lanes: None,
+            edit_ch: HashMap::new(),
         }
     }
 }
@@ -261,6 +266,7 @@ impl persist::json::Versioned for Prefs {
         self.muted.retain(|t| *t < 1024);
         self.soloed.retain(|t| *t < 1024);
         self.track_dest.retain(|t, _| *t < 1024);
+        self.edit_ch.retain(|t, c| *t < 1024 && *c < 16);
     }
 }
 
@@ -392,6 +398,7 @@ impl EditorView {
             let n = self.doc(|d| d.tracks.len());
             self.sel_track = t.min(n.saturating_sub(1));
         }
+        self.edit_ch = p.edit_ch;
         self.enc_override = p.enc.as_deref().map(|e| match e {
             "utf8" => smf_core::TextEncoding::Utf8,
             "sjis" => smf_core::TextEncoding::ShiftJis,
@@ -540,6 +547,7 @@ impl EditorView {
             scroll_x: Some(self.scroll_x),
             scroll_y: Some(self.scroll_y),
             sel_track: Some(self.sel_track),
+            edit_ch: self.edit_ch.clone(),
             note_h: Some(self.note_h),
             fold: Some(self.fold),
             drum: Some(self.drum),

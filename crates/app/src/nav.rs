@@ -928,13 +928,17 @@ impl EditorView {
         self.persist();
     }
 
+    /// Cycle the track's insert/edit channel — editor state, not a file
+    /// write. The `FF 20` channel-prefix meta is only touched through the
+    /// explicit Track ▸ Channel Prefix command (or MCP); playback always
+    /// follows each event's own channel.
     pub(crate) fn cycle_chan(&mut self, i: usize) {
-        let ops = {
-            let mut sh = lock_shared(&self.shared);
-            let cur = sh.doc.tracks.get(i).map(|t| t.out_channel).unwrap_or(0);
-            sh.doc.set_track_channel_ops(i, (cur + 1) % 16)
-        };
-        self.apply_tx("set track channel", ops);
+        let cur = self.edit_channel_of(
+            i,
+            self.doc(|d| d.tracks.get(i).map(|t| t.out_channel).unwrap_or(0)),
+        );
+        self.edit_ch.insert(i, (cur + 1) % 16);
+        self.persist();
     }
 
     /// Apply the rename field to the selected track.
@@ -1196,14 +1200,25 @@ impl EditorView {
             .cloned()
     }
 
-    /// Channel the selected track's previews route through.
+    /// Channel the selected track's previews route through — the track's
+    /// insert/edit channel (explicit editor state), defaulting to its
+    /// `FF 20` channel prefix. Per-event channels always rule on file
+    /// playback; this only decides what NEW/preview events sound on.
     pub(crate) fn sel_track_ch(&self) -> u8 {
         self.doc(|d| {
-            d.tracks
+            let prefix = d
+                .tracks
                 .get(self.sel_track)
-                .map(|t| t.out_channel & 0x0F)
-                .unwrap_or(0)
+                .map(|t| t.out_channel)
+                .unwrap_or(0);
+            self.edit_channel_of(self.sel_track, prefix)
         })
+    }
+
+    /// The effective insert/edit channel for `track`: the user's explicit
+    /// per-track choice when set, else the `FF 20` channel prefix, else 0.
+    pub(crate) fn edit_channel_of(&self, track: usize, prefix: u8) -> u8 {
+        self.edit_ch.get(&track).copied().unwrap_or(prefix & 0x0F)
     }
 
     /// Piano-key under a window-space position on the key strip — row

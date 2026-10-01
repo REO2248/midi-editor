@@ -1031,7 +1031,7 @@
     },
     {
       "deprecated": null,
-      "description": "Set the track's default channel (FF20 meta). Args: track, channel (1-16). Optional base_revision.",
+      "description": "Set the track's channel-prefix meta (FF 20): a hint players/editors may honor, NOT a reroute — per-event channels rule playback. To retarget existing events use set_channel. Args: track, channel (1-16). Optional base_revision.",
       "input_schema": {
         "properties": {
           "base_revision": {

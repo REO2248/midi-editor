@@ -1065,7 +1065,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ),
         spec(
             "set_track_channel",
-            "Set the track's default channel (FF20 meta). Args: track, channel (1-16). Optional base_revision.",
+            "Set the track's channel-prefix meta (FF 20): a hint players/editors may honor, NOT a reroute — per-event channels rule playback. To retarget existing events use set_channel. Args: track, channel (1-16). Optional base_revision.",
             object_schema(serde_json::json!({
                 "track": {"type": "integer"}, "channel": {"type": "integer"},
                 "base_revision": {"type": "integer"},
@@ -1406,6 +1406,8 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
                         Op::UpdateTrack { index, after, .. } => serde_json::json!({
                             "op": "update_track", "index": index,
                             "name": after.name.as_ref().map(|b| String::from_utf8_lossy(b).into_owned())}),
+                        Op::SetFormat { before, after } => serde_json::json!({
+                            "op": "set_format", "before": before, "after": after}),
                     })
                     .collect::<Vec<_>>();
                 return ok_json(serde_json::json!({
