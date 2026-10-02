@@ -196,11 +196,21 @@ pub(crate) fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
                             mcp_server::TransportReq::Play if v.playback.is_none() => {
                                 v.start_playback();
                             }
-                            mcp_server::TransportReq::Stop => v.stop_playback(),
+                            mcp_server::TransportReq::Stop => v.transport_stop(cx),
+                            mcp_server::TransportReq::SetLoop { start, end } => {
+                                {
+                                    let mut sh = crate::lock_shared(&v.shared);
+                                    sh.loop_start = start;
+                                    sh.loop_end = end;
+                                }
+                                v.persist();
+                                v.refresh_live_schedule();
+                            }
                             mcp_server::TransportReq::Seek { tick } => {
                                 v.play_us = v.doc(|d| {
                                     d.tempo_map_for(v.sel_track).tick_to_us(tick)
                                 });
+                                v.play_start_us = v.play_us;
                                 if v.playback.is_some() {
                                     v.stop_playback();
                                     v.start_playback();
@@ -225,6 +235,10 @@ pub(crate) fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
                                 // swapped mid-save — its state governs
                                 Ok(out) if out.committed => {
                                     tracing::info!(path = %out.path.display(), rev = out.revision, "document saved");
+                                    // the canonical path moves only after a
+                                    // durable write — Save-As to a failed
+                                    // target never steals it (#158)
+                                    v.adopt_saved_path(&out.path);
                                     v.status = t("status.saved").into();
                                     v.persist();
                                     // a verified normal save clears recovery
@@ -240,6 +254,15 @@ pub(crate) fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
                             cx.notify();
                         }
                     }
+                    if let Some((rx, saving)) = &v.dlg_rx {
+                        if let Ok(done) = rx.try_recv() {
+                            let saving = *saving;
+                            v.dlg_rx = None;
+                            if let Some(path) = done {
+                                v.finish_dialog(path, saving, cx);
+                            }
+                        }
+                    }
                     if dirty {
                         v.refresh_derived();
                         // cover routing changes that came from MCP tools —
@@ -249,6 +272,9 @@ pub(crate) fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
                         // a preview ringing on a route MCP just changed
                         // must not keep sounding into the wrong place
                         v.audition_off();
+                        // MCP-originated edits/routing reach the running
+                        // pass through the same live-update path (#140/#141)
+                        v.refresh_live_schedule();
                     }
                     // watch the backing .mid for external modification /
                     // deletion (only the MIDI file — the sidecar doesn't count)
@@ -376,6 +402,7 @@ impl EditorView {
         self.sel_track = 0;
         self.enc_override = None;
         self.play_us = 0;
+        self.play_start_us = 0;
         self.refresh_derived();
         self.reset_view_to_content();
         // the replaced document's snapshots no longer apply
@@ -434,7 +461,7 @@ impl EditorView {
 
     pub(crate) fn set_enc(&mut self, enc: Option<smf_core::TextEncoding>, cx: &mut Context<Self>) {
         self.enc_override = enc;
-        self.ev_key = (u64::MAX, u64::MAX, usize::MAX); // force event-row rebuild
+        self.ev_key = (u64::MAX, u64::MAX, usize::MAX, u64::MAX); // force event-row rebuild
         self.refresh_derived();
         self.persist();
         cx.notify();
@@ -464,6 +491,8 @@ impl EditorView {
             self.selection.clear();
             self.refresh_derived_sh(&mut sh);
             drop(sh);
+            // undo reaches the running pass too (#141)
+            self.refresh_live_schedule();
             cx.notify();
         }
     }
@@ -479,6 +508,7 @@ impl EditorView {
             self.selection.clear();
             self.refresh_derived_sh(&mut sh);
             drop(sh);
+            self.refresh_live_schedule();
             cx.notify();
         }
     }
@@ -569,6 +599,35 @@ impl EditorView {
                 true
             }
             Err(mcp_server::service::SaveError::NoPath) => false,
+            Err(e) => {
+                self.status = format!("{e}").into();
+                false
+            }
+        };
+        cx.notify();
+        ok
+    }
+
+    /// Synchronous save to an explicit target — the guard's picked
+    /// Save-As path. The canonical path adopts only after the write
+    /// lands; a failed Save-As leaves the old one alone (#158).
+    pub(crate) fn try_save_to(&mut self, path: &std::path::Path, cx: &mut Context<Self>) -> bool {
+        let ok = match mcp_server::service::save_document(
+            &self.shared,
+            mcp_server::service::SaveRequest {
+                path: Some(path),
+                ..Default::default()
+            },
+        ) {
+            Ok(out) => {
+                self.adopt_saved_path(&out.path);
+                self.status = t("status.saved").into();
+                self.persist();
+                recovery::clear_recovery();
+                self.file_stamp = watch::stat_file(&out.path);
+                self.ext_prompted = false;
+                true
+            }
             Err(e) => {
                 self.status = format!("{e}").into();
                 false
@@ -826,19 +885,166 @@ impl EditorView {
     }
 
     pub(crate) fn save_as(&mut self, cx: &mut Context<Self>) {
-        let rx = cx.prompt_for_new_path(
-            &std::env::current_dir().unwrap_or_default(),
-            Some("untitled.mid"),
-        );
-        cx.spawn(async move |this, cx| {
-            if let Ok(Ok(Some(path))) = rx.await {
-                if let Some(this) = this.upgrade() {
-                    this.update(cx, |v, cx| {
-                        crate::lock_shared(&v.shared).path = Some(path);
-                        v.save(cx);
-                    });
+        // Windows document conventions (#158): the dialog opens in the
+        // current document's folder (else the last-used one) and suggests
+        // the current file name — not a fresh "untitled".
+        let (dir, name) = self.save_dialog_start();
+        #[cfg(windows)]
+        {
+            // real "MIDI files / All files" filter + default extension —
+            // gpui's prompt API cannot express a filter list
+            let hwnd = self.dialog_hwnd(cx);
+            self.dlg_rx = Some((crate::filedlg::save_path(hwnd, dir, name), true));
+            cx.notify();
+        }
+        #[cfg(not(windows))]
+        {
+            let rx = cx.prompt_for_new_path(&dir, Some(&name));
+            cx.spawn(async move |this, cx| {
+                if let Ok(Ok(Some(path))) = rx.await {
+                    if let Some(this) = this.upgrade() {
+                        this.update(cx, |v, cx| {
+                            let mut path = path;
+                            if path.extension().is_none() {
+                                path.set_extension("mid");
+                            }
+                            // write to the picked target WITHOUT adopting
+                            // it — the canonical path only moves when the
+                            // write actually commits (adopt_saved_path)
+                            v.write_to(Some(&path), cx);
+                        });
+                    }
                 }
+            })
+            .detach();
+        }
+    }
+
+    /// Owner HWND for the native file dialogs, as a Send-able usize.
+    pub(crate) fn dialog_hwnd(&mut self, cx: &mut Context<Self>) -> usize {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        self.window_handle
+            .and_then(|wh| {
+                wh.update(cx, |_, w, _| match w.window_handle().map(|h| h.as_raw()) {
+                    Ok(RawWindowHandle::Win32(h)) => h.hwnd.get() as usize,
+                    _ => 0,
+                })
+                .ok()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Consume a native-dialog result picked in `save_as`/`open_dialog`.
+    pub(crate) fn finish_dialog(
+        &mut self,
+        path: std::path::PathBuf,
+        saving: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if saving {
+            let mut path = path;
+            if path.extension().is_none() {
+                path.set_extension("mid");
             }
+            // write to the picked target WITHOUT adopting it — the
+            // canonical path only moves when the write commits (#158)
+            self.write_to(Some(&path), cx);
+        } else {
+            self.open(path, cx);
+        }
+    }
+
+    /// Save-As dialog conventions (#158): the document's folder (else the
+    /// last-used one) and its current file name — the guard's prompt uses
+    /// the same start point.
+    pub(crate) fn save_dialog_start(&self) -> (std::path::PathBuf, String) {
+        let sh = lock_shared(&self.shared);
+        let dir = sh
+            .path
+            .as_ref()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .or_else(|| self.last_dir.clone())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let name = sh
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "untitled.mid".to_string());
+        (dir, name)
+    }
+
+    /// Adopt a just-committed save target as the document's canonical path
+    /// and remember its folder for the next dialog (#158).
+    pub(crate) fn adopt_saved_path(&mut self, p: &std::path::Path) {
+        {
+            let mut sh = lock_shared(&self.shared);
+            sh.path = Some(p.to_path_buf());
+        }
+        if let Some(dir) = p.parent() {
+            if self.last_dir.as_deref() != Some(dir) {
+                self.last_dir = Some(dir.to_path_buf());
+                self.save_global();
+            }
+        }
+    }
+
+    /// #162 — Format 0 multichannel import choice. Keep is the default
+    /// (non-destructive, byte preservation untouched); split runs one
+    /// explicit document transaction that converts to Format 1 with one
+    /// track per used channel. The prompt is deferred off the open handler
+    /// like the save-conflict prompt — `window.prompt` cannot nest inside
+    /// a view update.
+    fn prompt_fmt0_split(&mut self, cx: &mut Context<Self>) {
+        if self.prompt_active {
+            return;
+        }
+        let Some(wh) = self.window_handle else {
+            return;
+        };
+        self.prompt_active = true;
+        cx.spawn(async move |this, cx| {
+            let rx = wh
+                .update(cx, |_, w, app| {
+                    w.prompt(
+                        PromptLevel::Info,
+                        t("import.fmt0_title"),
+                        Some(t("import.fmt0_detail")),
+                        &[
+                            PromptButton::Ok(t("import.fmt0_keep").into()),
+                            PromptButton::Other(t("import.fmt0_split").into()),
+                            PromptButton::Cancel(t("guard.cancel").into()),
+                        ],
+                        app,
+                    )
+                })
+                .ok();
+            let idx = match rx {
+                Some(rx) => rx.await.unwrap_or(usize::MAX),
+                None => usize::MAX,
+            };
+            if idx == 1 {
+                this.update(cx, |v, cx| {
+                    let before = v.doc(|d| d.tracks.len());
+                    let ops = v.doc(|d| d.split_fmt0_by_channel_ops());
+                    if !ops.is_empty() {
+                        v.apply_tx("split channels to Format 1", ops);
+                        // each split track edits its own channel by default
+                        let chans: Vec<u8> = v.doc(|d| {
+                            (before..d.tracks.len())
+                                .map(|i| d.tracks[i].out_channel)
+                                .collect()
+                        });
+                        for (off, ch) in chans.into_iter().enumerate() {
+                            v.edit_ch.insert(before + off, ch);
+                        }
+                        v.sel_track = 1;
+                        v.persist();
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+            this.update(cx, |v, _cx| v.prompt_active = false).ok();
         })
         .detach();
     }
@@ -878,7 +1084,7 @@ impl EditorView {
             hd.probe,
             dests,
             mcp_auth,
-            self.count_in,
+            self.count_in_bars,
             self.midi_in,
         );
         let dir = diagnostics::app_data_dir().join("diagnostics");
@@ -896,23 +1102,45 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Open dialog start folder (#158): the document's folder, else the
+    /// last-used one, else the working directory.
+    pub(crate) fn open_dialog_start(&self) -> std::path::PathBuf {
+        let sh = lock_shared(&self.shared);
+        sh.path
+            .as_ref()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .or_else(|| self.last_dir.clone())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+    }
+
     pub(crate) fn open_dialog(&mut self, cx: &mut Context<Self>) {
-        let rx = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: None,
-        });
-        cx.spawn(async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = rx.await {
-                if let Some(p) = paths.into_iter().next() {
-                    if let Some(this) = this.upgrade() {
-                        this.update(cx, |v, cx| v.open(p, cx));
+        #[cfg(windows)]
+        {
+            // native IFileOpenDialog: MIDI filter + start folder (#158)
+            let hwnd = self.dialog_hwnd(cx);
+            let dir = self.open_dialog_start();
+            self.dlg_rx = Some((crate::filedlg::open_path(hwnd, dir), false));
+            cx.notify();
+        }
+        #[cfg(not(windows))]
+        {
+            let rx = cx.prompt_for_paths(PathPromptOptions {
+                files: true,
+                directories: false,
+                multiple: false,
+                prompt: None,
+            });
+            cx.spawn(async move |this, cx| {
+                if let Ok(Ok(Some(paths))) = rx.await {
+                    if let Some(p) = paths.into_iter().next() {
+                        if let Some(this) = this.upgrade() {
+                            this.update(cx, |v, cx| v.open(p, cx));
+                        }
                     }
                 }
-            }
-        })
-        .detach();
+            })
+            .detach();
+        }
     }
 
     /// Post-swap view reset shared by open() and snapshot restore:
@@ -928,6 +1156,7 @@ impl EditorView {
         self.mouse_pos = None;
         self.enc_override = None;
         self.play_us = 0;
+        self.play_start_us = 0;
         {
             let mut sh = lock_shared(&self.shared);
             sh.muted.clear();
@@ -960,6 +1189,9 @@ impl EditorView {
                 // must not carry over (apply_prefs early-returns then)
                 self.punch_in = None;
                 self.punch_out = None;
+                // #162: a format-0 file holding several channels gets an
+                // explicit keep/split choice after the swap settles
+                let fmt0_multi = d.format == 0 && d.channels_used().len() > 1;
                 // swap the document in place — the MCP server holds this same Arc
                 mcp_server::service::swap_document(&self.shared, d, Some(path.clone()));
                 // the new document also reports revision 0 — bump the epoch
@@ -972,6 +1204,7 @@ impl EditorView {
                 self.mouse_pos = None;
                 self.enc_override = None;
                 self.play_us = 0;
+                self.play_start_us = 0;
                 // rebuild the derived views, then land the view on the new
                 // content — a saved per-file sidecar (applied next) overrides
                 self.refresh_derived();
@@ -1004,6 +1237,16 @@ impl EditorView {
                     status = format!("{status} — {}", t("status.rec_discarded"));
                 }
                 self.status = status.into();
+                // opening adopts the folder as the last-used one (#158)
+                if let Some(dir) = path.parent() {
+                    if self.last_dir.as_deref() != Some(dir) {
+                        self.last_dir = Some(dir.to_path_buf());
+                        self.save_global();
+                    }
+                }
+                if fmt0_multi {
+                    self.prompt_fmt0_split(cx);
+                }
             }
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "open failed");

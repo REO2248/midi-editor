@@ -61,7 +61,14 @@ pub use persist::write_atomic;
 pub enum TransportReq {
     Play,
     Stop,
-    Seek { tick: u64 },
+    Seek {
+        tick: u64,
+    },
+    /// set/clear the explicit loop locators (#130) — ticks; `None` clears
+    SetLoop {
+        start: Option<u64>,
+        end: Option<u64>,
+    },
 }
 
 /// MCP authentication posture of the transport serving `Shared`. Written by

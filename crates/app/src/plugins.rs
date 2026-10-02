@@ -305,6 +305,19 @@ impl EditorView {
                 changed = true;
             }
         }
+        // a live routing refresh deferred while a plugin loaded — retry once
+        // nothing needed is still on the way up
+        if self.live_route_dirty && self.playback.is_some() {
+            let still_loading = self
+                .plugin_state
+                .values()
+                .any(|s| matches!(s, PluginState::Loading { .. }));
+            if !still_loading {
+                self.live_route_dirty = false;
+                self.refresh_live_routing();
+                changed = true;
+            }
+        }
         changed
     }
 
@@ -736,12 +749,15 @@ impl EditorView {
                     rec.input_lost = false;
                     // the new connection's t=0 restarts — re-anchor the
                     // doc-time base and clear the already-consumed count-in
-                    rec.base_us = self
-                        .playback
-                        .as_ref()
-                        .map(|p| p.position_us())
-                        .unwrap_or(self.play_us);
+                    rec.base_us = {
+                        let cin = self.live_countin_us;
+                        self.playback
+                            .as_ref()
+                            .map(|p| p.position_us().saturating_sub(cin))
+                            .unwrap_or(self.play_us)
+                    };
                     rec.cin_us = 0;
+                    rec.cin_region = None;
                     tracing::info!("recording input '{name}' reconnected");
                     changed = true;
                 }

@@ -53,6 +53,34 @@ pub(crate) struct GlobalPrefs {
     /// keybinding overrides: command id -> "ctrl+shift+z" descriptor
     #[serde(default)]
     pub(crate) keymap: HashMap<String, String>,
+    /// reset-on-stop: normal transport stop sends the full CC123/121/120
+    /// sweep instead of notes-off only (#161)
+    #[serde(default)]
+    pub(crate) reset_on_stop: bool,
+    /// count-in length in bars: 0 = off, 1/2/4 = bars (#137). When absent,
+    /// the legacy `count_in` bool maps to 1/0 bars.
+    #[serde(default)]
+    pub(crate) count_in_bars: Option<u8>,
+    /// input monitor mode: "off" | "auto" | "in" (#159); absent = auto
+    pub(crate) monitor: Option<String>,
+    /// armed track's input channel filter 0-15 (#159); absent = all
+    pub(crate) rec_in_ch: Option<u8>,
+    /// SysEx captured into takes (#160); absent = on — disabling skips
+    /// F0/F7 input at the gate so a bulk dump never lands in the take
+    pub(crate) rec_sysex: Option<bool>,
+    /// SysEx echoed to the armed destination while monitoring (#160);
+    /// absent = off — a bulk dump must not blast the output unasked
+    pub(crate) mon_sysex: Option<bool>,
+    /// return-to-start-on-stop (Cubase preference): a transport stop moves
+    /// the play point back to where the pass began. None (older files) =
+    /// on, the DAW-conventional default (#156).
+    pub(crate) return_to_start_on_stop: Option<bool>,
+    /// middle-C octave naming preference: 3, 4, or 5; absent = 4 (#164).
+    /// Display-only — MIDI data is never renumbered.
+    pub(crate) middle_c: Option<u8>,
+    /// last folder a document was opened from / saved into (#158) — the
+    /// file dialog's fallback start directory
+    pub(crate) last_dir: Option<String>,
 }
 
 impl Default for GlobalPrefs {
@@ -73,6 +101,15 @@ impl Default for GlobalPrefs {
             hc: None,
             theme: None,
             keymap: HashMap::new(),
+            reset_on_stop: false,
+            return_to_start_on_stop: None,
+            count_in_bars: None,
+            monitor: None,
+            middle_c: None,
+            last_dir: None,
+            rec_in_ch: None,
+            rec_sysex: None,
+            mon_sysex: None,
         }
     }
 }
@@ -139,8 +176,17 @@ pub(crate) struct Prefs {
     pub(crate) soloed: Vec<usize>,
     #[serde(default)]
     pub(crate) metronome: bool,
+    /// explicit metronome click destination identity — None = follow the
+    /// document default destination (#137)
+    pub(crate) met_dest: Option<output::Destination>,
     #[serde(default)]
     pub(crate) loop_enabled: bool,
+    /// explicit loop locators in ticks — None = unset (#130); absent in
+    /// old sidecars
+    #[serde(default)]
+    pub(crate) loop_start: Option<u64>,
+    #[serde(default)]
+    pub(crate) loop_end: Option<u64>,
     /// None in old sidecars = keep the default (overdub)
     pub(crate) rec_mode: Option<String>,
     /// punch bounds in ticks — None = not set
@@ -176,6 +222,10 @@ pub(crate) struct Prefs {
     pub(crate) scale_minor: Option<bool>,
     /// None in old sidecars = keep the default (page)
     pub(crate) follow: Option<String>,
+    /// per-track insert/edit channel (editor state; `FF 20` prefix is the
+    /// fallback when a track has no entry). New in v2 sidecars.
+    #[serde(default)]
+    pub(crate) edit_ch: HashMap<usize, u8>,
 }
 
 impl Default for Prefs {
@@ -187,7 +237,10 @@ impl Default for Prefs {
             muted: Vec::new(),
             soloed: Vec::new(),
             metronome: false,
+            met_dest: None,
             loop_enabled: false,
+            loop_start: None,
+            loop_end: None,
             chase_sysex: None,
             sysex_policy: None,
             rec_mode: None,
@@ -210,6 +263,7 @@ impl Default for Prefs {
             follow: None,
             poly_key: None,
             lanes: None,
+            edit_ch: HashMap::new(),
         }
     }
 }
@@ -261,6 +315,7 @@ impl persist::json::Versioned for Prefs {
         self.muted.retain(|t| *t < 1024);
         self.soloed.retain(|t| *t < 1024);
         self.track_dest.retain(|t, _| *t < 1024);
+        self.edit_ch.retain(|t, c| *t < 1024 && *c < 16);
     }
 }
 
@@ -345,6 +400,7 @@ impl EditorView {
             .iter()
             .map(|(t, d)| (*t, self.resolve_dest(d)))
             .collect();
+        let met_dest = p.met_dest.as_ref().map(|d| self.resolve_dest(d));
         {
             let mut sh = lock_shared(&self.shared);
             for (t, d) in overrides {
@@ -353,7 +409,10 @@ impl EditorView {
             sh.muted = p.muted.into_iter().collect();
             sh.soloed = p.soloed.into_iter().collect();
             sh.metronome = p.metronome;
+            sh.met_dest = met_dest;
             sh.loop_enabled = p.loop_enabled;
+            sh.loop_start = p.loop_start;
+            sh.loop_end = p.loop_end;
             if let Some(c) = p.chase_sysex {
                 sh.chase_sysex = c;
             }
@@ -392,6 +451,7 @@ impl EditorView {
             let n = self.doc(|d| d.tracks.len());
             self.sel_track = t.min(n.saturating_sub(1));
         }
+        self.edit_ch = p.edit_ch;
         self.enc_override = p.enc.as_deref().map(|e| match e {
             "utf8" => smf_core::TextEncoding::Utf8,
             "sjis" => smf_core::TextEncoding::ShiftJis,
@@ -497,9 +557,16 @@ impl EditorView {
         GlobalPrefs {
             version: <GlobalPrefs as persist::json::Versioned>::VERSION,
             recent: self.recent.iter().map(|r| r.to_string()).collect(),
-            count_in: self.count_in,
+            // legacy bool kept for older builds reading the same file —
+            // `count_in_bars` is authoritative (#137)
+            count_in: self.count_in_bars > 0,
             midi_in: self.midi_in.to_string(),
             in_latency_ms: self.in_latency_ms,
+            count_in_bars: Some(self.count_in_bars),
+            monitor: Some(self.monitor.label().to_string()),
+            rec_in_ch: self.rec_in_ch,
+            rec_sysex: Some(self.rec_sysex),
+            mon_sysex: Some(self.rec_mon_sysex),
             audio_device: self.audio_sel.device.clone(),
             sample_rate: self.audio_sel.sample_rate,
             buffer_size: self.audio_sel.buffer_size,
@@ -510,6 +577,10 @@ impl EditorView {
             hc: self.hc_pref,
             theme: Some(self.theme_mode.name().to_string()),
             keymap: self.keys.overrides.clone(),
+            reset_on_stop: self.reset_on_stop,
+            return_to_start_on_stop: Some(self.return_to_start_on_stop),
+            middle_c: Some(self.middle_c),
+            last_dir: self.last_dir.as_ref().map(|p| p.display().to_string()),
         }
         .save();
     }
@@ -530,7 +601,12 @@ impl EditorView {
             muted: sh.muted.iter().copied().collect(),
             soloed: sh.soloed.iter().copied().collect(),
             metronome: sh.metronome,
+            met_dest: sh
+                .met_dest
+                .and_then(|d| sh.dests.get(d).map(|(_, dest)| dest.clone())),
             loop_enabled: sh.loop_enabled,
+            loop_start: sh.loop_start,
+            loop_end: sh.loop_end,
             chase_sysex: Some(sh.chase_sysex),
             sysex_policy: Some(sh.sysex_policy.label().to_string()),
             rec_mode: Some(self.rec_mode.label().to_string()),
@@ -540,6 +616,7 @@ impl EditorView {
             scroll_x: Some(self.scroll_x),
             scroll_y: Some(self.scroll_y),
             sel_track: Some(self.sel_track),
+            edit_ch: self.edit_ch.clone(),
             note_h: Some(self.note_h),
             fold: Some(self.fold),
             drum: Some(self.drum),

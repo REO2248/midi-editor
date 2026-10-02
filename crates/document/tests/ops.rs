@@ -43,8 +43,9 @@ fn apply(d: &mut Document, ops: Vec<Op>) -> Transaction {
         base: d.revision(),
         ops,
     };
-    d.apply(tx.clone()).unwrap();
-    tx
+    // the effective transaction — synthesized normalization ops included —
+    // is the one `revert` restores byte-exactly
+    d.apply(tx).unwrap().tx
 }
 
 #[test]
@@ -357,10 +358,68 @@ fn set_time_sig_encodes_denominator_log2() {
             meta_type: 0x58,
             data,
         } => {
-            assert_eq!(&data[..], &[6, 3, 24, 8], "6/8 → dd=3");
+            // 6/8 → dd=3; a fresh compound meter clicks on the dotted
+            // quarter (36 clocks), bb stays the conventional 8
+            assert_eq!(&data[..], &[6, 3, 36, 8], "6/8 → dd=3");
         }
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn set_time_sig_rewrite_preserves_cc_bb() {
+    // a signature the file wrote with non-default cc/bb keeps those bytes
+    // when only nn/dd is rewritten
+    let mut d = doc(vec![vec![smf_core::Event {
+        tick: 0,
+        seq: 0,
+        raw_body: None,
+        kind: EventKind::Meta {
+            meta_type: 0x58,
+            data: Bytes::copy_from_slice(&[6, 3, 18, 4]),
+        },
+    }]]);
+    let __ops = d.set_time_sig_ops(0, 0, 3, 4);
+    apply(&mut d, __ops);
+    let e = d.tracks[0]
+        .events
+        .iter()
+        .find(|e| {
+            matches!(
+                e.kind,
+                EventKind::Meta {
+                    meta_type: 0x58,
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    match &e.kind {
+        EventKind::Meta { data, .. } => {
+            assert_eq!(
+                &data[..],
+                &[3, 2, 18, 4],
+                "cc/bb preserved across nn/dd rewrite"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    // the signature is still the single FF58 at that tick — set ops never
+    // grow a duplicate
+    assert_eq!(
+        d.tracks[0]
+            .events
+            .iter()
+            .filter(|e| matches!(
+                e.kind,
+                EventKind::Meta {
+                    meta_type: 0x58,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -458,8 +517,8 @@ fn delete_range_channel_ops_filters_channels() {
     assert_eq!(notes.len(), 1);
     assert_eq!(notes[0].channel, 1, "ch1 note must survive");
     assert_eq!(notes[0].key, 62);
-    // meta untouched; only ch0 events removed
-    assert_eq!(d.tracks[0].events.len(), 3);
+    // meta untouched; only ch0 events removed (+1 minted End-of-Track)
+    assert_eq!(d.tracks[0].events.len(), 4);
     assert!(d.tracks[0]
         .events
         .iter()
@@ -543,6 +602,7 @@ fn update_revert_restores_raw_body() {
     let tx = apply(
         &mut d,
         vec![Op::UpdateEvent {
+            pos: usize::MAX,
             track: 0,
             before: ev,
             after,
@@ -709,6 +769,7 @@ fn tick_only_edit_preserves_raw_body() {
     apply(
         &mut d,
         vec![Op::UpdateEvent {
+            pos: usize::MAX,
             track: 1,
             before: ev,
             after,
@@ -762,7 +823,8 @@ fn apply_is_atomic_on_unknown_track() {
             events: vec![new_ev],
         }],
     );
-    assert_eq!(d.tracks[0].events.len(), 2);
+    // original + insert + the structural End-of-Track the track gains
+    assert_eq!(d.tracks[0].events.len(), 3);
 }
 
 #[test]
@@ -770,7 +832,8 @@ fn duplicate_whole_track_range_does_not_overflow() {
     let mut d = doc(vec![vec![chan(100, 0x90, 60, 100)]]);
     let ops = d.duplicate_range_ops(0, 0, u64::MAX); // span = u64::MAX
     apply(&mut d, ops);
-    assert_eq!(d.tracks[0].events.len(), 2, "saturates instead of wrapping");
+    // original + duplicate + the structural End-of-Track
+    assert_eq!(d.tracks[0].events.len(), 3, "saturates instead of wrapping");
 }
 
 #[test]
@@ -1489,4 +1552,65 @@ fn swing_amount_zero_is_noop_and_hundred_clamps() {
     let ops = d.swing_ops(0, 0, u64::MAX, 240, 200);
     apply(&mut d, ops);
     assert_eq!(notes_on(&d, 0)[0].start_tick, 240 + 239);
+}
+
+/// #162 — the Format-0 split offers ops only for genuinely multichannel
+/// files, routes each channel to its own Format-1 track, and keeps the
+/// meta/EOT shell in track 0.
+#[test]
+fn split_fmt0_by_channel_ops() {
+    let meta = |tick: u64, ty: u8, data: &[u8]| smf_core::Event {
+        tick,
+        seq: 0,
+        raw_body: None,
+        kind: EventKind::Meta {
+            meta_type: ty,
+            data: data.to_vec().into(),
+        },
+    };
+    let fmt0 = |events: Vec<smf_core::Event>| {
+        Document::from_file(smf_core::File {
+            format: 0,
+            division: Division::Metrical(480),
+            tracks: vec![smf_core::Track { events }],
+            warnings: vec![],
+        })
+    };
+
+    // single-channel fmt0: no conversion offered
+    let d = fmt0(vec![chan(0, 0x90, 60, 100)]);
+    assert!(d.split_fmt0_by_channel_ops().is_empty());
+
+    // multichannel fmt0: conductor + one track per channel
+    let mut d = fmt0(vec![
+        meta(0, 0x51, &[0x07, 0xA1, 0x20]),
+        chan(0, 0x90, 60, 100),
+        chan(0, 0x91, 64, 100),
+        meta(960, 0x2F, &[]),
+    ]);
+    let ops = d.split_fmt0_by_channel_ops();
+    assert!(!ops.is_empty());
+    let tx = apply(&mut d, ops);
+    assert_eq!(d.format, 1);
+    assert_eq!(d.tracks.len(), 3);
+    // conductor keeps only non-channel events (tempo + EOT)
+    assert!(d.tracks[0]
+        .events
+        .iter()
+        .all(|e| matches!(e.kind, EventKind::Meta { .. })));
+    assert!(d.tracks[1]
+        .events
+        .iter()
+        .all(|e| matches!(e.kind, EventKind::Channel { status, .. } if status & 0x0F == 0)));
+    assert!(d.tracks[2]
+        .events
+        .iter()
+        .all(|e| matches!(e.kind, EventKind::Channel { status, .. } if status & 0x0F == 1)));
+    assert_eq!(d.tracks[1].out_channel, 0);
+    assert_eq!(d.tracks[2].out_channel, 1);
+    // undo restores the single-track format-0 document
+    d.revert(&tx);
+    assert_eq!(d.format, 0);
+    assert_eq!(d.tracks.len(), 1);
+    assert_eq!(d.tracks[0].events.len(), 4);
 }

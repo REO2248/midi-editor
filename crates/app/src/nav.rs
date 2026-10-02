@@ -121,14 +121,41 @@ pub(crate) const SNAPS: [(u32, bool, &str); 10] = [
 ];
 
 impl EditorView {
-    /// Select every note in the selected track.
-    pub(crate) fn select_all(&mut self, cx: &mut Context<Self>) {
-        self.selection = self
-            .notes
-            .iter()
-            .filter(|n| n.track == self.sel_track)
-            .map(|n| n.on_id)
-            .collect();
+    /// Select everything in the focused context (#152): the event list
+    /// selects rows, the lane selects its events, the roll/track areas
+    /// select the selected track's notes.
+    pub(crate) fn select_all(&mut self, window: &Window, cx: &mut Context<Self>) {
+        match self.area(window, cx) {
+            FocusArea::Events => {
+                self.sel_events = self
+                    .event_refs
+                    .iter()
+                    .flatten()
+                    .map(|(_, _, id)| *id)
+                    .collect();
+            }
+            FocusArea::Lane => {
+                // every event shown by every visible lane of this track
+                let cfgs = self.lanes.clone();
+                let mut ids = BTreeSet::new();
+                for cfg in cfgs {
+                    ids.extend(
+                        self.lane_events_cached(cfg.mode, cfg.poly_key)
+                            .iter()
+                            .map(|(id, _, _, _)| *id),
+                    );
+                }
+                self.lane_sel = ids;
+            }
+            _ => {
+                self.selection = self
+                    .notes
+                    .iter()
+                    .filter(|n| n.track == self.sel_track)
+                    .map(|n| n.on_id)
+                    .collect();
+            }
+        }
         cx.notify();
     }
 
@@ -337,6 +364,22 @@ impl EditorView {
     /// 480 fallback the pre-format-2 code did (position labels only).
     pub(crate) fn ppq(&self) -> u64 {
         self.doc(|d| d.tempo_map.ppq().unwrap_or(480))
+    }
+
+    /// The quantize grid in ticks — a dedicated setting (#139), not the
+    /// draw snap. Shares the SNAPS table so its label language matches.
+    pub(crate) fn quantize_grid(&self) -> u64 {
+        let (div, trip, _) = SNAPS[self.q_snap.min(SNAPS.len() - 1)];
+        if div == 0 {
+            // "off" quantize = 1-tick grid (no visible movement)
+            return 1;
+        }
+        let base = self.td().snap_base_ticks() / div as u64;
+        if trip {
+            (base * 2 / 3).max(1)
+        } else {
+            base.max(1)
+        }
     }
 
     pub(crate) fn snap_ticks(&self) -> i64 {
@@ -837,9 +880,10 @@ impl EditorView {
         }
     }
 
-    /// Note length used by cursor inserts — same rule as `insert_note`.
+    /// Note length used by cursor inserts — the explicit Note Length
+    /// setting (#144), never the hidden max(snap, quarter) policy.
     pub(crate) fn cursor_insert_len(&self) -> u64 {
-        self.snap_ticks().max(self.ppq() as i64 / 4) as u64
+        self.note_len.ticks(self)
     }
 
     /// Move the roll edit cursor and scroll it into view.
@@ -928,13 +972,17 @@ impl EditorView {
         self.persist();
     }
 
+    /// Cycle the track's insert/edit channel — editor state, not a file
+    /// write. The `FF 20` channel-prefix meta is only touched through the
+    /// explicit Track ▸ Channel Prefix command (or MCP); playback always
+    /// follows each event's own channel.
     pub(crate) fn cycle_chan(&mut self, i: usize) {
-        let ops = {
-            let mut sh = lock_shared(&self.shared);
-            let cur = sh.doc.tracks.get(i).map(|t| t.out_channel).unwrap_or(0);
-            sh.doc.set_track_channel_ops(i, (cur + 1) % 16)
-        };
-        self.apply_tx("set track channel", ops);
+        let cur = self.edit_channel_of(
+            i,
+            self.doc(|d| d.tracks.get(i).map(|t| t.out_channel).unwrap_or(0)),
+        );
+        self.edit_ch.insert(i, (cur + 1) % 16);
+        self.persist();
     }
 
     /// Apply the rename field to the selected track.
@@ -1196,14 +1244,25 @@ impl EditorView {
             .cloned()
     }
 
-    /// Channel the selected track's previews route through.
+    /// Channel the selected track's previews route through — the track's
+    /// insert/edit channel (explicit editor state), defaulting to its
+    /// `FF 20` channel prefix. Per-event channels always rule on file
+    /// playback; this only decides what NEW/preview events sound on.
     pub(crate) fn sel_track_ch(&self) -> u8 {
         self.doc(|d| {
-            d.tracks
+            let prefix = d
+                .tracks
                 .get(self.sel_track)
-                .map(|t| t.out_channel & 0x0F)
-                .unwrap_or(0)
+                .map(|t| t.out_channel)
+                .unwrap_or(0);
+            self.edit_channel_of(self.sel_track, prefix)
         })
+    }
+
+    /// The effective insert/edit channel for `track`: the user's explicit
+    /// per-track choice when set, else the `FF 20` channel prefix, else 0.
+    pub(crate) fn edit_channel_of(&self, track: usize, prefix: u8) -> u8 {
+        self.edit_ch.get(&track).copied().unwrap_or(prefix & 0x0F)
     }
 
     /// Piano-key under a window-space position on the key strip — row

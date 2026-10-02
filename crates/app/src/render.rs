@@ -35,6 +35,48 @@ pub(crate) const LANE_KEY_COLORS: [u32; 8] = [
 /// Snap-menu label: metrical files subdivide a whole note, SMPTE files a
 /// second — "1/16" vs "1/16s" makes the redefined grid explicit instead
 /// of silently suggesting beats that don't exist. "off" stays bare.
+impl EditorView {
+    /// Quantize grid rows (checkable) — labeled with the SNAPS table.
+    pub(crate) fn quant_grid_rows(&self, cx: &mut Context<Self>) -> Vec<MenuRow> {
+        let td = self.td();
+        SNAPS
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let label = snap_label(s.2, td);
+                Self::mi_leaf(
+                    ("qgrid", i),
+                    label,
+                    "",
+                    Some(self.q_snap == i),
+                    cx,
+                    move |v, _e, _cx| {
+                        v.q_snap = i;
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Quantize strength rows — 100/75/50 with the current pick checked.
+    pub(crate) fn quant_str_rows(&self, cx: &mut Context<Self>) -> Vec<MenuRow> {
+        [100u32, 75, 50]
+            .iter()
+            .enumerate()
+            .map(|(i, &st)| {
+                Self::mi_leaf(
+                    ("qstr", i),
+                    tf("quant.strength", &[("p", st.to_string().as_str())]),
+                    "",
+                    Some(self.q_str == st),
+                    cx,
+                    move |v, _e, _cx| v.q_str = st,
+                )
+            })
+            .collect()
+    }
+}
+
 fn snap_label(label: &'static str, td: TimeDisplay) -> String {
     if td.is_smpte() && label != "off" {
         format!("{label}s")
@@ -45,6 +87,13 @@ fn snap_label(label: &'static str, td: TimeDisplay) -> String {
 
 impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // native title bar follows the document (#163) — writes only on
+        // change so frames don't syscall
+        let title = self.window_title();
+        if title != self.last_title {
+            window.set_window_title(&title);
+            self.last_title = title;
+        }
         // the plugin editor lives in the helper subprocess's own window —
         // no native event queue to pump here
         // focus-loss guarantee: deactivate = release preview notes (the
@@ -96,10 +145,14 @@ impl Render for EditorView {
         // advance playhead / auto-stop (looping happens inside the
         // playback thread; reaching this branch means playback ended)
         if let Some(p) = &self.playback {
-            self.play_us = p.position_us();
+            self.play_us = self.live_pos_us(p);
             if !p.is_running() {
                 self.playback = None;
-                self.play_us = 0;
+                // natural end follows the same stop policy as a manual
+                // stop — return to the pass start when enabled (#156)
+                if self.return_to_start_on_stop {
+                    self.play_us = self.play_start_us;
+                }
             }
         }
         let (
@@ -150,8 +203,18 @@ impl Render for EditorView {
         // rebuilt on edits only, never per animation frame
         let doc_ui = self.doc_ui.clone();
         let n_diags = doc_ui.n_diags;
-        let tempo0 = doc_ui.tempo0;
-        let sig = doc_ui.sig.clone();
+        // tempo in force at the playhead on the conductor track (#133) —
+        // not the tick-0 tempo
+        let tempo0 = {
+            let tr = self.tempo_track();
+            self.doc(|d| crate::edit_ops::tempo_bpm_at(d, tr, d.tempo_map.us_to_tick(self.play_us)))
+        };
+        // signature in force at the playhead on the viewed track — the
+        // file's real FF58 map, not the first signature in the file
+        let sig = self.doc(|d| {
+            let m = d.meter_map_for(self.sel_track).meter_at(playhead_tick);
+            format!("{}/{}", m.num, 1u32 << m.den_pow.min(15))
+        });
         let track_names = doc_ui.track_names.clone();
         let track_chs = doc_ui.track_chs.clone();
         let markers = &doc_ui.markers;
@@ -162,10 +225,13 @@ impl Render for EditorView {
         // explicit UI timing mode — metrical bar/beat or SMPTE timecode,
         // drawn straight from the SMF division (never a pretend PPQ)
         let td = self.td();
+        // position labels + bar/beat grid follow the viewed track's real
+        // FF58 meter map — format 2: that sequence's own signatures
+        let pos_fmt = self.doc(|d| d.position_format_for(self.sel_track));
         let (grid_minor, grid_major) = td.grid_ticks(self.zoom);
         let note_min = td.min_grid_ticks();
         let badge = td.badge();
-        let pos = td.format_tick(playhead_tick);
+        let pos = pos_fmt.fmt(playhead_tick);
 
         // playhead follow — suspended while a drag is live or the user just
         // scrolled manually (`follow_hold`)
@@ -253,6 +319,7 @@ impl Render for EditorView {
         let cursor_t = self.cursor_tick;
         let cursor_k = self.cursor_key;
         let cursor_len = self.cursor_insert_len();
+        let pos_fmt_roll = pos_fmt.clone();
 
         let roll = canvas(
             move |bounds, _window, _cx| {
@@ -295,23 +362,49 @@ impl Render for EditorView {
                         }),
                     ));
                 }
-                // beat/bar lines — quarter/bar for metrical, frame/second
-                // for SMPTE (minor lines collapse when < ~4px apart)
+                // beat/bar lines — real FF58 bar boundaries for metrical
+                // (bars are not a fixed stride once the meter changes),
+                // frame/second for SMPTE (minor lines collapse when
+                // < ~4px apart)
                 let tick0 = (scroll_x / zoom).max(0.0) as u64;
-                let tick1 = tick0 + (f32::from(w) / zoom) as u64 + grid_minor;
-                let mut t = tick0 / grid_minor * grid_minor;
-                while t <= tick1 {
-                    let x = bounds.origin.x + px(t as f32 * zoom - scroll_x);
-                    let strong = t.is_multiple_of(grid_major);
-                    window.paint_quad(fill(
-                        Bounds::new(point(x, bounds.origin.y), size(px(1.0), h)),
-                        rgb(if strong {
-                            theme::current().grid_bar
-                        } else {
-                            theme::current().border
-                        }),
-                    ));
-                    t += grid_minor;
+                match &pos_fmt_roll {
+                    PositionFormat::Bbt(mm) => {
+                        let tick1 = tick0 + (f32::from(w) / zoom) as u64 + mm.bar_ticks_at(tick0);
+                        // minor beat lines collapse into bar-only when
+                        // they'd draw too close — same rule as SMPTE
+                        let min_beat_px = mm.beat_ticks_of(mm.meter_at(tick0)) as f32 * zoom;
+                        for (t, down) in mm.beat_lines_between(tick0, tick1) {
+                            if !down && min_beat_px < 4.0 {
+                                continue;
+                            }
+                            let x = bounds.origin.x + px(t as f32 * zoom - scroll_x);
+                            window.paint_quad(fill(
+                                Bounds::new(point(x, bounds.origin.y), size(px(1.0), h)),
+                                rgb(if down {
+                                    theme::current().grid_bar
+                                } else {
+                                    theme::current().border
+                                }),
+                            ));
+                        }
+                    }
+                    PositionFormat::Smpte(_) => {
+                        let tick1 = tick0 + (f32::from(w) / zoom) as u64 + grid_minor;
+                        let mut t = tick0 / grid_minor * grid_minor;
+                        while t <= tick1 {
+                            let x = bounds.origin.x + px(t as f32 * zoom - scroll_x);
+                            let strong = t.is_multiple_of(grid_major);
+                            window.paint_quad(fill(
+                                Bounds::new(point(x, bounds.origin.y), size(px(1.0), h)),
+                                rgb(if strong {
+                                    theme::current().grid_bar
+                                } else {
+                                    theme::current().border
+                                }),
+                            ));
+                            t += grid_minor;
+                        }
+                    }
                 }
                 // notes — enter the sorted list by binary search. While a
                 // Move/Duplicate drag shifts notes, widen the window toward
@@ -683,20 +776,24 @@ impl Render for EditorView {
                 t("tip.stop"),
                 false,
                 cx,
-                |v, _e, cx| {
-                    v.stop_playback();
-                    v.play_us = 0;
-                    cx.notify();
-                },
+                |v, _e, cx| v.transport_stop(cx),
+            ))
+            .child(Self::ibtn(
+                "i.start",
+                "skip_previous",
+                t("tip.go_start"),
+                false,
+                cx,
+                |v, _e, cx| v.go_to_start(cx),
             ))
             .child(Self::ibtn_c(
                 "i.rec",
                 "fiber_manual_record",
                 t("tip.rec"),
-                self.rec.is_some(),
+                self.is_recording(),
                 theme::current().danger,
                 cx,
-                |v, _e, _cx| v.toggle_record(),
+                |v, _e, cx| v.transport_record(cx),
             ))
             .child(Self::ibtn_c(
                 "i.loop",
@@ -968,9 +1065,10 @@ impl Render for EditorView {
                 false,
                 cx,
                 |v, _e, cx| {
-                    let g = v.snap_ticks().max(v.td().min_grid_ticks() as i64) as u64;
+                    let g = v.quantize_grid();
+                    let st = v.q_str;
                     v.apply_region_op("quantize", move |d, tr, f, to| {
-                        d.quantize_ops(tr, f, to, g, 100)
+                        d.quantize_ops(tr, f, to, g, st)
                     });
                     cx.notify();
                 },
@@ -1090,9 +1188,14 @@ impl Render for EditorView {
                     .text_size(px(metrics::TEXT_MD))
                     .text_color(rgb(th.text_muted))
                     .child(format!(
-                        "{} ({}){}",
+                        "{} ({}){}{}",
                         t("events.header"),
                         self.events.len(),
+                        if self.ev_filter.is_active() {
+                            format!(" [{}]", t("events.filtered"))
+                        } else {
+                            String::new()
+                        },
                         self.doc_ui
                             .mode_hint
                             .map(|m| format!(" [{}]", m.label()))
@@ -1346,6 +1449,35 @@ impl Render for EditorView {
                                     .child(name.to_string()),
                             )
                             .child(
+                                // record arm — DAW per-track arm state,
+                                // separate from transport Record (#159)
+                                div()
+                                    .id(("arm", i))
+                                    .test_support()
+                                    .role(Role::CheckBox)
+                                    .aria_label(tf("a11y.arm", &[("track", name.as_str())]))
+                                    .aria_toggled(if self.armed_track == Some(i) {
+                                        Toggled::True
+                                    } else {
+                                        Toggled::False
+                                    })
+                                    .px_1()
+                                    .text_size(px(9.0))
+                                    .text_color(rgb(if self.armed_track == Some(i) {
+                                        theme::current().danger
+                                    } else {
+                                        theme::current().text_muted_name
+                                    }))
+                                    .on_click(cx.listener(move |v, _e: &ClickEvent, w, cx| {
+                                        cx.stop_propagation();
+                                        v.sel_track = i;
+                                        v.toggle_arm();
+                                        w.focus(&v.tracks_fh, cx);
+                                        cx.notify();
+                                    }))
+                                    .child("R"),
+                            )
+                            .child(
                                 div()
                                     .id(("mute", i))
                                     .test_support()
@@ -1406,7 +1538,10 @@ impl Render for EditorView {
                                         "a11y.track_ch",
                                         &[(
                                             "ch",
-                                            (track_chs.get(i).copied().unwrap_or(0) + 1)
+                                            (self.edit_channel_of(
+                                                i,
+                                                track_chs.get(i).copied().unwrap_or(0),
+                                            ) + 1)
                                                 .to_string()
                                                 .as_str(),
                                         )],
@@ -1422,7 +1557,10 @@ impl Render for EditorView {
                                     }))
                                     .child(format!(
                                         "c{}",
-                                        track_chs.get(i).copied().unwrap_or(0) + 1
+                                        self.edit_channel_of(
+                                            i,
+                                            track_chs.get(i).copied().unwrap_or(0),
+                                        ) + 1
                                     )),
                             )
                     })),
@@ -1594,23 +1732,75 @@ impl Render for EditorView {
 
         let ruler_bounds_cell = self.ruler_bounds.clone();
         let ruler_play_tick = playhead_tick;
+        let pos_fmt_ruler = pos_fmt.clone();
+        let (loop_s, loop_e) = {
+            let sh = crate::lock_shared(&self.shared);
+            (sh.loop_start, sh.loop_end)
+        };
         let ruler = canvas(
             move |bounds, _window, _cx| {
                 ruler_bounds_cell.set(bounds);
             },
             move |bounds, _state, window, _cx| {
                 let w = bounds.size.width;
-                // coarse ticks: one bar for metrical, one second for SMPTE
+                // coarse ticks: real FF58 bar lines for metrical (meter
+                // changes make bars variable), one second for SMPTE
                 let tick0 = (scroll_x / zoom).max(0.0) as u64;
-                let tick1 = tick0 + (f32::from(w) / zoom) as u64 + grid_major;
-                let mut t = tick0 / grid_major * grid_major;
-                while t <= tick1 {
-                    let x = bounds.origin.x + px(t as f32 * zoom - scroll_x);
-                    window.paint_quad(fill(
-                        Bounds::new(point(x, bounds.origin.y + px(12.0)), size(px(1.0), px(8.0))),
-                        rgb(theme::current().state_off),
-                    ));
-                    t += grid_major;
+                match &pos_fmt_ruler {
+                    PositionFormat::Bbt(mm) => {
+                        let tick1 = tick0 + (f32::from(w) / zoom) as u64 + mm.bar_ticks_at(tick0);
+                        for t in mm.bar_starts_between(tick0, tick1) {
+                            let x = bounds.origin.x + px(t as f32 * zoom - scroll_x);
+                            window.paint_quad(fill(
+                                Bounds::new(
+                                    point(x, bounds.origin.y + px(12.0)),
+                                    size(px(1.0), px(8.0)),
+                                ),
+                                rgb(theme::current().state_off),
+                            ));
+                        }
+                    }
+                    PositionFormat::Smpte(_) => {
+                        let tick1 = tick0 + (f32::from(w) / zoom) as u64 + grid_major;
+                        let mut t = tick0 / grid_major * grid_major;
+                        while t <= tick1 {
+                            let x = bounds.origin.x + px(t as f32 * zoom - scroll_x);
+                            window.paint_quad(fill(
+                                Bounds::new(
+                                    point(x, bounds.origin.y + px(12.0)),
+                                    size(px(1.0), px(8.0)),
+                                ),
+                                rgb(theme::current().state_off),
+                            ));
+                            t += grid_major;
+                        }
+                    }
+                }
+                // explicit loop locators (#130): range band + edge handles
+                if let (Some(ls), Some(le)) = (loop_s, loop_e) {
+                    if le > ls {
+                        let x0 = bounds.origin.x + px(ls as f32 * zoom - scroll_x);
+                        let x1 = bounds.origin.x + px(le as f32 * zoom - scroll_x);
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                point(x0, bounds.origin.y),
+                                size(px(f32::from(x1 - x0).max(0.0)), px(4.0)),
+                            ),
+                            rgb(theme::current().accent),
+                        ));
+                    }
+                }
+                for lt in [loop_s, loop_e].into_iter().flatten() {
+                    let x = bounds.origin.x + px(lt as f32 * zoom - scroll_x);
+                    if x >= bounds.origin.x - px(4.0) && x <= bounds.origin.x + w + px(4.0) {
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                point(x - px(3.0), bounds.origin.y),
+                                size(px(6.0), px(8.0)),
+                            ),
+                            rgb(theme::current().accent),
+                        ));
+                    }
                 }
                 // playhead marker
                 let hx = bounds.origin.x + px(ruler_play_tick as f32 * zoom - scroll_x);
@@ -1749,11 +1939,56 @@ impl Render for EditorView {
                                 let b = this.ruler_bounds.get();
                                 let x = f32::from(ev.position.x) - f32::from(b.origin.x);
                                 let tick = ((x + this.scroll_x) / this.zoom).max(0.0) as u64;
+                                // grabbing a loop locator edge moves the
+                                // bound instead of seeking (#130)
+                                let near = |lt: Option<u64>| {
+                                    lt.is_some_and(|t| {
+                                        (t as f32 * this.zoom - this.scroll_x - x).abs() <= 6.0
+                                    })
+                                };
+                                let (ls, le) = {
+                                    let sh = crate::lock_shared(&this.shared);
+                                    (sh.loop_start, sh.loop_end)
+                                };
+                                if near(le) {
+                                    this.loop_drag = Some(crate::LoopDrag::End);
+                                    cx.notify();
+                                    return;
+                                }
+                                if near(ls) {
+                                    this.loop_drag = Some(crate::LoopDrag::Start);
+                                    cx.notify();
+                                    return;
+                                }
                                 // double-click on the ruler plays from that bar position
                                 this.seek_to_tick(tick, ev.click_count == 2, cx);
                             }),
                         )
                         .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
+                            // locator drag wins over scrub and works while
+                            // transport runs — the patch lands on mouse-up
+                            if let Some(which) = this.loop_drag {
+                                if ev.pressed_button != Some(MouseButton::Left) {
+                                    this.loop_drag = None;
+                                    return;
+                                }
+                                let b = this.ruler_bounds.get();
+                                let x = f32::from(ev.position.x) - f32::from(b.origin.x);
+                                let tick = ((x + this.scroll_x) / this.zoom).max(0.0) as u64;
+                                {
+                                    let mut sh = crate::lock_shared(&this.shared);
+                                    match which {
+                                        crate::LoopDrag::Start => {
+                                            sh.loop_start = Some(tick);
+                                        }
+                                        crate::LoopDrag::End => {
+                                            sh.loop_end = Some(tick);
+                                        }
+                                    }
+                                }
+                                cx.notify();
+                                return;
+                            }
                             // scrub: drag on the ruler moves the playhead.
                             // While playing, keep the engine running — a
                             // restart per move event would stutter audio.
@@ -1768,7 +2003,27 @@ impl Render for EditorView {
                             let tick = ((x + this.scroll_x) / this.zoom).max(0.0) as u64;
                             this.play_us = this.doc(|d| d.tempo_map.tick_to_us(tick));
                             cx.notify();
-                        })),
+                        }))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _ev: &MouseUpEvent, _w, cx| {
+                                if this.loop_drag.take().is_some() {
+                                    this.persist();
+                                    this.refresh_live_schedule();
+                                    cx.notify();
+                                }
+                            }),
+                        )
+                        .on_mouse_up_out(
+                            MouseButton::Left,
+                            cx.listener(|this, _ev: &MouseUpEvent, _w, cx| {
+                                if this.loop_drag.take().is_some() {
+                                    this.persist();
+                                    this.refresh_live_schedule();
+                                    cx.notify();
+                                }
+                            }),
+                        ),
                 )
                 // marker/lyric strip — meta 0x06/0x05 shown at their tick;
                 // click selects + seeks (then `e` edits, `Del` removes)
@@ -1823,6 +2078,8 @@ impl Render for EditorView {
                     let track_names_a11y = track_names.clone();
                     let scale_a11y = window.scale_factor();
                     let ppq = self.ppq();
+                    let pos_a11y = self.doc(|d| d.position_format_for(self.sel_track));
+                    let mc_off = self.mc_off();
                     div()
                         .id("piano-roll")
                         .test_support()
@@ -1838,11 +2095,13 @@ impl Render for EditorView {
                         .a11y_synthetic_children(move |b| {
                             a11y::RollA11y {
                                 bounds: roll_bounds_a11y.get(),
+                                mc_off,
                                 scale: scale_a11y,
                                 scroll_x,
                                 scroll_y,
                                 zoom,
                                 ppq,
+                                pos: pos_a11y,
                                 notes: notes_a11y,
                                 selection: selection_a11y,
                                 track_names: track_names_a11y,
@@ -1886,7 +2145,10 @@ impl Render for EditorView {
                                             .top(px(y))
                                             .text_size(px(7.0))
                                             .text_color(rgb(theme::current().text_dim))
-                                            .child(format!("C{}", k as i32 / 12 - 1))
+                                            .child(format!(
+                                                "C{}",
+                                                k as i32 / 12 - 1 + self.mc_off() as i32
+                                            ))
                                     })
                                 }))
                                 .on_mouse_down(
@@ -2371,6 +2633,8 @@ impl Render for EditorView {
                     Self::msep(),
                     Self::mi_sub("e.tool", t("edit.tool"), Sub::Tool, cx),
                     Self::mi_sub("e.snap", t("edit.snap"), Sub::Snap, cx),
+                    Self::mi_sub("e.notelen", t("edit.note_len"), Sub::NoteLen, cx),
+                    Self::mi_sub("e.insvel", t("edit.ins_vel"), Sub::InsVel, cx),
                     Self::msep(),
                     Self::mi_sub("e.quant", t("edit.quantize"), Sub::Quant, cx),
                     self.mi_cmd("edit.transpose_up", None, cx),
@@ -2387,11 +2651,16 @@ impl Render for EditorView {
                     Self::mi_sub("e.velset", t("edit.set_velocity"), Sub::VelSet, cx),
                     Self::mi_sub("e.relset", t("edit.set_release"), Sub::RelSet, cx),
                     Self::msep(),
+                    Self::mi_sub("e.alltrack", t("edit.apply_track"), Sub::AllTrack, cx),
+                    Self::msep(),
                     self.mi_cmd("edit.vel_up", None, cx),
                     self.mi_cmd("edit.vel_dn", None, cx),
                 ],
                 TopMenu::View => vec![
                     self.mi_cmd("view.events", Some(self.show_events), cx),
+                    Self::mi_sub("v.evftype", t("view.ev_ftype"), Sub::EvFType, cx),
+                    Self::mi_sub("v.evfchan", t("view.ev_fchan"), Sub::EvFChan, cx),
+                    Self::mi_sub("v.midc", t("view.middle_c"), Sub::MidC, cx),
                     Self::mi_sub("v.theme", t("view.theme"), Sub::Theme, cx),
                     self.mi_cmd(
                         "view.hc",
@@ -2508,9 +2777,32 @@ impl Render for EditorView {
                 }
                 TopMenu::Transport => vec![
                     self.mi_cmd("transport.play_stop", Some(self.playback.is_some()), cx),
-                    self.mi_cmd("transport.record", Some(self.rec.is_some()), cx),
+                    self.mi_cmd("transport.pause", None, cx),
+                    self.mi_cmd("transport.return_start", None, cx),
+                    self.mi_cmd("transport.go_start", None, cx),
+                    self.mi_cmd(
+                        "transport.return_on_stop",
+                        Some(self.return_to_start_on_stop),
+                        cx,
+                    ),
+                    self.mi_cmd("transport.record", Some(self.is_recording()), cx),
+                    self.mi_cmd(
+                        "rec.arm",
+                        Some(self.armed_track == Some(self.sel_track)),
+                        cx,
+                    ),
+                    Self::mi_sub("tr.mon", t("transport.monitor"), Sub::Monitor, cx),
                     self.mi_cmd("transport.loop", Some(loop_en), cx),
+                    self.mi_cmd("loop.set_start", None, cx),
+                    self.mi_cmd("loop.set_end", None, cx),
+                    self.mi_cmd("loop.set_selection", None, cx),
+                    self.mi_cmd("loop.clear", None, cx),
+                    self.mi_cmd("tempo.edit", None, cx),
+                    self.mi_cmd("tempo.delete", None, cx),
+                    self.mi_cmd("sig.edit", None, cx),
+                    self.mi_cmd("sig.delete", None, cx),
                     self.mi_cmd("transport.met", Some(met_en), cx),
+                    Self::mi_sub("tr.metdest", t("transport.met_dest"), Sub::MetDest, cx),
                     self.mi_cmd("transport.chase_sysex", Some(chsy_en), cx),
                     Self::mi(
                         "tr.sxp",
@@ -2625,7 +2917,9 @@ impl Render for EditorView {
                             v.quantize_last_take();
                         },
                     ),
-                    self.mi_cmd("transport.count_in", Some(self.count_in), cx),
+                    Self::mi_sub("tr.countin", t("transport.count_in"), Sub::CountIn, cx),
+                    self.mi_cmd("transport.panic", None, cx),
+                    self.mi_cmd("transport.reset_on_stop", Some(self.reset_on_stop), cx),
                     Self::msep(),
                     self.mi_cmd("transport.audition", Some(self.aud_enabled), cx),
                     Self::mi_sub("tr.audv", t("transport.aud_vel"), Sub::AudVel, cx),
@@ -2720,6 +3014,98 @@ impl Render for EditorView {
                         has_track_dest,
                         cx,
                     ),
+                    Sub::MetDest => self.dest_rows(
+                        DestPick::Metronome,
+                        &dests,
+                        &port_present,
+                        eff_dest,
+                        def_dest,
+                        has_track_dest,
+                        cx,
+                    ),
+                    Sub::Monitor => {
+                        let mut rows: Vec<MenuRow> = [
+                            crate::recording::MonMode::Off,
+                            crate::recording::MonMode::Auto,
+                            crate::recording::MonMode::In,
+                        ]
+                        .iter()
+                        .map(|&m| {
+                            Self::mi_leaf(
+                                ("mon", m.label().len()),
+                                t(match m {
+                                    crate::recording::MonMode::Off => "mon.off",
+                                    crate::recording::MonMode::Auto => "mon.auto",
+                                    crate::recording::MonMode::In => "mon.in",
+                                }),
+                                "",
+                                Some(self.monitor == m),
+                                cx,
+                                move |v, _e, _cx| {
+                                    v.monitor = m;
+                                    v.update_monitor();
+                                    v.save_global();
+                                },
+                            )
+                        })
+                        .collect();
+                        // SysEx policies (#160): capture into takes and
+                        // the thru echo — independent, both visible
+                        rows.push(Self::msep());
+                        rows.push(Self::mi_leaf(
+                            "mon.rec_sx",
+                            t("mon.rec_sx"),
+                            "",
+                            Some(self.rec_sysex),
+                            cx,
+                            |v, _e, _cx| {
+                                v.rec_sysex = !v.rec_sysex;
+                                if let Some(r) = v.rec.as_ref() {
+                                    r.sx_gate
+                                        .store(v.rec_sysex, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                v.save_global();
+                            },
+                        ));
+                        rows.push(Self::mi_leaf(
+                            "mon.echo_sx",
+                            t("mon.echo_sx"),
+                            "",
+                            Some(self.rec_mon_sysex),
+                            cx,
+                            |v, _e, _cx| {
+                                v.rec_mon_sysex = !v.rec_mon_sysex;
+                                if let Some(r) = v.rec.as_ref() {
+                                    r.mon_sx_gate.store(
+                                        v.rec_mon_sysex,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                }
+                                v.save_global();
+                            },
+                        ));
+                        rows
+                    }
+                    Sub::CountIn => [0u8, 1, 2, 4]
+                        .iter()
+                        .map(|&b| {
+                            let label: SharedString = match b {
+                                0 => t("countin.off").into(),
+                                _ => tf("countin.bars", &[("n", b.to_string().as_str())]).into(),
+                            };
+                            Self::mi_leaf(
+                                ("countin", b as usize),
+                                label,
+                                "",
+                                Some(self.count_in_bars == b),
+                                cx,
+                                move |v, _e, _cx| {
+                                    v.count_in_bars = b;
+                                    v.save_global();
+                                },
+                            )
+                        })
+                        .collect(),
                     Sub::InPort => {
                         let ports = midi_io::list_inputs().unwrap_or_default();
                         let mut rows: Vec<MenuRow> = vec![Self::mi_leaf(
@@ -2777,6 +3163,34 @@ impl Render for EditorView {
                                 v.save_global();
                             },
                         ));
+                        // armed track's input channel filter (#159):
+                        // All / 1..16 — SysEx passes unfiltered by design
+                        rows.push(Self::msep());
+                        rows.push(Self::mhead(t("input.chan")));
+                        rows.push(Self::mi_leaf(
+                            "inchan.all",
+                            t("inchan.all"),
+                            "",
+                            Some(self.rec_in_ch.is_none()),
+                            cx,
+                            |v, _e, _cx| {
+                                v.rec_in_ch = None;
+                                v.save_global();
+                            },
+                        ));
+                        rows.extend((0u8..16).map(|ch| {
+                            Self::mi_leaf(
+                                ("inchan", ch as usize),
+                                format!("{}", ch + 1),
+                                "",
+                                Some(self.rec_in_ch == Some(ch)),
+                                cx,
+                                move |v, _e, _cx| {
+                                    v.rec_in_ch = Some(ch);
+                                    v.save_global();
+                                },
+                            )
+                        }));
                         rows
                     }
                     Sub::Lane => {
@@ -3016,26 +3430,32 @@ impl Render for EditorView {
                                 .collect()
                         }
                     }
+                    // Quantize submenu (#139): the grid + strength are
+                    // visible settings picked before Apply — the toolbar
+                    // button and this menu resolve the same state.
                     Sub::Quant => {
-                        let g = self.snap_ticks().max(self.td().min_grid_ticks() as i64) as u64;
-                        [("100%", 100u32), ("75%", 75), ("50%", 50)]
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, (label, str_))| {
-                                Self::mi_leaf(
-                                    ("quant", i),
-                                    format!("Quantize {label}"),
-                                    "",
-                                    None,
-                                    cx,
-                                    move |v, _e, _cx| {
-                                        v.apply_region_op("quantize", move |d, t, f, to| {
-                                            d.quantize_ops(t, f, to, g, str_)
-                                        });
-                                    },
-                                )
-                            })
-                            .collect()
+                        let mut rows = vec![
+                            Self::mi_leaf(
+                                "quant.apply",
+                                t("quant.apply"),
+                                "",
+                                None,
+                                cx,
+                                |v, _e, cx| {
+                                    let g = v.quantize_grid();
+                                    let st = v.q_str;
+                                    v.apply_region_op("quantize", move |d, t, f, to| {
+                                        d.quantize_ops(t, f, to, g, st)
+                                    });
+                                    cx.notify();
+                                },
+                            ),
+                            Self::msep(),
+                        ];
+                        rows.extend(self.quant_grid_rows(cx));
+                        rows.push(Self::msep());
+                        rows.extend(self.quant_str_rows(cx));
+                        rows
                     }
                     Sub::Oct => {
                         let opts = [("+1 octave", 12i32), ("-1 octave", -12)];
@@ -3050,16 +3470,169 @@ impl Render for EditorView {
                             })
                             .collect()
                     }
+                    Sub::NoteLen => {
+                        let opts: Vec<NoteLen> = vec![
+                            NoteLen::Grid,
+                            NoteLen::LastUsed,
+                            NoteLen::Fixed {
+                                den: 4,
+                                trip: false,
+                                dot: false,
+                            },
+                            NoteLen::Fixed {
+                                den: 8,
+                                trip: false,
+                                dot: false,
+                            },
+                            NoteLen::Fixed {
+                                den: 16,
+                                trip: false,
+                                dot: false,
+                            },
+                            NoteLen::Fixed {
+                                den: 32,
+                                trip: false,
+                                dot: false,
+                            },
+                            NoteLen::Fixed {
+                                den: 8,
+                                trip: true,
+                                dot: false,
+                            },
+                            NoteLen::Fixed {
+                                den: 16,
+                                trip: true,
+                                dot: false,
+                            },
+                            NoteLen::Fixed {
+                                den: 8,
+                                trip: false,
+                                dot: true,
+                            },
+                            NoteLen::Fixed {
+                                den: 4,
+                                trip: false,
+                                dot: true,
+                            },
+                        ];
+                        opts.into_iter()
+                            .enumerate()
+                            .map(|(i, nl)| {
+                                Self::mi_leaf(
+                                    ("nlen", i),
+                                    nl.label(),
+                                    "",
+                                    Some(self.note_len == nl),
+                                    cx,
+                                    move |v, _e, _cx| {
+                                        v.note_len = nl;
+                                    },
+                                )
+                            })
+                            .collect()
+                    }
+                    Sub::InsVel => {
+                        let mut rows = Vec::new();
+                        rows.push(Self::mi_leaf(
+                            "ivel.last",
+                            tf("ins_vel.last", &[("v", self.last_vel.to_string().as_str())]),
+                            "",
+                            Some(self.vel_src == VelSrc::LastUsed),
+                            cx,
+                            |v, _e, _cx| v.vel_src = VelSrc::LastUsed,
+                        ));
+                        rows.extend([127u8, 112, 96, 80, 64, 48, 32].iter().enumerate().map(
+                            |(i, &v_)| {
+                                Self::mi_leaf(
+                                    ("ivel", i),
+                                    format!("{v_}"),
+                                    "",
+                                    Some(self.vel_src == VelSrc::Fixed(v_)),
+                                    cx,
+                                    move |v, _e, _cx| v.vel_src = VelSrc::Fixed(v_),
+                                )
+                            },
+                        ));
+                        rows
+                    }
+                    Sub::EvFType => {
+                        let mut rows = vec![Self::mi_leaf(
+                            "evf.all",
+                            t("evf.all"),
+                            "",
+                            Some(self.ev_filter.kinds.is_empty()),
+                            cx,
+                            |v, _e, cx| {
+                                v.ev_filter.kinds.clear();
+                                cx.notify();
+                            },
+                        )];
+                        rows.extend(EvKind::ALL.iter().enumerate().map(|(i, &k)| {
+                            let on = self.ev_filter.kinds.is_empty()
+                                || self.ev_filter.kinds.contains(&k);
+                            Self::mi_leaf(
+                                ("evf", i),
+                                t(k.i18n()),
+                                "",
+                                Some(on),
+                                cx,
+                                move |v, _e, cx| v.toggle_ev_kind(k, cx),
+                            )
+                        }));
+                        rows
+                    }
+                    Sub::EvFChan => {
+                        let mut rows = vec![Self::mi_leaf(
+                            "evc.all",
+                            t("evf.all"),
+                            "",
+                            Some(self.ev_filter.chan.is_none()),
+                            cx,
+                            |v, _e, cx| v.set_ev_chan(None, cx),
+                        )];
+                        rows.extend((0u8..16).enumerate().map(|(i, c)| {
+                            Self::mi_leaf(
+                                ("evc", i),
+                                format!("ch {}", c + 1),
+                                "",
+                                Some(self.ev_filter.chan == Some(c)),
+                                cx,
+                                move |v, _e, cx| v.set_ev_chan(Some(c), cx),
+                            )
+                        }));
+                        rows
+                    }
+                    Sub::MidC => [3u8, 4, 5]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, mc)| {
+                            Self::mi_leaf(
+                                ("midc", i),
+                                format!("C{mc}"),
+                                "",
+                                Some(self.middle_c == mc),
+                                cx,
+                                move |v, _e, cx| v.set_middle_c(mc, cx),
+                            )
+                        })
+                        .collect(),
                     Sub::LenSet => {
-                        // metrical: note fractions; SMPTE: frame/second
-                        // spans — never a fake-PPQ musical grid
+                        // metrical: note fractions + a real bar at the
+                        // edit cursor's position in the meter map; SMPTE:
+                        // frame/second spans — never a fake-PPQ grid
                         let opts: Vec<(String, u64)> = match td {
                             TimeDisplay::Metrical { ppq } => vec![
                                 ("1/32".into(), ppq / 8),
                                 ("1/16".into(), ppq / 4),
                                 ("1/8".into(), ppq / 2),
                                 ("1/4".into(), ppq),
-                                ("1 bar".into(), ppq * 4),
+                                (
+                                    "1 bar".into(),
+                                    self.doc(|d| {
+                                        d.meter_map_for(self.sel_track)
+                                            .bar_ticks_at(self.cursor_tick)
+                                    }),
+                                ),
                             ],
                             TimeDisplay::Smpte { .. } => {
                                 let f = td.cell_ticks();
@@ -3176,6 +3749,79 @@ impl Render for EditorView {
                                                 d.set_release_velocity_ops(t, f, to, vel)
                                             },
                                         );
+                                    },
+                                )
+                            })
+                            .collect()
+                    }
+                    // Edit ▸ Apply to Entire Track — the explicit
+                    // whole-track scope (#131). Selection-scoped commands
+                    // no-op without a selection; these never need one.
+                    Sub::AllTrack => {
+                        type TrackOp =
+                            Box<dyn Fn(&mut Document, usize, u64, u64) -> Vec<Op> + Send>;
+                        let g = self.snap_ticks().max(self.td().min_grid_ticks() as i64) as u64;
+                        let ppq = self.ppq() as i64;
+                        let items: Vec<(String, TrackOp)> = vec![
+                            (
+                                format!("Quantize 100% ({})", t("edit.snap")),
+                                Box::new(move |d, tr, f, to| d.quantize_ops(tr, f, to, g, 100)),
+                            ),
+                            (
+                                t("edit.transpose_up").to_string(),
+                                Box::new(|d, tr, f, to| d.transpose_ops(tr, f, to, 1)),
+                            ),
+                            (
+                                t("edit.transpose_dn").to_string(),
+                                Box::new(|d, tr, f, to| d.transpose_ops(tr, f, to, -1)),
+                            ),
+                            (
+                                "+1 octave".to_string(),
+                                Box::new(|d, tr, f, to| d.transpose_ops(tr, f, to, 12)),
+                            ),
+                            (
+                                "-1 octave".to_string(),
+                                Box::new(|d, tr, f, to| d.transpose_ops(tr, f, to, -12)),
+                            ),
+                            (
+                                t("edit.vel_up").to_string(),
+                                Box::new(|d, tr, f, to| d.scale_velocity_ops(tr, f, to, 1.25)),
+                            ),
+                            (
+                                t("edit.vel_dn").to_string(),
+                                Box::new(|d, tr, f, to| d.scale_velocity_ops(tr, f, to, 0.8)),
+                            ),
+                            (
+                                t("edit.humanize").to_string(),
+                                Box::new(move |d, tr, f, to| {
+                                    d.humanize_ops(tr, f, to, ppq / 32, 5, d.revision())
+                                }),
+                            ),
+                            (
+                                format!("{}: touch (0 gap)", t("edit.legato")),
+                                Box::new(|d, tr, f, to| d.legato_ops(tr, f, to, 0)),
+                            ),
+                            (
+                                t("edit.fix_overlaps").to_string(),
+                                Box::new(|d, tr, f, to| d.fix_overlaps_ops(tr, f, to)),
+                            ),
+                            (
+                                t("edit.join").to_string(),
+                                Box::new(|d, tr, f, to| d.join_ops(tr, f, to)),
+                            ),
+                        ];
+                        items
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, (label, op))| {
+                                Self::mi_leaf(
+                                    ("allt", i),
+                                    label.clone(),
+                                    "",
+                                    None,
+                                    cx,
+                                    move |v, _e, _cx| {
+                                        v.apply_track_op(&label, |d, tr, f, to| op(d, tr, f, to));
                                     },
                                 )
                             })
@@ -4263,7 +4909,7 @@ impl Render for EditorView {
                 // everything else is a registry command: the keymap (defaults
                 // + user overrides) maps the keystroke to a canonical action
                 if let Some(c) = this.keys.command_at(&cmd::describe(&ev.keystroke)) {
-                    if c.enabled.map(|f| f(this)).unwrap_or(true) {
+                    if c.enabled.map(|f| f(this, cx)).unwrap_or(true) {
                         (c.act)(this, w, cx);
                     }
                 }
@@ -4281,12 +4927,7 @@ impl Render for EditorView {
             .can_drop(|drag: &dyn Any, _w, _cx| drag.is::<ExternalPaths>())
             .drag_over::<ExternalPaths>(|s, _p, _w, _cx| s.bg(rgb(theme::current().accent_drop)))
             .on_drop(cx.listener(|v, paths: &ExternalPaths, w, cx| {
-                if let Some(p) = paths.paths().iter().find(|p| {
-                    matches!(
-                        p.extension().and_then(|e| e.to_str()),
-                        Some("mid") | Some("smf") | Some("midi")
-                    )
-                }) {
+                if let Some(p) = paths.paths().iter().find(|p| crate::is_midi_path(p)) {
                     v.confirm_discard_or_save(PendingAction::OpenPath(p.clone()), w, cx);
                 }
             }))

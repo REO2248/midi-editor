@@ -10,6 +10,7 @@ mod cmd;
 mod diagnostics;
 mod docevents;
 mod edit_ops;
+mod filedlg;
 mod geometry;
 mod guard;
 mod i18n;
@@ -55,7 +56,7 @@ use i18n::{t, tf};
 use menu::{menu_x, next_selectable, row_y, MenuRow, MENUS};
 
 use commands::UndoStack;
-use document::{Document, Event as DocEvent, EventId, Note, Op, TimeDisplay};
+use document::{Document, Event as DocEvent, EventId, Note, Op, PositionFormat, TimeDisplay};
 use gpui_kit::base::{ObservedElement, TestSupportExt};
 use gpui_kit::component::input::InputState;
 use gpui_kit::component::Root;
@@ -97,6 +98,13 @@ enum DragMode {
     Erase,
 }
 
+/// Which loop locator a ruler drag is moving (#130).
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum LoopDrag {
+    Start,
+    End,
+}
+
 /// A document-replacing action parked behind the discard guard
 /// (`guard.rs`). `CloseWindow` covers window close and, transitively, app
 /// quit — quitting always goes through closing the last window.
@@ -134,11 +142,118 @@ impl FocusArea {
     }
 }
 
+/// MIDI file recognition (#157): extension check is case-insensitive and
+/// accepts the usual family — .mid / .midi / .smf (and .kar, common on
+/// karaoke SMF files).
+pub(crate) fn is_midi_path(p: &std::path::Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            matches!(
+                e.to_ascii_lowercase().as_str(),
+                "mid" | "midi" | "smf" | "kar"
+            )
+        })
+        .unwrap_or(false)
+}
+
 /// One event-list row: display text plus the event's tick for seek-on-Enter.
 #[derive(Clone)]
 struct EvRow {
     tick: u64,
     text: SharedString,
+}
+
+/// Event-list type buckets for the filter bar (#145). `Escape` system
+/// messages ride the SysEx bucket; EOT/meta all land under Meta.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum EvKind {
+    Note,
+    PolyAT,
+    ChanAT,
+    CC,
+    Prog,
+    Pitch,
+    SysEx,
+    Meta,
+}
+
+impl EvKind {
+    const ALL: [EvKind; 8] = [
+        EvKind::Note,
+        EvKind::PolyAT,
+        EvKind::ChanAT,
+        EvKind::CC,
+        EvKind::Prog,
+        EvKind::Pitch,
+        EvKind::SysEx,
+        EvKind::Meta,
+    ];
+
+    fn of(k: &EventKind) -> Self {
+        match k {
+            EventKind::Channel { status, .. } => match status & 0xF0 {
+                0x80 | 0x90 => EvKind::Note,
+                0xA0 => EvKind::PolyAT,
+                0xB0 => EvKind::CC,
+                0xC0 => EvKind::Prog,
+                0xD0 => EvKind::ChanAT,
+                _ => EvKind::Pitch,
+            },
+            EventKind::Meta { .. } => EvKind::Meta,
+            _ => EvKind::SysEx,
+        }
+    }
+
+    fn i18n(self) -> &'static str {
+        match self {
+            EvKind::Note => "evf.note",
+            EvKind::PolyAT => "evf.polyat",
+            EvKind::ChanAT => "evf.chanat",
+            EvKind::CC => "evf.cc",
+            EvKind::Prog => "evf.prog",
+            EvKind::Pitch => "evf.pitch",
+            EvKind::SysEx => "evf.sysex",
+            EvKind::Meta => "evf.meta",
+        }
+    }
+}
+
+/// Event list display filter (#145/#146): kind checkboxes plus a channel
+/// restriction. Kind filtering is exact; the channel filter only applies
+/// to channel-voice events (meta/SysEx have no channel).
+#[derive(Clone, Default, PartialEq)]
+struct EvFilter {
+    /// empty = every kind shown (all-checked is normalized back to empty)
+    kinds: BTreeSet<EvKind>,
+    /// None = all channels; Some(0-15) = channel-voice events on that ch
+    chan: Option<u8>,
+}
+
+impl EvFilter {
+    fn key(&self) -> u64 {
+        let mut bits = 0u64;
+        for k in &self.kinds {
+            bits |= 1 << (*k as u64);
+        }
+        (bits << 8) | self.chan.map(|c| c as u64 + 1).unwrap_or(0)
+    }
+
+    fn is_active(&self) -> bool {
+        !self.kinds.is_empty() || self.chan.is_some()
+    }
+
+    fn accepts(&self, e: &EventKind) -> bool {
+        if !self.kinds.is_empty() && !self.kinds.contains(&EvKind::of(e)) {
+            return false;
+        }
+        if let Some(c) = self.chan {
+            if let EventKind::Channel { status, .. } = e {
+                return status & 0x0F == c;
+            }
+        }
+        true
+    }
 }
 
 /// Menubar dropdown that is currently open.
@@ -195,13 +310,33 @@ enum Sub {
     LegatoGap,
     /// Edit → swing amount presets
     Swing,
+    /// Edit → apply a transform to the entire selected track (#131)
+    AllTrack,
     Meta,
+    /// Transport → metronome click destination (#137)
+    MetDest,
+    /// Transport → count-in length
+    CountIn,
+    /// Transport → input monitor mode (#159)
+    Monitor,
+    /// Edit → new-note length picker (#144)
+    NoteLen,
+    /// Edit → new-note velocity picker (#153)
+    InsVel,
+    /// View → event-list type filter (#145)
+    EvFType,
+    /// View → event-list channel filter (#146)
+    EvFChan,
+    /// View → middle-C octave naming (#164)
+    MidC,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum DestPick {
     Track,
     Default,
+    /// metronome click destination (#137)
+    Metronome,
 }
 
 /// How the timeline tracks the playhead while the transport runs.
@@ -287,6 +422,73 @@ struct LaneCfg {
     h: f32,
     collapsed: bool,
     poly_key: Option<u8>,
+}
+
+/// New-note length (#144) — an explicit user choice, separate from the
+/// snap grid. `Fixed(den)` is the note fraction; `trip`/`dot` modify it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoteLen {
+    /// follow the snap grid's current value
+    Grid,
+    /// reuse the length of the last inserted note
+    LastUsed,
+    /// fixed length as a note fraction: denominator 4/8/16/32, optional
+    /// triplet (2/3) or dotted (3/2) feel
+    Fixed { den: u8, trip: bool, dot: bool },
+}
+
+impl NoteLen {
+    /// Resolve to ticks for the given doc/view state.
+    fn ticks(self, v: &EditorView) -> u64 {
+        match self {
+            Self::Grid => v.snap_ticks().max(1) as u64,
+            Self::LastUsed => v.last_note_len.max(1),
+            Self::Fixed { den, trip, dot } => {
+                let ppq = v.ppq().max(1);
+                let mut t = ppq * 4 / den.max(1) as u64;
+                if trip {
+                    t = t * 2 / 3;
+                }
+                if dot {
+                    t += t / 2;
+                }
+                t.max(1)
+            }
+        }
+    }
+
+    fn label(self) -> String {
+        match self {
+            Self::Grid => "Grid".to_string(),
+            Self::LastUsed => "Last used".to_string(),
+            Self::Fixed { den, trip, dot } => {
+                format!(
+                    "1/{}{}{}",
+                    den,
+                    if trip { "T" } else { "" },
+                    if dot { "." } else { "" }
+                )
+            }
+        }
+    }
+}
+
+/// New-note velocity (#153) — explicit fixed value or "last used".
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VelSrc {
+    /// reuse the velocity of the last inserted/edited note
+    LastUsed,
+    /// always this velocity
+    Fixed(u8),
+}
+
+impl VelSrc {
+    fn resolve(self, last: u8) -> u8 {
+        match self {
+            Self::LastUsed => last.clamp(1, 127),
+            Self::Fixed(v) => v.clamp(1, 127),
+        }
+    }
 }
 
 impl Default for LaneCfg {
@@ -383,8 +585,6 @@ struct DocUi {
     n_diags: usize,
     track_names: Vec<String>,
     track_chs: Vec<u8>,
-    sig: String,
-    tempo0: f64,
     /// detected GM/GS/XG reset SysEx — a display hint for patch naming
     mode_hint: Option<smf_core::ModeHint>,
     /// last tick with a note — the scrollable extent of the timeline
@@ -394,7 +594,7 @@ struct DocUi {
 impl DocUi {
     /// `notes` is the already-derived note view for this revision (passed in
     /// so the pairing pass runs once per revision, not once per consumer).
-    /// `seq_sel` scopes markers/tempo/sig/song-end to one sequence for
+    /// `seq_sel` scopes markers/tempo/song-end to one sequence for
     /// format-2 documents (None = whole document, formats 0/1).
     pub(crate) fn build(
         doc: &Document,
@@ -403,10 +603,6 @@ impl DocUi {
         seq_sel: Option<usize>,
     ) -> Self {
         let hint = enc_override.or_else(|| doc.text_encoding_hint());
-        let scan: &[document::Track] = match seq_sel.and_then(|i| doc.tracks.get(i)) {
-            Some(t) => std::slice::from_ref(t),
-            None => &doc.tracks,
-        };
         // meta 0x06/0x05 markers, from any track, at their tick
         let mut markers = Vec::new();
         for (ti, t) in doc.tracks.iter().enumerate() {
@@ -424,24 +620,6 @@ impl DocUi {
             }
         }
         markers.sort_unstable();
-        let tempo0 = doc
-            .tempo_map_for(seq_sel.unwrap_or(0))
-            .points()
-            .first()
-            .map(|(_, mpq, _)| 60_000_000.0 / *mpq as f64)
-            .unwrap_or(120.0);
-        let sig = scan
-            .first()
-            .and_then(|t| {
-                t.events.iter().find_map(|e| match &e.kind {
-                    EventKind::Meta {
-                        meta_type: 0x58,
-                        data,
-                    } if data.len() >= 2 => Some(format!("{}/{}", data[0], 1u8 << data[1])),
-                    _ => None,
-                })
-            })
-            .unwrap_or_else(|| "4/4".into());
         let track_names = doc
             .tracks
             .iter()
@@ -459,15 +637,26 @@ impl DocUi {
             markers,
             track_names,
             track_chs,
-            sig,
-            tempo0,
             mode_hint: doc.synth_mode(),
-            song_end: notes
+            // #138 — timeline extent follows the document's last event of
+            // ANY kind (a trailing marker/EOT/CC tail is content too), not
+            // just the last note end
+            song_end: doc
+                .tracks
                 .iter()
-                .filter(|n| seq_sel.is_none_or(|i| n.track == i))
-                .map(|n| n.end_tick.unwrap_or(n.start_tick))
+                .enumerate()
+                .filter(|(i, _)| seq_sel.is_none_or(|s| *i == s))
+                .flat_map(|(_, t)| t.events.iter().map(|e| e.tick))
                 .max()
-                .unwrap_or(0),
+                .unwrap_or(0)
+                .max(
+                    notes
+                        .iter()
+                        .filter(|n| seq_sel.is_none_or(|i| n.track == i))
+                        .map(|n| n.end_tick.unwrap_or(n.start_tick))
+                        .max()
+                        .unwrap_or(0),
+                ),
         }
     }
 }
@@ -488,8 +677,20 @@ struct EditorView {
     doc_epoch: u64,
     notes_key: (u64, u64),
     notes: Arc<Vec<Note>>,
-    ev_key: (u64, u64, usize),
+    ev_key: (u64, u64, usize, u64),
     events: Arc<Vec<EvRow>>,
+    /// event-list type/channel display filter (#145/#146)
+    ev_filter: EvFilter,
+    /// folder the file dialogs fall back to when no document is open
+    /// (#158); persisted in global prefs
+    last_dir: Option<std::path::PathBuf>,
+    /// in-flight native file dialog (#158): (receiver, is_save)
+    dlg_rx: Option<(std::sync::mpsc::Receiver<Option<std::path::PathBuf>>, bool)>,
+    /// last caption written to the native title bar (#163) — set only
+    /// when it changes, so render doesn't syscall every frame
+    last_title: String,
+    /// middle-C octave naming preference 3/4/5 (#164) — display only
+    middle_c: u8,
     /// Document-derived UI data (markers, track names, diagnostics count…).
     /// Rebuilt only when the document key or encoding hint changes — render
     /// runs at animation-frame rate during playback and must not rescan
@@ -532,17 +733,24 @@ struct EditorView {
     /// active so edge auto-scroll can keep the drag deltas current
     mouse_pos: Option<Point<Pixels>>,
     sel_track: usize,
+    /// insert/edit channel per track — pure editor state (sidecar), never
+    /// an SMF event. Absent entries fall back to the track's `FF 20`
+    /// channel prefix. Per-event channels rule playback as always.
+    edit_ch: HashMap<usize, u8>,
     /// selected note `on_id`s (marquee multi-select)
     selection: BTreeSet<EventId>,
     drag: Option<Drag>,
+    /// active loop-locator drag on the ruler (#130)
+    loop_drag: Option<LoopDrag>,
     /// active piano-roll tool
     tool: Tool,
     /// index into SNAPS — grid snap divisor of a whole note
     snap_idx: usize,
     /// on_ids swept by the erase tool during a drag; deleted as one tx
     erase_ids: BTreeSet<EventId>,
-    /// note clipboard (cut/copy/paste)
-    clipboard: Vec<ClipNote>,
+    /// event clipboard — mirrored to the OS clipboard on copy (#142);
+    /// kept in-process too so paste still works if OS access fails
+    clipboard: Option<Clip>,
     /// canvas bounds as painted last frame — for hit-testing
     roll_bounds: Rc<Cell<Bounds<Pixels>>>,
     /// piano-key strip bounds (the clickable keyboard left of the roll)
@@ -642,9 +850,29 @@ struct EditorView {
     enc_override: Option<smf_core::TextEncoding>,
     playback: Option<Playback>,
     play_us: u64,
+    /// µs position where the current transport pass began — the anchor
+    /// Return-to-Start and return-on-stop use (#156)
+    play_start_us: u64,
+    /// return-to-start-on-stop preference (Cubase-style): a transport stop
+    /// moves the play point back to where the pass began (#156)
+    return_to_start_on_stop: bool,
     /// restart at `loop_start_us` when playback reaches the end
     /// (`loop_enabled` itself lives in `shared` so MCP can toggle it)
     loop_start_us: u64,
+    /// live-schedule routing snapshot (#140/#141): dest → sink index, the
+    /// transport-lane sink indices, and track → dest as of the last schedule
+    /// build. A committed edit with an unchanged dest map needs only an
+    /// events patch; a routing change rebuilds sinks and patches both.
+    live_sink_of: HashMap<usize, usize>,
+    live_transport: Vec<usize>,
+    live_dest_of: HashMap<usize, usize>,
+    /// a routing refresh was deferred because a newly-assigned plugin is
+    /// still loading — retried when its slot reports Ready
+    live_route_dirty: bool,
+    /// count-in hold of the running pass (#137): the schedule's µs domain
+    /// runs this far ahead of the document while the song is parked —
+    /// subtracted from worker positions so `play_us` stays document-true
+    live_countin_us: u64,
     /// playhead follow mode during playback (per-song pref)
     follow: Follow,
     /// manual scroll pauses follow until this instant
@@ -704,7 +932,36 @@ struct EditorView {
     /// editor keys (Del, arrows) keep working after commit
     meta_refocus: bool,
     /// one-bar count-in before MIDI recording starts (global pref)
-    count_in: bool,
+    count_in_bars: u8,
+    /// armed track for recording — session state, `None` = no arm (#159)
+    armed_track: Option<usize>,
+    /// input monitor mode — Off / Auto / In (#159)
+    monitor: crate::recording::MonMode,
+    /// armed track's input channel filter — `None` = all channels (#159)
+    rec_in_ch: Option<u8>,
+    /// SysEx capture into takes (#160) — off drops F0/F7 at the gate
+    rec_sysex: bool,
+    /// SysEx monitor echo (#160) — off by default so a bulk dump doesn't
+    /// blast the armed destination unasked
+    rec_mon_sysex: bool,
+    /// new-note length source (#144): grid / last-used / fixed fraction —
+    /// an explicit state instead of the hidden max(snap, quarter) policy
+    note_len: NoteLen,
+    /// the last length actually used to draw/insert a note (for
+    /// NoteLen::LastUsed)
+    last_note_len: u64,
+    /// new-note velocity source (#153): fixed value or the last velocity
+    /// used — visible in Edit ▸ Insert Velocity
+    vel_src: VelSrc,
+    /// last velocity actually written (for VelSrc::LastUsed)
+    last_vel: u8,
+    /// quantize grid index into SNAPS — separate from draw snap (#139)
+    q_snap: usize,
+    /// quantize strength 0-100 — visible before applying (#139)
+    q_str: u32,
+    /// reset-on-stop preference: full CC121/120 controller reset on
+    /// transport stop — off means a normal stop only releases notes (#161)
+    reset_on_stop: bool,
     /// recently opened files (global pref, newest first)
     recent: Vec<SharedString>,
     /// recording source — MIDI input port name; empty = first available
@@ -992,7 +1249,12 @@ impl EditorView {
             doc_epoch: 0,
             notes_key: (u64::MAX, u64::MAX),
             notes: Arc::new(vec![]),
-            ev_key: (u64::MAX, u64::MAX, usize::MAX),
+            ev_key: (u64::MAX, u64::MAX, usize::MAX, u64::MAX),
+            ev_filter: EvFilter::default(),
+            last_dir: g.last_dir.as_ref().map(std::path::PathBuf::from),
+            dlg_rx: None,
+            last_title: String::new(),
+            middle_c: g.middle_c.unwrap_or(4).clamp(3, 5),
             events: Arc::new(vec![]),
             doc_ui: Arc::new(DocUi::default()),
             doc_ui_key: (u64::MAX, u64::MAX, usize::MAX),
@@ -1018,10 +1280,12 @@ impl EditorView {
             sel_track: 0,
             selection: BTreeSet::new(),
             drag: None,
+            loop_drag: None,
             tool: Tool::Select,
             snap_idx: 7, // 1/16
             erase_ids: BTreeSet::new(),
-            clipboard: Vec::new(),
+            edit_ch: HashMap::new(),
+            clipboard: None,
             roll_bounds: Rc::new(Cell::new(Bounds::new(
                 point(px(0.0), px(0.0)),
                 size(px(0.0), px(0.0)),
@@ -1097,7 +1361,14 @@ impl EditorView {
             enc_override: None,
             playback: None,
             play_us: 0,
+            play_start_us: 0,
+            return_to_start_on_stop: g.return_to_start_on_stop.unwrap_or(true),
             loop_start_us: 0,
+            live_sink_of: HashMap::new(),
+            live_transport: Vec::new(),
+            live_dest_of: HashMap::new(),
+            live_route_dirty: false,
+            live_countin_us: 0,
             follow: Follow::Page,
             follow_hold: None,
             lanes: vec![LaneCfg::default()],
@@ -1115,7 +1386,13 @@ impl EditorView {
             meta_sel: None,
             meta_pending: None,
             meta_refocus: false,
-            count_in: g.count_in,
+            // legacy `count_in: true` migrates to 1 bar; explicit
+            // `count_in_bars` wins when present (#137)
+            count_in_bars: g
+                .count_in_bars
+                .unwrap_or(if g.count_in { 1 } else { 0 })
+                .min(4),
+            reset_on_stop: g.reset_on_stop,
             recent: g.recent.iter().map(|p| p.as_str().into()).collect(),
             midi_in: g.midi_in.clone().into(),
             in_latency_ms: g.in_latency_ms,
@@ -1128,9 +1405,25 @@ impl EditorView {
             hc_pref: g.hc,
             _appearance: None,
             rec_mode: RecMode::Overdub,
+            armed_track: None,
+            monitor: g
+                .monitor
+                .as_deref()
+                .and_then(recording::MonMode::from_label)
+                .unwrap_or(recording::MonMode::Auto),
+            rec_in_ch: g.rec_in_ch.filter(|c| *c < 16),
+            rec_sysex: g.rec_sysex.unwrap_or(true),
+            rec_mon_sysex: g.mon_sysex.unwrap_or(false),
             punch_in: None,
             punch_out: None,
             last_take: None,
+            note_len: NoteLen::Grid,
+            last_note_len: 120,
+            vel_src: VelSrc::LastUsed,
+            last_vel: 100,
+            q_snap: 7, // SNAPS "1/16" — the toolbar's historical default
+
+            q_str: 100,
             open_sub: None,
             show_events: true,
             audition: Audition::spawn(),
@@ -1193,6 +1486,51 @@ impl EditorView {
         self.theme_mode = mode;
         self.apply_theme(cx);
         self.save_global();
+    }
+
+    /// Native title-bar caption (#163): `song.mid — midi-editor` with a
+    /// trailing `*` while the document is dirty — what Alt-Tab and the
+    /// taskbar show.
+    pub(crate) fn window_title(&self) -> String {
+        let sh = lock_shared(&self.shared);
+        let name = sh
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| t("doc.untitled").to_string());
+        let dirty = sh.doc.revision() != sh.saved_revision;
+        format!("{}{} — midi-editor", name, if dirty { "*" } else { "" })
+    }
+
+    /// Octave-number shift for display labels (#164): middle-C 4 → 0.
+    pub(crate) fn mc_off(&self) -> i64 {
+        self.middle_c as i64 - 4
+    }
+
+    pub(crate) fn set_middle_c(&mut self, mc: u8, cx: &mut Context<Self>) {
+        self.middle_c = mc.clamp(3, 5);
+        self.save_global();
+        cx.notify();
+    }
+
+    /// Event-list kind toggle (#145): empty set = all kinds; filling all
+    /// eight collapses back to empty so the filter reads "All".
+    pub(crate) fn toggle_ev_kind(&mut self, k: EvKind, cx: &mut Context<Self>) {
+        let f = &mut self.ev_filter.kinds;
+        if f.is_empty() || !f.remove(&k) {
+            f.insert(k);
+        }
+        if self.ev_filter.kinds.len() == EvKind::ALL.len() {
+            self.ev_filter.kinds.clear();
+        }
+        cx.notify();
+    }
+
+    /// Event-list channel display filter (#146). Display only — the edit
+    /// channel stays the track's `edit_ch` from #129.
+    pub(crate) fn set_ev_chan(&mut self, c: Option<u8>, cx: &mut Context<Self>) {
+        self.ev_filter.chan = c.filter(|c| *c < 16);
+        cx.notify();
     }
 
     pub(crate) fn on_sys_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1292,31 +1630,33 @@ impl EditorView {
         } else {
             usize::MAX
         };
-        let vkey = (key.0, key.1, seq_sel);
+        let vkey = (key.0, key.1, seq_sel, self.ev_filter.key());
         if self.ev_key != vkey {
             let (rows, refs) = self.build_event_rows(&sh.doc);
             self.events = Arc::new(rows);
             self.event_refs = Arc::new(refs);
-            // drop event-list selections that no longer exist
-            let ids: BTreeSet<EventId> = self
-                .event_refs
+            // drop event-list selections that left the document — a row
+            // hidden by the display filter keeps its selection (#145)
+            let ids: BTreeSet<EventId> = sh
+                .doc
+                .tracks
                 .iter()
-                .flatten()
-                .map(|&(_, _, id)| id)
+                .flat_map(|tr| tr.events.iter().map(|e| e.id))
                 .collect();
             self.sel_events.retain(|id| ids.contains(id));
             // the row count changes with edits — keep the selection valid
             self.ev_sel = self.ev_sel.min(self.events.len().saturating_sub(1));
             self.ev_key = vkey;
         }
-        if self.doc_ui_key != vkey || self.doc_ui_enc != self.enc_override {
+        let dkey = (vkey.0, vkey.1, vkey.2);
+        if self.doc_ui_key != dkey || self.doc_ui_enc != self.enc_override {
             self.doc_ui = Arc::new(DocUi::build(
                 &sh.doc,
                 &self.notes,
                 self.enc_override,
                 (seq_sel != usize::MAX).then_some(seq_sel),
             ));
-            self.doc_ui_key = vkey;
+            self.doc_ui_key = dkey;
             self.doc_ui_enc = self.enc_override;
         }
         // view-derived state: the visible row map (fold/drum), the key
@@ -1468,11 +1808,17 @@ impl EditorView {
     /// longer, and sizing the view by them would lie about this one's end.
     /// At least four coarse cells (bars / seconds) past the content.
     pub(crate) fn doc_end_ticks(&self) -> u64 {
+        // at least four coarse cells: real bars under the viewed track's
+        // meter map for metrical, displayed seconds for SMPTE
+        let min_extent = self.doc(|d| match d.time_display() {
+            TimeDisplay::Metrical { .. } => d.meter_map_for(self.sel_track).bar_ticks_at(0) * 4,
+            TimeDisplay::Smpte { .. } => d.time_display().bar_ticks() * 4,
+        });
         if self.is_seq() {
             self.doc(|d| d.track_end_tick(self.sel_track))
-                .max(self.td().bar_ticks() * 4)
+                .max(min_extent)
         } else {
-            self.doc_ui.song_end.max(self.td().bar_ticks() * 4)
+            self.doc_ui.song_end.max(min_extent)
         }
     }
 
@@ -1532,7 +1878,6 @@ impl EditorView {
     }
 
     pub(crate) fn build_event_rows(&self, doc: &Document) -> EvRowOut {
-        let td = doc.time_display();
         let seq = doc.is_sequential();
         let hint = self.enc_override.or(doc.text_encoding_hint());
         let rpn_tags = Self::rpn_row_tags(doc);
@@ -1568,9 +1913,13 @@ impl EditorView {
                 continue; // a format-2 event list shows one sequence
             }
             for (ei, e) in tr.events.iter().enumerate() {
-                // bar.beat.tick for metrical, hh:mm:ss.ff timecode for
-                // SMPTE — position labels always match the file's timing
-                let pos = td.format_tick(e.tick);
+                if !self.ev_filter.accepts(&e.kind) {
+                    continue;
+                }
+                // bar.beat.tick under the real FF58 map for metrical,
+                // hh:mm:ss.ff timecode for SMPTE — position labels
+                // always match the file's timing
+                let pos = doc.format_position_for(ti, e.tick);
                 let body = match &e.kind {
                     EventKind::Channel { status, data, .. } => {
                         let ch = (status & 0x0F) + 1;
@@ -1653,11 +2002,15 @@ impl EditorView {
 
     pub(crate) fn apply_tx(&mut self, label: &str, ops: Vec<Op>) {
         let arc = self.shared.clone();
-        let mut sh = lock_shared(&arc);
-        match sh.apply(label, ops) {
-            Ok(_) => self.refresh_derived_sh(&mut sh),
-            Err(e) => self.status = tf("status.apply_failed", &[("e", &e.to_string())]).into(),
+        {
+            let mut sh = lock_shared(&arc);
+            match sh.apply(label, ops) {
+                Ok(_) => self.refresh_derived_sh(&mut sh),
+                Err(e) => self.status = tf("status.apply_failed", &[("e", &e.to_string())]).into(),
+            }
         }
+        // committed transactions reach the running pass (#141)
+        self.refresh_live_schedule();
     }
 
     // --- event-properties inspector -------------------------------------
@@ -1897,7 +2250,8 @@ fn spawn_mcp(
 #[cfg(test)]
 mod tests {
     use crate::{
-        assemble_events, empty_doc, file_arg_from, plugin_plan, route_events, track_audible,
+        assemble_events, clip_from_item, clip_to_item, countin_clicks_of, empty_doc, file_arg_from,
+        is_midi_path, park_schedule, plugin_plan, route_events, track_audible, Clip, ClipEvent,
         GlobalPrefs, PluginPlan, PluginState, Prefs,
     };
     use std::collections::{HashMap, HashSet};
@@ -1912,6 +2266,20 @@ mod tests {
     #[test]
     pub(crate) fn fresh_documents_share_revision_zero() {
         assert_eq!(empty_doc().revision(), empty_doc().revision());
+    }
+
+    /// #157 — extension recognition ignores case and covers the whole
+    /// SMF family; anything else is not a MIDI file.
+    #[test]
+    pub(crate) fn midi_extension_is_case_insensitive() {
+        for p in [
+            "a.mid", "B.MID", "c.Midi", "d.smf", "e.SMF", "f.midi", "g.kar",
+        ] {
+            assert!(is_midi_path(Path::new(p)), "{p}");
+        }
+        for p in ["a.txt", "b.mid.txt", "noext", ".midignore"] {
+            assert!(!is_midi_path(Path::new(p)), "{p}");
+        }
     }
 
     pub(crate) fn testdir(name: &str) -> std::path::PathBuf {
@@ -2425,21 +2793,62 @@ mod tests {
             EventKind::Channel { data, .. } => assert_eq!(*data, [0x7F, 0x7F]),
             _ => panic!(),
         }
-        // meta type accepts 0x hex
+        // meta type accepts 0x hex (sequencer-specific — structural
+        // types like 0x2F End-of-Track are covered below)
         let (_, ei_m) = super::find_event(&d, id_meta).unwrap();
-        let ops = edit_event_field(&mut d, 0, ei_m, PropField::MetaType, "0x2F").unwrap();
+        let ops = edit_event_field(&mut d, 0, ei_m, PropField::MetaType, "0x7F").unwrap();
         apply(&mut d, ops);
+        let (_, ei_m) = super::find_event(&d, id_meta).unwrap();
         match &d.tracks[0].events[ei_m].kind {
-            EventKind::Meta { meta_type, .. } => assert_eq!(*meta_type, 0x2F),
+            EventKind::Meta { meta_type, .. } => assert_eq!(*meta_type, 0x7F),
             _ => panic!(),
         }
         // hex payload replaces the data bytes
         let ops = edit_event_field(&mut d, 0, ei_m, PropField::HexData, "03 12 ff").unwrap();
         apply(&mut d, ops);
+        let (_, ei_m) = super::find_event(&d, id_meta).unwrap();
         match &d.tracks[0].events[ei_m].kind {
             EventKind::Meta { data, .. } => assert_eq!(&data[..], &[0x03, 0x12, 0xff]),
             _ => panic!(),
         }
+        // converting an event to End-of-Track collapses to a single
+        // terminator at the track end — exactly one EOT survives, its
+        // payload is no longer field-editable
+        let ops = edit_event_field(&mut d, 0, ei_m, PropField::MetaType, "0x2F").unwrap();
+        apply(&mut d, ops);
+        let n_eot = d.tracks[0]
+            .events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    EventKind::Meta {
+                        meta_type: 0x2F,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(n_eot, 1, "exactly one End-of-Track survives");
+        let ei_m = d.tracks[0]
+            .events
+            .iter()
+            .position(|e| {
+                matches!(
+                    e.kind,
+                    EventKind::Meta {
+                        meta_type: 0x2F,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert_eq!(ei_m, d.tracks[0].events.len() - 1, "EOT not at track end");
+        assert!(edit_event_field(&mut d, 0, ei_m, PropField::HexData, "00").is_err());
+        // its tick stays editable (intentional silent tail)
+        assert!(!edit_event_field(&mut d, 0, ei_m, PropField::Tick, "960")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -2620,6 +3029,348 @@ mod tests {
         assert_eq!(got[0].2, vec![0xF0, 0x7E, 0xF7]);
         assert_eq!(got[1].2, vec![0xB0, 7, 90]);
         assert_eq!(got[2].2, note(60));
+    }
+
+    /// #137 — a parked count-in defers every song event at/after the pass
+    /// start by the hold, retimes both chases to the deferred boundary,
+    /// and leaves the pre-start tail where the worker's partition skips it.
+    #[test]
+    pub(crate) fn park_schedule_defers_song_and_retimes_chase() {
+        let start = 2_000_000u64;
+        let cin = 1_000_000u64;
+        let mut events = vec![
+            (start - 500_000, 0usize, note(60)),
+            (start, 0usize, note(62)),
+            (start + 250_000, 0usize, vec![0x80, 60, 0]),
+        ];
+        let mut chase = vec![(start - 10_000, 0usize, vec![0xB0, 7, 90])];
+        let mut chase_sx = vec![(0u64, 0usize, vec![0xF0, 0x7E, 0xF7])];
+        let boundary = park_schedule(&mut events, &mut chase, &mut chase_sx, start, cin);
+        assert_eq!(boundary, start + cin);
+        // pre-start event untouched; at/after events slid by exactly cin
+        assert_eq!(events[0].0, start - 500_000);
+        assert_eq!(events[1].0, start + cin);
+        assert_eq!(events[2].0, start + 250_000 + cin);
+        // chase state fires AT the capture boundary, not the parked tail
+        assert!(chase.iter().all(|e| e.0 == boundary));
+        assert!(chase_sx.iter().all(|e| e.0 == boundary));
+        let out = assemble_events(events, chase, chase_sx, boundary);
+        // chases splice ahead of the first deferred song event at the
+        // boundary — inside the hold nothing but count-in clicks emits
+        let at = out.iter().position(|e| e.0 >= boundary).unwrap();
+        assert_eq!(out[at].2, vec![0xF0, 0x7E, 0xF7]);
+        assert_eq!(out[at + 1].2, vec![0xB0, 7, 90]);
+        assert_eq!(out[at + 2].2, note(62));
+        // the recorded-tick contract: input heard when deferred event e
+        // emits maps to doc_us = base + (rel − cin) = e.0 − cin — its
+        // ORIGINAL doc position — wall time and document time agree (#137)
+        for orig in [start, start + 250_000] {
+            assert!(out.iter().any(|e| e.0 - cin == orig));
+        }
+    }
+
+    /// #137 — count-in clicks step the meter map's own `cc` cadence in
+    /// TICK space across a 4/4→3/4 change, land inside the hold window,
+    /// and put an accented click exactly on the deferred capture boundary.
+    #[test]
+    pub(crate) fn countin_clicks_follow_the_real_meter_map() {
+        use document::Document;
+        use smf_core::{Division, Event as SmfEvent, EventKind};
+        // 4/4 for two bars (1920 ticks), 3/4 (1440-tick bars) after —
+        // record at the second 3/4 bar's start: the pre-region's last bar
+        // is 3/4, its first is 4/4.
+        let sig = |tick, n: u8, d: u8| SmfEvent {
+            tick,
+            seq: 0,
+            raw_body: None,
+            kind: EventKind::Meta {
+                meta_type: 0x58,
+                data: vec![n, d, 24, 8].into(),
+            },
+        };
+        let trk = |events: Vec<SmfEvent>| smf_core::Track { events };
+        let d = Document::from_file(smf_core::File {
+            format: 1,
+            division: Division::Metrical(480),
+            tracks: vec![trk(vec![sig(0, 4, 2), sig(3840, 3, 2)]), trk(vec![])],
+            warnings: vec![],
+        });
+        let mm = d.meter_map_for(0);
+        let tm = d.tempo_map_for(0);
+        let t1 = 5280u64; // second 3/4 bar start
+                          // 2 bars back: the first 3/4 bar [3840,5280) + the last 4/4 bar
+                          // [1920,3840) — each sized by its own signature
+        let t0 = mm.countin_start(t1, 2);
+        assert_eq!(t0, 1920);
+        let start_us = tm.tick_to_us(t1);
+        let cin = start_us - tm.tick_to_us(t0);
+        let clicks = countin_clicks_of(&mm, &tm, false, 0, (t0, t1), cin, 7);
+        // ons only — offs ride +20ms behind each
+        let ons: Vec<(u64, u8)> = clicks
+            .iter()
+            .filter(|(_, _, b)| b[2] == 110)
+            .map(|(us, _, b)| (*us, b[1]))
+            .collect();
+        // every click inside the hold [start_us, start_us + cin]
+        assert!(ons
+            .iter()
+            .all(|(us, _)| *us >= start_us && *us <= start_us + cin));
+        // cc=24 clocks = one click per quarter → 1920,2400,…,5280 ticks;
+        // accents on bar lines (1920 4/4, 3840+1440n 3/4) and always on
+        // the record point itself
+        let want: Vec<(u64, u8)> = [1920u64, 2400, 2880, 3360, 3840, 4320, 4800, 5280]
+            .iter()
+            .map(|&t| {
+                (
+                    tm.tick_to_us(t) + cin,
+                    if t == t1 || mm.bar_start_tick(t) == t {
+                        76
+                    } else {
+                        77
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(ons, want);
+        // the boundary click is accented and coincides with the deferred
+        // song start — click and capture share the boundary
+        assert_eq!(ons.last().unwrap().0, start_us + cin);
+        assert_eq!(ons.last().unwrap().1, 76);
+    }
+
+    /// #137 — a tempo change inside the pre-region sizes the hold by the
+    /// tempi actually covering it: the parked µs window equals the span
+    /// the performer hears, on either side of the tempo breakpoint.
+    #[test]
+    pub(crate) fn countin_lead_in_uses_the_tempi_of_the_pre_region() {
+        use document::Document;
+        use smf_core::{Division, Event as SmfEvent, EventKind};
+        let sig = |tick| SmfEvent {
+            tick,
+            seq: 0,
+            raw_body: None,
+            kind: EventKind::Meta {
+                meta_type: 0x58,
+                data: vec![4, 2, 24, 8].into(),
+            },
+        };
+        let tempo = |tick, mpq: u32| SmfEvent {
+            tick,
+            seq: 0,
+            raw_body: None,
+            kind: EventKind::Meta {
+                meta_type: 0x51,
+                data: mpq.to_be_bytes()[1..].to_vec().into(),
+            },
+        };
+        // 4/4 throughout; 120bpm for one bar, then 60bpm — a 1-bar
+        // count-in before bar 3 spans only the 60bpm bar (4s), while
+        // before bar 2 it spans the 120bpm bar (2s)
+        let d = Document::from_file(smf_core::File {
+            format: 1,
+            division: Division::Metrical(480),
+            tracks: vec![smf_core::Track {
+                events: vec![sig(0), tempo(0, 500_000), tempo(1920, 1_000_000)],
+            }],
+            warnings: vec![],
+        });
+        let mm = d.meter_map_for(0);
+        let tm = d.tempo_map_for(0);
+        let cin = |at: u64| {
+            let t0 = mm.countin_start(at, 1);
+            tm.tick_to_us(at) - tm.tick_to_us(t0)
+        };
+        assert_eq!(cin(1920), 2_000_000); // the 120bpm bar
+        assert_eq!(cin(3840), 4_000_000); // the 60bpm bar
+                                          // mid-bar inside the 60bpm region: full 60bpm bar + pickup
+        assert_eq!(cin(3840 + 960), 4_000_000 + 2_000_000);
+    }
+
+    /// #142/#143 — the OS-clipboard payload is a versioned format-1
+    /// fragment: per-event track identity, raw bodies and same-tick order
+    /// survive a serialize→parse round trip; a multi-track copy reports
+    /// no single source; the terminator the writer mints never leaks back.
+    #[test]
+    pub(crate) fn clipboard_roundtrip_keeps_tracks_and_drops_synthetic_eot() {
+        use smf_core::{Division, EventKind};
+        let ev = |dtick, seq, track, status: u8| ClipEvent {
+            dtick,
+            seq,
+            track,
+            raw_body: Some(vec![status, 64, 90].into()),
+            kind: EventKind::Channel {
+                status,
+                data: [64, 90],
+                len: 2,
+            },
+        };
+        let clip = Clip {
+            events: vec![
+                ev(0, 0, 0, 0x90),   // note-on, track 0
+                ev(0, 1, 0, 0xB0),   // CC same tick after it — order kept
+                ev(480, 0, 2, 0x91), // track 2, channel preserved
+            ],
+            src: None,
+            keep_tracks: false,
+            division: Division::Metrical(480),
+        };
+        let back = clip_from_item(&clip_to_item(&clip)).expect("own payload parses");
+        // no EOT was selected → none comes back through the fragment
+        assert_eq!(back.events.len(), 3);
+        assert!(
+            !back.events.iter().any(|e| matches!(
+                e.kind,
+                EventKind::Meta {
+                    meta_type: 0x2F,
+                    ..
+                }
+            )),
+            "writer's terminator leaked: {:?}",
+            back.events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert_eq!(back.src, None); // multi-track → no single source
+        assert_eq!(back.events[0].track, 0);
+        assert_eq!(back.events[2].track, 2);
+        // same-tick ordering survives by stream position
+        assert_eq!((back.events[0].dtick, back.events[0].seq), (0, 0));
+        assert_eq!((back.events[1].dtick, back.events[1].seq), (0, 1));
+        assert_eq!(back.events[2].dtick, 480);
+        // raw bodies byte-exact
+        assert_eq!(
+            back.events[0].raw_body.as_deref(),
+            Some(&[0x90u8, 64, 90][..])
+        );
+    }
+
+    /// #143 — a single-track copy keeps `src` so paste targets the active
+    /// track; a selected EOT rides the fragment unharmed (not mistaken
+    /// for the writer's terminator).
+    #[test]
+    pub(crate) fn clipboard_single_track_src_and_selected_eot_survive() {
+        use smf_core::{Division, EventKind};
+        let ch = |dtick| ClipEvent {
+            dtick,
+            seq: 0,
+            track: 1,
+            raw_body: None,
+            kind: EventKind::Channel {
+                status: 0x90,
+                data: [64, 90],
+                len: 2,
+            },
+        };
+        let eot = ClipEvent {
+            dtick: 960,
+            seq: 1,
+            track: 1,
+            raw_body: Some(vec![0xFF, 0x2F, 0x00].into()),
+            kind: EventKind::Meta {
+                meta_type: 0x2F,
+                data: bytes::Bytes::new(),
+            },
+        };
+        let clip = Clip {
+            events: vec![ch(0), ch(480), eot],
+            src: Some(1),
+            keep_tracks: false,
+            division: Division::Metrical(480),
+        };
+        let back = clip_from_item(&clip_to_item(&clip)).unwrap();
+        assert_eq!(back.src, Some(1));
+        assert_eq!(back.events.len(), 3);
+        assert!(back.events.iter().all(|e| e.track == 1));
+        assert!(back.events.iter().any(|e| matches!(
+            e.kind,
+            EventKind::Meta {
+                meta_type: 0x2F,
+                ..
+            }
+        )));
+    }
+
+    /// #142 — foreign or stale-version clipboard payloads fail closed so
+    /// paste falls back to the in-process copy.
+    #[test]
+    pub(crate) fn clipboard_rejects_foreign_and_stale_formats() {
+        let foreign = gpui_kit::ClipboardItem::new_string_with_metadata("x".into(), "{}".into());
+        assert!(clip_from_item(&foreign).is_none());
+        let v1 = gpui_kit::ClipboardItem::new_string_with_metadata(
+            "x".into(),
+            r#"{"v":1,"fmt":"midi-editor/smf-clip/1","smf":"00"}"#.into(),
+        );
+        assert!(clip_from_item(&v1).is_none());
+    }
+
+    /// #160 — the record gate bounds F7 chunks exactly like F0: a runaway
+    /// escape/continuation can't exhaust the take either. Realtime and
+    /// channel-filtered voice are classified for their own counters.
+    #[test]
+    pub(crate) fn rec_gate_bounds_f0_and_f7_sysex_alike() {
+        use crate::recording::{rec_gate, RecGate, MAX_REC_SYSEX};
+        assert_eq!(rec_gate(0xF0, MAX_REC_SYSEX + 1, None), RecGate::Oversized);
+        assert_eq!(rec_gate(0xF7, MAX_REC_SYSEX + 1, None), RecGate::Oversized);
+        assert_eq!(rec_gate(0xF0, 64, None), RecGate::SysEx);
+        assert_eq!(rec_gate(0xF7, 64, None), RecGate::SysEx);
+        // channel filter touches voice only — SysEx is channel-less
+        assert_eq!(rec_gate(0x90, 3, Some(1)), RecGate::Filtered);
+        assert_eq!(rec_gate(0x91, 3, Some(1)), RecGate::Voice);
+        assert_eq!(rec_gate(0xF7, 64, Some(1)), RecGate::SysEx);
+        assert_eq!(rec_gate(0xF8, 1, None), RecGate::Realtime);
+        assert_eq!(rec_gate(0xFE, 1, None), RecGate::Realtime);
+    }
+
+    /// #160 — capture and echo are independent, visible toggles: SysEx
+    /// lands in the take only when Record SysEx is on, and echoes to the
+    /// armed destination only when the echo policy is on (off default).
+    #[test]
+    pub(crate) fn rec_sysex_capture_and_echo_are_independent() {
+        use crate::recording::{mon_echoes, rec_captures, RecGate};
+        // voice always captures and echoes when the sinks are open
+        assert!(rec_captures(RecGate::Voice, false));
+        assert!(mon_echoes(RecGate::Voice, false));
+        // capture disabled: a bulk dump can't land in the take
+        assert!(!rec_captures(RecGate::SysEx, false));
+        assert!(rec_captures(RecGate::SysEx, true));
+        // thru default off — the dump doesn't blast the destination
+        assert!(!mon_echoes(RecGate::SysEx, false));
+        assert!(mon_echoes(RecGate::SysEx, true));
+        // dropped classes never reach either sink
+        for g in [RecGate::Realtime, RecGate::Filtered, RecGate::Oversized] {
+            assert!(!rec_captures(g, true) && !mon_echoes(g, true));
+        }
+    }
+
+    /// #160 — a SysEx delivered in split chunks stores verbatim: wire F0
+    /// becomes an SMF F0 (trailing F7 stays inside the payload), wire F7
+    /// becomes an SMF F7 escape, and channel voice keeps its channel.
+    #[test]
+    pub(crate) fn wire_to_kind_maps_f0_f7_and_voice_verbatim() {
+        use crate::recording::wire_to_kind;
+        use smf_core::EventKind;
+        // complete F0 incl. its trailing F7 byte → SMF SysEx payload
+        let (ch, kind) = wire_to_kind(&[0xF0, 0x7E, 0x7F, 0x09, 0xF7]).unwrap();
+        assert_eq!(ch, None);
+        assert!(matches!(kind, EventKind::SysEx(p) if p.as_ref() == [0x7E, 0x7F, 0x09, 0xF7]));
+        // a continuation chunk → escape, payload verbatim
+        let (ch, kind) = wire_to_kind(&[0xF7, 1, 2, 3, 0xF7]).unwrap();
+        assert_eq!(ch, None);
+        assert!(matches!(kind, EventKind::Escape(p) if p.as_ref() == [1, 2, 3, 0xF7]));
+        // channel voice keeps its channel for replace-in-loop keying
+        let (ch, kind) = wire_to_kind(&[0x93, 64, 100]).unwrap();
+        assert_eq!(ch, Some(3));
+        assert!(matches!(
+            kind,
+            EventKind::Channel {
+                status: 0x93,
+                data: [64, 100],
+                len: 2
+            }
+        ));
+        // 1-data-byte forms read correctly; truncated input is dropped
+        let (ch, _) = wire_to_kind(&[0xC5, 7]).unwrap();
+        assert_eq!(ch, Some(5));
+        assert!(wire_to_kind(&[0xC5]).is_none());
+        assert!(wire_to_kind(&[]).is_none());
     }
 
     #[test]

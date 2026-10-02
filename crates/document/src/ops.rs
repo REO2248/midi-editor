@@ -46,7 +46,8 @@ impl Document {
         grid: u64,
         strength: u32,
     ) -> Vec<Op> {
-        let grid = grid.max(1) as i64;
+        // i128 intermediates: u64-range ticks and grids never overflow
+        let grid = grid.max(1) as i128;
         let str_f = strength.min(100) as f64 / 100.0;
         let mut ops = Vec::new();
         for n in self
@@ -54,19 +55,21 @@ impl Document {
             .into_iter()
             .filter(|n| n.track == track && n.start_tick >= from && n.start_tick < to)
         {
-            let start = n.start_tick as i64;
+            let start = n.start_tick as i128;
             let snapped = ((start + grid / 2) / grid) * grid;
-            let new_start = (start as f64 + (snapped - start) as f64 * str_f).round() as i64;
+            let new_start = (start as f64 + (snapped - start) as f64 * str_f).round() as i128;
             let delta = new_start - start;
             if delta == 0 {
                 continue;
             }
+            let delta = delta.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
             let ids: Vec<EventId> = [Some(n.on_id), n.off_id].into_iter().flatten().collect();
             for id in ids {
                 if let Some((ti, ei)) = self.by_id.get(&id).copied() {
                     let mut after = self.tracks[ti].events[ei].clone();
                     after.tick = after.tick.saturating_add_signed(delta);
                     ops.push(Op::UpdateEvent {
+                        pos: usize::MAX,
                         track: ti,
                         before: self.tracks[ti].events[ei].clone(),
                         after,
@@ -101,6 +104,7 @@ impl Document {
                         data[0] = new_key;
                     }
                     ops.push(Op::UpdateEvent {
+                        pos: usize::MAX,
                         track: ti,
                         before,
                         after,
@@ -130,6 +134,7 @@ impl Document {
                     data[1] = nv;
                 }
                 ops.push(Op::UpdateEvent {
+                    pos: usize::MAX,
                     track: ti,
                     before,
                     after,
@@ -198,6 +203,7 @@ impl Document {
                         }
                     }
                     ops.push(Op::UpdateEvent {
+                        pos: usize::MAX,
                         track: ti,
                         before,
                         after,
@@ -236,6 +242,7 @@ impl Document {
                 let mut after = before.clone();
                 after.tick = new_end;
                 ops.push(Op::UpdateEvent {
+                    pos: usize::MAX,
                     track: ti,
                     before,
                     after,
@@ -284,6 +291,7 @@ impl Document {
                     let mut after = before.clone();
                     after.tick = after.tick.saturating_add_signed(delta);
                     ops.push(Op::UpdateEvent {
+                        pos: usize::MAX,
                         track: ti,
                         before,
                         after,
@@ -324,6 +332,7 @@ impl Document {
             let mut off_after = off_before.clone();
             off_after.tick = at;
             ops.push(Op::UpdateEvent {
+                pos: usize::MAX,
                 track: oti,
                 before: off_before.clone(),
                 after: off_after,
@@ -399,6 +408,7 @@ impl Document {
                             let mut after = before.clone();
                             after.tick = end;
                             ops.push(Op::UpdateEvent {
+                                pos: usize::MAX,
                                 track: ti,
                                 before,
                                 after,
@@ -466,6 +476,7 @@ impl Document {
                 }
             }
             ops.push(Op::UpdateEvent {
+                pos: usize::MAX,
                 track: ti,
                 before,
                 after,
@@ -491,6 +502,7 @@ impl Document {
                 let mut after = before.clone();
                 after.tick = new_end;
                 ops.push(Op::UpdateEvent {
+                    pos: usize::MAX,
                     track: ti,
                     before,
                     after,
@@ -518,6 +530,7 @@ impl Document {
                     data[1] = vel.clamp(1, 127);
                 }
                 ops.push(Op::UpdateEvent {
+                    pos: usize::MAX,
                     track: ti,
                     before,
                     after,
@@ -562,6 +575,7 @@ impl Document {
                     data[1] = vel;
                 }
                 ops.push(Op::UpdateEvent {
+                    pos: usize::MAX,
                     track: ti,
                     before,
                     after,
@@ -591,6 +605,7 @@ impl Document {
                     *status = (*status & 0xF0) | (channel & 0x0F);
                 }
                 ops.push(Op::UpdateEvent {
+                    pos: usize::MAX,
                     track,
                     before: e.clone(),
                     after,
@@ -945,6 +960,7 @@ impl Document {
                         data[1] = data_msb & 0x7F;
                     }
                     ops.push(Op::UpdateEvent {
+                        pos: usize::MAX,
                         track: ti,
                         before: self.tracks[ti].events[ei].clone(),
                         after,
@@ -961,6 +977,7 @@ impl Document {
                         data[1] = l & 0x7F;
                     }
                     ops.push(Op::UpdateEvent {
+                        pos: usize::MAX,
                         track: ti,
                         before: self.tracks[ti].events[ei].clone(),
                         after,
@@ -1025,6 +1042,7 @@ impl Document {
                 data[1] = val & 0x7F;
             }
             ops.push(Op::UpdateEvent {
+                pos: usize::MAX,
                 track: ti,
                 before: e.clone(),
                 after,
@@ -1102,6 +1120,7 @@ impl Document {
                 data,
             };
             return vec![Op::UpdateEvent {
+                pos: usize::MAX,
                 track,
                 before: e,
                 after,
@@ -1148,10 +1167,49 @@ impl Document {
 
     /// Set/replace the time signature at `tick` on `track` (denominator
     /// given as the actual value — 4, 8, … — encoded to the SMF
-    /// power-of-two form).
+    /// power-of-two form). Rewriting nn/dd alone preserves the stored
+    /// `cc`/`bb` bytes; a brand-new signature gets the conventional
+    /// quarter-note click (36 clocks in compound meter) and 8 32nds.
     pub fn set_time_sig_ops(&mut self, track: usize, tick: u64, num: u8, den: u8) -> Vec<Op> {
         let dd = (den.max(1) as f64).log2().round() as u8;
-        let data = Bytes::copy_from_slice(&[num, dd, 24, 8]);
+        let (cc, bb) = match self
+            .tracks
+            .get(track)
+            .and_then(|t| {
+                t.events.iter().find(|e| {
+                    e.tick == tick
+                        && matches!(
+                            e.kind,
+                            EventKind::Meta {
+                                meta_type: 0x58,
+                                ..
+                            }
+                        )
+                })
+            })
+            .map(|e| match &e.kind {
+                EventKind::Meta { data, .. } if data.len() >= 4 => (data[2], data[3]),
+                _ => (24, 8),
+            }) {
+            Some(cb) => cb,
+            None => (MeterEvent::default_click_clocks(num, dd), 8),
+        };
+        self.set_time_sig_full_ops(track, tick, num, den, cc, bb)
+    }
+
+    /// Set/replace a time signature with the complete `nn dd cc bb`
+    /// payload — every byte the caller wants stored is written verbatim.
+    pub fn set_time_sig_full_ops(
+        &mut self,
+        track: usize,
+        tick: u64,
+        num: u8,
+        den: u8,
+        cc: u8,
+        bb: u8,
+    ) -> Vec<Op> {
+        let dd = (den.max(1) as f64).log2().round() as u8;
+        let data = Bytes::copy_from_slice(&[num, dd, cc, bb]);
         if let Some(e) = self
             .tracks
             .get(track)
@@ -1175,6 +1233,7 @@ impl Document {
                 data,
             };
             return vec![Op::UpdateEvent {
+                pos: usize::MAX,
                 track,
                 before: e,
                 after,
@@ -1215,6 +1274,7 @@ impl Document {
                 data: Bytes::copy_from_slice(&[channel & 0x0F]),
             };
             return vec![Op::UpdateEvent {
+                pos: usize::MAX,
                 track,
                 before: e,
                 after,
@@ -1362,7 +1422,7 @@ impl Document {
                 },
             );
         }
-        vec![Op::InsertTrack {
+        let mut ops = vec![Op::InsertTrack {
             index: self.tracks.len(),
             track: Track {
                 name: name.map(|n| Bytes::copy_from_slice(n.as_bytes())),
@@ -1370,11 +1430,24 @@ impl Document {
                 out_channel: 0,
                 events,
             },
-        }]
+        }];
+        // a format-0 file already holding a track becomes format 1 —
+        // declared explicitly in the transaction, never by the serializer
+        if self.format == 0 && !self.tracks.is_empty() {
+            ops.push(Op::SetFormat {
+                before: 0,
+                after: 1,
+            });
+        }
+        ops
     }
 
     /// Remove track `index` entirely (undo restores it wholesale).
+    /// The last track cannot be removed — a document keeps at least one.
     pub fn remove_track_ops(&mut self, index: usize) -> Vec<Op> {
+        if self.tracks.len() <= 1 {
+            return vec![];
+        }
         match self.tracks.get(index) {
             Some(t) => vec![Op::RemoveTrack {
                 index,
@@ -1382,6 +1455,19 @@ impl Document {
             }],
             None => vec![],
         }
+    }
+
+    /// Explicit format conversion transaction content (e.g. format 1 →
+    /// format 2, or 1 → 0 when a single-track file is saved back).
+    /// `Document::apply` enforces the resulting invariant.
+    pub fn set_format_ops(&mut self, format: u16) -> Vec<Op> {
+        if format == self.format {
+            return vec![];
+        }
+        vec![Op::SetFormat {
+            before: self.format,
+            after: format,
+        }]
     }
 
     /// Set/replace the track name meta (0x03) at tick 0.
@@ -1408,6 +1494,7 @@ impl Document {
                 data: Bytes::copy_from_slice(name.as_bytes()),
             };
             return vec![Op::UpdateEvent {
+                pos: usize::MAX,
                 track,
                 before: e,
                 after,
@@ -1460,6 +1547,7 @@ impl Document {
             let mut after = e.clone();
             after.kind = EventKind::Meta { meta_type, data };
             return vec![Op::UpdateEvent {
+                pos: usize::MAX,
                 track,
                 before: e,
                 after,
@@ -1521,6 +1609,7 @@ impl Document {
                 data,
             };
             return vec![Op::UpdateEvent {
+                pos: usize::MAX,
                 track: 0,
                 before: e,
                 after,
@@ -1534,5 +1623,78 @@ impl Document {
                 data,
             },
         )
+    }
+}
+
+impl Document {
+    /// #162 — explicit Format 0 → Format 1 conversion splitting channel
+    /// events into one track per used channel. Non-channel content (tempo,
+    /// signatures, text, SysEx, EOT) stays in track 0 — it is never
+    /// duplicated or moved. Returns empty unless the document is format 0
+    /// with more than one channel in use, so accidental single-channel
+    /// files never get spurious tracks.
+    pub fn split_fmt0_by_channel_ops(&self) -> Vec<Op> {
+        if self.format != 0 || self.tracks.len() != 1 {
+            return Vec::new();
+        }
+        let tr = &self.tracks[0];
+        let chans: std::collections::BTreeSet<u8> = tr
+            .events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::Channel { status, .. } => Some(status & 0x0F),
+                _ => None,
+            })
+            .collect();
+        if chans.len() <= 1 {
+            return Vec::new();
+        }
+        let mut ops = vec![Op::SetFormat {
+            before: 0,
+            after: 1,
+        }];
+        let removed: Vec<(usize, Event)> = tr
+            .events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e.kind, EventKind::Channel { .. }))
+            .map(|(i, e)| (i, e.clone()))
+            .collect();
+        ops.push(Op::RemoveEvents { track: 0, removed });
+        for ch in chans {
+            let events: Vec<Event> = tr
+                .events
+                .iter()
+                .filter(
+                    |e| matches!(&e.kind, EventKind::Channel { status, .. } if status & 0x0F == ch),
+                )
+                .cloned()
+                .collect();
+            ops.push(Op::InsertTrack {
+                index: usize::MAX,
+                track: Track {
+                    name: Some(format!("Channel {}", ch + 1).into_bytes().into()),
+                    out_port: tr.out_port,
+                    out_channel: ch,
+                    events,
+                },
+            });
+        }
+        ops
+    }
+}
+
+impl Document {
+    /// Channels (0-15) present in the document's channel events — the
+    /// basis of the Format-0 multichannel import check (#162).
+    pub fn channels_used(&self) -> std::collections::BTreeSet<u8> {
+        self.tracks
+            .iter()
+            .flat_map(|t| t.events.iter())
+            .filter_map(|e| match &e.kind {
+                EventKind::Channel { status, .. } => Some(status & 0x0F),
+                _ => None,
+            })
+            .collect()
     }
 }

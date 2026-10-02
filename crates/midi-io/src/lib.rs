@@ -398,7 +398,23 @@ impl Timebase {
         if let Some(d) = &self.diag {
             d.note(dev_us != 0, arrival.saturating_sub(raw));
         }
+
         raw.saturating_sub(self.latency_us)
+    }
+
+    /// Stream clock reading at call time — µs since `new()` under arrival
+    /// stamping; once a device timestamp anchors the map, advances by host
+    /// time from the anchor (the backend clock can't be queried outside the
+    /// callback). Used to rebase a take's zero when recording starts long
+    /// after the input opened (#159 arm-vs-record split).
+    pub fn now_us(&self) -> u64 {
+        match self.anchor {
+            Some((_, i0)) => {
+                let base = i0.saturating_duration_since(self.t0).as_micros() as u64;
+                base.saturating_add(i0.elapsed().as_micros() as u64)
+            }
+            None => self.t0.elapsed().as_micros() as u64,
+        }
     }
 }
 
@@ -415,6 +431,16 @@ pub struct Input {
     /// reopening with `(name, ord)` retargets the exact same endpoint
     /// after an unplug/replug
     pub ord: usize,
+    /// stream clock — `now_us()` reads the timestamp domain `cb` sees
+    tb: std::sync::Arc<std::sync::Mutex<Timebase>>,
+}
+
+impl Input {
+    /// Current reading of the timestamp domain the callback reports (#159):
+    /// lets a take rebase its zero when recording engages after monitoring.
+    pub fn now_us(&self) -> u64 {
+        self.tb.lock().unwrap_or_else(|e| e.into_inner()).now_us()
+    }
 }
 
 impl Input {
@@ -498,12 +524,22 @@ impl Input {
     where
         F: FnMut(u64, &[u8]) + Send + 'static,
     {
-        let mut tb = Timebase::new(opts.latency_us, opts.diag);
+        let tb = std::sync::Arc::new(std::sync::Mutex::new(Timebase::new(
+            opts.latency_us,
+            opts.diag,
+        )));
+        let tb2 = tb.clone();
         let conn = inp
             .connect(
                 &port,
                 "midi-editor-in",
-                move |ts, bytes, _| cb(tb.stamp(ts, std::time::Instant::now()), bytes),
+                move |ts, bytes, _| {
+                    let us = tb2
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .stamp(ts, std::time::Instant::now());
+                    cb(us, bytes)
+                },
                 (),
             )
             .map_err(|e| Error::Connect(e.to_string()))?;
@@ -511,6 +547,7 @@ impl Input {
             _conn: conn,
             name,
             ord,
+            tb,
         })
     }
 }
@@ -946,9 +983,16 @@ fn set_timer_resolution(_ms: u32) {}
 pub trait Clock {
     /// Current time in µs. The epoch is arbitrary — only differences matter.
     fn now_us(&self) -> u64;
-    /// Block until `target_us` (same epoch as `now_us`) or until `stop`
-    /// flips. Returns true if the target was reached; false on abort.
-    fn wait_until_us(&mut self, target_us: u64, stop: &std::sync::atomic::AtomicBool) -> bool;
+    /// Block until `target_us` (same epoch as `now_us`) or until `stop` or
+    /// `watch` flips. Returns true if the target was reached; false on abort.
+    /// `watch` interrupts the wait so a queued `SchedulePatch` applies at the
+    /// next event boundary instead of the next deadline.
+    fn wait_until_us(
+        &mut self,
+        target_us: u64,
+        stop: &std::sync::atomic::AtomicBool,
+        watch: &std::sync::atomic::AtomicBool,
+    ) -> bool;
 }
 
 /// Wall-clock `Clock`: `Instant` + 2 ms sleep/spin hybrid — the policy the
@@ -969,7 +1013,12 @@ impl Clock for SystemClock {
     fn now_us(&self) -> u64 {
         self.t0.elapsed().as_micros() as u64
     }
-    fn wait_until_us(&mut self, target_us: u64, stop: &std::sync::atomic::AtomicBool) -> bool {
+    fn wait_until_us(
+        &mut self,
+        target_us: u64,
+        stop: &std::sync::atomic::AtomicBool,
+        watch: &std::sync::atomic::AtomicBool,
+    ) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
         let target = self.t0 + std::time::Duration::from_micros(target_us);
         loop {
@@ -977,7 +1026,7 @@ impl Clock for SystemClock {
             if now >= target {
                 return true;
             }
-            if stop.load(Relaxed) {
+            if stop.load(Relaxed) || watch.load(Relaxed) {
                 return false;
             }
             let rem = target - now;
@@ -990,32 +1039,188 @@ impl Clock for SystemClock {
     }
 }
 
+/// A live update to a running schedule, queued via `Playback::update`.
+/// `events` replaces the whole schedule in the same absolute-µs domain;
+/// `loop_from_us` replaces the wrap point. When `sinks` is `Some` the
+/// destination set changed (a routing edit): every old sink is panicked and
+/// the new array takes over — event sink indices then refer to the NEW
+/// array. With `sinks: None` (content, mute/solo, or loop edit) sinks stay
+/// and only notes that lost their scheduled note-off are released — a
+/// channel-scoped All Notes Off, so tracks sharing one destination keep
+/// their own sounding notes.
+pub struct SchedulePatch {
+    pub events: Vec<(u64, usize, Vec<u8>)>,
+    pub loop_from_us: Option<u64>,
+    /// loop's right locator in the same us domain — `None` wraps at the
+    /// schedule's last event (the old unbounded behavior)
+    pub loop_end_us: Option<u64>,
+    pub sinks: Option<Vec<Box<dyn EventSink>>>,
+}
+
+/// Control-plane message for a running schedule.
+pub enum SchedMsg {
+    /// Swap the remaining schedule (and optionally the routing).
+    Patch(SchedulePatch),
+    /// Full panic on every open sink — the transport keeps running. This is
+    /// the "emergency silence" path, distinct from normal-stop cleanup.
+    Panic,
+}
+
+/// Track one channel message delivery against the sounding-note table.
+fn note_sent(
+    sounding: &mut std::collections::BTreeMap<(usize, u8), u32>,
+    idx: usize,
+    bytes: &[u8],
+) {
+    if bytes.len() < 3 {
+        return;
+    }
+    let ch = bytes[0] & 0x0F;
+    match bytes[0] & 0xF0 {
+        0x90 if bytes[2] != 0 => *sounding.entry((idx, ch)).or_insert(0) += 1,
+        0x80 | 0x90 => {
+            let key = (idx, ch);
+            if let Some(c) = sounding.get_mut(&key) {
+                *c = c.saturating_sub(1);
+                if *c == 0 {
+                    sounding.remove(&key);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Drain every queued patch. Returns true when at least one applied.
+/// `from_us` is the timeline point playback resumes from — a sounding note
+/// survives only if the new schedule still delivers its note-off at or after
+/// that point; otherwise the channel gets CC123 and the entry drops.
+fn drain_updates(
+    updates: &std::sync::mpsc::Receiver<SchedMsg>,
+    events: &mut Vec<(u64, usize, Vec<u8>)>,
+    loop_from_us: &mut Option<u64>,
+    loop_end_us: &mut Option<u64>,
+    sinks: &mut Vec<Box<dyn EventSink>>,
+    sounding: &mut std::collections::BTreeMap<(usize, u8), u32>,
+    from_us: u64,
+) -> bool {
+    let mut applied = false;
+    while let Ok(msg) = updates.try_recv() {
+        let SchedMsg::Patch(p) = msg else {
+            // explicit Panic: silence everything now, transport continues —
+            // it does not reschedule, so `applied` stays untouched and the
+            // caller doesn't rewind `i` into already-sent events
+            for s in sinks.iter_mut() {
+                s.panic();
+            }
+            sounding.clear();
+            continue;
+        };
+        applied = true;
+        *events = p.events;
+        *loop_from_us = p.loop_from_us;
+        *loop_end_us = p.loop_end_us;
+        match p.sinks {
+            Some(new) => {
+                for s in sinks.iter_mut() {
+                    s.panic();
+                }
+                *sinks = new;
+                sounding.clear();
+            }
+            None => {
+                let keys: Vec<(usize, u8)> = sounding.keys().copied().collect();
+                for (s, ch) in keys {
+                    let survives = events.iter().any(|(us, si, b)| {
+                        *us >= from_us
+                            && *si == s
+                            && b.len() >= 3
+                            && (b[0] & 0x0F) == ch
+                            && ((b[0] & 0xF0) == 0x80 || ((b[0] & 0xF0) == 0x90 && b[2] == 0))
+                    });
+                    if survives {
+                        continue;
+                    }
+                    if let Some(sink) = sinks.get_mut(s) {
+                        sink.send_at(&[0xB0 | ch, 123, 0], 0);
+                    }
+                    sounding.remove(&(s, ch));
+                }
+            }
+        }
+    }
+    applied
+}
+
 /// The scheduling core of `Playback`, generic over `Clock` so tests can run
 /// it synchronously on a fake clock. See `Playback::start` for the contract.
 ///
 /// `events` must be sorted by absolute µs; `start_us` seeks (earlier events
 /// skipped, clock base = `start_us`); `loop_from_us` notes-offs every sink at
-/// the end of each pass and restarts the schedule at that point. Every exit
-/// path — stop, end of timeline, or a loop with nothing left to replay —
-/// ends with `panic()` on every sink. `pos` is updated as the schedule
-/// advances so the UI can draw a playhead.
+/// the end of each pass and restarts the schedule at that point. `watch`
+/// (set by `Playback::update`) interrupts the current wait: queued
+/// `SchedulePatch`es are drained, sounding notes that lost their note-off are
+/// released, and the remaining schedule resumes from the reached position.
+/// Every exit path — stop, end of timeline, or a loop with nothing left to
+/// replay — ends with `notes_off()` on every sink, or `panic()` when
+/// `panic_on_stop` (reset-on-stop) is set. `pos` is updated as the
+/// schedule advances so the UI can draw a playhead.
+#[allow(clippy::too_many_arguments)]
 pub fn run_schedule(
     clock: &mut impl Clock,
-    sinks: &mut [Box<dyn EventSink>],
-    events: &[(u64, usize, Vec<u8>)],
+    sinks: &mut Vec<Box<dyn EventSink>>,
+    mut events: Vec<(u64, usize, Vec<u8>)>,
     start_us: u64,
-    loop_from_us: Option<u64>,
+    mut loop_from_us: Option<u64>,
+    mut loop_end_us: Option<u64>,
     stop: &std::sync::atomic::AtomicBool,
     pos: &std::sync::atomic::AtomicU64,
+    watch: &std::sync::atomic::AtomicBool,
+    updates: &std::sync::mpsc::Receiver<SchedMsg>,
+    panic_on_stop: bool,
 ) {
-    use std::sync::atomic::Ordering::Relaxed;
+    use std::sync::atomic::Ordering::{Acquire, Relaxed};
     let mut base_us = start_us;
     let mut epoch0_us = clock.now_us();
     let mut i = events.partition_point(|(us, _, _)| *us < base_us);
+    // (sink, channel) -> note-ons delivered without their note-off yet.
+    // Schedule patches consult it so orphaned notes get a channel-scoped
+    // All Notes Off instead of hanging.
+    let mut sounding: std::collections::BTreeMap<(usize, u8), u32> =
+        std::collections::BTreeMap::new();
     'outer: loop {
-        while i < events.len() {
+        // the pass ends at the right locator when one is set — recomputed
+        // per event so a patch moving the bound applies mid-pass; an empty
+        // or inverted range is ignored so a degenerate loop can't starve
+        while i < events.len()
+            && events[i].0
+                < loop_end_us
+                    .filter(|le| loop_from_us.is_none_or(|ls| *le > ls))
+                    .unwrap_or(u64::MAX)
+        {
             if stop.load(Relaxed) {
                 break 'outer;
+            }
+            if watch.load(Acquire) {
+                watch.store(false, Relaxed);
+                // rebase at the timeline point actually reached — events
+                // due during the drain stay skipped rather than bursting
+                let now = clock.now_us();
+                base_us += now.saturating_sub(epoch0_us);
+                epoch0_us = now;
+                if drain_updates(
+                    updates,
+                    &mut events,
+                    &mut loop_from_us,
+                    &mut loop_end_us,
+                    sinks,
+                    &mut sounding,
+                    base_us,
+                ) {
+                    i = events.partition_point(|(us, _, _)| *us < base_us);
+                    pos.store(base_us, Relaxed);
+                }
+                continue;
             }
             let (us, sink_idx, bytes) = &events[i];
             i += 1;
@@ -1024,13 +1229,52 @@ pub fn run_schedule(
                 continue;
             };
             let wake_us = (epoch0_us + (us - base_us)).saturating_sub(sink.lead_us());
-            if !clock.wait_until_us(wake_us, stop) {
-                break 'outer;
+            if !clock.wait_until_us(wake_us, stop, watch) {
+                if stop.load(Relaxed) {
+                    break 'outer;
+                }
+                continue;
             }
             pos.store(us, Relaxed);
             let deadline_us = epoch0_us + (us - base_us);
             let rem = deadline_us.saturating_sub(clock.now_us());
             sink.send_at(bytes, rem);
+            note_sent(&mut sounding, *sink_idx, bytes);
+        }
+        // a patch may have queued (or emptied) the timeline while the pass
+        // ran out — apply it before the wrap decision
+        if watch.load(Acquire) {
+            watch.store(false, Relaxed);
+            let now = clock.now_us();
+            base_us += now.saturating_sub(epoch0_us);
+            epoch0_us = now;
+            if drain_updates(
+                updates,
+                &mut events,
+                &mut loop_from_us,
+                &mut loop_end_us,
+                sinks,
+                &mut sounding,
+                base_us,
+            ) {
+                i = events.partition_point(|(us, _, _)| *us < base_us);
+                pos.store(base_us, Relaxed);
+                continue 'outer;
+            }
+        }
+        // bounded loop: hold until the right locator before wrapping —
+        // the cycle is temporal, so content shorter than the range leaves
+        // silence instead of wrapping early (#130)
+        if let (Some(ls), Some(le)) = (loop_from_us, loop_end_us) {
+            if le > ls && le > base_us {
+                let deadline = epoch0_us + (le - base_us);
+                if !clock.wait_until_us(deadline, stop, watch) {
+                    if stop.load(Relaxed) {
+                        break;
+                    }
+                    continue 'outer; // watch fired — the drain runs next pass
+                }
+            }
         }
         // loop wrap: release notes but keep tails and controller
         // state — the schedule restarts with chase events at the
@@ -1038,11 +1282,14 @@ pub fn run_schedule(
         for s in sinks.iter_mut() {
             s.notes_off();
         }
+        sounding.clear();
         match loop_from_us {
             Some(ls) => {
                 let ni = events.partition_point(|(us, _, _)| *us < ls);
-                // nothing to replay → don't spin on panic forever
-                if ni >= events.len() {
+                // with a right locator the range loops even while empty —
+                // the temporal cycle itself is the point; unbounded keeps
+                // the old "nothing left to replay → stop" guard
+                if loop_end_us.is_none() && ni >= events.len() {
                     break;
                 }
                 base_us = ls;
@@ -1053,8 +1300,17 @@ pub fn run_schedule(
             None => break,
         }
     }
-    for s in sinks.iter_mut() {
-        s.panic();
+    // exit cleanup policy (#161): a normal stop releases sounding notes
+    // (CC123) and preserves controller/modulation state; `panic_on_stop`
+    // (the reset-on-stop preference) adds the full CC123/121/120 sweep.
+    if panic_on_stop {
+        for s in sinks.iter_mut() {
+            s.panic();
+        }
+    } else {
+        for s in sinks.iter_mut() {
+            s.notes_off();
+        }
     }
 }
 
@@ -1071,6 +1327,8 @@ pub fn run_schedule(
 pub struct Playback {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     position_us: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    updated: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    tx: std::sync::mpsc::Sender<SchedMsg>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -1080,34 +1338,66 @@ impl Playback {
     /// the index of the sink to deliver it to. With `loop_from_us`, reaching
     /// the end all-notes-offs every sink and restarts the schedule at that
     /// point — sinks (and VST3 audio streams) stay alive across the boundary.
+    /// Queue later edits through `update` instead of restarting.
     pub fn start(
         mut sinks: Vec<Box<dyn EventSink>>,
         events: Vec<(u64, usize, Vec<u8>)>,
         start_us: u64,
         loop_from_us: Option<u64>,
+        loop_end_us: Option<u64>,
+        panic_on_stop: bool,
     ) -> Self {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let position_us = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let (stop2, pos2) = (stop.clone(), position_us.clone());
+        let updated = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel::<SchedMsg>();
+        let (stop2, pos2, watch2) = (stop.clone(), position_us.clone(), updated.clone());
         let thread = std::thread::spawn(move || {
             set_timer_resolution(1);
             let mut clock = SystemClock::default();
             run_schedule(
                 &mut clock,
                 &mut sinks,
-                &events,
+                events,
                 start_us,
                 loop_from_us,
+                loop_end_us,
                 &stop2,
                 &pos2,
+                &watch2,
+                &rx,
+                panic_on_stop,
             );
             set_timer_resolution(0);
         });
         Self {
             stop,
             position_us,
+            updated,
+            tx,
             thread: Some(thread),
         }
+    }
+
+    /// Queue a schedule patch for the running thread; it applies at the next
+    /// event boundary (bounded by the 2 ms wait granularity). Events use the
+    /// same absolute-µs domain the schedule was built with. No-op once the
+    /// schedule thread has exited.
+    pub fn update(&self, patch: SchedulePatch) {
+        // send first, then flag: an Acquire load of `updated` on the worker
+        // guarantees the queued patch is visible to it
+        let _ = self.tx.send(SchedMsg::Patch(patch));
+        self.updated
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Emergency silence on the running pass: every open sink gets the full
+    /// panic burst while the transport keeps going — the user-facing Panic
+    /// command, distinct from stop cleanup (which follows `panic_on_stop`).
+    pub fn panic_now(&self) {
+        let _ = self.tx.send(SchedMsg::Panic);
+        self.updated
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     pub fn position_us(&self) -> u64 {
@@ -1251,9 +1541,9 @@ mod tests {
         fn now_us(&self) -> u64 {
             self.now
         }
-        fn wait_until_us(&mut self, target_us: u64, _stop: &AtomicBool) -> bool {
+        fn wait_until_us(&mut self, target_us: u64, stop: &AtomicBool, watch: &AtomicBool) -> bool {
             self.now = target_us;
-            true
+            !stop.load(Relaxed) && !watch.load(Relaxed)
         }
     }
 
@@ -1351,6 +1641,8 @@ mod tests {
             events,
             0,
             None,
+            None,
+            false,
         );
         let snap = wait_for(&log, 2);
         pb.stop();
@@ -1378,6 +1670,8 @@ mod tests {
             events,
             900_000, // 100 ms before the second event
             None,
+            None,
+            false,
         );
         let snap = wait_for(&log, 1);
         pb.stop();
@@ -1454,7 +1748,21 @@ mod tests {
             sends: 0,
         })];
         let mut clock = FakeClock { now: 0 };
-        run_schedule(&mut clock, &mut sinks, &events, 0, Some(0), &stop, &pos);
+        let watch = AtomicBool::new(false);
+        let (_tx, rx) = std::sync::mpsc::channel();
+        run_schedule(
+            &mut clock,
+            &mut sinks,
+            events,
+            0,
+            Some(0),
+            None,
+            &stop,
+            &pos,
+            &watch,
+            &rx,
+            true,
+        );
         let snapshot = log.lock().unwrap().clone();
         // note-on played twice → the schedule wrapped and replayed
         assert_eq!(
@@ -1476,6 +1784,437 @@ mod tests {
         assert!(snapshot[notes_off_pos..]
             .iter()
             .any(|b| b.len() == 3 && b[0] & 0xF0 == 0xB0 && b[1] == 121));
+    }
+
+    /// #137 — a parked count-in pass: the hold emits only clicks, the
+    /// song's first event lands exactly on the deferred boundary, and
+    /// `pos` reports parked-domain µs (the view subtracts the hold to
+    /// recover document position). Sink also captures `pos` per send so
+    /// the wall-time ↔ playhead ↔ recorded-tick contract is checkable:
+    /// input heard ON a boundary event maps to `base + rel − cin` — the
+    /// record start — so click and capture share the same boundary.
+    #[test]
+    fn parked_countin_aligns_wall_playhead_and_capture() {
+        /// `(position µs at send, bytes)` — the value the UI playhead
+        /// mirrors, paired with what was emitted.
+        type PosLog = Arc<Mutex<Vec<(u64, Vec<u8>)>>>;
+
+        /// `pos`-observing sink: records the schedule position reported
+        /// for every send.
+        struct PosSink {
+            log: PosLog,
+            pos: Arc<AtomicU64>,
+        }
+
+        impl EventSink for PosSink {
+            fn send_at(&mut self, bytes: &[u8], _rem_us: u64) {
+                let p = self.pos.load(Relaxed);
+                self.log.lock().unwrap().push((p, bytes.to_vec()));
+            }
+            fn notes_off(&mut self) {}
+            fn panic(&mut self) {}
+        }
+
+        let start = 1_000_000u64;
+        let cin = 500_000u64;
+        let boundary = start + cin;
+        // parked schedule as the view builds it: clicks fill the hold,
+        // an accented click + the first note sit on the boundary
+        let events = vec![
+            (start, 0usize, vec![0x99, 77, 110]),
+            (start + 250_000, 0usize, vec![0x99, 77, 110]),
+            (boundary, 0usize, vec![0x99, 76, 110]),
+            (boundary, 0usize, vec![0x90, 60, 100]),
+            (boundary + 100_000, 0usize, vec![0x80, 60, 0]),
+        ];
+        let log: PosLog = Arc::new(Mutex::new(Vec::new()));
+        let pos = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let watch = AtomicBool::new(false);
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut sinks: Vec<Box<dyn EventSink>> = vec![Box::new(PosSink {
+            log: log.clone(),
+            pos: pos.clone(),
+        })];
+        let mut clock = FakeClock { now: 0 };
+        run_schedule(
+            &mut clock,
+            &mut sinks,
+            events,
+            start,
+            None,
+            None,
+            &stop,
+            pos.as_ref(),
+            &watch,
+            &rx,
+            false,
+        );
+        let got = log.lock().unwrap().clone();
+        // `pos` reports each event's parked µs at send time
+        assert_eq!(
+            got.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+            vec![
+                start,
+                start + 250_000,
+                boundary,
+                boundary,
+                boundary + 100_000
+            ]
+        );
+        // inside the hold only clicks (0x99) emitted; the first channel
+        // event landed exactly at the boundary — never a moment early
+        let first_note = got.iter().position(|(_, b)| b[0] == 0x90).unwrap();
+        assert_eq!(got[first_note].0, boundary);
+        assert!(got[..first_note].iter().all(|(_, b)| b[0] == 0x99));
+        // the capture contract: the take's `rel` is the input clock since
+        // engage (epoch ≈ ref), so an event heard at parked time `p` has
+        // rel = p − start and maps to doc_us = base + rel − cin = p − cin
+        // — a note struck when the boundary event sounds lands exactly on
+        // the record start (`base`)
+        let base = start;
+        let struck_on_boundary = base + (boundary - start) - cin;
+        assert_eq!(struck_on_boundary, base);
+        // and one struck mid-song lands on the heard event's doc position
+        let heard = boundary + 100_000;
+        assert_eq!(base + (heard - start) - cin, heard - cin);
+    }
+
+    // --- live schedule updates (#140/#141) ----------------------------------
+
+    /// Sink that queues a `SchedulePatch` after its `fire_after`-th send —
+    /// the update lands mid-run while later events are still pending. This
+    /// is what `Playback::update` does (send, then flag), driven from inside
+    /// the synchronous fake-clock run.
+    struct PatchSink {
+        log: Arc<Mutex<Vec<Vec<u8>>>>,
+        tx: std::sync::mpsc::Sender<SchedMsg>,
+        watch: Arc<AtomicBool>,
+        patch: Mutex<Option<SchedulePatch>>,
+        /// like `patch` but queues `SchedMsg::Panic` — the mid-run
+        /// equivalent of `Playback::panic_now`
+        panic: bool,
+        fire_after: usize,
+        sends: usize,
+        stop_after: Option<(usize, Arc<AtomicBool>)>,
+    }
+
+    impl EventSink for PatchSink {
+        fn send_at(&mut self, bytes: &[u8], _rem_us: u64) {
+            self.log.lock().unwrap().push(bytes.to_vec());
+            self.sends += 1;
+            if self.sends == self.fire_after {
+                let msg = if self.panic {
+                    Some(SchedMsg::Panic)
+                } else {
+                    self.patch.lock().unwrap().take().map(SchedMsg::Patch)
+                };
+                if let Some(m) = msg {
+                    let _ = self.tx.send(m);
+                    self.watch.store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+            if let Some((n, stop)) = &self.stop_after {
+                if self.sends == *n {
+                    stop.store(true, Relaxed);
+                }
+            }
+        }
+        fn notes_off(&mut self) {
+            for ch in 0u8..16 {
+                self.log.lock().unwrap().push(vec![0xB0 | ch, 123, 0]);
+            }
+        }
+        fn panic(&mut self) {
+            for ch in 0u8..16 {
+                for ctl in [123u8, 121, 120] {
+                    self.log.lock().unwrap().push(vec![0xB0 | ch, ctl, 0]);
+                }
+            }
+        }
+    }
+
+    fn is_cc123_on(b: &[u8], ch: u8) -> bool {
+        b.len() == 3 && b[0] == 0xB0 | ch && b[1] == 123
+    }
+
+    /// A committed edit swaps the future schedule mid-pass: the deleted
+    /// note's dangling on gets a channel-scoped All Notes Off, while the
+    /// untouched channel on the same sink keeps its scheduled note-off —
+    /// mute-style silence without disturbing sibling tracks.
+    #[test]
+    fn events_patch_releases_only_orphaned_channels() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let pos = AtomicU64::new(0);
+        let watch = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        // patched timeline: ch0's note-off is deleted; ch1's stays
+        let patch = SchedulePatch {
+            events: vec![(5_000u64, 0usize, vec![0x81, 64, 0])],
+            loop_from_us: None,
+            loop_end_us: None,
+            sinks: None,
+        };
+        let mut sinks: Vec<Box<dyn EventSink>> = vec![Box::new(PatchSink {
+            log: log.clone(),
+            tx,
+            watch: watch.clone(),
+            patch: Mutex::new(Some(patch)),
+            panic: false,
+            fire_after: 2,
+            sends: 0,
+            stop_after: None,
+        })];
+        let events = vec![
+            (0u64, 0usize, vec![0x90, 60, 100]),
+            (1_000u64, 0usize, vec![0x91, 64, 100]),
+            (5_000u64, 0usize, vec![0x81, 64, 0]),
+            (6_000u64, 0usize, vec![0x80, 60, 0]),
+        ];
+        let mut clock = FakeClock { now: 0 };
+        run_schedule(
+            &mut clock, &mut sinks, events, 0, None, None, &stop, &pos, &watch, &rx, false,
+        );
+        let snap = log.lock().unwrap().clone();
+        // orphaned ch0: CC123 lands before the surviving ch1 note-off
+        let orphan = snap
+            .iter()
+            .position(|b| is_cc123_on(b, 0))
+            .expect("ch0 CC123");
+        let ch1_off = snap
+            .iter()
+            .position(|b| *b == vec![0x81, 64, 0])
+            .expect("ch1 note-off played");
+        assert!(orphan < ch1_off, "orphan release must precede ch1 off");
+        // the surviving channel sees no early CC123 — only the final panic's
+        let ch1_cc123 = snap
+            .iter()
+            .position(|b| is_cc123_on(b, 1))
+            .expect("panic releases ch1");
+        assert!(ch1_cc123 > ch1_off, "ch1 must not be cut early");
+    }
+
+    /// A routing change panics the old sink and continues the pass on the
+    /// replacement — future events arrive at the new destination.
+    #[test]
+    fn routing_patch_panics_old_sink_and_moves_to_new() {
+        let log_a = Arc::new(Mutex::new(Vec::new()));
+        let log_b = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let pos = AtomicU64::new(0);
+        let watch = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let patch = SchedulePatch {
+            events: vec![(5_000u64, 0usize, vec![0x80, 60, 0])],
+            loop_from_us: None,
+            loop_end_us: None,
+            sinks: Some(vec![Box::new(RecordingSink::recording(log_b.clone()))]),
+        };
+        let mut sinks: Vec<Box<dyn EventSink>> = vec![Box::new(PatchSink {
+            log: log_a.clone(),
+            tx,
+            watch: watch.clone(),
+            patch: Mutex::new(Some(patch)),
+            panic: false,
+            fire_after: 1,
+            sends: 0,
+            stop_after: None,
+        })];
+        let events = vec![
+            (0u64, 0usize, vec![0x90, 60, 100]),
+            (5_000u64, 0usize, vec![0x80, 60, 0]),
+        ];
+        let mut clock = FakeClock { now: 0 };
+        run_schedule(
+            &mut clock, &mut sinks, events, 0, None, None, &stop, &pos, &watch, &rx, false,
+        );
+        let a = log_a.lock().unwrap().clone();
+        let b = log_b.lock().unwrap().clone();
+        // old sink: note-on, then panic cleanup, nothing else
+        assert_eq!(a[0], vec![0x90, 60, 100]);
+        assert!(a[1..].iter().all(|b| b[0] & 0xF0 == 0xB0));
+        assert!(a[1..].iter().any(|b| b[1] == 120));
+        // new sink: receives the remaining schedule verbatim, then the
+        // end-of-run panic
+        assert_eq!(b[0], vec![0x80, 60, 0]);
+        assert!(b[1..].iter().all(|m| m[0] & 0xF0 == 0xB0));
+    }
+
+    /// A patch can install a loop the running schedule didn't have: the new
+    /// wrap point takes effect at the end of the current pass.
+    #[test]
+    fn patch_can_install_loop_point() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let pos = AtomicU64::new(0);
+        let watch = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let patch = SchedulePatch {
+            events: vec![
+                (0u64, 0usize, vec![0x90, 60, 100]),
+                (5_000u64, 0usize, vec![0x80, 60, 0]),
+            ],
+            loop_from_us: Some(0),
+            loop_end_us: None,
+            sinks: None,
+        };
+        let mut sinks: Vec<Box<dyn EventSink>> = vec![Box::new(PatchSink {
+            log: log.clone(),
+            tx,
+            watch: watch.clone(),
+            patch: Mutex::new(Some(patch)),
+            panic: false,
+            fire_after: 1,
+            sends: 0,
+            // sends counted: on(1), patch → rebase replays on(2), off(3),
+            // wrap notes-off bypasses send_at, pass2 on(4) off(5) → stop
+            stop_after: Some((5, stop.clone())),
+        })];
+        let events = vec![
+            (0u64, 0usize, vec![0x90, 60, 100]),
+            (5_000u64, 0usize, vec![0x80, 60, 0]),
+        ];
+        let mut clock = FakeClock { now: 0 };
+        run_schedule(
+            &mut clock, &mut sinks, events, 0, None, None, &stop, &pos, &watch, &rx, false,
+        );
+        let snap = log.lock().unwrap().clone();
+        // rebase replay + the installed loop's wrap replay = 3 note-ons
+        assert_eq!(
+            snap.iter().filter(|b| *b == &vec![0x90, 60, 100]).count(),
+            3
+        );
+        // wrap cleanup happened between passes
+        assert!(snap.iter().any(|b| is_cc123_on(b, 0)));
+    }
+
+    /// Clock that flips `stop` after `max` bounded-loop waits — drives an
+    /// empty or all-silent range for a fixed number of cycles, where a
+    /// send-counting sink could never trigger (no events are delivered).
+    struct WaitStopClock {
+        now: u64,
+        waits: u64,
+        max: u64,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl Clock for WaitStopClock {
+        fn now_us(&self) -> u64 {
+            self.now
+        }
+        fn wait_until_us(&mut self, target_us: u64, stop: &AtomicBool, watch: &AtomicBool) -> bool {
+            self.now = target_us;
+            self.waits += 1;
+            if self.waits >= self.max {
+                self.stop.store(true, Relaxed);
+            }
+            !stop.load(Relaxed) && !watch.load(Relaxed)
+        }
+    }
+
+    /// #130: an explicit right locator turns the wrap into a temporal cycle —
+    /// content that ends early waits out the rest of the range instead of
+    /// wrapping ahead of time.
+    #[test]
+    fn bounded_loop_waits_for_right_locator() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let pos = AtomicU64::new(0);
+        let watch = Arc::new(AtomicBool::new(false));
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut sinks: Vec<Box<dyn EventSink>> = vec![Box::new(PatchSink {
+            log: log.clone(),
+            tx: _tx.clone(),
+            watch: watch.clone(),
+            patch: Mutex::new(None),
+            panic: false,
+            fire_after: usize::MAX,
+            sends: 0,
+            // on, off, wrap CC123s bypass send_at, on, off → stop
+            stop_after: Some((4, stop.clone())),
+        })];
+        let events = vec![
+            (0u64, 0usize, vec![0x90, 60, 100]),
+            (5_000u64, 0usize, vec![0x80, 60, 0]),
+        ];
+        let mut clock = WaitStopClock {
+            now: 0,
+            waits: 0,
+            max: u64::MAX,
+            stop: stop.clone(),
+        };
+        // loop 0..20_000 over a 5_000-long phrase → two passes per log
+        run_schedule(
+            &mut clock,
+            &mut sinks,
+            events,
+            0,
+            Some(0),
+            Some(20_000),
+            &stop,
+            &pos,
+            &watch,
+            &rx,
+            false,
+        );
+        let snap = log.lock().unwrap().clone();
+        // two passes → two note-ons; CC123 cleanup between them
+        assert_eq!(
+            snap.iter().filter(|b| *b == &vec![0x90, 60, 100]).count(),
+            2
+        );
+        assert!(snap.iter().any(|b| is_cc123_on(b, 0)));
+        // the clock actually held until the right locator before wrapping —
+        // the wrap wait drove `now` to 20_000 (and beyond on the 2nd pass)
+        assert!(clock.now >= 20_000);
+    }
+
+    /// #130: a bounded loop over a range with no scheduled events keeps
+    /// cycling on the temporal bound — it neither exits early nor spins a
+    /// single pass.
+    #[test]
+    fn empty_bounded_range_cycles_until_stop() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let pos = AtomicU64::new(0);
+        let watch = Arc::new(AtomicBool::new(false));
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut sinks: Vec<Box<dyn EventSink>> = vec![Box::new(PatchSink {
+            log: log.clone(),
+            tx: _tx,
+            watch: watch.clone(),
+            patch: Mutex::new(None),
+            panic: false,
+            fire_after: usize::MAX,
+            sends: 0,
+            stop_after: None,
+        })];
+        // only event sits past the right locator — never delivered
+        let events = vec![(50_000u64, 0usize, vec![0x90, 60, 100])];
+        let mut clock = WaitStopClock {
+            now: 0,
+            waits: 0,
+            max: 4, // four wrap waits, then stop
+            stop: stop.clone(),
+        };
+        run_schedule(
+            &mut clock,
+            &mut sinks,
+            events,
+            0,
+            Some(0),
+            Some(10_000),
+            &stop,
+            &pos,
+            &watch,
+            &rx,
+            false,
+        );
+        // it cycled on the bound repeatedly — each wait hit the locator
+        assert!(clock.waits >= 4);
+        // and never delivered the out-of-range note
+        assert!(log.lock().unwrap().iter().all(|b| b[0] & 0xF0 == 0xB0));
     }
 
     // --- SysEx long-message policy ----------------------------------------
@@ -1634,7 +2373,7 @@ mod tests {
             (0u64, 0usize, dump),
             (50_000u64, 0usize, vec![0x90, 60, 100]),
         ];
-        let mut pb = Playback::start(vec![Box::new(sink)], events, 0, None);
+        let mut pb = Playback::start(vec![Box::new(sink)], events, 0, None, None, false);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while log.lock().unwrap().is_empty() {
             assert!(std::time::Instant::now() < deadline, "note never arrived");
@@ -1754,6 +2493,8 @@ mod tests {
             events,
             5_000,
             None,
+            None,
+            false,
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while log.lock().unwrap().is_empty() {
@@ -1784,6 +2525,8 @@ mod tests {
             events,
             0,
             None,
+            None,
+            false,
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -1823,6 +2566,8 @@ mod tests {
             events,
             0,
             None,
+            None,
+            true, // reset-on-stop preference enabled
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
         pb.stop();
@@ -1833,5 +2578,82 @@ mod tests {
                 "missing panic controller {ctl}"
             );
         }
+    }
+
+    /// Default stop cleanup is notes-off only: CC123 silences sounding
+    /// notes, but CC121/120 (controller/sound reset) are NOT sent — a
+    /// normal stop must not zero modulation/expression on external gear.
+    #[test]
+    fn normal_stop_sends_notes_off_only() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let events = vec![
+            (0u64, 0usize, vec![0x90, 60, 100]),
+            (60_000_000u64, 0usize, vec![0x80, 60, 0]),
+        ];
+        let mut pb = Playback::start(
+            vec![Box::new(RecordingSink::recording(log.clone()))],
+            events,
+            0,
+            None,
+            None,
+            false,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        pb.stop();
+        let sent = log.lock().unwrap().clone();
+        assert!(
+            sent.iter().any(|b| b == &vec![0xB0, 123, 0]),
+            "missing All Notes Off"
+        );
+        for ctl in [121u8, 120] {
+            assert!(
+                !sent.iter().any(|b| b == &vec![0xB0, ctl, 0]),
+                "normal stop sent reset controller {ctl}"
+            );
+        }
+    }
+
+    /// Explicit Panic on the running pass delivers the full reset burst
+    /// while the transport keeps scheduling — driven as `SchedMsg::Panic`
+    /// (what `Playback::panic_now` sends) on the fake clock (#161).
+    #[test]
+    fn panic_now_sends_full_reset_while_running() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let pos = AtomicU64::new(0);
+        let watch = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut sinks: Vec<Box<dyn EventSink>> = vec![Box::new(PatchSink {
+            log: log.clone(),
+            tx,
+            watch: watch.clone(),
+            patch: Mutex::new(None),
+            panic: true,
+            // panic queues after the first note-on; stop after the last
+            fire_after: 1,
+            sends: 0,
+            stop_after: Some((3, stop.clone())),
+        })];
+        let events = vec![
+            (0u64, 0usize, vec![0x90, 60, 100]),
+            (5_000u64, 0usize, vec![0x80, 60, 0]),
+            (8_000u64, 0usize, vec![0x90, 62, 100]),
+        ];
+        let mut clock = FakeClock { now: 0 };
+        run_schedule(
+            &mut clock, &mut sinks, events, 0, None, None, &stop, &pos, &watch, &rx, false,
+        );
+        let sent = log.lock().unwrap().clone();
+        for ctl in [123u8, 121, 120] {
+            assert!(
+                sent.iter().any(|b| b == &vec![0xB0, ctl, 0]),
+                "missing panic controller {ctl}"
+            );
+        }
+        // the burst landed mid-run: panic bytes sit between the two note-ons
+        let on60 = sent.iter().position(|b| *b == vec![0x90, 60, 100]).unwrap();
+        let on62 = sent.iter().position(|b| *b == vec![0x90, 62, 100]).unwrap();
+        let panic_at = sent.iter().position(|b| *b == vec![0xB0, 121, 0]).unwrap();
+        assert!(on60 < panic_at && panic_at < on62);
     }
 }

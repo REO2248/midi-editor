@@ -1,0 +1,7 @@
+# corpus_gen writes the manifest with LF; stop git converting it to
+# CRLF on Windows checkouts or `corpus_gen --check` reports a false drift
+fixtures/corpus/manifest.json -text
+
+# UI-test goldens are compared byte-exact against rendered text; CRLF
+# conversion on Windows checkouts makes every golden drift
+crates/app/tests/goldens/*.txt -text

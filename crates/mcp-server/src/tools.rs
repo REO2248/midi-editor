@@ -570,6 +570,7 @@ fn build_ops(doc: &mut Document, ops: &[serde_json::Value]) -> Result<Vec<Op>, P
                     }
                     after.raw_body = None;
                     Ok(Op::UpdateEvent {
+                        pos: usize::MAX,
                         track: et,
                         before,
                         after,
@@ -608,6 +609,7 @@ fn build_ops(doc: &mut Document, ops: &[serde_json::Value]) -> Result<Vec<Op>, P
                         };
                         after.raw_body = None;
                         out.push(Op::UpdateEvent {
+                            pos: usize::MAX,
                             track: 0,
                             before: e.clone(),
                             after,
@@ -886,14 +888,19 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "destination": {},
             })),
         ),
-        spec(
-            "transport",
-            "Ask the GUI transport: {action: \"play\"|\"stop\"|\"seek\", tick?}. Only works while the app is running.",
+        ToolSpec {
+            // v2: added the `set_loop` action + start/end args (#130)
+            version: 2,
+            ..spec(
+                "transport",
+                "Ask the GUI transport: {action: \"play\"|\"stop\"|\"seek\"|\"set_loop\", tick?, start?, end?}. set_loop sets/clears the explicit loop locators in ticks (omit a bound to clear it). Only works while the app is running.",
             object_schema(serde_json::json!({
                 "action": {"type": "string"},
                 "tick": {"type": "integer"},
-            })),
-        ),
+                "start": {"type": "integer"},
+                "end": {"type": "integer"},
+            })))
+        },
         spec(
             "quantize",
             "Snap note onsets to a grid (duration preserved). Args: track? (all when omitted), from?, to?, grid? (ticks, default ppq/4 metrical / one frame SMPTE), strength? (0-100, default 100). Optional base_revision.",
@@ -1065,7 +1072,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ),
         spec(
             "set_track_channel",
-            "Set the track's default channel (FF20 meta). Args: track, channel (1-16). Optional base_revision.",
+            "Set the track's channel-prefix meta (FF 20): a hint players/editors may honor, NOT a reroute — per-event channels rule playback. To retarget existing events use set_channel. Args: track, channel (1-16). Optional base_revision.",
             object_schema(serde_json::json!({
                 "track": {"type": "integer"}, "channel": {"type": "integer"},
                 "base_revision": {"type": "integer"},
@@ -1406,6 +1413,8 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
                         Op::UpdateTrack { index, after, .. } => serde_json::json!({
                             "op": "update_track", "index": index,
                             "name": after.name.as_ref().map(|b| String::from_utf8_lossy(b).into_owned())}),
+                        Op::SetFormat { before, after } => serde_json::json!({
+                            "op": "set_format", "before": before, "after": after}),
                     })
                     .collect::<Vec<_>>();
                 return ok_json(serde_json::json!({
@@ -1848,6 +1857,12 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
                 Some("seek") => Some(TransportReq::Seek {
                     tick: args["tick"].as_u64().unwrap_or(0),
                 }),
+                // explicit loop locators in ticks (#130); omit a bound to
+                // clear it — `end` must exceed `start` to take effect
+                Some("set_loop") => Some(TransportReq::SetLoop {
+                    start: args["start"].as_u64(),
+                    end: args["end"].as_u64(),
+                }),
                 _ => None,
             };
             match req {
@@ -1856,7 +1871,7 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
                     sh.gui_notify.fetch_add(1, Ordering::Relaxed);
                     ok_json(serde_json::json!({"queued": true}))
                 }
-                None => err_json("action must be play|stop|seek"),
+                None => err_json("action must be play|stop|seek|set_loop"),
             }
         }
         "quantize" => {
@@ -2669,6 +2684,8 @@ fn dests_json(sh: &Shared) -> serde_json::Value {
         "soloed": sh.soloed.iter().copied().collect::<Vec<_>>(),
         "metronome": sh.metronome,
         "loop_enabled": sh.loop_enabled,
+        "loop_start": sh.loop_start,
+        "loop_end": sh.loop_end,
     })
 }
 

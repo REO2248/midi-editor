@@ -20,7 +20,7 @@ pub struct Command {
     /// default bindings, "ctrl+shift+z" style; keys\[0\] shows in menus
     pub keys: &'static [&'static str],
     /// palette/menu enable predicate; None = always enabled
-    pub enabled: Option<fn(&EditorView) -> bool>,
+    pub enabled: Option<fn(&EditorView, &mut Context<EditorView>) -> bool>,
     pub act: Act,
 }
 
@@ -194,19 +194,26 @@ impl KeyMap {
     }
 }
 
-fn has_ev_sel(v: &EditorView) -> bool {
+fn has_ev_sel(v: &EditorView, _cx: &mut Context<EditorView>) -> bool {
     !v.sel_events.is_empty()
 }
 
-fn has_sel(v: &EditorView) -> bool {
-    !v.selection.is_empty()
+fn has_sel(v: &EditorView, _cx: &mut Context<EditorView>) -> bool {
+    // any focused-context selection (#152): notes, lane marquee, event rows
+    !v.selection.is_empty() || !v.lane_sel.is_empty() || !v.sel_events.is_empty()
 }
 
-fn has_clip(v: &EditorView) -> bool {
-    !v.clipboard.is_empty()
+fn has_clip(v: &EditorView, cx: &mut Context<EditorView>) -> bool {
+    // in-process copy, or a `midi-editor/smf-clip` payload left on the OS
+    // clipboard by ANOTHER midi-editor process (#142) — Paste is enabled
+    // whenever `paste()` could actually find a clip
+    v.clipboard.is_some()
+        || cx
+            .read_from_clipboard()
+            .is_some_and(|item| crate::clip_from_item(&item).is_some())
 }
 
-fn can_undo(v: &EditorView) -> bool {
+fn can_undo(v: &EditorView, _cx: &mut Context<EditorView>) -> bool {
     !crate::lock_shared(&v.shared).undo.is_empty()
 }
 
@@ -241,8 +248,13 @@ pub static COMMANDS: &[Command] = &[
     }),
     cmd!("file.save", "menu.save", &["ctrl+s"], None, |v, _w, cx| v
         .save(cx)),
-    cmd!("file.save_as", "menu.save_as", &[], None, |v, _w, cx| v
-        .save_as(cx)),
+    cmd!(
+        "file.save_as",
+        "menu.save_as",
+        &["ctrl+shift+s"],
+        None,
+        |v, _w, cx| { v.save_as(cx) }
+    ),
     // edit
     cmd!(
         "edit.undo",
@@ -263,21 +275,21 @@ pub static COMMANDS: &[Command] = &[
         "menu.select_all",
         &["ctrl+a"],
         None,
-        |v, _w, cx| v.select_all(cx)
+        |v, w, cx| v.select_all(w, cx)
     ),
     cmd!(
         "edit.cut",
         "edit.cut",
         &["ctrl+x"],
         Some(has_sel),
-        |v, _w, cx| v.copy_selected(true, cx)
+        |v, w, cx| v.copy_selected(true, w, cx)
     ),
     cmd!(
         "edit.copy",
         "edit.copy",
         &["ctrl+c"],
         Some(has_sel),
-        |v, _w, cx| v.copy_selected(false, cx)
+        |v, w, cx| v.copy_selected(false, w, cx)
     ),
     cmd!(
         "edit.paste",
@@ -298,7 +310,7 @@ pub static COMMANDS: &[Command] = &[
         "menu.delete",
         &["delete", "backspace"],
         Some(has_sel),
-        |v, _w, cx| v.delete_selected(cx)
+        |v, w, cx| v.delete_selected(w, cx)
     ),
     cmd!(
         "edit.marker_ins",
@@ -314,7 +326,7 @@ pub static COMMANDS: &[Command] = &[
         "edit.meta_edit",
         "edit.meta_edit",
         &["e"],
-        Some(|v: &EditorView| v.meta_sel.is_some()),
+        Some(|v: &EditorView, _cx: &mut Context<EditorView>| v.meta_sel.is_some()),
         |v, w, cx| {
             if let Some((tr, id)) = v.meta_sel {
                 let m = v.doc(|d| {
@@ -578,6 +590,8 @@ pub static COMMANDS: &[Command] = &[
             }
         }
         v.persist();
+        // live mix control: the running pass updates in place (#140)
+        v.refresh_live_schedule();
     }),
     cmd!("track.solo", "track.solo", &[], None, |v, _w, _cx| {
         let t = v.sel_track;
@@ -588,6 +602,7 @@ pub static COMMANDS: &[Command] = &[
             }
         }
         v.persist();
+        v.refresh_live_schedule();
     }),
     cmd!(
         "track.plugin_gui",
@@ -623,13 +638,52 @@ pub static COMMANDS: &[Command] = &[
         None,
         |v, _w, cx| v.toggle_play(cx)
     ),
+    // pause/continue: stop in place (play point kept) / resume — the
+    // in-place counterpart of Stop (#156)
+    cmd!(
+        "transport.pause",
+        "transport.pause",
+        &[],
+        None,
+        |v, _w, cx| v.toggle_pause(cx)
+    ),
+    // return to where the current transport pass began
+    cmd!(
+        "transport.return_start",
+        "transport.return_start",
+        &[],
+        None,
+        |v, _w, cx| v.return_to_start(cx)
+    ),
+    // go to song start (tick 0)
+    cmd!(
+        "transport.go_start",
+        "transport.go_start",
+        &["home"],
+        None,
+        |v, _w, cx| v.go_to_start(cx)
+    ),
+    // return-on-stop preference (#156)
+    cmd!(
+        "transport.return_on_stop",
+        "transport.return_on_stop",
+        &[],
+        None,
+        |v, _w, _cx| {
+            v.return_to_start_on_stop = !v.return_to_start_on_stop;
+            v.save_global();
+        }
+    ),
     cmd!(
         "transport.record",
         "transport.record",
         &[],
         None,
-        |v, _w, _cx| v.toggle_record()
+        |v, _w, cx| v.transport_record(cx)
     ),
+    cmd!("rec.arm", "rec.arm", &[], None, |v, _w, _cx| {
+        v.toggle_arm()
+    }),
     cmd!(
         "transport.loop",
         "transport.loop",
@@ -641,14 +695,96 @@ pub static COMMANDS: &[Command] = &[
                 sh.loop_enabled = !sh.loop_enabled;
             }
             v.persist();
+            v.refresh_live_schedule();
         }
     ),
+    // explicit loop locators (#130) — Set Start/End to Playhead, Set to
+    // Selection, Clear. A bound that collides with the other clears it
+    // rather than silently swapping or producing an inverted range.
+    cmd!(
+        "loop.set_start",
+        "loop.set_start",
+        &[],
+        None,
+        |v, _w, _cx| {
+            let t = v.playhead_tick();
+            {
+                let mut sh = crate::lock_shared(&v.shared);
+                sh.loop_start = Some(t);
+                if sh.loop_end.is_some_and(|e| e <= t) {
+                    sh.loop_end = None;
+                }
+            }
+            v.persist();
+            v.refresh_live_schedule();
+        }
+    ),
+    cmd!("loop.set_end", "loop.set_end", &[], None, |v, _w, _cx| {
+        let t = v.playhead_tick();
+        {
+            let mut sh = crate::lock_shared(&v.shared);
+            sh.loop_end = Some(t);
+            if sh.loop_start.is_some_and(|s| s >= t) {
+                sh.loop_start = None;
+            }
+        }
+        v.persist();
+        v.refresh_live_schedule();
+    }),
+    cmd!(
+        "loop.set_selection",
+        "loop.set_selection",
+        &[],
+        None,
+        |v, _w, _cx| {
+            let mut lo = u64::MAX;
+            let mut hi = 0u64;
+            for n in v.notes.iter().filter(|n| v.selection.contains(&n.on_id)) {
+                lo = lo.min(n.start_tick);
+                hi = hi.max(n.end_tick.unwrap_or(n.start_tick + 1));
+            }
+            if lo > hi {
+                v.status = t("status.nosel").into();
+                return;
+            }
+            {
+                let mut sh = crate::lock_shared(&v.shared);
+                sh.loop_start = Some(lo);
+                sh.loop_end = Some(hi);
+            }
+            v.persist();
+            v.refresh_live_schedule();
+        }
+    ),
+    cmd!("loop.clear", "loop.clear", &[], None, |v, _w, _cx| {
+        {
+            let mut sh = crate::lock_shared(&v.shared);
+            sh.loop_start = None;
+            sh.loop_end = None;
+        }
+        v.persist();
+        v.refresh_live_schedule();
+    }),
+    // tempo / signature edits at the playhead (#133) — the dialog inserts a
+    // new event prefilled with the value in force, or edits the existing
+    // event at that tick; delete removes it
+    cmd!("tempo.edit", "tempo.edit", &[], None, |v, w, cx| v
+        .open_tempo_sig_edit(0x51, w, cx)),
+    cmd!("tempo.delete", "tempo.delete", &[], None, |v, _w, cx| {
+        v.delete_tempo_sig(0x51, cx)
+    }),
+    cmd!("sig.edit", "sig.edit", &[], None, |v, w, cx| v
+        .open_tempo_sig_edit(0x58, w, cx)),
+    cmd!("sig.delete", "sig.delete", &[], None, |v, _w, cx| {
+        v.delete_tempo_sig(0x58, cx)
+    }),
     cmd!("transport.met", "transport.met", &[], None, |v, _w, _cx| {
         {
             let mut sh = crate::lock_shared(&v.shared);
             sh.metronome = !sh.metronome;
         }
         v.persist();
+        v.refresh_live_schedule();
     }),
     cmd!(
         "transport.chase_sysex",
@@ -661,6 +797,7 @@ pub static COMMANDS: &[Command] = &[
                 sh.chase_sysex = !sh.chase_sysex;
             }
             v.persist();
+            v.refresh_live_schedule();
         }
     ),
     cmd!(
@@ -669,7 +806,31 @@ pub static COMMANDS: &[Command] = &[
         &[],
         None,
         |v, _w, _cx| {
-            v.count_in = !v.count_in;
+            const BARS: [u8; 4] = [0, 1, 2, 4];
+            let i = BARS.iter().position(|&b| b == v.count_in_bars).unwrap_or(0);
+            v.count_in_bars = BARS[(i + 1) % BARS.len()];
+            v.save_global();
+        }
+    ),
+    // explicit emergency silence — full CC123/121/120 sweep (#161)
+    cmd!(
+        "transport.panic",
+        "transport.panic",
+        &[],
+        None,
+        |v, _w, cx| {
+            v.midi_panic();
+            cx.notify();
+        }
+    ),
+    // reset-on-stop preference: off = stop releases notes only
+    cmd!(
+        "transport.reset_on_stop",
+        "transport.reset_on_stop",
+        &[],
+        None,
+        |v, _w, _cx| {
+            v.reset_on_stop = !v.reset_on_stop;
             v.save_global();
         }
     ),

@@ -185,9 +185,11 @@ fn apply_and_revert() {
             events: vec![new_ev],
         }],
     };
-    d.apply(tx.clone()).unwrap();
-    assert_eq!(d.tracks[0].events.len(), 2);
-    d.revert(&tx);
+    let applied = d.apply(tx).unwrap();
+    // inserted event + the structural End-of-Track the track gains
+    assert_eq!(d.tracks[0].events.len(), 3);
+    d.revert(&applied.tx);
+    // undo removes the minted EOT too — exact pre-edit state
     assert_eq!(d.tracks[0].events.len(), 1);
 }
 
@@ -196,6 +198,166 @@ fn tempo_map_basic() {
     // 120bpm default, 480ppq: tick 480 -> 500000us
     let d = doc_with_note();
     assert_eq!(d.tempo_map.tick_to_us(480), 500_000);
+}
+
+#[test]
+fn premature_eot_collapses_on_edit_and_undo_restores() {
+    // imported file whose stored EOT sits before later content: the doc
+    // keeps it verbatim until a transaction touches the track, then the
+    // effective tx collapses it to one terminator last — and undo puts
+    // the exact pre-edit structure back
+    let is_eot = |e: &Event| {
+        matches!(
+            e.kind,
+            EventKind::Meta {
+                meta_type: 0x2F,
+                ..
+            }
+        )
+    };
+    let mk = |tick: u64, seq: u32, eot: bool| smf_core::Event {
+        tick,
+        seq,
+        raw_body: None,
+        kind: if eot {
+            EventKind::Meta {
+                meta_type: 0x2F,
+                data: Bytes::new(),
+            }
+        } else {
+            EventKind::Channel {
+                status: 0x90,
+                data: [64, 90],
+                len: 2,
+            }
+        },
+    };
+    let f = smf_core::File {
+        format: 1,
+        division: Division::Metrical(480),
+        tracks: vec![smf_core::Track {
+            events: vec![mk(0, 0, true), mk(480, 1, false), mk(960, 2, true)],
+        }],
+        warnings: vec![],
+    };
+    let mut d = Document::from_file(f);
+    // untouched: both stored EOTs ride along verbatim
+    assert_eq!(d.tracks[0].events.iter().filter(|e| is_eot(e)).count(), 2);
+
+    let new_ev = Event {
+        id: d.alloc_event_id(),
+        tick: 1440,
+        seq: 0,
+        raw_body: None,
+        kind: EventKind::Channel {
+            status: 0x90,
+            data: [65, 90],
+            len: 2,
+        },
+    };
+    let applied = d
+        .apply(Transaction {
+            label: "ins".into(),
+            base: d.revision(),
+            ops: vec![Op::InsertEvents {
+                track: 0,
+                events: vec![new_ev],
+            }],
+        })
+        .unwrap();
+    // the touched track carries exactly one EOT, sorted last at the new end
+    let eots: Vec<&Event> = d.tracks[0].events.iter().filter(|e| is_eot(e)).collect();
+    assert_eq!(eots.len(), 1);
+    let last = d.tracks[0]
+        .events
+        .iter()
+        .max_by_key(|e| (e.tick, e.seq))
+        .unwrap();
+    assert!(is_eot(last));
+    assert_eq!(last.tick, 1440, "terminator reticked past new content");
+
+    d.revert(&applied.tx);
+    // exact pre-edit structure: both stored EOTs back at their ticks
+    let t = &d.tracks[0];
+    assert_eq!(t.events.len(), 3);
+    let eot_ticks: Vec<u64> = t
+        .events
+        .iter()
+        .filter(|e| is_eot(e))
+        .map(|e| e.tick)
+        .collect();
+    assert_eq!(eot_ticks, vec![0, 960]);
+}
+
+#[test]
+fn undo_restores_event_order_among_same_tick_events() {
+    // position-exact undo: an event whose (tick, seq) collides with
+    // siblings must come back at its original index — a re-sort lands it
+    // at an arbitrary slot among the equal keys and reorders the bytes
+    let is_eot = |e: &Event| {
+        matches!(
+            e.kind,
+            EventKind::Meta {
+                meta_type: 0x2F,
+                ..
+            }
+        )
+    };
+    let f = smf_core::File {
+        format: 1,
+        division: Division::Metrical(480),
+        tracks: vec![smf_core::Track {
+            events: vec![smf_core::Event {
+                tick: 0,
+                seq: 0,
+                raw_body: None,
+                kind: EventKind::Meta {
+                    meta_type: 0x2F,
+                    data: Bytes::new(),
+                },
+            }],
+        }],
+        warnings: vec![],
+    };
+    let mut d = Document::from_file(f);
+    fn ins(d: &mut Document, tick: u64, key: u8) -> Applied {
+        let ev = Event {
+            id: d.alloc_event_id(),
+            tick,
+            seq: u32::MAX,
+            raw_body: None,
+            kind: EventKind::Channel {
+                status: 0x90,
+                data: [key, 100],
+                len: 2,
+            },
+        };
+        d.apply(Transaction {
+            label: "ins".into(),
+            base: d.revision(),
+            ops: vec![Op::InsertEvents {
+                track: 0,
+                events: vec![ev],
+            }],
+        })
+        .unwrap()
+    }
+    ins(&mut d, 0, 60);
+    ins(&mut d, 0, 62); // the EOT now shares (0, MAX) with the notes
+    ins(&mut d, 0, 64);
+    let before = d.serialize(smf_core::WriteOptions::default());
+    let eot_pos = d.tracks[0].events.iter().position(is_eot).unwrap();
+
+    // an edit past the track's end reticks the EOT — the synthesized
+    // UpdateEvent must round-trip back to the exact same slot
+    let applied = ins(&mut d, 3347, 65);
+    d.revert(&applied.tx);
+    assert_eq!(d.serialize(smf_core::WriteOptions::default()), before);
+    assert_eq!(
+        d.tracks[0].events.iter().position(is_eot).unwrap(),
+        eot_pos,
+        "EOT must return to its original slot among the same-key events"
+    );
 }
 
 // ---- chase_events ----

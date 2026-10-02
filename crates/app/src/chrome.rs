@@ -30,6 +30,24 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) -> Vec<MenuRow> {
         let mut rows = Vec::new();
+        // current explicit metronome routing (None = follows the document
+        // default destination) — #137
+        let met_sel = crate::lock_shared(&self.shared).met_dest;
+        if kind == DestPick::Metronome {
+            rows.push(Self::mi_leaf(
+                "metdest.default",
+                t("metdest.default"),
+                "",
+                Some(met_sel.is_none()),
+                cx,
+                |v, _e, _cx| {
+                    crate::lock_shared(&v.shared).met_dest = None;
+                    v.persist();
+                    v.refresh_live_schedule();
+                },
+            ));
+            rows.push(Self::msep());
+        }
         if kind == DestPick::Track {
             rows.push(Self::mi_leaf(
                 "dest.default",
@@ -67,10 +85,10 @@ impl EditorView {
             ));
         } else {
             for (i, label) in midi {
-                let selected = if kind == DestPick::Track {
-                    has_track_dest && eff_dest == i
-                } else {
-                    def_dest == i
+                let selected = match kind {
+                    DestPick::Track => has_track_dest && eff_dest == i,
+                    DestPick::Default => def_dest == i,
+                    DestPick::Metronome => met_sel == Some(i),
                 };
                 // an offline port keeps its row + assignment — marked so it
                 // is not confused with a live endpoint
@@ -92,14 +110,19 @@ impl EditorView {
                     cx,
                     move |v, _e, _cx| {
                         let mut sh = crate::lock_shared(&v.shared);
-                        if kind == DestPick::Track {
-                            sh.track_dest.insert(v.sel_track, i);
-                        } else {
-                            sh.default_dest = i;
+                        match kind {
+                            DestPick::Track => {
+                                sh.track_dest.insert(v.sel_track, i);
+                            }
+                            DestPick::Default => sh.default_dest = i,
+                            DestPick::Metronome => sh.met_dest = Some(i),
                         }
                         drop(sh);
                         v.audition_off();
                         v.persist();
+                        // destination change reaches the running pass
+                        // (events + sinks) — #140
+                        v.refresh_live_schedule();
                     },
                 ));
             }
@@ -183,10 +206,10 @@ impl EditorView {
                     }
                     _ => None,
                 };
-                let selected = if kind == DestPick::Track {
-                    has_track_dest && eff_dest == i
-                } else {
-                    def_dest == i
+                let selected = match kind {
+                    DestPick::Track => has_track_dest && eff_dest == i,
+                    DestPick::Default => def_dest == i,
+                    DestPick::Metronome => met_sel == Some(i),
                 };
                 let path2 = path.clone();
                 rows.push(Self::mi_plugin(
@@ -199,10 +222,12 @@ impl EditorView {
                     cx,
                     move |v, _e, _cx| {
                         let mut sh = crate::lock_shared(&v.shared);
-                        if kind == DestPick::Track {
-                            sh.track_dest.insert(v.sel_track, i);
-                        } else {
-                            sh.default_dest = i;
+                        match kind {
+                            DestPick::Track => {
+                                sh.track_dest.insert(v.sel_track, i);
+                            }
+                            DestPick::Default => sh.default_dest = i,
+                            DestPick::Metronome => sh.met_dest = Some(i),
                         }
                         drop(sh);
                         v.audition_off();
@@ -590,15 +615,17 @@ impl EditorView {
                 let lane_events = lane_events.clone();
                 let notes = self.notes.clone();
                 let sel_track = lane_sel_track;
-                let ppq = self.ppq();
+                let pos = self.doc(|d| d.position_format_for(self.sel_track));
+                let mc_off = self.mc_off();
                 move |b| {
                     a11y::LaneA11y {
                         bounds: cell.get(),
+                        mc_off,
                         scale: scale_factor,
                         scroll_x,
                         zoom,
-                        ppq,
                         mode,
+                        pos,
                         events: lane_events,
                         notes,
                         sel_track,
@@ -820,10 +847,10 @@ impl EditorView {
         &self,
         id: &'static str,
         check: Option<bool>,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> MenuRow {
         let c = cmd::find(id).expect("unknown command id");
-        let enabled = c.enabled.map(|f| f(self)).unwrap_or(true);
+        let enabled = c.enabled.map(|f| f(self, cx)).unwrap_or(true);
         MenuRow::Leaf(LeafRow {
             id: c.id.into(),
             label: cmd::label(c),

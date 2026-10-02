@@ -5,18 +5,221 @@
 
 use super::*;
 
+/// One captured clipboard event — tick re-anchored at the copy's earliest
+/// tick so paste drops the material at the edit cursor. The raw SMF body
+/// is kept: a copied event never loses bytes its kind doesn't model (#142).
 #[derive(Clone)]
-pub(crate) struct ClipNote {
-    dtick: i64,
-    key: u8,
-    len: u64,
-    vel: u8,
-    /// release velocity + wire form carried through copy/paste/duplicate
-    /// so a copied note doesn't flatten its release to 0x80 vel-0
-    off_vel: u8,
-    off_via_on: bool,
-    ch: u8,
-    track: usize,
+pub(crate) struct ClipEvent {
+    pub(crate) dtick: u64,
+    /// same-tick ordering position carried from the source file
+    pub(crate) seq: u32,
+    pub(crate) track: usize,
+    pub(crate) raw_body: Option<bytes::Bytes>,
+    pub(crate) kind: EventKind,
+}
+
+/// The OS-clipboard payload (#142): any event kinds, serialized to a
+/// format-1 SMF fragment — one fragment track per source track so every
+/// event's track identity survives the trip through another process
+/// (#143). `src` is Some(t) only when every event came from one track —
+/// a single-track copy pastes onto the active track, while a multi-track
+/// copy anchors relative to it. `keep_tracks` is the duplicate/retile
+/// case: events must land back on their exact source tracks.
+#[derive(Clone)]
+pub(crate) struct Clip {
+    pub(crate) events: Vec<ClipEvent>,
+    pub(crate) src: Option<usize>,
+    pub(crate) keep_tracks: bool,
+    /// division the dticks are expressed in — converted on paste when the
+    /// target document divides differently
+    pub(crate) division: smf_core::Division,
+}
+
+/// Clipboard metadata format version tag — bump when the payload shape
+/// changes so stale payloads fail closed (#142). v2 packs one fragment
+/// track per source track plus a `tracks`/`eots` table; v1's flattened
+/// format-0 payload can't carry track identity and is rejected.
+const CLIP_FMT: &str = "midi-editor/smf-clip/2";
+
+fn is_eot_kind(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Meta {
+            meta_type: 0x2F,
+            ..
+        }
+    )
+}
+
+/// hex encode (no base64 dep) — used for the SMF fragment in clipboard
+/// metadata JSON.
+fn hex_enc(b: &[u8]) -> String {
+    const H: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(b.len() * 2);
+    for &x in b {
+        s.push(H[(x >> 4) as usize] as char);
+        s.push(H[(x & 15) as usize] as char);
+    }
+    s
+}
+
+fn hex_dec(s: &str) -> Option<Vec<u8>> {
+    let b = s.as_bytes();
+    if !b.len().is_multiple_of(2) {
+        return None;
+    }
+    let v = |c: u8| -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    };
+    (0..b.len())
+        .step_by(2)
+        .map(|i| Some(v(b[i])? * 16 + v(b[i + 1])?))
+        .collect()
+}
+
+/// Serialize a captured selection to the OS-clipboard item: a readable
+/// one-line summary as the text flavor (harmless in other apps) plus a
+/// format-1 SMF fragment in the private metadata flavor — one fragment
+/// track per distinct source track so the paste can restore each event's
+/// original track identity (#142/#143).
+pub(crate) fn clip_to_item(clip: &Clip) -> ClipboardItem {
+    // fragment layout: one track per distinct source track, ascending.
+    // `tracks[i]` maps fragment track i back to the original track index;
+    // `eots[i]` counts the End-of-Track events that were actually
+    // SELECTED on it — write() mints a terminator for any fragment track
+    // lacking one, and that synthetic event must not leak into the paste
+    let mut order: Vec<usize> = clip.events.iter().map(|e| e.track).collect();
+    order.sort_unstable();
+    order.dedup();
+    let frag: Vec<smf_core::Track> = order
+        .iter()
+        .map(|&ot| smf_core::Track {
+            events: clip
+                .events
+                .iter()
+                .filter(|e| e.track == ot)
+                .map(|e| smf_core::Event {
+                    tick: e.dtick,
+                    seq: e.seq,
+                    raw_body: e.raw_body.clone(),
+                    kind: e.kind.clone(),
+                })
+                .collect(),
+        })
+        .collect();
+    let eots: Vec<usize> = order
+        .iter()
+        .map(|&ot| {
+            clip.events
+                .iter()
+                .filter(|e| e.track == ot && is_eot_kind(&e.kind))
+                .count()
+        })
+        .collect();
+    let smf = smf_core::write(1, clip.division, &frag, smf_core::WriteOptions::default());
+    let meta = serde_json::json!({
+        "v": 2,
+        "fmt": CLIP_FMT,
+        "div": match clip.division {
+            smf_core::Division::Metrical(ppq) => serde_json::json!(ppq),
+            smf_core::Division::Smpte { fps, ticks_per_frame } =>
+                serde_json::json!({"smpte": [fps, ticks_per_frame]}),
+        },
+        "tracks": order,
+        "eots": eots,
+        "smf": hex_enc(&smf),
+    })
+    .to_string();
+    ClipboardItem::new_string_with_metadata(
+        format!("midi-editor: {} events", clip.events.len()),
+        meta,
+    )
+}
+
+/// Parse the private clipboard flavor back into a `Clip`. Returns `None`
+/// for foreign clipboard contents (no metadata or wrong format tag) so
+/// paste falls through to the in-process clipboard. Each fragment track's
+/// `tracks[i]` entry restores the events' original track index, and
+/// `eots[i]` keeps only the End-of-Track events the selection actually
+/// carried — the terminator write() synthesizes for a track without one
+/// sorts last by (tick,seq) and is dropped here (#142/#143).
+pub(crate) fn clip_from_item(item: &ClipboardItem) -> Option<Clip> {
+    let meta = item.entries.iter().find_map(|e| match e {
+        ClipboardEntry::String(cs) => cs.metadata.clone(),
+        _ => None,
+    })?;
+    let v: serde_json::Value = serde_json::from_str(&meta).ok()?;
+    if v.get("fmt").and_then(|f| f.as_str()) != Some(CLIP_FMT) {
+        return None;
+    }
+    let tracks: Vec<usize> = v
+        .get("tracks")?
+        .as_array()?
+        .iter()
+        .map(|x| x.as_u64().map(|n| n as usize))
+        .collect::<Option<_>>()?;
+    let eots: Vec<usize> = v
+        .get("eots")?
+        .as_array()?
+        .iter()
+        .map(|x| x.as_u64().unwrap_or(0) as usize)
+        .collect();
+    let smf = hex_dec(v.get("smf")?.as_str()?)?;
+    let f = smf_core::parse_lenient(&smf).ok()?;
+    let division = match v.get("div") {
+        Some(serde_json::Value::Number(n)) => {
+            smf_core::Division::Metrical(n.as_u64().unwrap_or(480) as u16)
+        }
+        Some(serde_json::Value::Object(o)) => match o.get("smpte") {
+            Some(serde_json::Value::Array(a)) if a.len() == 2 => smf_core::Division::Smpte {
+                fps: a[0].as_u64().unwrap_or(25) as u8,
+                ticks_per_frame: a[1].as_u64().unwrap_or(40) as u8,
+            },
+            _ => smf_core::Division::Metrical(480),
+        },
+        _ => smf_core::Division::Metrical(480),
+    };
+    let mut events = Vec::new();
+    for (i, t) in f.tracks.into_iter().enumerate() {
+        let orig = tracks.get(i).copied().unwrap_or(i);
+        // the terminator write() appended sorts last by (tick,seq) —
+        // keep only as many EOTs, earliest first, as the selection had
+        let keep: BTreeSet<(u64, u32)> = t
+            .events
+            .iter()
+            .filter(|e| is_eot_kind(&e.kind))
+            .map(|e| (e.tick, e.seq))
+            .take(eots.get(i).copied().unwrap_or(0))
+            .collect();
+        for e in t.events {
+            if is_eot_kind(&e.kind) && !keep.contains(&(e.tick, e.seq)) {
+                continue;
+            }
+            events.push(ClipEvent {
+                dtick: e.tick,
+                seq: e.seq,
+                track: orig,
+                raw_body: e.raw_body,
+                kind: e.kind,
+            });
+        }
+    }
+    // dtick re-anchored at the fragment's earliest kept tick
+    let lo = events.iter().map(|e| e.dtick).min().unwrap_or(0);
+    for e in &mut events {
+        e.dtick = e.dtick.saturating_sub(lo);
+    }
+    (!events.is_empty()).then(|| Clip {
+        events,
+        src: (tracks.len() == 1).then_some(tracks[0]),
+        keep_tracks: false,
+        division,
+    })
 }
 
 /// Meta edit dialog target: `id > 0` rewrites that event's bytes (same
@@ -72,7 +275,8 @@ pub(crate) enum PropTarget {
 pub(crate) fn prop_field_label(f: PropField, ev: Option<&DocEvent>) -> SharedString {
     let key = match f {
         PropField::Tick => "prop.tick",
-        PropField::Channel | PropField::NoteChannel | PropField::TrackChannel => "prop.channel",
+        PropField::Channel | PropField::NoteChannel => "prop.channel",
+        PropField::TrackChannel => "prop.chan_prefix",
         PropField::MetaType => "prop.meta_type",
         PropField::HexData => "prop.hex_data",
         PropField::NoteStart => "prop.start",
@@ -115,6 +319,51 @@ pub(crate) fn hex_of(data: &[u8]) -> String {
         .map(|b| format!("{b:02X}"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Tempo event (0x51) at an exact tick — (id, bpm) when one exists (#133).
+pub(crate) fn tempo_event_at(d: &Document, track: usize, tick: u64) -> Option<(EventId, f64)> {
+    d.tracks
+        .get(track)?
+        .events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::Meta {
+                meta_type: 0x51,
+                data,
+            } if e.tick == tick && data.len() >= 3 => {
+                let mpq = ((data[0] as u32) << 16) | ((data[1] as u32) << 8) | data[2] as u32;
+                Some((e.id, 60_000_000.0 / mpq.max(1) as f64))
+            }
+            _ => None,
+        })
+}
+
+/// Signature event (0x58) at an exact tick — (id, numerator, denominator).
+pub(crate) fn sig_event_at(d: &Document, track: usize, tick: u64) -> Option<(EventId, u8, u8)> {
+    d.tracks
+        .get(track)?
+        .events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::Meta {
+                meta_type: 0x58,
+                data,
+            } if e.tick == tick && data.len() >= 2 => Some((e.id, data[0], 1u8 << data[1].min(7))),
+            _ => None,
+        })
+}
+
+/// BPM in force at `tick` — the last tempo point at or before it (SMF
+/// default 120 when the track carries none).
+pub(crate) fn tempo_bpm_at(d: &Document, track: usize, tick: u64) -> f64 {
+    d.tempo_map_for(track)
+        .points()
+        .iter()
+        .rev()
+        .find(|(t, _, _)| *t <= tick)
+        .map(|(_, mpq, _)| 60_000_000.0 / *mpq as f64)
+        .unwrap_or(120.0)
 }
 
 /// Per-kind inspector rows for one event. Editable rows carry `Some(field)`;
@@ -311,8 +560,22 @@ pub(crate) fn edit_event_field(
         Some(e) => e.clone(),
         None => return Err(format!("event not found: track {ti} index {ei}")),
     };
+    // End-of-Track is the structural terminator: only its position is
+    // user-editable (an intentional silent tail). The document keeps it
+    // last; kind/payload edits would corrupt the structure.
+    if matches!(
+        ev.kind,
+        EventKind::Meta {
+            meta_type: 0x2F,
+            ..
+        }
+    ) && field != PropField::Tick
+    {
+        return Err("End-of-Track is structural — only its tick may be edited".into());
+    }
     let mk = |after: DocEvent| {
         vec![Op::UpdateEvent {
+            pos: usize::MAX,
             track: ti,
             before: ev.clone(),
             after,
@@ -433,6 +696,7 @@ pub(crate) fn edit_note_field(
     let mut ops = Vec::new();
     let mut upd = |pos: (usize, usize), after: DocEvent| {
         ops.push(Op::UpdateEvent {
+            pos: usize::MAX,
             track: pos.0,
             before: d.tracks[pos.0].events[pos.1].clone(),
             after,
@@ -656,8 +920,14 @@ impl EditorView {
             if self.selection.len() == 1 {
                 let on_id = *self.selection.iter().next().unwrap();
                 if let Some(n) = d.notes().into_iter().find(|n| n.on_id == on_id) {
+                    // inspector echoes the chosen octave convention (#164)
+                    let k = format!(
+                        "{} ({})",
+                        n.key,
+                        a11y::note_name(n.key as i64 + self.mc_off() * 12)
+                    );
                     return (
-                        tf("prop.note_title", &[("k", &n.key.to_string())]).into(),
+                        tf("prop.note_title", &[("k", &k)]).into(),
                         note_prop_rows(&n, d),
                     );
                 }
@@ -699,7 +969,7 @@ impl EditorView {
             });
             rows.push(PropRow {
                 field: Some(PropField::TrackChannel),
-                label: t("prop.channel").into(),
+                label: t("prop.chan_prefix").into(),
                 value: (tr.out_channel + 1).to_string(),
                 warn: false,
             });
@@ -784,34 +1054,56 @@ impl EditorView {
     }
 
     /// Run a semantic region transform (`Document` *_ops generator) on the
-    /// selection's range — or the whole selected track when nothing is
-    /// selected. The same generators power the MCP tools, so GUI and AI edits
+    /// selection's range. With no selection this is a no-op — selection-
+    /// scoped commands never silently retarget the whole track (#131); the
+    /// explicit whole-track path is `apply_track_op`.
+    /// The same generators power the MCP tools, so GUI and AI edits
     /// share semantics and undo.
     pub(crate) fn apply_region_op(
         &mut self,
         label: &str,
         f: impl Fn(&mut Document, usize, u64, u64) -> Vec<Op>,
     ) {
-        let (tracks, from, to) = if self.selection.is_empty() {
-            (vec![self.sel_track], 0, u64::MAX)
-        } else {
-            let mut tracks = BTreeSet::new();
-            let (mut lo, mut hi) = (u64::MAX, 0u64);
-            for n in self.notes.iter() {
-                if self.selection.contains(&n.on_id) {
-                    tracks.insert(n.track);
-                    lo = lo.min(n.start_tick);
-                    hi = hi.max(n.end_tick.unwrap_or(n.start_tick));
-                }
+        if self.selection.is_empty() {
+            self.status = t("status.nosel").into();
+            return;
+        }
+        let mut tracks = BTreeSet::new();
+        let (mut lo, mut hi) = (u64::MAX, 0u64);
+        for n in self.notes.iter() {
+            if self.selection.contains(&n.on_id) {
+                tracks.insert(n.track);
+                lo = lo.min(n.start_tick);
+                hi = hi.max(n.end_tick.unwrap_or(n.start_tick));
             }
-            (tracks.into_iter().collect::<Vec<_>>(), lo, hi + 1)
-        };
+        }
+        let (tracks, from, to) = (tracks.into_iter().collect::<Vec<_>>(), lo, hi + 1);
         let ops = {
             let mut sh = lock_shared(&self.shared);
             tracks
                 .into_iter()
                 .flat_map(|t| f(&mut sh.doc, t, from, to))
                 .collect::<Vec<_>>()
+        };
+        if ops.is_empty() {
+            self.status = format!("{label}: nothing to change").into();
+        } else {
+            self.apply_tx(label, ops);
+            self.status = label.to_string().into();
+        }
+    }
+
+    /// Explicit whole-track transform — the "Apply to Entire Track" menu.
+    /// Equivalent to Select-All-then-transform, but names its scope so a
+    /// user who means "the whole track" doesn't have to select anything.
+    pub(crate) fn apply_track_op(
+        &mut self,
+        label: &str,
+        f: impl Fn(&mut Document, usize, u64, u64) -> Vec<Op>,
+    ) {
+        let ops = {
+            let mut sh = lock_shared(&self.shared);
+            f(&mut sh.doc, self.sel_track, 0, u64::MAX)
         };
         if ops.is_empty() {
             self.status = format!("{label}: nothing to change").into();
@@ -854,71 +1146,112 @@ impl EditorView {
         cx.notify();
     }
 
-    /// Set the tick-0 tempo to current bpm + delta (via the shared op layer).
+    /// Nudge the tempo at the playhead — bumps the point in force there
+    /// (writing a new tempo event at the playhead tick when none exists),
+    /// never silently rewriting tick 0 (#133).
     pub(crate) fn bump_tempo(&mut self, delta: f64) {
         let tr = self.tempo_track();
-        let cur = self.doc(|d| {
-            d.tempo_map_for(tr)
-                .points()
-                .first()
-                .map(|(_, mpq, _)| 60_000_000.0 / *mpq as f64)
-                .unwrap_or(120.0)
-        });
+        let tick = self.doc(|d| d.tempo_map.us_to_tick(self.play_us));
+        let cur = self.doc(|d| tempo_bpm_at(d, tr, tick));
         let ops = {
             let mut sh = lock_shared(&self.shared);
             sh.doc
-                .set_tempo_ops(tr, 0, (cur + delta).clamp(10.0, 400.0))
+                .set_tempo_ops(tr, tick, (cur + delta).clamp(10.0, 400.0))
         };
         self.apply_tx("set tempo", ops);
     }
 
-    /// Cycle the tick-0 time signature through common meters.
+    /// Cycle the signature in force at the playhead through common meters —
+    /// writes at the playhead tick, preserving the stored cc/bb bytes on an
+    /// existing event (#133).
     pub(crate) fn cycle_time_sig(&mut self) {
         const SIGS: [(u8, u8); 6] = [(4, 4), (3, 4), (2, 4), (5, 4), (6, 8), (7, 8)];
         let tr = self.tempo_track();
+        let tick = self.doc(|d| d.tempo_map.us_to_tick(self.play_us));
         let cur = self.doc(|d| {
-            d.tracks.get(tr).and_then(|t| {
-                t.events.iter().find_map(|e| match &e.kind {
-                    EventKind::Meta {
-                        meta_type: 0x58,
-                        data,
-                    } if data.len() >= 2 => Some((data[0], 1u8 << data[1])),
-                    _ => None,
-                })
-            })
+            let m = d.meter_map_for(tr).meter_at(tick);
+            (m.num, (1u32 << m.den_pow.min(15)) as u8)
         });
-        let next = match cur.and_then(|c| SIGS.iter().position(|s| *s == c)) {
+        let next = match SIGS.iter().position(|s| *s == cur) {
             Some(i) => SIGS[(i + 1) % SIGS.len()],
             None => SIGS[1],
         };
         let ops = {
             let mut sh = lock_shared(&self.shared);
-            sh.doc.set_time_sig_ops(tr, 0, next.0, next.1)
+            sh.doc.set_time_sig_ops(tr, tick, next.0, next.1)
         };
         self.apply_tx("set time signature", ops);
     }
 
+    /// Tempo/signature edit dialog at the playhead tick — a matching event
+    /// there is edited in place; otherwise a new one is inserted prefilled
+    /// with the value in force (#133).
+    pub(crate) fn open_tempo_sig_edit(
+        &mut self,
+        meta_type: u8,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tr = self.tempo_track();
+        let tick = self.doc(|d| d.tempo_map.us_to_tick(self.play_us));
+        let id = self.doc(|d| match meta_type {
+            0x51 => tempo_event_at(d, tr, tick).map(|(id, _)| id),
+            0x58 => sig_event_at(d, tr, tick).map(|(id, _, _)| id),
+            _ => None,
+        });
+        self.open_meta_edit(tr, tick, meta_type, id.unwrap_or(0), window, cx);
+    }
+
+    /// Delete the tempo/signature event at the playhead tick (#133).
+    pub(crate) fn delete_tempo_sig(&mut self, meta_type: u8, cx: &mut Context<Self>) {
+        let tr = self.tempo_track();
+        let tick = self.doc(|d| d.tempo_map.us_to_tick(self.play_us));
+        let id = self.doc(|d| match meta_type {
+            0x51 => tempo_event_at(d, tr, tick).map(|(id, _)| id),
+            0x58 => sig_event_at(d, tr, tick).map(|(id, _, _)| id),
+            _ => None,
+        });
+        match id {
+            Some(id) => {
+                let ops = {
+                    let mut sh = lock_shared(&self.shared);
+                    sh.doc.remove_meta_ops(tr, id)
+                };
+                self.apply_tx("delete meta", ops);
+            }
+            None => self.status = t("status.meta_none").into(),
+        }
+        cx.notify();
+    }
+
     #[allow(dead_code)]
     pub(crate) fn insert_note(&mut self, tick: u64, key: u8, cx: &mut Context<Self>) {
-        let len = self.snap_ticks().max(self.td().min_grid_ticks() as i64) as u64;
+        let len = self.note_len.ticks(self);
         self.insert_note_len(tick, key, len, cx);
     }
 
     pub(crate) fn insert_note_len(&mut self, tick: u64, key: u8, len: u64, cx: &mut Context<Self>) {
-        let (on_id, off_id, track) = {
+        let (on_id, off_id, track, ch) = {
             let mut sh = lock_shared(&self.shared);
             let track = self.sel_track.min(sh.doc.tracks.len().saturating_sub(1));
-            (sh.doc.alloc_event_id(), sh.doc.alloc_event_id(), track)
+            let prefix = sh.doc.tracks.get(track).map(|t| t.out_channel).unwrap_or(0);
+            (
+                sh.doc.alloc_event_id(),
+                sh.doc.alloc_event_id(),
+                track,
+                self.edit_channel_of(track, prefix),
+            )
         };
         let tick = self.snap_down(tick as i64).max(0) as u64;
+        let on_vel = self.vel_src.resolve(self.last_vel);
         let on = DocEvent {
             id: on_id,
             tick,
             seq: u32::MAX / 2,
             raw_body: None,
             kind: EventKind::Channel {
-                status: 0x90,
-                data: [key, 100],
+                status: 0x90 | ch,
+                data: [key, on_vel],
                 len: 2,
             },
         };
@@ -928,11 +1261,13 @@ impl EditorView {
             seq: u32::MAX / 2,
             raw_body: None,
             kind: EventKind::Channel {
-                status: 0x80,
+                status: 0x80 | ch,
                 data: [key, 0],
                 len: 2,
             },
         };
+        self.last_note_len = len.max(1);
+        self.last_vel = on_vel;
         self.apply_tx(
             "insert note",
             vec![Op::InsertEvents {
@@ -1018,21 +1353,34 @@ impl EditorView {
         }
     }
 
-    pub(crate) fn delete_selected(&mut self, cx: &mut Context<Self>) {
+    /// Delete acts on the focused context (#152): roll/track areas delete
+    /// note selections, the lane deletes its marquee set, the event list
+    /// deletes its selected rows.
+    pub(crate) fn delete_selected(&mut self, window: &Window, cx: &mut Context<Self>) {
         if self.meta_sel.is_some() {
             self.delete_meta(cx);
             return;
         }
+        self.delete_selected_area(self.area(window, cx), cx);
+    }
+
+    fn delete_selected_area(&mut self, area: FocusArea, cx: &mut Context<Self>) {
         let mut sh = lock_shared(&self.shared);
         let mut ops = Vec::new();
-        for &on_id in &self.selection {
-            let off_id = self
-                .notes
-                .iter()
-                .find(|n| n.on_id == on_id)
-                .and_then(|n| n.off_id);
-            if let Some(op) = Self::remove_note_op(&sh, on_id, off_id) {
-                ops.push(op);
+        let in_roll = matches!(
+            area,
+            FocusArea::Roll | FocusArea::Tracks | FocusArea::MenuBar
+        );
+        if in_roll {
+            for &on_id in &self.selection {
+                let off_id = self
+                    .notes
+                    .iter()
+                    .find(|n| n.on_id == on_id)
+                    .and_then(|n| n.off_id);
+                if let Some(op) = Self::remove_note_op(&sh, on_id, off_id) {
+                    ops.push(op);
+                }
             }
         }
         // lane marquee selection + event-list row selection delete whole
@@ -1044,13 +1392,14 @@ impl EditorView {
                 queued.extend(removed.iter().map(|(_, e)| e.id));
             }
         }
-        let extra: Vec<EventId> = self
-            .lane_sel
-            .iter()
-            .copied()
-            .chain(self.sel_events.iter().copied())
-            .filter(|id| !queued.contains(id))
-            .collect();
+        let mut extra: Vec<EventId> = Vec::new();
+        if area == FocusArea::Events {
+            extra.extend(self.sel_events.iter().copied());
+        }
+        if area == FocusArea::Lane {
+            extra.extend(self.lane_sel.iter().copied());
+        }
+        extra.retain(|id| !queued.contains(id));
         // an event that is part of an RPN/NRPN write deletes the whole
         // parameter entry — removing a lone selector/data CC would leave
         // a corrupt half-write in the file
@@ -1137,6 +1486,7 @@ impl EditorView {
                     _ => continue,
                 }
                 ops.push(Op::UpdateEvent {
+                    pos: usize::MAX,
                     track: ti,
                     before: e.clone(),
                     after,
@@ -1181,6 +1531,12 @@ impl EditorView {
                                 data[0] as i8,
                                 if data[1] == 1 { "minor" } else { "major" }
                             ))
+                        } else if meta_type == 0x51 && data.len() >= 3 {
+                            let mpq =
+                                ((data[0] as u32) << 16) | ((data[1] as u32) << 8) | data[2] as u32;
+                            Some(format!("{:.2}", 60_000_000.0 / mpq.max(1) as f64))
+                        } else if meta_type == 0x58 && data.len() >= 2 {
+                            Some(format!("{}/{}", data[0], 1u32 << data[1].min(7)))
                         } else {
                             Some(smf_core::decode_text(data, None))
                         }
@@ -1189,7 +1545,16 @@ impl EditorView {
                 })
                 .unwrap_or_default()
         } else {
-            String::new()
+            // a fresh tempo/signature event pre-fills the value in force at
+            // the insertion tick, not a blank or the tick-0 default (#133)
+            match meta_type {
+                0x51 => format!("{:.2}", tempo_bpm_at(&sh.doc, track, tick)),
+                0x58 => {
+                    let m = sh.doc.meter_map_for(track).meter_at(tick);
+                    format!("{}/{}", m.num, 1u32 << m.den_pow.min(7))
+                }
+                _ => String::new(),
+            }
         };
         drop(sh);
         self.meta_input.update(cx, |i, cx| {
@@ -1220,6 +1585,35 @@ impl EditorView {
                     None => {
                         self.meta_edit = Some(me);
                         self.status = t("status.keysig_parse").into();
+                        cx.notify();
+                        return;
+                    }
+                }
+            } else if me.meta_type == 0x51 {
+                // numeric BPM — writes the tempo map at the dialog's tick
+                match text.trim().parse::<f64>() {
+                    Ok(bpm) if (10.0..=400.0).contains(&bpm) => {
+                        sh.doc.set_tempo_ops(me.track, me.tick, bpm)
+                    }
+                    _ => {
+                        self.meta_edit = Some(me);
+                        self.status = t("status.tempo_parse").into();
+                        cx.notify();
+                        return;
+                    }
+                }
+            } else if me.meta_type == 0x58 {
+                // "n/d" — numerator and denominator value; cc/bb preserved
+                let parse = text.trim().split_once('/').and_then(|(n, d)| {
+                    Some((n.trim().parse::<u8>().ok()?, d.trim().parse::<u8>().ok()?))
+                });
+                match parse {
+                    Some((n, d)) if n >= 1 && d >= 1 => {
+                        sh.doc.set_time_sig_ops(me.track, me.tick, n, d)
+                    }
+                    _ => {
+                        self.meta_edit = Some(me);
+                        self.status = t("status.sig_parse").into();
                         cx.notify();
                         return;
                     }
@@ -1271,107 +1665,199 @@ impl EditorView {
             0x05 => "meta.lyric",
             0x06 => "meta.marker",
             0x07 => "meta.cue",
+            0x51 => "meta.tempo",
+            0x58 => "meta.timesig",
             0x59 => "meta.keysig",
             _ => "meta.text",
         }
     }
 
     /// Copy the selection into the note clipboard (`cut` also deletes it).
-    pub(crate) fn copy_selected(&mut self, cut: bool, cx: &mut Context<Self>) {
-        let min_len = self.td().min_grid_ticks();
-        let sel: Vec<Note> = self
-            .notes
+    /// Gather every selected event of the focused area as document
+    /// events — notes contribute on+off pairs; the event-list and lane
+    /// sets contribute their events verbatim (#142/#152). Falls back
+    /// across sets so a mixed selection copies whole.
+    fn selected_doc_events(&self, area: FocusArea) -> Vec<(usize, document::Event)> {
+        let sh = lock_shared(&self.shared);
+        let mut ids: BTreeSet<EventId> = match area {
+            FocusArea::Events => self.sel_events.clone(),
+            FocusArea::Lane => self.lane_sel.clone(),
+            _ => self.selection.clone(),
+        };
+        // notes copy as on+off pairs — resolving on_id to both events
+        let mut extra = Vec::new();
+        if ids.is_empty() || area == FocusArea::Roll || area == FocusArea::Tracks {
+            for n in self.notes.iter().filter(|n| ids.contains(&n.on_id)) {
+                if let Some(off) = n.off_id {
+                    extra.push(off);
+                }
+            }
+        }
+        ids.extend(extra);
+        let mut out: Vec<(usize, document::Event)> = sh
+            .doc
+            .tracks
             .iter()
-            .filter(|n| self.selection.contains(&n.on_id))
-            .cloned()
+            .enumerate()
+            .flat_map(|(ti, t)| t.events.iter().map(move |e| (ti, e)))
+            .filter(|(_, e)| ids.contains(&e.id))
+            .map(|(ti, e)| (ti, e.clone()))
             .collect();
-        if sel.is_empty() {
+        out.sort_by_key(|(_, e)| (e.tick, e.seq));
+        out
+    }
+
+    /// Copy the focused area's selection to the OS clipboard (#142):
+    /// every selected event kind, byte-faithful, readable by another
+    /// midi-editor process. `cut` deletes afterwards in one transaction.
+    pub(crate) fn copy_selected(&mut self, cut: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let area = self.area(window, cx);
+        let evs = self.selected_doc_events(area);
+        if evs.is_empty() {
             self.status = t("status.nosel").into();
             cx.notify();
             return;
         }
-        let lo = sel.iter().map(|n| n.start_tick).min().unwrap();
-        self.clipboard = sel
-            .iter()
-            .map(|n| ClipNote {
-                dtick: (n.start_tick - lo) as i64,
-                key: n.key,
-                len: n
-                    .end_tick
-                    .unwrap_or(n.start_tick + min_len)
-                    .saturating_sub(n.start_tick)
-                    .max(1),
-                vel: n.vel,
-                off_vel: n.off_vel,
-                off_via_on: n.off_via_on,
-                ch: n.channel,
-                track: n.track,
-            })
-            .collect();
-        let n = self.clipboard.len();
+        let lo = evs.iter().map(|(_, e)| e.tick).min().unwrap_or(0);
+        let div = lock_shared(&self.shared).doc.division;
+        let src = {
+            let mut ts = evs.iter().map(|(t, _)| *t);
+            let first = ts.next();
+            ts.all(|t| Some(t) == first).then_some(first).flatten()
+        };
+        let clip = Clip {
+            events: evs
+                .into_iter()
+                .map(|(t, e)| ClipEvent {
+                    dtick: e.tick.saturating_sub(lo),
+                    seq: e.seq,
+                    track: t,
+                    raw_body: e.raw_body,
+                    kind: e.kind,
+                })
+                .collect(),
+            src,
+            keep_tracks: false,
+            division: div,
+        };
+        let n = clip.events.len();
+        cx.write_to_clipboard(clip_to_item(&clip));
+        self.clipboard = Some(clip);
         if cut {
-            self.delete_selected(cx);
+            self.delete_selected_area(area, cx);
         }
         self.status = tf("status.copied", &[("n", &n.to_string())]).into();
         cx.notify();
     }
 
-    /// Insert `items` as fresh notes at `anchor` — shared by paste/duplicate.
+    /// Insert a `Clip` at `anchor` — shared by paste/duplicate. Any event
+    /// kinds; fresh ids; raw bodies preserved so SysEx/meta/text bytes
+    /// round-trip (#142). Track policy (#143): a single-track copy lands
+    /// on the active track; a multi-track copy is anchored relative — its
+    /// lowest source track lands on the active track and every other
+    /// source track keeps its offset, with fresh tracks appended for
+    /// overflow instead of collapsing onto the last one; format 2 always
+    /// lands in the viewed sequence.
     pub(crate) fn insert_clip(
         &mut self,
-        items: &[ClipNote],
+        clip: &Clip,
         anchor: u64,
         label: &str,
         cx: &mut Context<Self>,
     ) {
-        if items.is_empty() {
+        if clip.events.is_empty() {
             return;
         }
+        // convert dticks when the source divided time differently
+        let scale = match (clip.division, self.doc(|d| d.division)) {
+            (smf_core::Division::Metrical(a), smf_core::Division::Metrical(b))
+                if a != b && a > 0 =>
+            {
+                Some(b as f64 / a as f64)
+            }
+            _ => None,
+        };
         let mut ops = Vec::new();
         let mut sel_ids = Vec::new();
+        let mut sel_ev = Vec::new();
         {
             let mut sh = lock_shared(&self.shared);
             let ntr = sh.doc.tracks.len();
             // format 2: paste lands in the viewed sequence regardless of
-            // which sequence the clipboard notes were copied from
+            // which sequence the clipboard events were copied from
             let seq_target = sh
                 .doc
                 .is_sequential()
                 .then(|| self.sel_track.min(ntr.saturating_sub(1)));
+            let anchor_track = self.sel_track.min(ntr.saturating_sub(1));
+            let src_min = clip.events.iter().map(|c| c.track).min().unwrap_or(0);
+            let target_of = |src: usize| -> usize {
+                seq_target.unwrap_or_else(|| {
+                    if clip.keep_tracks {
+                        // duplicate/retile: same document, exact tracks
+                        src.min(ntr.saturating_sub(1))
+                    } else if clip.src.is_some() {
+                        anchor_track
+                    } else {
+                        anchor_track + src.saturating_sub(src_min)
+                    }
+                })
+            };
+            // overflow appends fresh tracks inside this transaction (an
+            // explicit part of the paste, undoable in one step); a
+            // format-0 file declares its conversion to format 1 here too
+            let top = clip
+                .events
+                .iter()
+                .map(|c| target_of(c.track))
+                .max()
+                .unwrap_or(0);
+            for index in ntr..=top {
+                ops.push(Op::InsertTrack {
+                    index,
+                    track: document::Track {
+                        name: None,
+                        out_port: 0,
+                        out_channel: 0,
+                        events: vec![DocEvent {
+                            id: sh.doc.alloc_event_id(),
+                            tick: 0,
+                            seq: 0,
+                            raw_body: None,
+                            kind: EventKind::Meta {
+                                meta_type: 0x2F,
+                                data: bytes::Bytes::new(),
+                            },
+                        }],
+                    },
+                });
+            }
+            if top >= ntr && sh.doc.format == 0 {
+                ops.push(Op::SetFormat {
+                    before: 0,
+                    after: 1,
+                });
+            }
             let mut per_track: BTreeMap<usize, Vec<DocEvent>> = BTreeMap::new();
-            for c in items {
-                let track = seq_target.unwrap_or_else(|| c.track.min(ntr.saturating_sub(1)));
-                let tick = (anchor as i64 + c.dtick).max(0) as u64;
-                let ch = c.ch & 0x0F;
-                let on_id = sh.doc.alloc_event_id();
-                let off_id = sh.doc.alloc_event_id();
-                sel_ids.push(on_id);
-                per_track.entry(track).or_default().extend([
-                    DocEvent {
-                        id: on_id,
-                        tick,
-                        seq: u32::MAX / 2,
-                        raw_body: None,
-                        kind: EventKind::Channel {
-                            status: 0x90 | ch,
-                            data: [c.key, c.vel],
-                            len: 2,
-                        },
-                    },
-                    DocEvent {
-                        id: off_id,
-                        tick: tick + c.len,
-                        seq: u32::MAX / 2,
-                        raw_body: None,
-                        kind: EventKind::Channel {
-                            // keep the copied note's off form: a 0x90v0
-                            // can't carry release velocity; 0x80 can
-                            status: (if c.off_via_on { 0x90 } else { 0x80 }) | ch,
-                            data: [c.key, if c.off_via_on { 0 } else { c.off_vel }],
-                            len: 2,
-                        },
-                    },
-                ]);
+            for c in &clip.events {
+                let track = target_of(c.track);
+                let d = c.dtick;
+                let d = scale.map(|s| (d as f64 * s).round() as u64).unwrap_or(d);
+                let tick = anchor + d;
+                let id = sh.doc.alloc_event_id();
+                match &c.kind {
+                    EventKind::Channel { status, .. } if status & 0xF0 == 0x90 => {
+                        sel_ids.push(id);
+                    }
+                    _ => sel_ev.push(id),
+                }
+                per_track.entry(track).or_default().push(DocEvent {
+                    id,
+                    tick,
+                    seq: c.seq,
+                    raw_body: c.raw_body.clone(),
+                    kind: c.kind.clone(),
+                });
             }
             for (track, events) in per_track {
                 ops.push(Op::InsertEvents { track, events });
@@ -1379,64 +1865,58 @@ impl EditorView {
         }
         self.apply_tx(label, ops);
         self.selection = sel_ids.into_iter().collect();
+        self.sel_events = sel_ev.into_iter().collect();
         cx.notify();
     }
 
-    /// Paste the clipboard at the edit cursor (playhead), snapped to the grid.
+    /// Paste at the visible edit cursor — never re-snapped, never
+    /// re-quantized (#143). The OS clipboard wins so another midi-editor
+    /// process's copy pastes here; the in-process copy is the fallback
+    /// (and covers hosts whose clipboard access fails) (#142).
     pub(crate) fn paste(&mut self, cx: &mut Context<Self>) {
-        if self.clipboard.is_empty() {
+        let ext = cx
+            .read_from_clipboard()
+            .and_then(|item| clip_from_item(&item));
+        let clip = ext.or_else(|| self.clipboard.clone());
+        let Some(clip) = clip else {
             self.status = t("status.noclip").into();
             cx.notify();
             return;
-        }
-        // the anchor lives in the viewed sequence's timeline (per-seq map)
-        let anchor = self
-            .snap_down(
-                self.doc(|d| d.tempo_map_for(self.sel_track).us_to_tick(self.play_us)) as i64,
-            )
-            .max(0) as u64;
-        let src = self.clipboard.clone();
-        self.insert_clip(&src, anchor, "paste notes", cx);
+        };
+        let anchor = self.cursor_tick;
+        self.insert_clip(&clip, anchor, "paste", cx);
     }
 
     /// Duplicate the selection, tiled immediately after it (Ctrl+D).
     pub(crate) fn duplicate_selected(&mut self, cx: &mut Context<Self>) {
-        let min_len = self.td().min_grid_ticks();
-        let sel: Vec<Note> = self
-            .notes
-            .iter()
-            .filter(|n| self.selection.contains(&n.on_id))
-            .cloned()
-            .collect();
-        if sel.is_empty() {
+        // duplicates reuse the full clipboard capture so CC/meta pairs
+        // tile the same way notes do
+        let evs = self.selected_doc_events(FocusArea::Roll);
+        if evs.is_empty() {
             self.status = t("status.nosel").into();
             cx.notify();
             return;
         }
-        let lo = sel.iter().map(|n| n.start_tick).min().unwrap();
-        let hi = sel
-            .iter()
-            .map(|n| n.end_tick.unwrap_or(n.start_tick))
-            .max()
-            .unwrap();
-        let items: Vec<ClipNote> = sel
-            .iter()
-            .map(|n| ClipNote {
-                dtick: (n.start_tick - lo) as i64,
-                key: n.key,
-                len: n
-                    .end_tick
-                    .unwrap_or(n.start_tick + min_len)
-                    .saturating_sub(n.start_tick)
-                    .max(1),
-                vel: n.vel,
-                off_vel: n.off_vel,
-                off_via_on: n.off_via_on,
-                ch: n.channel,
-                track: n.track,
-            })
-            .collect();
-        self.insert_clip(&items, hi, "duplicate notes", cx);
+        let lo = evs.iter().map(|(_, e)| e.tick).min().unwrap_or(0);
+        let hi = evs.iter().map(|(_, e)| e.tick).max().unwrap_or(0) + 1;
+        let div = lock_shared(&self.shared).doc.division;
+        let clip = Clip {
+            events: evs
+                .into_iter()
+                .map(|(t, e)| ClipEvent {
+                    dtick: e.tick.saturating_sub(lo),
+                    seq: e.seq,
+                    track: t,
+                    raw_body: e.raw_body,
+                    kind: e.kind,
+                })
+                .collect(),
+            // duplicate tiles in place — same tracks as the source
+            src: None,
+            keep_tracks: true,
+            division: div,
+        };
+        self.insert_clip(&clip, hi, "duplicate", cx);
     }
 
     /// Move every selected note by (dtick, dkey) — arrow-key nudge.
@@ -1473,6 +1953,7 @@ impl EditorView {
                         data[0] = nk;
                     }
                     ops.push(Op::UpdateEvent {
+                        pos: usize::MAX,
                         track: n.track,
                         before: e.clone(),
                         after,
@@ -1515,6 +1996,7 @@ impl EditorView {
                         data[1] = nv;
                     }
                     ops.push(Op::UpdateEvent {
+                        pos: usize::MAX,
                         track: n.track,
                         before: e.clone(),
                         after,
@@ -1604,6 +2086,7 @@ impl EditorView {
                                 let mut after = e.clone();
                                 after.tick = new_end;
                                 ops.push(Op::UpdateEvent {
+                                    pos: usize::MAX,
                                     track: d.track,
                                     before: e.clone(),
                                     after,
@@ -1631,6 +2114,7 @@ impl EditorView {
                                 data[1] = vel;
                             }
                             ops.push(Op::UpdateEvent {
+                                pos: usize::MAX,
                                 track: d.track,
                                 before: e.clone(),
                                 after,
@@ -1701,7 +2185,7 @@ impl EditorView {
                 let cfg = self.lanes.get(d.lane).copied().unwrap_or_default();
                 let lane_mode = cfg.mode;
                 if d.on_id == 0 {
-                    let ch = track_events.out_channel & 0x0F;
+                    let ch = self.edit_channel_of(d.track, track_events.out_channel);
                     let (status, data, len) = match lane_mode {
                         LaneMode::CC(cc) => (0xB0 | ch, [cc, d.dkey.clamp(0, 127) as u8], 2u8),
                         LaneMode::PitchBend => {
@@ -1758,6 +2242,7 @@ impl EditorView {
                                 }
                             }
                             ops.push(Op::UpdateEvent {
+                                pos: usize::MAX,
                                 track: d.track,
                                 before: e.clone(),
                                 after,
@@ -1840,6 +2325,7 @@ impl EditorView {
                     .cloned();
                 if let Some(before) = before {
                     ops.push(Op::UpdateEvent {
+                        pos: usize::MAX,
                         track: ti,
                         before,
                         after,

@@ -16,7 +16,10 @@
 //! `main()`, and every test pins `i18n::set_test_lang` on its own thread
 //! so locales can't bleed between parallel tests.
 
-use crate::{empty_doc, EditorView, LaneMode, PluginState, Sub, Tool, TopMenu, NOTE_H};
+use crate::{
+    a11y, empty_doc, Clip, ClipEvent, EditorView, EvKind, LaneMode, PluginState, Sub, Tool,
+    TopMenu, NOTE_H,
+};
 use document::Document;
 use gpui_kit::component::input::InputState;
 use gpui_kit::component::Root;
@@ -196,6 +199,9 @@ fn dump(window: &Window, v: &EditorView) -> String {
             Sub::VelSet => "VelSet",
             Sub::Chan => "Chan",
             Sub::Dest => "Dest",
+            Sub::EvFType => "EvFType",
+            Sub::EvFChan => "EvFChan",
+            Sub::MidC => "MidC",
             Sub::DefDest => "DefDest",
             Sub::InPort => "InPort",
             Sub::Lane => "Lane",
@@ -209,7 +215,13 @@ fn dump(window: &Window, v: &EditorView) -> String {
             Sub::Scale => "Scale",
             Sub::LegatoGap => "LegatoGap",
             Sub::Swing => "Swing",
+            Sub::AllTrack => "AllTrack",
             Sub::Meta => "Meta",
+            Sub::MetDest => "MetDest",
+            Sub::CountIn => "CountIn",
+            Sub::Monitor => "Monitor",
+            Sub::NoteLen => "NoteLen",
+            Sub::InsVel => "InsVel",
         })
         .unwrap_or("-");
     let _ = writeln!(
@@ -608,6 +620,47 @@ fn lane_chip_cycles_modes(cx: &mut TestAppContext) {
     .unwrap();
 }
 
+/// #131: a selection-scoped transform with an empty selection must not
+/// touch the document; the explicit whole-track op still works.
+#[gpui_kit::test]
+fn region_op_requires_selection(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, fixture_doc());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        view.update(cx, |v, _| {
+            let rev0 = crate::lock_shared(&v.shared).doc.revision();
+            v.selection.clear();
+            v.apply_region_op("transpose", |d, t, f, to| d.transpose_ops(t, f, to, 1));
+            assert_eq!(
+                crate::lock_shared(&v.shared).doc.revision(),
+                rev0,
+                "empty-selection transpose mutated the document"
+            );
+            assert!(!v.status.is_empty(), "no-selection op gave no status");
+            // single-note selection → applies to its track/range only
+            let on_id = v
+                .notes
+                .iter()
+                .find(|n| n.track == 1)
+                .expect("fixture track-1 note")
+                .on_id;
+            v.selection.insert(on_id);
+            v.apply_region_op("transpose", |d, t, f, to| d.transpose_ops(t, f, to, 1));
+            let rev1 = crate::lock_shared(&v.shared).doc.revision();
+            assert!(rev1 > rev0, "selected-note transpose did nothing");
+            // explicit whole-track path works regardless of selection
+            v.selection.clear();
+            v.apply_track_op("transpose", |d, t, f, to| d.transpose_ops(t, f, to, -1));
+            assert!(
+                crate::lock_shared(&v.shared).doc.revision() > rev1,
+                "whole-track op did nothing"
+            );
+        });
+    })
+    .unwrap();
+}
+
 /// Drag a chord note right: the note's start moves to the snapped tick.
 #[gpui_kit::test]
 fn note_drag_moves_note(cx: &mut TestAppContext) {
@@ -639,6 +692,398 @@ fn note_drag_moves_note(cx: &mut TestAppContext) {
         });
         let after = after.expect("moved note missing from document");
         assert!(after > before, "drag did not move the note's start tick");
+    })
+    .unwrap();
+}
+
+// --- #133: playhead-aware tempo / signature controls ------------------------
+
+/// Tempo bump at the playhead writes a tempo event at the playhead tick and
+/// leaves the tick-0 tempo untouched.
+#[gpui_kit::test]
+fn tempo_bump_writes_at_playhead(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, fixture_doc());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        view.update(cx, |v, _cx| {
+            v.play_us = v.doc(|d| d.tempo_map.tick_to_us(480));
+            v.bump_tempo(1.0);
+            let sh = crate::lock_shared(&v.shared);
+            assert!(
+                crate::edit_ops::tempo_event_at(&sh.doc, 0, 480).is_some(),
+                "no tempo event written at the playhead tick"
+            );
+            assert!(
+                (crate::edit_ops::tempo_bpm_at(&sh.doc, 0, 0) - 120.0).abs() < 0.01,
+                "tick-0 tempo was rewritten"
+            );
+            let (_, bpm) = crate::edit_ops::tempo_event_at(&sh.doc, 0, 480).unwrap();
+            assert!((bpm - 121.0).abs() < 0.5);
+        });
+    })
+    .unwrap();
+}
+
+/// Signature cycle at the playhead inserts a signature event there without
+/// touching the file's tick-0 signature.
+#[gpui_kit::test]
+fn sig_cycle_writes_at_playhead(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, fixture_doc());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        view.update(cx, |v, _cx| {
+            v.play_us = v.doc(|d| d.tempo_map.tick_to_us(960));
+            v.cycle_time_sig();
+            let sh = crate::lock_shared(&v.shared);
+            let (_, num, den) = crate::edit_ops::sig_event_at(&sh.doc, 0, 960)
+                .expect("no signature event at the playhead tick");
+            assert_eq!((num, den), (3, 4));
+            // tick-0 4/4 is still in force before the playhead
+            let m = sh.doc.meter_map_for(0).meter_at(0);
+            assert_eq!((m.num, 1u32 << m.den_pow), (4, 4));
+        });
+    })
+    .unwrap();
+}
+
+/// `delete_tempo_sig` removes the event at the playhead tick; earlier events
+/// stay in force so the map falls back correctly.
+#[gpui_kit::test]
+fn tempo_delete_at_playhead(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, fixture_doc());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        view.update(cx, |v, cx| {
+            v.play_us = v.doc(|d| d.tempo_map.tick_to_us(480));
+            v.bump_tempo(1.0);
+            v.delete_tempo_sig(0x51, cx);
+            let sh = crate::lock_shared(&v.shared);
+            assert!(crate::edit_ops::tempo_event_at(&sh.doc, 0, 480).is_none());
+            assert!((crate::edit_ops::tempo_bpm_at(&sh.doc, 0, 480) - 120.0).abs() < 0.01);
+        });
+    })
+    .unwrap();
+}
+
+/// #145 — event-list type + channel filters rebuild the row set while
+/// keeping hidden selections alive.
+#[gpui_kit::test]
+fn event_list_filters_by_kind_and_channel(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, fixture_doc());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        view.update(cx, |v, cx| {
+            let all = v.events.len();
+            assert!(all > 0);
+
+            // kind filter: notes only
+            v.toggle_ev_kind(EvKind::Note, cx);
+            v.refresh_derived();
+            let notes = v.events.len();
+            assert!(notes > 0 && notes < all, "notes {notes} < all {all}");
+            assert!(v.event_refs.iter().flatten().all(|&(ti, ei, _)| {
+                let d = v.doc(|d| d.tracks[ti].events[ei].kind.clone());
+                matches!(d, EventKind::Channel { status, .. } if status & 0xF0 == 0x80 || status & 0xF0 == 0x90)
+            }));
+
+            // channel filter narrows further
+            v.set_ev_chan(Some(0), cx);
+            v.refresh_derived();
+            let ch1 = v.events.len();
+            assert!(ch1 <= notes, "ch {ch1} <= notes {notes}");
+            assert!(v.event_refs.iter().flatten().all(|&(ti, ei, _)| {
+                let d = v.doc(|d| d.tracks[ti].events[ei].kind.clone());
+                matches!(d, EventKind::Channel { status, .. } if status & 0x0F == 0)
+            }));
+
+            // select a visible row, then hide its kind — selection survives
+            if let Some((_, _, id)) = v.event_refs.iter().flatten().next().copied() {
+                v.sel_events.insert(id);
+                v.ev_filter.kinds.insert(EvKind::CC); // still filtering
+                v.ev_filter.kinds.remove(&EvKind::Note); // notes now hidden
+                v.refresh_derived();
+                assert!(v.sel_events.contains(&id), "hidden row keeps selection");
+            }
+
+            // reset restores all rows
+            v.ev_filter.kinds.clear();
+            v.set_ev_chan(None, cx);
+            v.refresh_derived();
+            assert_eq!(v.events.len(), all);
+        });
+    })
+    .unwrap();
+}
+
+/// #164 — the middle-C preference shifts printed octave numbers only.
+#[gpui_kit::test]
+fn middle_c_preference_shifts_octave_labels(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, fixture_doc());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        view.update(cx, |v, cx| {
+            assert_eq!(v.middle_c, 4);
+            assert_eq!(a11y::note_name_mc(60, v.mc_off()), "C4");
+            v.set_middle_c(3, cx);
+            assert_eq!(a11y::note_name_mc(60, v.mc_off()), "C3");
+            v.set_middle_c(5, cx);
+            assert_eq!(a11y::note_name_mc(60, v.mc_off()), "C5");
+            // clamps out-of-range values rather than panicking
+            v.set_middle_c(9, cx);
+            assert_eq!(v.middle_c, 5);
+        });
+    })
+    .unwrap();
+}
+
+/// #138 — timeline extent follows the last event of any kind: a trailing
+/// marker/meta past the last note must stretch the song end, and a pure
+/// EOT tail counts too.
+#[gpui_kit::test]
+fn song_extent_includes_meta_and_eot_tails(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, fixture_doc());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        view.update(cx, |v, _cx| {
+            let before = v.doc_end_ticks();
+            // append a marker way past the last note end
+            let (max, id) = {
+                let mut sh = crate::lock_shared(&v.shared);
+                (
+                    sh.doc
+                        .tracks
+                        .iter()
+                        .flat_map(|t| t.events.iter().map(|e| e.tick))
+                        .max()
+                        .unwrap_or(0),
+                    sh.doc.alloc_event_id(),
+                )
+            };
+            let tail = document::Event {
+                id,
+                tick: max + 96 * 480,
+                seq: 0,
+                raw_body: None,
+                kind: smf_core::EventKind::Meta {
+                    meta_type: 0x06,
+                    data: b"tail".to_vec().into(),
+                },
+            };
+            v.apply_tx(
+                "append marker",
+                vec![document::Op::InsertEvents {
+                    track: 1,
+                    events: vec![tail],
+                }],
+            );
+            let after = v.doc_end_ticks();
+            assert!(after > before, "extent {before} -> {after}");
+        });
+    })
+    .unwrap();
+}
+
+/// #163 — the native caption is `name — midi-editor` and gains the dirty
+/// marker only while there are unsaved edits.
+#[gpui_kit::test]
+fn window_title_tracks_document_state(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, fixture_doc());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        view.update(cx, |v, _cx| {
+            // no backing path: untitled, and a fresh doc starts clean
+            let t = v.window_title();
+            assert!(t.ends_with(" — midi-editor"), "{t}");
+            assert!(!t.contains('*'), "{t}");
+        });
+        // an edit flips the dirty marker on
+        view.update(cx, |v, _cx| {
+            v.apply_tx(
+                "rename",
+                vec![document::Op::UpdateTrack {
+                    index: 0,
+                    before: v.doc(|d| d.tracks[0].clone()),
+                    after: {
+                        let mut t = v.doc(|d| d.tracks[0].clone());
+                        t.name = Some(b"X".to_vec().into());
+                        t
+                    },
+                }],
+            );
+            assert!(v.window_title().contains('*'));
+        });
+    })
+    .unwrap();
+}
+
+// --- #143 anchored-relative paste track policy --------------------------------
+
+fn clip_note(dtick: u64, track: usize, status: u8) -> ClipEvent {
+    ClipEvent {
+        dtick,
+        seq: 0,
+        track,
+        raw_body: None,
+        kind: EventKind::Channel {
+            status,
+            data: [60, 90],
+            len: 2,
+        },
+    }
+}
+
+fn small_doc(format: u16, ntracks: usize) -> Document {
+    Document::from_file(smf_core::File {
+        format,
+        division: Division::Metrical(480),
+        tracks: (0..ntracks)
+            .map(|i| smf_core::Track {
+                events: vec![meta(0, 0, 0x03, format!("T{i}").as_bytes())],
+            })
+            .collect(),
+        warnings: vec![],
+    })
+}
+
+fn chans(d: &Document, t: usize) -> usize {
+    d.tracks[t]
+        .events
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::Channel { .. }))
+        .count()
+}
+
+/// #143 — a multi-track paste anchors relative to the active track: the
+/// clip's lowest source track lands there, every other source track
+/// keeps its offset, and overflow appends fresh tracks instead of
+/// collapsing onto the last one. One undo removes the whole thing.
+#[gpui_kit::test]
+fn paste_multitrack_anchors_relative_and_grows(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, small_doc(1, 2));
+    let clip = Clip {
+        events: vec![clip_note(0, 0, 0x90), clip_note(480, 2, 0x91)],
+        src: None,
+        keep_tracks: false,
+        division: Division::Metrical(480),
+    };
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        view.update(cx, |v, cx| {
+            v.sel_track = 1;
+            v.insert_clip(&clip, 0, "paste", cx);
+            // {0,2} anchored at 1 → {1,3}: grew instead of squashing
+            // track-2 content onto the last existing track
+            assert_eq!(v.doc(|d| d.tracks.len()), 4);
+            assert_eq!(v.doc(|d| chans(d, 0)), 0);
+            assert_eq!(v.doc(|d| chans(d, 1)), 1);
+            assert_eq!(v.doc(|d| chans(d, 2)), 0); // gap track, appended empty
+            assert_eq!(v.doc(|d| chans(d, 3)), 1);
+            // channel identity survived the remap
+            assert!(v.doc(|d| d.tracks[3]
+                .events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::Channel { status: 0x91, .. }))));
+            // the appended track is a real track — its own EOT on the end
+            assert!(v.doc(|d| matches!(
+                d.tracks[3].events.last().map(|e| &e.kind),
+                Some(EventKind::Meta {
+                    meta_type: 0x2F,
+                    ..
+                })
+            )));
+            // one undo removes the whole paste including appended tracks
+            v.undo(cx);
+            assert_eq!(v.doc(|d| d.tracks.len()), 2);
+            assert_eq!(v.doc(|d| chans(d, 1)), 0);
+        });
+    })
+    .unwrap();
+}
+
+/// #143 — cross-document paste into a format-0 file that has too few
+/// tracks appends the needed track and declares the explicit fmt0→1
+/// conversion inside the same transaction.
+#[gpui_kit::test]
+fn paste_multitrack_extends_format0(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, small_doc(0, 1));
+    let clip = Clip {
+        events: vec![clip_note(0, 0, 0x90), clip_note(0, 1, 0x92)],
+        src: None,
+        keep_tracks: false,
+        division: Division::Metrical(480),
+    };
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        view.update(cx, |v, cx| {
+            v.sel_track = 0;
+            v.insert_clip(&clip, 0, "paste", cx);
+            assert_eq!(v.doc(|d| d.tracks.len()), 2);
+            assert_eq!(v.doc(|d| d.format), 1, "fmt0→1 declared, not silent");
+            assert_eq!(v.doc(|d| chans(d, 0)), 1);
+            assert_eq!(v.doc(|d| chans(d, 1)), 1);
+            v.undo(cx);
+            assert_eq!(v.doc(|d| d.tracks.len()), 1);
+            assert_eq!(v.doc(|d| d.format), 0);
+        });
+    })
+    .unwrap();
+}
+
+/// #143 — `keep_tracks` (duplicate/retile) preserves exact source
+/// indexes even when the active track sits somewhere else entirely.
+#[gpui_kit::test]
+fn keep_tracks_duplicate_ignores_anchor(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, small_doc(1, 3));
+    let clip = Clip {
+        events: vec![clip_note(0, 0, 0x90), clip_note(0, 2, 0x91)],
+        src: None,
+        keep_tracks: true,
+        division: Division::Metrical(480),
+    };
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        view.update(cx, |v, cx| {
+            v.sel_track = 1; // not the anchor — exact tracks win
+            v.insert_clip(&clip, 0, "duplicate", cx);
+            assert_eq!(v.doc(|d| d.tracks.len()), 3);
+            assert_eq!(v.doc(|d| chans(d, 0)), 1);
+            assert_eq!(v.doc(|d| chans(d, 1)), 0);
+            assert_eq!(v.doc(|d| chans(d, 2)), 1);
+        });
+    })
+    .unwrap();
+}
+
+/// #143 — a single-track copy still targets the active track.
+#[gpui_kit::test]
+fn paste_single_track_targets_active(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, small_doc(1, 3));
+    let clip = Clip {
+        events: vec![clip_note(0, 0, 0x90), clip_note(480, 0, 0x80)],
+        src: Some(0),
+        keep_tracks: false,
+        division: Division::Metrical(480),
+    };
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        view.update(cx, |v, cx| {
+            v.sel_track = 2;
+            v.insert_clip(&clip, 0, "paste", cx);
+            assert_eq!(v.doc(|d| d.tracks.len()), 3);
+            assert_eq!(v.doc(|d| chans(d, 0)), 0);
+            assert_eq!(v.doc(|d| chans(d, 2)), 2);
+        });
     })
     .unwrap();
 }
