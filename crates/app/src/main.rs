@@ -75,6 +75,14 @@ use std::sync::Mutex;
 const NOTE_H: f32 = 13.0;
 const DANGLING_COLOR: u32 = 0xff4f4f;
 
+/// Piano-key gutter on the roll's left edge.
+pub(crate) const KBD_W: f32 = 48.0;
+/// Left offset of the roll canvas inside the timeline column (`KBD_W` +
+/// the roll's 1px focus border). Every other timeline strip (minimap,
+/// ruler, marker strip, lanes) indents by this so their tick 0 sits
+/// above the roll's tick 0.
+pub(crate) const ROLL_GUTTER: f32 = KBD_W + 1.0;
+
 /// What a left-drag on the piano roll is doing.
 #[derive(Clone, Copy, PartialEq)]
 enum DragMode {
