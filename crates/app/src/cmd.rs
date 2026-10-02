@@ -20,7 +20,7 @@ pub struct Command {
     /// default bindings, "ctrl+shift+z" style; keys\[0\] shows in menus
     pub keys: &'static [&'static str],
     /// palette/menu enable predicate; None = always enabled
-    pub enabled: Option<fn(&EditorView) -> bool>,
+    pub enabled: Option<fn(&EditorView, &mut Context<EditorView>) -> bool>,
     pub act: Act,
 }
 
@@ -194,20 +194,26 @@ impl KeyMap {
     }
 }
 
-fn has_ev_sel(v: &EditorView) -> bool {
+fn has_ev_sel(v: &EditorView, _cx: &mut Context<EditorView>) -> bool {
     !v.sel_events.is_empty()
 }
 
-fn has_sel(v: &EditorView) -> bool {
+fn has_sel(v: &EditorView, _cx: &mut Context<EditorView>) -> bool {
     // any focused-context selection (#152): notes, lane marquee, event rows
     !v.selection.is_empty() || !v.lane_sel.is_empty() || !v.sel_events.is_empty()
 }
 
-fn has_clip(v: &EditorView) -> bool {
+fn has_clip(v: &EditorView, cx: &mut Context<EditorView>) -> bool {
+    // in-process copy, or a `midi-editor/smf-clip` payload left on the OS
+    // clipboard by ANOTHER midi-editor process (#142) — Paste is enabled
+    // whenever `paste()` could actually find a clip
     v.clipboard.is_some()
+        || cx
+            .read_from_clipboard()
+            .is_some_and(|item| crate::clip_from_item(&item).is_some())
 }
 
-fn can_undo(v: &EditorView) -> bool {
+fn can_undo(v: &EditorView, _cx: &mut Context<EditorView>) -> bool {
     !crate::lock_shared(&v.shared).undo.is_empty()
 }
 
@@ -320,7 +326,7 @@ pub static COMMANDS: &[Command] = &[
         "edit.meta_edit",
         "edit.meta_edit",
         &["e"],
-        Some(|v: &EditorView| v.meta_sel.is_some()),
+        Some(|v: &EditorView, _cx: &mut Context<EditorView>| v.meta_sel.is_some()),
         |v, w, cx| {
             if let Some((tr, id)) = v.meta_sel {
                 let m = v.doc(|d| {

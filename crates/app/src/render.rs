@@ -4909,7 +4909,7 @@ impl Render for EditorView {
                 // everything else is a registry command: the keymap (defaults
                 // + user overrides) maps the keystroke to a canonical action
                 if let Some(c) = this.keys.command_at(&cmd::describe(&ev.keystroke)) {
-                    if c.enabled.map(|f| f(this)).unwrap_or(true) {
+                    if c.enabled.map(|f| f(this, cx)).unwrap_or(true) {
                         (c.act)(this, w, cx);
                     }
                 }

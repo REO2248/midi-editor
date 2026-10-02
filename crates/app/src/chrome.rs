@@ -847,10 +847,10 @@ impl EditorView {
         &self,
         id: &'static str,
         check: Option<bool>,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> MenuRow {
         let c = cmd::find(id).expect("unknown command id");
-        let enabled = c.enabled.map(|f| f(self)).unwrap_or(true);
+        let enabled = c.enabled.map(|f| f(self, cx)).unwrap_or(true);
         MenuRow::Leaf(LeafRow {
             id: c.id.into(),
             label: cmd::label(c),
