@@ -2243,8 +2243,9 @@ fn spawn_mcp(
 #[cfg(test)]
 mod tests {
     use crate::{
-        assemble_events, countin_clicks_of, empty_doc, file_arg_from, is_midi_path, park_schedule,
-        plugin_plan, route_events, track_audible, GlobalPrefs, PluginPlan, PluginState, Prefs,
+        assemble_events, clip_from_item, clip_to_item, countin_clicks_of, empty_doc,
+        file_arg_from, is_midi_path, park_schedule, plugin_plan, route_events, track_audible,
+        Clip, ClipEvent, GlobalPrefs, PluginPlan, PluginState, Prefs,
     };
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
@@ -3176,6 +3177,119 @@ mod tests {
         assert_eq!(cin(3840), 4_000_000); // the 60bpm bar
                                           // mid-bar inside the 60bpm region: full 60bpm bar + pickup
         assert_eq!(cin(3840 + 960), 4_000_000 + 2_000_000);
+    }
+
+    /// #142/#143 — the OS-clipboard payload is a versioned format-1
+    /// fragment: per-event track identity, raw bodies and same-tick order
+    /// survive a serialize→parse round trip; a multi-track copy reports
+    /// no single source; the terminator the writer mints never leaks back.
+    #[test]
+    pub(crate) fn clipboard_roundtrip_keeps_tracks_and_drops_synthetic_eot() {
+        use smf_core::{Division, EventKind};
+        let ev = |dtick, seq, track, status: u8| ClipEvent {
+            dtick,
+            seq,
+            track,
+            raw_body: Some(vec![status, 64, 90].into()),
+            kind: EventKind::Channel {
+                status,
+                data: [64, 90],
+                len: 2,
+            },
+        };
+        let clip = Clip {
+            events: vec![
+                ev(0, 0, 0, 0x90),   // note-on, track 0
+                ev(0, 1, 0, 0xB0),   // CC same tick after it — order kept
+                ev(480, 0, 2, 0x91), // track 2, channel preserved
+            ],
+            src: None,
+            division: Division::Metrical(480),
+        };
+        let back = clip_from_item(&clip_to_item(&clip)).expect("own payload parses");
+        // no EOT was selected → none comes back through the fragment
+        assert_eq!(back.events.len(), 3);
+        assert!(
+            !back.events.iter().any(|e| matches!(
+                e.kind,
+                EventKind::Meta {
+                    meta_type: 0x2F,
+                    ..
+                }
+            )),
+            "writer's terminator leaked: {:?}",
+            back.events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert_eq!(back.src, None); // multi-track → no single source
+        assert_eq!(back.events[0].track, 0);
+        assert_eq!(back.events[2].track, 2);
+        // same-tick ordering survives by stream position
+        assert_eq!((back.events[0].dtick, back.events[0].seq), (0, 0));
+        assert_eq!((back.events[1].dtick, back.events[1].seq), (0, 1));
+        assert_eq!(back.events[2].dtick, 480);
+        // raw bodies byte-exact
+        assert_eq!(
+            back.events[0].raw_body.as_deref(),
+            Some(&[0x90u8, 64, 90][..])
+        );
+    }
+
+    /// #143 — a single-track copy keeps `src` so paste targets the active
+    /// track; a selected EOT rides the fragment unharmed (not mistaken
+    /// for the writer's terminator).
+    #[test]
+    pub(crate) fn clipboard_single_track_src_and_selected_eot_survive() {
+        use smf_core::{Division, EventKind};
+        let ch = |dtick| ClipEvent {
+            dtick,
+            seq: 0,
+            track: 1,
+            raw_body: None,
+            kind: EventKind::Channel {
+                status: 0x90,
+                data: [64, 90],
+                len: 2,
+            },
+        };
+        let eot = ClipEvent {
+            dtick: 960,
+            seq: 1,
+            track: 1,
+            raw_body: Some(vec![0xFF, 0x2F, 0x00].into()),
+            kind: EventKind::Meta {
+                meta_type: 0x2F,
+                data: bytes::Bytes::new(),
+            },
+        };
+        let clip = Clip {
+            events: vec![ch(0), ch(480), eot],
+            src: Some(1),
+            division: Division::Metrical(480),
+        };
+        let back = clip_from_item(&clip_to_item(&clip)).unwrap();
+        assert_eq!(back.src, Some(1));
+        assert_eq!(back.events.len(), 3);
+        assert!(back.events.iter().all(|e| e.track == 1));
+        assert!(back.events.iter().any(|e| matches!(
+            e.kind,
+            EventKind::Meta {
+                meta_type: 0x2F,
+                ..
+            }
+        )));
+    }
+
+    /// #142 — foreign or stale-version clipboard payloads fail closed so
+    /// paste falls back to the in-process copy.
+    #[test]
+    pub(crate) fn clipboard_rejects_foreign_and_stale_formats() {
+        let foreign = gpui_kit::ClipboardItem::new_string_with_metadata("x".into(), "{}".into());
+        assert!(clip_from_item(&foreign).is_none());
+        let v1 = gpui_kit::ClipboardItem::new_string_with_metadata(
+            "x".into(),
+            r#"{"v":1,"fmt":"midi-editor/smf-clip/1","smf":"00"}"#.into(),
+        );
+        assert!(clip_from_item(&v1).is_none());
     }
 
     #[test]

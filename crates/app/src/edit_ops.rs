@@ -19,10 +19,11 @@ pub(crate) struct ClipEvent {
 }
 
 /// The OS-clipboard payload (#142): any event kinds, serialized to a
-/// format-0 SMF fragment for the private clipboard format so two
-/// midi-editor processes exchange byte-lossless data. `src` is Some(t)
-/// only when every event came from one track — a single-track copy pastes
-/// onto the active track, a multi-track copy onto its own tracks (#143).
+/// format-1 SMF fragment — one fragment track per source track so every
+/// event's track identity survives the trip through another process
+/// (#143). `src` is Some(t) only when every event came from one track — a
+/// single-track copy pastes onto the active track, a multi-track copy
+/// onto its own tracks.
 #[derive(Clone)]
 pub(crate) struct Clip {
     pub(crate) events: Vec<ClipEvent>,
@@ -32,9 +33,21 @@ pub(crate) struct Clip {
     pub(crate) division: smf_core::Division,
 }
 
-/// Clipboard metadata format version tag — bump when the JSON shape
-/// changes so stale payloads fail closed (#142).
-const CLIP_FMT: &str = "midi-editor/smf-clip/1";
+/// Clipboard metadata format version tag — bump when the payload shape
+/// changes so stale payloads fail closed (#142). v2 packs one fragment
+/// track per source track plus a `tracks`/`eots` table; v1's flattened
+/// format-0 payload can't carry track identity and is rejected.
+const CLIP_FMT: &str = "midi-editor/smf-clip/2";
+
+fn is_eot_kind(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Meta {
+            meta_type: 0x2F,
+            ..
+        }
+    )
+}
 
 /// hex encode (no base64 dep) — used for the SMF fragment in clipboard
 /// metadata JSON.
@@ -68,16 +81,26 @@ fn hex_dec(s: &str) -> Option<Vec<u8>> {
 }
 
 /// Serialize a captured selection to the OS-clipboard item: a readable
-/// one-line summary as the text flavor (harmless in other apps) plus the
-/// SMF fragment in the private metadata flavor (#142).
+/// one-line summary as the text flavor (harmless in other apps) plus a
+/// format-1 SMF fragment in the private metadata flavor — one fragment
+/// track per distinct source track so the paste can restore each event's
+/// original track identity (#142/#143).
 pub(crate) fn clip_to_item(clip: &Clip) -> ClipboardItem {
-    let smf = smf_core::write(
-        0,
-        clip.division,
-        &[smf_core::Track {
+    // fragment layout: one track per distinct source track, ascending.
+    // `tracks[i]` maps fragment track i back to the original track index;
+    // `eots[i]` counts the End-of-Track events that were actually
+    // SELECTED on it — write() mints a terminator for any fragment track
+    // lacking one, and that synthetic event must not leak into the paste
+    let mut order: Vec<usize> = clip.events.iter().map(|e| e.track).collect();
+    order.sort_unstable();
+    order.dedup();
+    let frag: Vec<smf_core::Track> = order
+        .iter()
+        .map(|&ot| smf_core::Track {
             events: clip
                 .events
                 .iter()
+                .filter(|e| e.track == ot)
                 .map(|e| smf_core::Event {
                     tick: e.dtick,
                     seq: e.seq,
@@ -85,17 +108,28 @@ pub(crate) fn clip_to_item(clip: &Clip) -> ClipboardItem {
                     kind: e.kind.clone(),
                 })
                 .collect(),
-        }],
-        smf_core::WriteOptions::default(),
-    );
+        })
+        .collect();
+    let eots: Vec<usize> = order
+        .iter()
+        .map(|&ot| {
+            clip.events
+                .iter()
+                .filter(|e| e.track == ot && is_eot_kind(&e.kind))
+                .count()
+        })
+        .collect();
+    let smf = smf_core::write(1, clip.division, &frag, smf_core::WriteOptions::default());
     let meta = serde_json::json!({
-        "v": 1,
+        "v": 2,
         "fmt": CLIP_FMT,
         "div": match clip.division {
             smf_core::Division::Metrical(ppq) => serde_json::json!(ppq),
             smf_core::Division::Smpte { fps, ticks_per_frame } =>
                 serde_json::json!({"smpte": [fps, ticks_per_frame]}),
         },
+        "tracks": order,
+        "eots": eots,
         "smf": hex_enc(&smf),
     })
     .to_string();
@@ -107,7 +141,11 @@ pub(crate) fn clip_to_item(clip: &Clip) -> ClipboardItem {
 
 /// Parse the private clipboard flavor back into a `Clip`. Returns `None`
 /// for foreign clipboard contents (no metadata or wrong format tag) so
-/// paste falls through to the in-process clipboard.
+/// paste falls through to the in-process clipboard. Each fragment track's
+/// `tracks[i]` entry restores the events' original track index, and
+/// `eots[i]` keeps only the End-of-Track events the selection actually
+/// carried — the terminator write() synthesizes for a track without one
+/// sorts last by (tick,seq) and is dropped here (#142/#143).
 pub(crate) fn clip_from_item(item: &ClipboardItem) -> Option<Clip> {
     let meta = item.entries.iter().find_map(|e| match e {
         ClipboardEntry::String(cs) => cs.metadata.clone(),
@@ -117,15 +155,20 @@ pub(crate) fn clip_from_item(item: &ClipboardItem) -> Option<Clip> {
     if v.get("fmt").and_then(|f| f.as_str()) != Some(CLIP_FMT) {
         return None;
     }
+    let tracks: Vec<usize> = v
+        .get("tracks")?
+        .as_array()?
+        .iter()
+        .map(|x| x.as_u64().map(|n| n as usize))
+        .collect::<Option<_>>()?;
+    let eots: Vec<usize> = v
+        .get("eots")?
+        .as_array()?
+        .iter()
+        .map(|x| x.as_u64().unwrap_or(0) as usize)
+        .collect();
     let smf = hex_dec(v.get("smf")?.as_str()?)?;
     let f = smf_core::parse_lenient(&smf).ok()?;
-    let src = f
-        .tracks
-        .iter()
-        .flat_map(|t| t.events.iter())
-        .map(|e| e.tick)
-        .min()
-        .unwrap_or(0);
     let division = match v.get("div") {
         Some(serde_json::Value::Number(n)) => {
             smf_core::Division::Metrical(n.as_u64().unwrap_or(480) as u16)
@@ -139,21 +182,39 @@ pub(crate) fn clip_from_item(item: &ClipboardItem) -> Option<Clip> {
         },
         _ => smf_core::Division::Metrical(480),
     };
-    let events = f
-        .tracks
-        .into_iter()
-        .flat_map(|t| t.events)
-        .map(|e| ClipEvent {
-            dtick: e.tick.saturating_sub(src),
-            seq: e.seq,
-            track: 0, // single source track — paste targets the active track
-            raw_body: e.raw_body,
-            kind: e.kind,
-        })
-        .collect::<Vec<_>>();
+    let mut events = Vec::new();
+    for (i, t) in f.tracks.into_iter().enumerate() {
+        let orig = tracks.get(i).copied().unwrap_or(i);
+        // the terminator write() appended sorts last by (tick,seq) —
+        // keep only as many EOTs, earliest first, as the selection had
+        let keep: BTreeSet<(u64, u32)> = t
+            .events
+            .iter()
+            .filter(|e| is_eot_kind(&e.kind))
+            .map(|e| (e.tick, e.seq))
+            .take(eots.get(i).copied().unwrap_or(0))
+            .collect();
+        for e in t.events {
+            if is_eot_kind(&e.kind) && !keep.contains(&(e.tick, e.seq)) {
+                continue;
+            }
+            events.push(ClipEvent {
+                dtick: e.tick,
+                seq: e.seq,
+                track: orig,
+                raw_body: e.raw_body,
+                kind: e.kind,
+            });
+        }
+    }
+    // dtick re-anchored at the fragment's earliest kept tick
+    let lo = events.iter().map(|e| e.dtick).min().unwrap_or(0);
+    for e in &mut events {
+        e.dtick = e.dtick.saturating_sub(lo);
+    }
     (!events.is_empty()).then(|| Clip {
         events,
-        src: Some(0),
+        src: (tracks.len() == 1).then_some(tracks[0]),
         division,
     })
 }
