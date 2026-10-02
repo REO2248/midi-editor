@@ -637,6 +637,8 @@ impl EditorView {
             })
             .h(px(cfg.h))
             .w_full()
+            .pl(px(ROLL_GUTTER))
+            .pr(px(1.0))
             .bg(rgb(th.bg_lane))
             .relative()
             .child(lane.size_full())

@@ -1,6 +1,6 @@
 view: tool=Select sel_track=1 snap_idx=7 lane=Vel events_panel=true help=false out_status=true menu=- sub=-
 view: scroll=(0.0,559.0) zoom=0.0800 selection=0 play_us=0 notes=35 events=80 status="test document"
-canvas: roll=[199,129,900x673] ruler=[150,88,950x25] lane=[150,820,950x56] mini=[150,68,950x19]
+canvas: roll=[199,129,900x673] ruler=[199,88,900x25] lane=[199,820,900x56] mini=[199,68,900x19]
 elem [View(EntityId(1v1)), Name("gpui_component::window_border::WindowBorder"), Name("window-backdrop"), Name("root"), View(EntityId(8v1)), Name("editor"), Name("events-panel"), Name("events-list"), Name("events"), NamedInteger("ev", 0)] [1101,94,339x18] vis=true role=Some(ListItem) label=Some("[missing-eot] tk1 @0") value=None checked=None sel=None dis=None
 elem [View(EntityId(1v1)), Name("gpui_component::window_border::WindowBorder"), Name("window-backdrop"), Name("root"), View(EntityId(8v1)), Name("editor"), Name("events-panel"), Name("events-list"), Name("events"), NamedInteger("ev", 1)] [1101,112,339x18] vis=true role=Some(ListItem) label=Some("[missing-eot] tk2 @3840") value=None checked=None sel=None dis=None
 elem [View(EntityId(1v1)), Name("gpui_component::window_border::WindowBorder"), Name("window-backdrop"), Name("root"), View(EntityId(8v1)), Name("editor"), Name("events-panel"), Name("events-list"), Name("events"), NamedInteger("ev", 10)] [1101,274,339x18] vis=true role=Some(ListItem) label=Some("    1.1.  0  T1  NoteOn  ch1   64  90") value=None checked=None sel=None dis=None

@@ -1880,6 +1880,8 @@ impl Render for EditorView {
                         })
                         .h(px(20.0))
                         .w_full()
+                        .pl(px(ROLL_GUTTER))
+                        .pr(px(1.0))
                         .bg(rgb(theme::current().bg_canvas))
                         .border_b_1()
                         .border_color(rgb(theme::current().border))
@@ -1927,6 +1929,8 @@ impl Render for EditorView {
                         })
                         .h(px(26.0))
                         .w_full()
+                        .pl(px(ROLL_GUTTER))
+                        .pr(px(1.0))
                         .bg(rgb(theme::current().bg_panel))
                         .border_b_1()
                         .border_color(rgb(theme::current().border))
@@ -2037,7 +2041,10 @@ impl Render for EditorView {
                         .children(markers.iter().enumerate().filter_map(
                             |(i, (tk, id, ti, txt))| {
                                 let (tk, id, ti) = (*tk, *id, *ti);
-                                let x = tk as f32 * zoom - scroll_x;
+                                // markers are absolute inside a full-width
+                                // strip — `pl` doesn't shift them, so the
+                                // roll's left offset is added explicitly
+                                let x = tk as f32 * zoom - scroll_x + ROLL_GUTTER;
                                 let sel = self.meta_sel == Some((ti, id));
                                 (x > -80.0).then(|| {
                                     div()
@@ -2123,7 +2130,7 @@ impl Render for EditorView {
                         // pitch through the selected track's routing
                         .child(
                             div()
-                                .w(px(48.0))
+                                .w(px(KBD_W))
                                 .h_full()
                                 .relative()
                                 .overflow_hidden()
