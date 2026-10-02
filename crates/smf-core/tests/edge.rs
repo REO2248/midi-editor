@@ -151,6 +151,43 @@ fn missing_eot_gets_added_and_converges() {
 }
 
 #[test]
+fn duplicate_eot_untouched_is_byte_exact() {
+    // two End-of-Track metas in one stream — unusual but parseable; an
+    // untouched save must not collapse them
+    let t = [
+        0x00, 0x90, 0x3C, 0x64, // note on
+        0x60, 0x80, 0x3C, 0x00, // note off
+        0x00, 0xFF, 0x2F, 0x00, // EOT
+        0x40, 0xFF, 0x2F, 0x00, // second EOT 64 ticks later
+    ];
+    let mut f = header(0, 480, 1);
+    f.extend(mtrk(&t));
+    let parsed = parse(&f).unwrap();
+    assert_eq!(rt(&parsed), f, "duplicate EOT must survive untouched");
+}
+
+#[test]
+fn premature_eot_untouched_is_byte_exact() {
+    // events continue after an early End-of-Track — unusual but real;
+    // an untouched save must not move or re-emit the terminator
+    let t = [
+        0x00, 0x90, 0x3C, 0x64, // note on
+        0x00, 0xFF, 0x2F, 0x00, // premature EOT at tick 0
+        0x60, 0x80, 0x3C, 0x00, // note off AFTER the EOT
+        0x00, 0xFF, 0x2F, 0x00, // real EOT
+    ];
+    let mut f = header(0, 480, 1);
+    f.extend(mtrk(&t));
+    let parsed = parse(&f).unwrap();
+    assert_eq!(
+        rt(&parsed),
+        f,
+        "premature EOT + trailing events must survive untouched"
+    );
+    converges(&f);
+}
+
+#[test]
 fn junk_chunk_warns_but_survives() {
     let t = [0x00, 0xFF, 0x2F, 0x00];
     let mut f = header(1, 480, 2);

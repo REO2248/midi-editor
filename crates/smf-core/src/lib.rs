@@ -736,25 +736,11 @@ pub fn write(format_req: u16, division: Division, tracks: &[Track], opts: WriteO
         let mut sorted: Vec<&Event> = track.events.iter().collect();
         sorted.sort_by_key(|e| (e.tick, e.seq));
 
-        // End-of-Track is the structural terminator: exactly one, always
-        // last. Stored EOTs mid-stream are skipped and re-emitted at the
-        // track's real end — their max tick is kept so an intentional
-        // silent tail survives.
-        let mut last_eot: Option<&Event> = None;
-        let mut eot_tick = 0u64;
+        // Stored events serialize verbatim — including End-of-Track metas
+        // wherever they sit (a mid-stream or duplicate EOT in an imported
+        // file survives a save byte-exact). Canonicalizing EOT after a
+        // structural edit is the document layer's job, not the writer's.
         for ev in sorted {
-            if matches!(
-                ev.kind,
-                EventKind::Meta {
-                    meta_type: 0x2F,
-                    ..
-                }
-            ) {
-                eot_tick = eot_tick.max(ev.tick);
-                last_eot = Some(ev);
-                prev_status = None; // a meta event ends running status
-                continue;
-            }
             let delta = ev.tick - prev_tick;
             prev_tick = ev.tick;
             write_vlq(delta, &mut body);
@@ -788,19 +774,22 @@ pub fn write(format_req: u16, division: Division, tracks: &[Track], opts: WriteO
                 prev_status = if is_channel { Some(first) } else { None };
             }
         }
-        // emit the single terminator: at the stored max EOT tick or the
-        // last content tick, whichever is later
-        let end = eot_tick.max(prev_tick);
-        write_vlq(end - prev_tick, &mut body);
-        match last_eot {
-            Some(ev) => {
-                let body_bytes = match &ev.raw_body {
-                    Some(raw) if !raw.is_empty() => raw.clone(),
-                    _ => Bytes::from(vec![0xFF, 0x2F, 0x00]),
-                };
-                body.extend_from_slice(&body_bytes);
-            }
-            None => body.extend_from_slice(&[0xFF, 0x2F, 0x00]),
+        // A track with no End-of-Track anywhere is malformed — mint one at
+        // the last event's tick so the output is always a valid MTrk.
+        // Any stored EOT (even a premature one) means we add nothing:
+        // re-ordering or de-duplicating it here would edit untouched data.
+        let has_eot = track.events.iter().any(|e| {
+            matches!(
+                e.kind,
+                EventKind::Meta {
+                    meta_type: 0x2F,
+                    ..
+                }
+            )
+        });
+        if !has_eot {
+            write_vlq(0, &mut body);
+            body.extend_from_slice(&[0xFF, 0x2F, 0x00]);
         }
 
         out.extend_from_slice(b"MTrk");
