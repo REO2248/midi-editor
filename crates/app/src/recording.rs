@@ -46,43 +46,56 @@ impl EditorView {
         let dropped_rt = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let dropped_sx = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let in_ch = self.rec_in_ch;
-        let (buf2, rec_flag, mon2, rt2, sx2) = (
+        // SysEx policies ride atomics so toggling them while armed takes
+        // effect live — the input callback never re-opens (#160)
+        let sx_gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(self.rec_sysex));
+        let mon_sx_gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            self.rec_mon_sysex,
+        ));
+        let (buf2, rec_flag, mon2, rt2, sx2, sx_gate2, mon_sx2) = (
             buf.clone(),
             recording.clone(),
             mon.clone(),
             dropped_rt.clone(),
             dropped_sx.clone(),
+            sx_gate.clone(),
+            mon_sx_gate.clone(),
         );
         let cb = move |us, b: &[u8]| {
             use std::sync::atomic::Ordering::Relaxed;
             if b.is_empty() {
                 return;
             }
-            let st = b[0];
-            // realtime (clock/start/stop/active-sensing) is transport
-            // signalling, never document content or thru traffic (#160)
-            if st >= 0xF8 {
-                rt2.fetch_add(1, Relaxed);
-                return;
+            let g = rec_gate(b[0], b.len(), in_ch);
+            match g {
+                // realtime (clock/start/stop/active-sensing) is transport
+                // signalling, never document content or thru traffic (#160)
+                RecGate::Realtime => {
+                    rt2.fetch_add(1, Relaxed);
+                    return;
+                }
+                RecGate::Filtered => return,
+                // oversized SysEx is dropped at the gate, never buffered
+                // into the take nor echoed thru (#160 memory bound)
+                RecGate::Oversized => {
+                    sx2.fetch_add(1, Relaxed);
+                    return;
+                }
+                _ => {}
             }
-            // the armed track's input-channel filter applies to channel
-            // voice only — SysEx/escape pass unfiltered (#159)
-            if st < 0xF0 && in_ch.is_some_and(|c| st & 0x0F != c) {
-                return;
-            }
-            // oversized SysEx is dropped at the gate, not buffered into
-            // the take (#160 memory bound)
-            if st == 0xF0 && b.len() > MAX_REC_SYSEX {
-                sx2.fetch_add(1, Relaxed);
-                return;
-            }
-            if rec_flag.load(Relaxed) {
+            // SysEx capture has its own visible toggle — off means a bulk
+            // dump can't land in the take even while recording (#160)
+            if rec_flag.load(Relaxed) && rec_captures(g, sx_gate2.load(Relaxed)) {
                 buf2.lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .push((us, b.to_vec()));
             }
             if let Some(sink) = mon2.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-                sink.send_at(b, 0);
+                // thru policy: SysEx echoes only when explicitly enabled —
+                // the bulk-dump echo defaults off (#160)
+                if mon_echoes(g, mon_sx2.load(Relaxed)) {
+                    sink.send_at(b, 0);
+                }
             }
         };
         let diag = midi_io::InputDiag::new();
@@ -112,6 +125,8 @@ impl EditorView {
                     mon,
                     dropped_rt,
                     dropped_sx,
+                    sx_gate,
+                    mon_sx_gate,
                 });
                 self.update_monitor();
                 true
@@ -324,36 +339,8 @@ impl EditorView {
                     continue;
                 }
             }
-            let (ch, kind) = match b[0] {
-                // SysEx: wire F0 <payload…F7> -> SMF F0 + VLQ(len) + payload
-                // (the trailing F7 is part of the stored payload) (#160)
-                0xF0 if b.len() > 1 => (
-                    None,
-                    EventKind::SysEx(bytes::Bytes::copy_from_slice(&b[1..])),
-                ),
-                // escape / SysEx continuation: wire F7 <bytes> -> SMF F7
-                0xF7 if b.len() > 1 => (
-                    None,
-                    EventKind::Escape(bytes::Bytes::copy_from_slice(&b[1..])),
-                ),
-                0x80..=0xEF => {
-                    let len = match b[0] & 0xF0 {
-                        0xC0 | 0xD0 => 1,
-                        _ => 2,
-                    };
-                    if b.len() < 1 + len as usize {
-                        continue;
-                    }
-                    (
-                        Some(b[0] & 0x0F),
-                        EventKind::Channel {
-                            status: b[0],
-                            data: [b[1], b.get(2).copied().unwrap_or(0)],
-                            len,
-                        },
-                    )
-                }
-                _ => continue,
+            let Some((ch, kind)) = wire_to_kind(&b) else {
+                continue;
             };
             captured.push((
                 pass,
@@ -559,11 +546,103 @@ pub(crate) struct Rec {
     pub(crate) dropped_rt: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// oversized SysEx discarded at the gate
     pub(crate) dropped_sx: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// live SysEx-capture toggle mirrored into the input callback (#160)
+    pub(crate) sx_gate: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// live SysEx-echo toggle mirrored into the input callback (#160)
+    pub(crate) mon_sx_gate: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Maximum captured SysEx payload per message (#160) — a runaway firmware
-/// dump can't exhaust the take buffer. Larger input is dropped + counted.
+/// dump can't exhaust the take buffer. Applies to F0 AND F7 (escape /
+/// continuation) chunks alike; larger input is dropped + counted.
 pub(crate) const MAX_REC_SYSEX: usize = 1 << 20;
+
+/// What the record input gate does with one raw message (#160).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RecGate {
+    /// realtime (0xF8+) — transport signalling, dropped and counted,
+    /// never buffered or echoed
+    Realtime,
+    /// channel voice outside the armed track's input filter
+    Filtered,
+    /// F0/F7 over `MAX_REC_SYSEX` — dropped and counted, never echoed
+    Oversized,
+    /// F0/F7 within bounds — capture/echo follow their own toggles
+    SysEx,
+    /// channel voice — buffered while recording, echoed while monitoring
+    Voice,
+}
+
+/// The record gate's classification of one input message: realtime,
+/// channel-filtered, oversized SysEx, SysEx, or voice. `in_ch` filters
+/// channel voice only — SysEx is channel-less and always passes (#159).
+pub(crate) fn rec_gate(st: u8, len: usize, in_ch: Option<u8>) -> RecGate {
+    if st >= 0xF8 {
+        return RecGate::Realtime;
+    }
+    if st < 0xF0 && in_ch.is_some_and(|c| st & 0x0F != c) {
+        return RecGate::Filtered;
+    }
+    if st == 0xF0 || st == 0xF7 {
+        if len > MAX_REC_SYSEX {
+            return RecGate::Oversized;
+        }
+        return RecGate::SysEx;
+    }
+    RecGate::Voice
+}
+
+/// Whether a gated message lands in the take while recording (#160):
+/// voice always; SysEx only when the capture toggle is on.
+pub(crate) fn rec_captures(g: RecGate, rec_sx: bool) -> bool {
+    g == RecGate::Voice || (g == RecGate::SysEx && rec_sx)
+}
+
+/// Whether a gated message echoes to the monitor sink (#160): voice
+/// always; SysEx only when the echo toggle is on (off by default — a
+/// bulk dump must not blast the armed destination).
+pub(crate) fn mon_echoes(g: RecGate, mon_sx: bool) -> bool {
+    g == RecGate::Voice || (g == RecGate::SysEx && mon_sx)
+}
+
+/// One raw input message → `(channel, kind)` for the take: wire F0 keeps
+/// its whole payload incl. the trailing F7 byte (SMF F0 + VLQ(len)), a
+/// wire F7 becomes an SMF F7 escape — a SysEx delivered in split chunks
+/// lands verbatim as F0 + F7 continuation events (#160). Channel voice
+/// carries its channel so replace-in-loop can key on it.
+pub(crate) fn wire_to_kind(b: &[u8]) -> Option<(Option<u8>, EventKind)> {
+    if b.is_empty() {
+        return None;
+    }
+    match b[0] {
+        0xF0 if b.len() > 1 => Some((
+            None,
+            EventKind::SysEx(bytes::Bytes::copy_from_slice(&b[1..])),
+        )),
+        0xF7 if b.len() > 1 => Some((
+            None,
+            EventKind::Escape(bytes::Bytes::copy_from_slice(&b[1..])),
+        )),
+        0x80..=0xEF => {
+            let len = match b[0] & 0xF0 {
+                0xC0 | 0xD0 => 1,
+                _ => 2,
+            };
+            if b.len() < 1 + len as usize {
+                return None;
+            }
+            Some((
+                Some(b[0] & 0x0F),
+                EventKind::Channel {
+                    status: b[0],
+                    data: [b[1], b.get(2).copied().unwrap_or(0)],
+                    len,
+                },
+            ))
+        }
+        _ => None,
+    }
+}
 
 /// Input monitor mode (#159) — whether armed input echoes to its routed
 /// destination.

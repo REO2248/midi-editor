@@ -939,6 +939,11 @@ struct EditorView {
     monitor: crate::recording::MonMode,
     /// armed track's input channel filter — `None` = all channels (#159)
     rec_in_ch: Option<u8>,
+    /// SysEx capture into takes (#160) — off drops F0/F7 at the gate
+    rec_sysex: bool,
+    /// SysEx monitor echo (#160) — off by default so a bulk dump doesn't
+    /// blast the armed destination unasked
+    rec_mon_sysex: bool,
     /// new-note length source (#144): grid / last-used / fixed fraction —
     /// an explicit state instead of the hidden max(snap, quarter) policy
     note_len: NoteLen,
@@ -1407,6 +1412,8 @@ impl EditorView {
                 .and_then(recording::MonMode::from_label)
                 .unwrap_or(recording::MonMode::Auto),
             rec_in_ch: g.rec_in_ch.filter(|c| *c < 16),
+            rec_sysex: g.rec_sysex.unwrap_or(true),
+            rec_mon_sysex: g.mon_sysex.unwrap_or(false),
             punch_in: None,
             punch_out: None,
             last_take: None,
@@ -3290,6 +3297,84 @@ mod tests {
             r#"{"v":1,"fmt":"midi-editor/smf-clip/1","smf":"00"}"#.into(),
         );
         assert!(clip_from_item(&v1).is_none());
+    }
+
+    /// #160 — the record gate bounds F7 chunks exactly like F0: a runaway
+    /// escape/continuation can't exhaust the take either. Realtime and
+    /// channel-filtered voice are classified for their own counters.
+    #[test]
+    pub(crate) fn rec_gate_bounds_f0_and_f7_sysex_alike() {
+        use crate::recording::{rec_gate, RecGate, MAX_REC_SYSEX};
+        assert_eq!(
+            rec_gate(0xF0, MAX_REC_SYSEX + 1, None),
+            RecGate::Oversized
+        );
+        assert_eq!(
+            rec_gate(0xF7, MAX_REC_SYSEX + 1, None),
+            RecGate::Oversized
+        );
+        assert_eq!(rec_gate(0xF0, 64, None), RecGate::SysEx);
+        assert_eq!(rec_gate(0xF7, 64, None), RecGate::SysEx);
+        // channel filter touches voice only — SysEx is channel-less
+        assert_eq!(rec_gate(0x90, 3, Some(1)), RecGate::Filtered);
+        assert_eq!(rec_gate(0x91, 3, Some(1)), RecGate::Voice);
+        assert_eq!(rec_gate(0xF7, 64, Some(1)), RecGate::SysEx);
+        assert_eq!(rec_gate(0xF8, 1, None), RecGate::Realtime);
+        assert_eq!(rec_gate(0xFE, 1, None), RecGate::Realtime);
+    }
+
+    /// #160 — capture and echo are independent, visible toggles: SysEx
+    /// lands in the take only when Record SysEx is on, and echoes to the
+    /// armed destination only when the echo policy is on (off default).
+    #[test]
+    pub(crate) fn rec_sysex_capture_and_echo_are_independent() {
+        use crate::recording::{mon_echoes, rec_captures, RecGate};
+        // voice always captures and echoes when the sinks are open
+        assert!(rec_captures(RecGate::Voice, false));
+        assert!(mon_echoes(RecGate::Voice, false));
+        // capture disabled: a bulk dump can't land in the take
+        assert!(!rec_captures(RecGate::SysEx, false));
+        assert!(rec_captures(RecGate::SysEx, true));
+        // thru default off — the dump doesn't blast the destination
+        assert!(!mon_echoes(RecGate::SysEx, false));
+        assert!(mon_echoes(RecGate::SysEx, true));
+        // dropped classes never reach either sink
+        for g in [RecGate::Realtime, RecGate::Filtered, RecGate::Oversized] {
+            assert!(!rec_captures(g, true) && !mon_echoes(g, true));
+        }
+    }
+
+    /// #160 — a SysEx delivered in split chunks stores verbatim: wire F0
+    /// becomes an SMF F0 (trailing F7 stays inside the payload), wire F7
+    /// becomes an SMF F7 escape, and channel voice keeps its channel.
+    #[test]
+    pub(crate) fn wire_to_kind_maps_f0_f7_and_voice_verbatim() {
+        use crate::recording::wire_to_kind;
+        use smf_core::EventKind;
+        // complete F0 incl. its trailing F7 byte → SMF SysEx payload
+        let (ch, kind) = wire_to_kind(&[0xF0, 0x7E, 0x7F, 0x09, 0xF7]).unwrap();
+        assert_eq!(ch, None);
+        assert!(matches!(kind, EventKind::SysEx(p) if p.as_ref() == [0x7E, 0x7F, 0x09, 0xF7]));
+        // a continuation chunk → escape, payload verbatim
+        let (ch, kind) = wire_to_kind(&[0xF7, 1, 2, 3, 0xF7]).unwrap();
+        assert_eq!(ch, None);
+        assert!(matches!(kind, EventKind::Escape(p) if p.as_ref() == [1, 2, 3, 0xF7]));
+        // channel voice keeps its channel for replace-in-loop keying
+        let (ch, kind) = wire_to_kind(&[0x93, 64, 100]).unwrap();
+        assert_eq!(ch, Some(3));
+        assert!(matches!(
+            kind,
+            EventKind::Channel {
+                status: 0x93,
+                data: [64, 100],
+                len: 2
+            }
+        ));
+        // 1-data-byte forms read correctly; truncated input is dropped
+        let (ch, _) = wire_to_kind(&[0xC5, 7]).unwrap();
+        assert_eq!(ch, Some(5));
+        assert!(wire_to_kind(&[0xC5]).is_none());
+        assert!(wire_to_kind(&[]).is_none());
     }
 
     #[test]

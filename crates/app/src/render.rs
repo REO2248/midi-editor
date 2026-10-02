@@ -3023,31 +3023,71 @@ impl Render for EditorView {
                         has_track_dest,
                         cx,
                     ),
-                    Sub::Monitor => [
-                        crate::recording::MonMode::Off,
-                        crate::recording::MonMode::Auto,
-                        crate::recording::MonMode::In,
-                    ]
-                    .iter()
-                    .map(|&m| {
-                        Self::mi_leaf(
-                            ("mon", m.label().len()),
-                            t(match m {
-                                crate::recording::MonMode::Off => "mon.off",
-                                crate::recording::MonMode::Auto => "mon.auto",
-                                crate::recording::MonMode::In => "mon.in",
-                            }),
+                    Sub::Monitor => {
+                        let mut rows: Vec<MenuRow> = [
+                            crate::recording::MonMode::Off,
+                            crate::recording::MonMode::Auto,
+                            crate::recording::MonMode::In,
+                        ]
+                        .iter()
+                        .map(|&m| {
+                            Self::mi_leaf(
+                                ("mon", m.label().len()),
+                                t(match m {
+                                    crate::recording::MonMode::Off => "mon.off",
+                                    crate::recording::MonMode::Auto => "mon.auto",
+                                    crate::recording::MonMode::In => "mon.in",
+                                }),
+                                "",
+                                Some(self.monitor == m),
+                                cx,
+                                move |v, _e, _cx| {
+                                    v.monitor = m;
+                                    v.update_monitor();
+                                    v.save_global();
+                                },
+                            )
+                        })
+                        .collect();
+                        // SysEx policies (#160): capture into takes and
+                        // the thru echo — independent, both visible
+                        rows.push(Self::msep());
+                        rows.push(Self::mi_leaf(
+                            "mon.rec_sx",
+                            t("mon.rec_sx"),
                             "",
-                            Some(self.monitor == m),
+                            Some(self.rec_sysex),
                             cx,
-                            move |v, _e, _cx| {
-                                v.monitor = m;
-                                v.update_monitor();
+                            |v, _e, _cx| {
+                                v.rec_sysex = !v.rec_sysex;
+                                if let Some(r) = v.rec.as_ref() {
+                                    r.sx_gate.store(
+                                        v.rec_sysex,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                }
                                 v.save_global();
                             },
-                        )
-                    })
-                    .collect(),
+                        ));
+                        rows.push(Self::mi_leaf(
+                            "mon.echo_sx",
+                            t("mon.echo_sx"),
+                            "",
+                            Some(self.rec_mon_sysex),
+                            cx,
+                            |v, _e, _cx| {
+                                v.rec_mon_sysex = !v.rec_mon_sysex;
+                                if let Some(r) = v.rec.as_ref() {
+                                    r.mon_sx_gate.store(
+                                        v.rec_mon_sysex,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                }
+                                v.save_global();
+                            },
+                        ));
+                        rows
+                    }
                     Sub::CountIn => [0u8, 1, 2, 4]
                         .iter()
                         .map(|&b| {

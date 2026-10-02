@@ -65,6 +65,12 @@ pub(crate) struct GlobalPrefs {
     pub(crate) monitor: Option<String>,
     /// armed track's input channel filter 0-15 (#159); absent = all
     pub(crate) rec_in_ch: Option<u8>,
+    /// SysEx captured into takes (#160); absent = on — disabling skips
+    /// F0/F7 input at the gate so a bulk dump never lands in the take
+    pub(crate) rec_sysex: Option<bool>,
+    /// SysEx echoed to the armed destination while monitoring (#160);
+    /// absent = off — a bulk dump must not blast the output unasked
+    pub(crate) mon_sysex: Option<bool>,
     /// return-to-start-on-stop (Cubase preference): a transport stop moves
     /// the play point back to where the pass began. None (older files) =
     /// on, the DAW-conventional default (#156).
@@ -102,6 +108,8 @@ impl Default for GlobalPrefs {
             middle_c: None,
             last_dir: None,
             rec_in_ch: None,
+            rec_sysex: None,
+            mon_sysex: None,
         }
     }
 }
@@ -557,6 +565,8 @@ impl EditorView {
             count_in_bars: Some(self.count_in_bars),
             monitor: Some(self.monitor.label().to_string()),
             rec_in_ch: self.rec_in_ch,
+            rec_sysex: Some(self.rec_sysex),
+            mon_sysex: Some(self.rec_mon_sysex),
             audio_device: self.audio_sel.device.clone(),
             sample_rate: self.audio_sel.sample_rate,
             buffer_size: self.audio_sel.buffer_size,
