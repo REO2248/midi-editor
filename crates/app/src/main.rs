@@ -3211,6 +3211,7 @@ mod tests {
                 ev(480, 0, 2, 0x91), // track 2, channel preserved
             ],
             src: None,
+            keep_tracks: false,
             division: Division::Metrical(480),
         };
         let back = clip_from_item(&clip_to_item(&clip)).expect("own payload parses");
@@ -3271,6 +3272,7 @@ mod tests {
         let clip = Clip {
             events: vec![ch(0), ch(480), eot],
             src: Some(1),
+            keep_tracks: false,
             division: Division::Metrical(480),
         };
         let back = clip_from_item(&clip_to_item(&clip)).unwrap();

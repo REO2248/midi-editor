@@ -17,7 +17,8 @@
 //! so locales can't bleed between parallel tests.
 
 use crate::{
-    a11y, empty_doc, EditorView, EvKind, LaneMode, PluginState, Sub, Tool, TopMenu, NOTE_H,
+    a11y, empty_doc, Clip, ClipEvent, EditorView, EvKind, LaneMode, PluginState, Sub, Tool,
+    TopMenu, NOTE_H,
 };
 use document::Document;
 use gpui_kit::component::input::InputState;
@@ -917,6 +918,171 @@ fn window_title_tracks_document_state(cx: &mut TestAppContext) {
                 }],
             );
             assert!(v.window_title().contains('*'));
+        });
+    })
+    .unwrap();
+}
+
+// --- #143 anchored-relative paste track policy --------------------------------
+
+fn clip_note(dtick: u64, track: usize, status: u8) -> ClipEvent {
+    ClipEvent {
+        dtick,
+        seq: 0,
+        track,
+        raw_body: None,
+        kind: EventKind::Channel {
+            status,
+            data: [60, 90],
+            len: 2,
+        },
+    }
+}
+
+fn small_doc(format: u16, ntracks: usize) -> Document {
+    Document::from_file(smf_core::File {
+        format,
+        division: Division::Metrical(480),
+        tracks: (0..ntracks)
+            .map(|i| smf_core::Track {
+                events: vec![meta(0, 0, 0x03, format!("T{i}").as_bytes())],
+            })
+            .collect(),
+        warnings: vec![],
+    })
+}
+
+fn chans(d: &Document, t: usize) -> usize {
+    d.tracks[t]
+        .events
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::Channel { .. }))
+        .count()
+}
+
+/// #143 — a multi-track paste anchors relative to the active track: the
+/// clip's lowest source track lands there, every other source track
+/// keeps its offset, and overflow appends fresh tracks instead of
+/// collapsing onto the last one. One undo removes the whole thing.
+#[gpui_kit::test]
+fn paste_multitrack_anchors_relative_and_grows(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, small_doc(1, 2));
+    let clip = Clip {
+        events: vec![clip_note(0, 0, 0x90), clip_note(480, 2, 0x91)],
+        src: None,
+        keep_tracks: false,
+        division: Division::Metrical(480),
+    };
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        view.update(cx, |v, cx| {
+            v.sel_track = 1;
+            v.insert_clip(&clip, 0, "paste", cx);
+            // {0,2} anchored at 1 → {1,3}: grew instead of squashing
+            // track-2 content onto the last existing track
+            assert_eq!(v.doc(|d| d.tracks.len()), 4);
+            assert_eq!(v.doc(|d| chans(d, 0)), 0);
+            assert_eq!(v.doc(|d| chans(d, 1)), 1);
+            assert_eq!(v.doc(|d| chans(d, 2)), 0); // gap track, appended empty
+            assert_eq!(v.doc(|d| chans(d, 3)), 1);
+            // channel identity survived the remap
+            assert!(v.doc(|d| d.tracks[3]
+                .events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::Channel { status: 0x91, .. }))));
+            // the appended track is a real track — its own EOT on the end
+            assert!(v.doc(|d| matches!(
+                d.tracks[3].events.last().map(|e| &e.kind),
+                Some(EventKind::Meta {
+                    meta_type: 0x2F,
+                    ..
+                })
+            )));
+            // one undo removes the whole paste including appended tracks
+            v.undo(cx);
+            assert_eq!(v.doc(|d| d.tracks.len()), 2);
+            assert_eq!(v.doc(|d| chans(d, 1)), 0);
+        });
+    })
+    .unwrap();
+}
+
+/// #143 — cross-document paste into a format-0 file that has too few
+/// tracks appends the needed track and declares the explicit fmt0→1
+/// conversion inside the same transaction.
+#[gpui_kit::test]
+fn paste_multitrack_extends_format0(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, small_doc(0, 1));
+    let clip = Clip {
+        events: vec![clip_note(0, 0, 0x90), clip_note(0, 1, 0x92)],
+        src: None,
+        keep_tracks: false,
+        division: Division::Metrical(480),
+    };
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        view.update(cx, |v, cx| {
+            v.sel_track = 0;
+            v.insert_clip(&clip, 0, "paste", cx);
+            assert_eq!(v.doc(|d| d.tracks.len()), 2);
+            assert_eq!(v.doc(|d| d.format), 1, "fmt0→1 declared, not silent");
+            assert_eq!(v.doc(|d| chans(d, 0)), 1);
+            assert_eq!(v.doc(|d| chans(d, 1)), 1);
+            v.undo(cx);
+            assert_eq!(v.doc(|d| d.tracks.len()), 1);
+            assert_eq!(v.doc(|d| d.format), 0);
+        });
+    })
+    .unwrap();
+}
+
+/// #143 — `keep_tracks` (duplicate/retile) preserves exact source
+/// indexes even when the active track sits somewhere else entirely.
+#[gpui_kit::test]
+fn keep_tracks_duplicate_ignores_anchor(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, small_doc(1, 3));
+    let clip = Clip {
+        events: vec![clip_note(0, 0, 0x90), clip_note(0, 2, 0x91)],
+        src: None,
+        keep_tracks: true,
+        division: Division::Metrical(480),
+    };
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        view.update(cx, |v, cx| {
+            v.sel_track = 1; // not the anchor — exact tracks win
+            v.insert_clip(&clip, 0, "duplicate", cx);
+            assert_eq!(v.doc(|d| d.tracks.len()), 3);
+            assert_eq!(v.doc(|d| chans(d, 0)), 1);
+            assert_eq!(v.doc(|d| chans(d, 1)), 0);
+            assert_eq!(v.doc(|d| chans(d, 2)), 1);
+        });
+    })
+    .unwrap();
+}
+
+/// #143 — a single-track copy still targets the active track.
+#[gpui_kit::test]
+fn paste_single_track_targets_active(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, small_doc(1, 3));
+    let clip = Clip {
+        events: vec![clip_note(0, 0, 0x90), clip_note(480, 0, 0x80)],
+        src: Some(0),
+        keep_tracks: false,
+        division: Division::Metrical(480),
+    };
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        view.update(cx, |v, cx| {
+            v.sel_track = 2;
+            v.insert_clip(&clip, 0, "paste", cx);
+            assert_eq!(v.doc(|d| d.tracks.len()), 3);
+            assert_eq!(v.doc(|d| chans(d, 0)), 0);
+            assert_eq!(v.doc(|d| chans(d, 2)), 2);
         });
     })
     .unwrap();

@@ -21,13 +21,15 @@ pub(crate) struct ClipEvent {
 /// The OS-clipboard payload (#142): any event kinds, serialized to a
 /// format-1 SMF fragment — one fragment track per source track so every
 /// event's track identity survives the trip through another process
-/// (#143). `src` is Some(t) only when every event came from one track — a
-/// single-track copy pastes onto the active track, a multi-track copy
-/// onto its own tracks.
+/// (#143). `src` is Some(t) only when every event came from one track —
+/// a single-track copy pastes onto the active track, while a multi-track
+/// copy anchors relative to it. `keep_tracks` is the duplicate/retile
+/// case: events must land back on their exact source tracks.
 #[derive(Clone)]
 pub(crate) struct Clip {
     pub(crate) events: Vec<ClipEvent>,
     pub(crate) src: Option<usize>,
+    pub(crate) keep_tracks: bool,
     /// division the dticks are expressed in — converted on paste when the
     /// target document divides differently
     pub(crate) division: smf_core::Division,
@@ -215,6 +217,7 @@ pub(crate) fn clip_from_item(item: &ClipboardItem) -> Option<Clip> {
     (!events.is_empty()).then(|| Clip {
         events,
         src: (tracks.len() == 1).then_some(tracks[0]),
+        keep_tracks: false,
         division,
     })
 }
@@ -1734,6 +1737,7 @@ impl EditorView {
                 })
                 .collect(),
             src,
+            keep_tracks: false,
             division: div,
         };
         let n = clip.events.len();
@@ -1748,9 +1752,12 @@ impl EditorView {
 
     /// Insert a `Clip` at `anchor` — shared by paste/duplicate. Any event
     /// kinds; fresh ids; raw bodies preserved so SysEx/meta/text bytes
-    /// round-trip (#142). A single-track copy lands on the active track;
-    /// a multi-track copy keeps its own tracks; format 2 always lands in
-    /// the viewed sequence (#143).
+    /// round-trip (#142). Track policy (#143): a single-track copy lands
+    /// on the active track; a multi-track copy is anchored relative — its
+    /// lowest source track lands on the active track and every other
+    /// source track keeps its offset, with fresh tracks appended for
+    /// overflow instead of collapsing onto the last one; format 2 always
+    /// lands in the viewed sequence.
     pub(crate) fn insert_clip(
         &mut self,
         clip: &Clip,
@@ -1782,15 +1789,58 @@ impl EditorView {
                 .doc
                 .is_sequential()
                 .then(|| self.sel_track.min(ntr.saturating_sub(1)));
+            let anchor_track = self.sel_track.min(ntr.saturating_sub(1));
+            let src_min = clip.events.iter().map(|c| c.track).min().unwrap_or(0);
+            let target_of = |src: usize| -> usize {
+                seq_target.unwrap_or_else(|| {
+                    if clip.keep_tracks {
+                        // duplicate/retile: same document, exact tracks
+                        src.min(ntr.saturating_sub(1))
+                    } else if clip.src.is_some() {
+                        anchor_track
+                    } else {
+                        anchor_track + src.saturating_sub(src_min)
+                    }
+                })
+            };
+            // overflow appends fresh tracks inside this transaction (an
+            // explicit part of the paste, undoable in one step); a
+            // format-0 file declares its conversion to format 1 here too
+            let top = clip
+                .events
+                .iter()
+                .map(|c| target_of(c.track))
+                .max()
+                .unwrap_or(0);
+            for index in ntr..=top {
+                ops.push(Op::InsertTrack {
+                    index,
+                    track: document::Track {
+                        name: None,
+                        out_port: 0,
+                        out_channel: 0,
+                        events: vec![DocEvent {
+                            id: sh.doc.alloc_event_id(),
+                            tick: 0,
+                            seq: 0,
+                            raw_body: None,
+                            kind: EventKind::Meta {
+                                meta_type: 0x2F,
+                                data: bytes::Bytes::new(),
+                            },
+                        }],
+                    },
+                });
+            }
+            if top >= ntr && sh.doc.format == 0 {
+                ops.push(Op::SetFormat {
+                    before: 0,
+                    after: 1,
+                });
+            }
             let mut per_track: BTreeMap<usize, Vec<DocEvent>> = BTreeMap::new();
             for c in &clip.events {
-                let track = seq_target.unwrap_or_else(|| {
-                    if clip.src.is_some() {
-                        self.sel_track.min(ntr.saturating_sub(1))
-                    } else {
-                        c.track.min(ntr.saturating_sub(1))
-                    }
-                });
+                let track = target_of(c.track);
                 let d = c.dtick;
                 let d = scale.map(|s| (d as f64 * s).round() as u64).unwrap_or(d);
                 let tick = anchor + d;
@@ -1863,6 +1913,7 @@ impl EditorView {
                 .collect(),
             // duplicate tiles in place — same tracks as the source
             src: None,
+            keep_tracks: true,
             division: div,
         };
         self.insert_clip(&clip, hi, "duplicate", cx);
