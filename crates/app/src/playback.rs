@@ -51,6 +51,81 @@ pub(crate) fn assemble_events(
     events
 }
 
+/// Park a doc-domain schedule behind a count-in hold of `cin` µs
+/// (#137): every event at or after `start_us` slides `cin` later so the
+/// song begins emitting exactly when capture time begins — the hold
+/// window is filled by `countin_clicks_of` output, appended afterward in
+/// the already-parked domain. Both chase lists describe state AT the
+/// pass start, so they retime to the deferred boundary rather than the
+/// pre-start tail the worker skips. Returns the boundary µs to hand
+/// `assemble_events` as its partition point (and to `position_us`-domain
+/// callers as the start anchor).
+pub(crate) fn park_schedule(
+    events: &mut [(u64, usize, Vec<u8>)],
+    chase: &mut [(u64, usize, Vec<u8>)],
+    chase_sx: &mut [(u64, usize, Vec<u8>)],
+    start_us: u64,
+    cin: u64,
+) -> u64 {
+    let boundary = start_us + cin;
+    if cin == 0 {
+        return boundary;
+    }
+    for e in events.iter_mut() {
+        if e.0 >= start_us {
+            e.0 += cin;
+        }
+    }
+    for e in chase.iter_mut().chain(chase_sx.iter_mut()) {
+        e.0 = boundary;
+    }
+    boundary
+}
+
+/// Count-in clicks for the pre-region `(t0, t1)` ticks, emitted in the
+/// parked domain — each click's doc µs plus `cin`, so the first lands at
+/// the hold's start and the record point's own (accented) click lands
+/// exactly on the deferred boundary (#137). The cadence steps in TICK
+/// space — through the same meter map and `cc` clocks the running
+/// metronome uses — clamped onto `t1` so a partial trailing beat can't
+/// overshoot the boundary. Free so schedule tests drive it without a view.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn countin_clicks_of(
+    mm: &document::MeterMap,
+    tm: &document::TempoMap,
+    smpte: bool,
+    smpte_click_ticks: u64,
+    region: (u64, u64),
+    cin: u64,
+    sink: usize,
+) -> Vec<(u64, usize, Vec<u8>)> {
+    let (t0, t1) = region;
+    let mut out = Vec::new();
+    let mut t = t0;
+    loop {
+        let accent = if smpte {
+            true
+        } else {
+            t == t1 || mm.bar_start_tick(t) == t
+        };
+        let note = if accent { 76 } else { 77 };
+        let us = tm.tick_to_us(t) + cin;
+        out.push((us, sink, vec![0x99, note, 110]));
+        out.push((us + 20_000, sink, vec![0x99, note, 0]));
+        if t >= t1 {
+            break;
+        }
+        t = t
+            .saturating_add(if smpte {
+                smpte_click_ticks
+            } else {
+                mm.click_ticks_at(t)
+            })
+            .min(t1);
+    }
+    out
+}
+
 /// `EditorView::transport_points` on a bare `Document` — free so tests can
 /// drive it without a view. Tempo map + every `0x58` meter meta as `(µs,
 /// TransportCmd)`, sorted by µs.
@@ -127,9 +202,13 @@ pub(crate) struct LiveCtx {
     met_dest: Option<usize>,
     /// document default destination index — metronome fallback target
     default_dest: usize,
-    /// count-in lead-in µs for this pass — clicks always sound inside it
-    /// even when the metronome toggle is off (#137); 0 = no count-in
+    /// count-in hold µs for this pass — the song is parked that long
+    /// while the pre-region's clicks sound (#137); 0 = no count-in
     countin_us: u64,
+    /// count-in pre-region `(region start, record start)` in ticks — the
+    /// click cadence walks this span in the meter map's own domain and
+    /// lands shifted by `countin_us` inside the hold (#137)
+    countin_region: Option<(u64, u64)>,
     loop_enabled: bool,
     /// explicit loop locators in ticks (#130) — both  = unset
     loop_start: Option<u64>,
@@ -300,9 +379,10 @@ impl EditorView {
             metronome: sh.metronome,
             met_dest: sh.met_dest,
             default_dest: sh.default_dest,
-            // set only on the initial pass in start_playback — a mid-run
-            // refresh keeps click generation for the metronome only
-            countin_us: 0,
+            // the running pass's hold — set by start_playback, kept on
+            // every refresh so a rebuild stays in the parked domain
+            countin_us: self.live_countin_us,
+            countin_region: self.rec.as_ref().and_then(|r| r.cin_region),
             loop_enabled: sh.loop_enabled,
             loop_start: sh.loop_start,
             loop_end: sh.loop_end,
@@ -440,23 +520,22 @@ impl EditorView {
         let mut events: Vec<(u64, usize, Vec<u8>)> =
             route_events(self.doc(|d| d.timeline_sysex()), &audible, dest_of, sink_of);
         events.extend(route_events(tagged, &audible, dest_of, sink_of));
-        if ctx.metronome || ctx.countin_us > 0 {
-            // explicit click destination (#137): the configured metronome
-            // output else the document default — never "first open port"
-            let click_d = ctx.met_dest.unwrap_or(ctx.default_dest);
-            let click_sink = sink_of.get(&click_d).copied();
+        // count-in hold: with `cin` > 0 the song is parked — every event
+        // at or after the pass start is deferred by `cin` below, and the
+        // hold window is filled by the pre-region's own clicks (#137)
+        let cin = ctx.countin_us;
+        // explicit click destination (#137): the configured metronome
+        // output else the document default — never "first open port"
+        let click_d = ctx.met_dest.unwrap_or(ctx.default_dest);
+        let click_sink = sink_of.get(&click_d).copied();
+        if ctx.metronome {
             if let Some(s) = click_sink {
                 // clicks follow the FF58 map: one per `cc` clocks
                 // (24 = a quarter) with woodblock 76 on real bar lines —
-                // never a fake-PPQ beat or a hard-coded 4/4 accent. With
-                // the metronome off they cover only the count-in window.
+                // never a fake-PPQ beat or a hard-coded 4/4 accent.
                 let td = self.td();
                 let mm = self.doc(|d| d.meter_map_for(self.sel_track));
-                let end_us = if ctx.metronome {
-                    events.iter().map(|e| e.0).max().unwrap_or(0)
-                } else {
-                    start_us + ctx.countin_us
-                };
+                let end_us = events.iter().map(|e| e.0).max().unwrap_or(0);
                 let mut t = 0u64;
                 loop {
                     let us = self.doc(|d| d.tempo_map_for(self.sel_track).tick_to_us(t));
@@ -491,17 +570,19 @@ impl EditorView {
                 events.push((us, s, output::encode_transport(&cmd)));
             }
         }
-        // globally sort before seek partitioning and the chase splice —
-        // transport payloads join the same ordered stream
-        events.sort_by_key(|e| e.0);
-        let chase = route_events(
+        // park the song during the count-in hold (#137): every event at
+        // or after the pass start slides `cin` later — the pre-start
+        // tail stays skipped by the worker's partition either way; and
+        // both chases describe state AT the pass start so they retime to
+        // the deferred boundary instead of the skipped tail
+        let mut chase = route_events(
             self.doc(|d| d.chase_events(start_us)),
             &audible,
             dest_of,
             sink_of,
         );
         // opt-in SysEx chase
-        let chase_sx = if ctx.chase_sysex {
+        let mut chase_sx = if ctx.chase_sysex {
             route_events(
                 self.doc(|d| d.chase_sysex(start_us)),
                 &audible,
@@ -511,11 +592,21 @@ impl EditorView {
         } else {
             Vec::new()
         };
-        let mut events = assemble_events(events, chase, chase_sx, start_us);
+        let boundary = park_schedule(&mut events, &mut chase, &mut chase_sx, start_us, cin);
+        // count-in clicks in the parked domain — appended after the shift
+        // so they land inside the hold window, not beyond it
+        if let (Some(region), Some(s)) = (ctx.countin_region, click_sink) {
+            if cin > 0 {
+                events.extend(self.countin_clicks(region, cin, s));
+            }
+        }
+        let mut events = assemble_events(events, chase, chase_sx, boundary);
         // explicit loop locator ≠ the pass start: splice a second chase at
         // the left locator so each wrap re-establishes channel state and
-        // plugin transport where the cycle restarts (#130)
-        if let Some(ls) = loop_ls_us.filter(|&ls| ls != start_us) {
+        // plugin transport where the cycle restarts (#130). In a parked
+        // pass a locator before the record point folds into the boundary
+        // chase — no schedule µs exists for it during the hold.
+        if let Some(ls) = loop_ls_us.filter(|&ls| ls != start_us && (cin == 0 || ls > start_us)) {
             let mut lc = route_events(self.doc(|d| d.chase_events(ls)), &audible, dest_of, sink_of);
             if ctx.chase_sysex {
                 lc.splice(
@@ -528,11 +619,46 @@ impl EditorView {
                     lc.push((us, s, output::encode_transport(&cmd)));
                 }
             }
+            let ls_w = ls + cin;
+            if cin > 0 {
+                for e in &mut lc {
+                    e.0 = ls_w;
+                }
+            }
             lc.sort_by_key(|e| e.0);
-            let at = events.partition_point(|e| e.0 < ls);
+            let at = events.partition_point(|e| e.0 < ls_w);
             events.splice(at..at, lc);
         }
         events
+    }
+
+    /// Count-in clicks for the viewed track's meter/tempo maps — the
+    /// viewed sequence's own map in format 2, like the metronome (#137).
+    fn countin_clicks(
+        &self,
+        region: (u64, u64),
+        cin: u64,
+        sink: usize,
+    ) -> Vec<(u64, usize, Vec<u8>)> {
+        self.doc(|d| {
+            countin_clicks_of(
+                &d.meter_map_for(self.sel_track),
+                &d.tempo_map_for(self.sel_track),
+                matches!(self.td(), TimeDisplay::Smpte { .. }),
+                self.td().click_ticks(),
+                region,
+                cin,
+                sink,
+            )
+        })
+    }
+
+    /// Worker's reported position mapped back to document µs — during a
+    /// count-in hold the schedule runs `live_countin_us` ahead of the
+    /// document, so `play_us` walks the pre-region while the song is
+    /// parked (#137).
+    pub(crate) fn live_pos_us(&self, p: &Playback) -> u64 {
+        p.position_us().saturating_sub(self.live_countin_us)
     }
 
     /// Live control-plane update (#140/#141): committed transactions,
@@ -551,7 +677,7 @@ impl EditorView {
             self.refresh_live_routing();
             return;
         }
-        let pos = pb.position_us();
+        let pos = self.live_pos_us(pb);
         let (loop_from, loop_end) = self.loop_range_us(&ctx);
         let events = self.build_live_events(
             &ctx,
@@ -582,7 +708,11 @@ impl EditorView {
         self.live_transport = transport_of.values().copied().collect();
         self.live_dest_of = ctx.dest_of_track.clone();
         self.live_route_dirty = false;
-        let pos = self.playback.as_ref().map(|p| p.position_us()).unwrap_or(0);
+        let pos = self
+            .playback
+            .as_ref()
+            .map(|p| self.live_pos_us(p))
+            .unwrap_or(0);
         let (loop_from, loop_end) = self.loop_range_us(&ctx);
         let events = self.build_live_events(
             &ctx,
@@ -627,10 +757,21 @@ impl EditorView {
         sinks: Option<Vec<Box<dyn EventSink>>>,
     ) {
         if let Some(pb) = &self.playback {
+            // locator bounds are doc µs — translate into the running
+            // pass's parked domain. During a count-in a left locator
+            // before the record point can't be expressed, so the pass
+            // cycles from the capture boundary (#137)
+            let cin = self.live_countin_us;
             pb.update(midi_io::SchedulePatch {
                 events,
-                loop_from_us,
-                loop_end_us,
+                loop_from_us: loop_from_us.map(|v| {
+                    (if cin > 0 {
+                        v.max(self.play_start_us)
+                    } else {
+                        v
+                    }) + cin
+                }),
+                loop_end_us: loop_end_us.map(|v| v + cin),
                 sinks,
             });
         }
@@ -646,14 +787,17 @@ impl EditorView {
             self.status = t("status.no_port").into();
             return;
         }
-        // record arm with a count-in: the pass carries the lead-in length so
-        // click generation covers it on the click destination (#137)
+        // record arm with a count-in: the pass parks the song for the
+        // lead-in — clicks fill the hold and playback starts exactly at
+        // the capture boundary (#137)
         ctx.countin_us = self
             .rec
             .as_ref()
             .filter(|r| r.recording.load(std::sync::atomic::Ordering::Relaxed))
             .map(|r| r.cin_us)
             .unwrap_or(0);
+        ctx.countin_region = self.rec.as_ref().and_then(|r| r.cin_region);
+        self.live_countin_us = ctx.countin_us;
         let needed = self.needed_dests(&ctx);
         let (sinks, sink_of, transport_of, loading) = self.open_sinks(&ctx, &needed);
         if !loading.is_empty() {
@@ -674,12 +818,15 @@ impl EditorView {
         self.live_transport = transport_lanes;
         self.live_dest_of = ctx.dest_of_track.clone();
         self.live_route_dirty = false;
+        // locators shift into the parked domain with the schedule; a
+        // left locator before the record point folds to the boundary
+        let cin = ctx.countin_us;
         self.playback = Some(Playback::start(
             sinks,
             events,
             self.play_us,
-            loop_from,
-            loop_end,
+            loop_from.map(|v| (if cin > 0 { v.max(self.play_us) } else { v }) + cin),
+            loop_end.map(|v| v + cin),
             self.reset_on_stop,
         ));
         // Auto monitoring silences the echo while the transport runs
@@ -728,9 +875,10 @@ impl EditorView {
         self.live_dest_of.clear();
         self.live_route_dirty = false;
         if let Some(mut p) = self.playback.take() {
-            self.play_us = p.position_us();
+            self.play_us = self.live_pos_us(&p);
             p.stop();
         }
+        self.live_countin_us = 0;
         // surface the long-message diagnostic for the pass that just ended:
         // a dump that was deferred or dropped is silent unless reported
         let (mut inl, mut def, mut drop_n, mut worst) = (0u64, 0u64, 0u64, 0u64);

@@ -6,25 +6,29 @@
 use super::*;
 
 impl EditorView {
-    /// Count-in lead-in in µs for the viewed track — N real FF58 bars for
-    /// metrical, N displayed seconds for SMPTE (#137).
-    fn count_in_us(&self) -> u64 {
+    /// Count-in geometry for a record pass starting at `at_us` (#137):
+    /// `(region start tick, record start tick, lead-in µs)`. The bars are
+    /// walked BACKWARD from the record position's own bar — the lead-in
+    /// is metered by the signatures and tempi actually covering the
+    /// pre-region, so recording into a 3/4 section after a 4/4 opening
+    /// counts 3/4 bars and a tempo ramp inside the count-in is heard in
+    /// the clicks. SMPTE has no bar grid: a "bar" is the displayed second.
+    fn countin_region(&self, at_us: u64) -> (u64, u64, u64) {
         if self.count_in_bars == 0 {
-            return 0;
+            return (0, 0, 0);
         }
         self.doc(|d| {
-            let ticks = match d.time_display() {
-                TimeDisplay::Metrical { .. } => {
-                    let mm = d.meter_map_for(self.sel_track);
-                    let mut t = 0u64;
-                    for _ in 0..self.count_in_bars {
-                        t += mm.bar_ticks_at(t);
-                    }
-                    t
+            let tm = d.tempo_map_for(self.sel_track);
+            let start_tick = tm.us_to_tick(at_us);
+            let t0 = match d.time_display() {
+                TimeDisplay::Metrical { .. } => d
+                    .meter_map_for(self.sel_track)
+                    .countin_start(start_tick, self.count_in_bars as u64),
+                TimeDisplay::Smpte { .. } => {
+                    start_tick.saturating_sub(self.td().bar_ticks() * self.count_in_bars as u64)
                 }
-                TimeDisplay::Smpte { .. } => self.td().bar_ticks() * self.count_in_bars as u64,
             };
-            d.tempo_map_for(self.sel_track).tick_to_us(ticks)
+            (t0, start_tick, at_us.saturating_sub(tm.tick_to_us(t0)))
         })
     }
 
@@ -101,6 +105,7 @@ impl EditorView {
                     base_us: self.play_us,
                     ref_us: 0,
                     cin_us: 0,
+                    cin_region: None,
                     diag,
                     loop_span_us: None,
                     arm_track: track,
@@ -157,7 +162,15 @@ impl EditorView {
                 return;
             }
         }
-        let cin_us = self.count_in_us();
+        // a count-in only applies when this engage parks a fresh
+        // transport start — a mid-pass punch can't pause a running
+        // schedule, so no lead-in is banked for it (#137)
+        let (cin_us, cin_region) = if self.playback.is_none() {
+            let (t0, t1, cin) = self.countin_region(self.play_us);
+            (cin, (cin > 0).then_some((t0, t1)))
+        } else {
+            (0, None)
+        };
         if let Some(r) = self.rec.as_mut() {
             r.recording
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -167,6 +180,7 @@ impl EditorView {
             r.ref_us = r.input.now_us();
             r.base_us = self.play_us;
             r.cin_us = cin_us;
+            r.cin_region = cin_region;
         }
         if self.playback.is_none() {
             self.start_playback();
@@ -527,6 +541,10 @@ pub(crate) struct Rec {
     pub(crate) ref_us: u64,
     /// count-in duration — input before this is discarded
     pub(crate) cin_us: u64,
+    /// count-in pre-region in ticks `(region start, record start)` — the
+    /// parked pass emits its clicks inside this span shifted by `cin_us`
+    /// so the boundary click lands exactly on capture start (#137)
+    pub(crate) cin_region: Option<(u64, u64)>,
     /// jitter counters — how much callback-delivery delay the backend
     /// timestamps absorbed this take (surfaced as a debug diagnostic)
     pub(crate) diag: std::sync::Arc<midi_io::InputDiag>,

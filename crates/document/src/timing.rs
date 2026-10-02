@@ -385,12 +385,31 @@ impl MeterMap {
         let mut cur = 0u64;
         loop {
             let n = self.bar_end_at(cur);
-            if n >= start || n <= cur {
+            if n <= cur {
                 return prev;
+            }
+            if n >= start {
+                // `cur` opens the bar that ends at (or contains) `start`
+                // — itself the boundary just before it
+                return cur;
             }
             prev = cur;
             cur = n;
         }
+    }
+
+    /// Tick where a `bars`-bar count-in ending at `start_tick` begins —
+    /// walks bar lines BACKWARD from the position's own bar so the
+    /// pre-region is metered by the signatures actually preceding the
+    /// record point: counting into a 3/4 section after a 4/4 opening
+    /// counts 3/4 bars, and a mid-bar start adds its pickup remainder on
+    /// top of the full bars (#137).
+    pub fn countin_start(&self, start_tick: u64, bars: u64) -> u64 {
+        let mut t0 = self.bar_start_tick(start_tick);
+        for _ in 0..bars {
+            t0 = self.prev_bar_start(t0);
+        }
+        t0
     }
 
     /// Bar-line ticks in `[from, to)` — for ruler/grid drawing where bars
@@ -591,6 +610,38 @@ mod tests {
         );
         // a 4/4 map would have put bar lines at 1920/3840 — these are not
         assert!(!lines.iter().any(|&(t, d)| t == 1920 && d));
+    }
+
+    /// #137 — a count-in is metered by the region PRECEDING the record
+    /// point, walked backward bar by bar; never extrapolated from tick 0.
+    #[test]
+    fn countin_start_walks_bars_backward_from_the_record_point() {
+        let mut evs = Vec::new();
+        // 4/4 (1920-tick bars) for two bars, then 3/4 (1440-tick bars)
+        sig(&mut evs, 1, 3840, 3, 2);
+        let mm = MeterMap::build(
+            &[crate::Track {
+                name: None,
+                out_port: 0,
+                out_channel: 0,
+                events: evs,
+            }],
+            Division::Metrical(480),
+        );
+        // record into the second 3/4 bar (starts at 3840+1440=5280):
+        // one bar of count-in is the FIRST 3/4 bar [3840,5280), not a
+        // 1920-tick 4/4 bar — the old tick-0 math got this wrong
+        assert_eq!(mm.countin_start(5280, 1), 3840);
+        // two bars back covers both 3/4 bars — meter across the boundary
+        // is honored per bar, not averaged
+        assert_eq!(mm.countin_start(5280 + 1440, 2), 3840);
+        // recording on the 3/4 change itself counts in the last 4/4 bar
+        assert_eq!(mm.countin_start(3840, 1), 1920);
+        // a mid-bar record point adds its pickup remainder: the full bar
+        // BEFORE the containing bar is the region start
+        assert_eq!(mm.countin_start(3840 + 720, 1), 1920);
+        // count-in can't run before tick 0 — it saturates at the top
+        assert_eq!(mm.countin_start(960, 4), 0);
     }
 
     #[test]

@@ -869,6 +869,10 @@ struct EditorView {
     /// a routing refresh was deferred because a newly-assigned plugin is
     /// still loading — retried when its slot reports Ready
     live_route_dirty: bool,
+    /// count-in hold of the running pass (#137): the schedule's µs domain
+    /// runs this far ahead of the document while the song is parked —
+    /// subtracted from worker positions so `play_us` stays document-true
+    live_countin_us: u64,
     /// playhead follow mode during playback (per-song pref)
     follow: Follow,
     /// manual scroll pauses follow until this instant
@@ -1359,6 +1363,7 @@ impl EditorView {
             live_transport: Vec::new(),
             live_dest_of: HashMap::new(),
             live_route_dirty: false,
+            live_countin_us: 0,
             follow: Follow::Page,
             follow_hold: None,
             lanes: vec![LaneCfg::default()],
@@ -2238,8 +2243,8 @@ fn spawn_mcp(
 #[cfg(test)]
 mod tests {
     use crate::{
-        assemble_events, empty_doc, file_arg_from, is_midi_path, plugin_plan, route_events,
-        track_audible, GlobalPrefs, PluginPlan, PluginState, Prefs,
+        assemble_events, countin_clicks_of, empty_doc, file_arg_from, is_midi_path, park_schedule,
+        plugin_plan, route_events, track_audible, GlobalPrefs, PluginPlan, PluginState, Prefs,
     };
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
@@ -3016,6 +3021,161 @@ mod tests {
         assert_eq!(got[0].2, vec![0xF0, 0x7E, 0xF7]);
         assert_eq!(got[1].2, vec![0xB0, 7, 90]);
         assert_eq!(got[2].2, note(60));
+    }
+
+    /// #137 — a parked count-in defers every song event at/after the pass
+    /// start by the hold, retimes both chases to the deferred boundary,
+    /// and leaves the pre-start tail where the worker's partition skips it.
+    #[test]
+    pub(crate) fn park_schedule_defers_song_and_retimes_chase() {
+        let start = 2_000_000u64;
+        let cin = 1_000_000u64;
+        let mut events = vec![
+            (start - 500_000, 0usize, note(60)),
+            (start, 0usize, note(62)),
+            (start + 250_000, 0usize, vec![0x80, 60, 0]),
+        ];
+        let mut chase = vec![(start - 10_000, 0usize, vec![0xB0, 7, 90])];
+        let mut chase_sx = vec![(0u64, 0usize, vec![0xF0, 0x7E, 0xF7])];
+        let boundary = park_schedule(&mut events, &mut chase, &mut chase_sx, start, cin);
+        assert_eq!(boundary, start + cin);
+        // pre-start event untouched; at/after events slid by exactly cin
+        assert_eq!(events[0].0, start - 500_000);
+        assert_eq!(events[1].0, start + cin);
+        assert_eq!(events[2].0, start + 250_000 + cin);
+        // chase state fires AT the capture boundary, not the parked tail
+        assert!(chase.iter().all(|e| e.0 == boundary));
+        assert!(chase_sx.iter().all(|e| e.0 == boundary));
+        let out = assemble_events(events, chase, chase_sx, boundary);
+        // chases splice ahead of the first deferred song event at the
+        // boundary — inside the hold nothing but count-in clicks emits
+        let at = out.iter().position(|e| e.0 >= boundary).unwrap();
+        assert_eq!(out[at].2, vec![0xF0, 0x7E, 0xF7]);
+        assert_eq!(out[at + 1].2, vec![0xB0, 7, 90]);
+        assert_eq!(out[at + 2].2, note(62));
+        // the recorded-tick contract: input heard when deferred event e
+        // emits maps to doc_us = base + (rel − cin) = e.0 − cin — its
+        // ORIGINAL doc position — wall time and document time agree (#137)
+        for orig in [start, start + 250_000] {
+            assert!(out.iter().any(|e| e.0 - cin == orig));
+        }
+    }
+
+    /// #137 — count-in clicks step the meter map's own `cc` cadence in
+    /// TICK space across a 4/4→3/4 change, land inside the hold window,
+    /// and put an accented click exactly on the deferred capture boundary.
+    #[test]
+    pub(crate) fn countin_clicks_follow_the_real_meter_map() {
+        use document::Document;
+        use smf_core::{Division, Event as SmfEvent, EventKind};
+        // 4/4 for two bars (1920 ticks), 3/4 (1440-tick bars) after —
+        // record at the second 3/4 bar's start: the pre-region's last bar
+        // is 3/4, its first is 4/4.
+        let sig = |tick, n: u8, d: u8| SmfEvent {
+            tick,
+            seq: 0,
+            raw_body: None,
+            kind: EventKind::Meta {
+                meta_type: 0x58,
+                data: vec![n, d, 24, 8].into(),
+            },
+        };
+        let trk = |events: Vec<SmfEvent>| smf_core::Track { events };
+        let d = Document::from_file(smf_core::File {
+            format: 1,
+            division: Division::Metrical(480),
+            tracks: vec![trk(vec![sig(0, 4, 2), sig(3840, 3, 2)]), trk(vec![])],
+            warnings: vec![],
+        });
+        let mm = d.meter_map_for(0);
+        let tm = d.tempo_map_for(0);
+        let t1 = 5280u64; // second 3/4 bar start
+                          // 2 bars back: the first 3/4 bar [3840,5280) + the last 4/4 bar
+                          // [1920,3840) — each sized by its own signature
+        let t0 = mm.countin_start(t1, 2);
+        assert_eq!(t0, 1920);
+        let start_us = tm.tick_to_us(t1);
+        let cin = start_us - tm.tick_to_us(t0);
+        let clicks = countin_clicks_of(&mm, &tm, false, 0, (t0, t1), cin, 7);
+        // ons only — offs ride +20ms behind each
+        let ons: Vec<(u64, u8)> = clicks
+            .iter()
+            .filter(|(_, _, b)| b[2] == 110)
+            .map(|(us, _, b)| (*us, b[1]))
+            .collect();
+        // every click inside the hold [start_us, start_us + cin]
+        assert!(ons
+            .iter()
+            .all(|(us, _)| *us >= start_us && *us <= start_us + cin));
+        // cc=24 clocks = one click per quarter → 1920,2400,…,5280 ticks;
+        // accents on bar lines (1920 4/4, 3840+1440n 3/4) and always on
+        // the record point itself
+        let want: Vec<(u64, u8)> = [1920u64, 2400, 2880, 3360, 3840, 4320, 4800, 5280]
+            .iter()
+            .map(|&t| {
+                (
+                    tm.tick_to_us(t) + cin,
+                    if t == t1 || mm.bar_start_tick(t) == t {
+                        76
+                    } else {
+                        77
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(ons, want);
+        // the boundary click is accented and coincides with the deferred
+        // song start — click and capture share the boundary
+        assert_eq!(ons.last().unwrap().0, start_us + cin);
+        assert_eq!(ons.last().unwrap().1, 76);
+    }
+
+    /// #137 — a tempo change inside the pre-region sizes the hold by the
+    /// tempi actually covering it: the parked µs window equals the span
+    /// the performer hears, on either side of the tempo breakpoint.
+    #[test]
+    pub(crate) fn countin_lead_in_uses_the_tempi_of_the_pre_region() {
+        use document::Document;
+        use smf_core::{Division, Event as SmfEvent, EventKind};
+        let sig = |tick| SmfEvent {
+            tick,
+            seq: 0,
+            raw_body: None,
+            kind: EventKind::Meta {
+                meta_type: 0x58,
+                data: vec![4, 2, 24, 8].into(),
+            },
+        };
+        let tempo = |tick, mpq: u32| SmfEvent {
+            tick,
+            seq: 0,
+            raw_body: None,
+            kind: EventKind::Meta {
+                meta_type: 0x51,
+                data: mpq.to_be_bytes()[1..].to_vec().into(),
+            },
+        };
+        // 4/4 throughout; 120bpm for one bar, then 60bpm — a 1-bar
+        // count-in before bar 3 spans only the 60bpm bar (4s), while
+        // before bar 2 it spans the 120bpm bar (2s)
+        let d = Document::from_file(smf_core::File {
+            format: 1,
+            division: Division::Metrical(480),
+            tracks: vec![smf_core::Track {
+                events: vec![sig(0), tempo(0, 500_000), tempo(1920, 1_000_000)],
+            }],
+            warnings: vec![],
+        });
+        let mm = d.meter_map_for(0);
+        let tm = d.tempo_map_for(0);
+        let cin = |at: u64| {
+            let t0 = mm.countin_start(at, 1);
+            tm.tick_to_us(at) - tm.tick_to_us(t0)
+        };
+        assert_eq!(cin(1920), 2_000_000); // the 120bpm bar
+        assert_eq!(cin(3840), 4_000_000); // the 60bpm bar
+                                          // mid-bar inside the 60bpm region: full 60bpm bar + pickup
+        assert_eq!(cin(3840 + 960), 4_000_000 + 2_000_000);
     }
 
     #[test]

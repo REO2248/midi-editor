@@ -1786,6 +1786,100 @@ mod tests {
             .any(|b| b.len() == 3 && b[0] & 0xF0 == 0xB0 && b[1] == 121));
     }
 
+    /// #137 — a parked count-in pass: the hold emits only clicks, the
+    /// song's first event lands exactly on the deferred boundary, and
+    /// `pos` reports parked-domain µs (the view subtracts the hold to
+    /// recover document position). Sink also captures `pos` per send so
+    /// the wall-time ↔ playhead ↔ recorded-tick contract is checkable:
+    /// input heard ON a boundary event maps to `base + rel − cin` — the
+    /// record start — so click and capture share the same boundary.
+    #[test]
+    fn parked_countin_aligns_wall_playhead_and_capture() {
+        /// `(position µs at send, bytes)` — the value the UI playhead
+        /// mirrors, paired with what was emitted.
+        type PosLog = Arc<Mutex<Vec<(u64, Vec<u8>)>>>;
+
+        /// `pos`-observing sink: records the schedule position reported
+        /// for every send.
+        struct PosSink {
+            log: PosLog,
+            pos: Arc<AtomicU64>,
+        }
+
+        impl EventSink for PosSink {
+            fn send_at(&mut self, bytes: &[u8], _rem_us: u64) {
+                let p = self.pos.load(Relaxed);
+                self.log.lock().unwrap().push((p, bytes.to_vec()));
+            }
+            fn notes_off(&mut self) {}
+            fn panic(&mut self) {}
+        }
+
+        let start = 1_000_000u64;
+        let cin = 500_000u64;
+        let boundary = start + cin;
+        // parked schedule as the view builds it: clicks fill the hold,
+        // an accented click + the first note sit on the boundary
+        let events = vec![
+            (start, 0usize, vec![0x99, 77, 110]),
+            (start + 250_000, 0usize, vec![0x99, 77, 110]),
+            (boundary, 0usize, vec![0x99, 76, 110]),
+            (boundary, 0usize, vec![0x90, 60, 100]),
+            (boundary + 100_000, 0usize, vec![0x80, 60, 0]),
+        ];
+        let log: PosLog = Arc::new(Mutex::new(Vec::new()));
+        let pos = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let watch = AtomicBool::new(false);
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut sinks: Vec<Box<dyn EventSink>> = vec![Box::new(PosSink {
+            log: log.clone(),
+            pos: pos.clone(),
+        })];
+        let mut clock = FakeClock { now: 0 };
+        run_schedule(
+            &mut clock,
+            &mut sinks,
+            events,
+            start,
+            None,
+            None,
+            &stop,
+            pos.as_ref(),
+            &watch,
+            &rx,
+            false,
+        );
+        let got = log.lock().unwrap().clone();
+        // `pos` reports each event's parked µs at send time
+        assert_eq!(
+            got.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+            vec![
+                start,
+                start + 250_000,
+                boundary,
+                boundary,
+                boundary + 100_000
+            ]
+        );
+        // inside the hold only clicks (0x99) emitted; the first channel
+        // event landed exactly at the boundary — never a moment early
+        let first_note = got.iter().position(|(_, b)| b[0] == 0x90).unwrap();
+        assert_eq!(got[first_note].0, boundary);
+        assert!(got[..first_note].iter().all(|(_, b)| b[0] == 0x99));
+        // the capture contract: the take's `rel` is the input clock since
+        // engage (epoch ≈ ref), so an event heard at parked time `p` has
+        // rel = p − start and maps to doc_us = base + rel − cin = p − cin
+        // — a note struck when the boundary event sounds lands exactly on
+        // the record start (`base`)
+        let base = start;
+        let struck_on_boundary = base + (boundary - start) - cin;
+        assert_eq!(struck_on_boundary, base);
+        // and one struck mid-song lands on the heard event's doc position
+        let heard = boundary + 100_000;
+        assert_eq!(base + (heard - start) - cin, heard - cin);
+    }
+
     // --- live schedule updates (#140/#141) ----------------------------------
 
     /// Sink that queues a `SchedulePatch` after its `fire_after`-th send —

@@ -145,7 +145,7 @@ impl Render for EditorView {
         // advance playhead / auto-stop (looping happens inside the
         // playback thread; reaching this branch means playback ended)
         if let Some(p) = &self.playback {
-            self.play_us = p.position_us();
+            self.play_us = self.live_pos_us(p);
             if !p.is_running() {
                 self.playback = None;
                 // natural end follows the same stop policy as a manual
