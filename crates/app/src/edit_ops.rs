@@ -572,6 +572,7 @@ pub(crate) fn edit_event_field(
     }
     let mk = |after: DocEvent| {
         vec![Op::UpdateEvent {
+            pos: usize::MAX,
             track: ti,
             before: ev.clone(),
             after,
@@ -692,6 +693,7 @@ pub(crate) fn edit_note_field(
     let mut ops = Vec::new();
     let mut upd = |pos: (usize, usize), after: DocEvent| {
         ops.push(Op::UpdateEvent {
+            pos: usize::MAX,
             track: pos.0,
             before: d.tracks[pos.0].events[pos.1].clone(),
             after,
@@ -1481,6 +1483,7 @@ impl EditorView {
                     _ => continue,
                 }
                 ops.push(Op::UpdateEvent {
+                    pos: usize::MAX,
                     track: ti,
                     before: e.clone(),
                     after,
@@ -1899,6 +1902,7 @@ impl EditorView {
                         data[0] = nk;
                     }
                     ops.push(Op::UpdateEvent {
+                        pos: usize::MAX,
                         track: n.track,
                         before: e.clone(),
                         after,
@@ -1941,6 +1945,7 @@ impl EditorView {
                         data[1] = nv;
                     }
                     ops.push(Op::UpdateEvent {
+                        pos: usize::MAX,
                         track: n.track,
                         before: e.clone(),
                         after,
@@ -2030,6 +2035,7 @@ impl EditorView {
                                 let mut after = e.clone();
                                 after.tick = new_end;
                                 ops.push(Op::UpdateEvent {
+                                    pos: usize::MAX,
                                     track: d.track,
                                     before: e.clone(),
                                     after,
@@ -2057,6 +2063,7 @@ impl EditorView {
                                 data[1] = vel;
                             }
                             ops.push(Op::UpdateEvent {
+                                pos: usize::MAX,
                                 track: d.track,
                                 before: e.clone(),
                                 after,
@@ -2184,6 +2191,7 @@ impl EditorView {
                                 }
                             }
                             ops.push(Op::UpdateEvent {
+                                pos: usize::MAX,
                                 track: d.track,
                                 before: e.clone(),
                                 after,
@@ -2266,6 +2274,7 @@ impl EditorView {
                     .cloned();
                 if let Some(before) = before {
                     ops.push(Op::UpdateEvent {
+                        pos: usize::MAX,
                         track: ti,
                         before,
                         after,

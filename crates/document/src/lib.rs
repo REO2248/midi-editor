@@ -111,6 +111,11 @@ pub enum Op {
     },
     UpdateEvent {
         track: usize,
+        /// Index `before` occupied when the op applied — resolved by
+        /// `Document::apply` (`usize::MAX` until then). Undo re-inserts
+        /// `before` at exactly this slot so the original position among
+        /// same-(tick,seq) events is restored byte-for-byte.
+        pos: usize,
         before: Event,
         after: Event,
     },

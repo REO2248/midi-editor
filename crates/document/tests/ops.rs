@@ -602,6 +602,7 @@ fn update_revert_restores_raw_body() {
     let tx = apply(
         &mut d,
         vec![Op::UpdateEvent {
+            pos: usize::MAX,
             track: 0,
             before: ev,
             after,
@@ -768,6 +769,7 @@ fn tick_only_edit_preserves_raw_body() {
     apply(
         &mut d,
         vec![Op::UpdateEvent {
+            pos: usize::MAX,
             track: 1,
             before: ev,
             after,

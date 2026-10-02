@@ -289,6 +289,77 @@ fn premature_eot_collapses_on_edit_and_undo_restores() {
     assert_eq!(eot_ticks, vec![0, 960]);
 }
 
+#[test]
+fn undo_restores_event_order_among_same_tick_events() {
+    // position-exact undo: an event whose (tick, seq) collides with
+    // siblings must come back at its original index — a re-sort lands it
+    // at an arbitrary slot among the equal keys and reorders the bytes
+    let is_eot = |e: &Event| {
+        matches!(
+            e.kind,
+            EventKind::Meta {
+                meta_type: 0x2F,
+                ..
+            }
+        )
+    };
+    let f = smf_core::File {
+        format: 1,
+        division: Division::Metrical(480),
+        tracks: vec![smf_core::Track {
+            events: vec![smf_core::Event {
+                tick: 0,
+                seq: 0,
+                raw_body: None,
+                kind: EventKind::Meta {
+                    meta_type: 0x2F,
+                    data: Bytes::new(),
+                },
+            }],
+        }],
+        warnings: vec![],
+    };
+    let mut d = Document::from_file(f);
+    fn ins(d: &mut Document, tick: u64, key: u8) -> Applied {
+        let ev = Event {
+            id: d.alloc_event_id(),
+            tick,
+            seq: u32::MAX,
+            raw_body: None,
+            kind: EventKind::Channel {
+                status: 0x90,
+                data: [key, 100],
+                len: 2,
+            },
+        };
+        d.apply(Transaction {
+            label: "ins".into(),
+            base: d.revision(),
+            ops: vec![Op::InsertEvents {
+                track: 0,
+                events: vec![ev],
+            }],
+        })
+        .unwrap()
+    }
+    ins(&mut d, 0, 60);
+    ins(&mut d, 0, 62); // the EOT now shares (0, MAX) with the notes
+    ins(&mut d, 0, 64);
+    let before = d.serialize(smf_core::WriteOptions::default());
+    let eot_pos = d.tracks[0].events.iter().position(is_eot).unwrap();
+
+    // an edit past the track's end reticks the EOT — the synthesized
+    // UpdateEvent must round-trip back to the exact same slot
+    let applied = ins(&mut d, 3347, 65);
+    d.revert(&applied.tx);
+    assert_eq!(d.serialize(smf_core::WriteOptions::default()), before);
+    assert_eq!(
+        d.tracks[0].events.iter().position(is_eot).unwrap(),
+        eot_pos,
+        "EOT must return to its original slot among the same-key events"
+    );
+}
+
 // ---- chase_events ----
 
 fn chase_doc(events: Vec<smf_core::Event>) -> Document {

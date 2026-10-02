@@ -129,8 +129,9 @@ impl Document {
         let mut format = self.format;
         let mut tracks = self.tracks.clone();
         let mut touched = std::collections::BTreeSet::new();
+        let mut resolved: Vec<Vec<usize>> = Vec::with_capacity(tx.ops.len());
         for op in &tx.ops {
-            apply_op(&mut format, &mut tracks, op, &mut touched)?;
+            resolved.push(apply_op(&mut format, &mut tracks, op, &mut touched)?);
         }
         if tracks.is_empty() {
             return Err(ApplyError::EmptyDocument);
@@ -149,8 +150,9 @@ impl Document {
             synth.extend(eot_normalize_ops(ti, &tracks[ti], &mut self.next_event_id));
         }
         let mut extra = std::collections::BTreeSet::new();
+        let mut synth_res: Vec<Vec<usize>> = Vec::with_capacity(synth.len());
         for op in &synth {
-            apply_op(&mut format, &mut tracks, op, &mut extra)?;
+            synth_res.push(apply_op(&mut format, &mut tracks, op, &mut extra)?);
         }
         self.format = format;
         self.tracks = tracks;
@@ -158,7 +160,27 @@ impl Document {
         self.rebuild_index();
         self.rebuild_maps();
         let mut ops = tx.ops;
+        resolved.extend(synth_res);
         ops.extend(synth);
+        // write apply-time positions into the effective transaction so
+        // undo restores exact original slots: UpdateEvent `pos` holds
+        // `before`'s index, RemoveEvents entries hold each removed event's
+        // index at removal time
+        for (op, r) in ops.iter_mut().zip(resolved) {
+            match op {
+                Op::UpdateEvent { pos, .. } => {
+                    if let Some(&p) = r.first() {
+                        *pos = p;
+                    }
+                }
+                Op::RemoveEvents { removed, .. } => {
+                    for ((i, _), p) in removed.iter_mut().zip(r) {
+                        *i = p;
+                    }
+                }
+                _ => {}
+            }
+        }
         Ok(Applied {
             revision: self.revision,
             tx: Transaction {
@@ -187,20 +209,40 @@ impl Document {
                 }
                 Op::RemoveEvents { track, removed } => {
                     if let Some(t) = self.tracks.get_mut(*track) {
-                        for (_, e) in removed {
-                            let pos = t
-                                .events
-                                .binary_search_by_key(&(e.tick, e.seq), |x| (x.tick, x.seq))
-                                .unwrap_or_else(|p| p);
-                            t.events.insert(pos, e.clone());
+                        // restore each event at its resolved index — a
+                        // key-based insert would land at an arbitrary slot
+                        // among same-(tick,seq) events. usize::MAX marks
+                        // an event apply() never removed — don't insert it
+                        let mut reinsert: Vec<(usize, &Event)> = removed
+                            .iter()
+                            .filter(|(i, _)| *i != usize::MAX)
+                            .map(|(i, e)| (*i, e))
+                            .collect();
+                        reinsert.sort_by_key(|(i, _)| *i);
+                        for (i, e) in reinsert {
+                            t.events.insert(i.min(t.events.len()), e.clone());
                         }
                     }
                 }
-                Op::UpdateEvent { track, before, .. } => {
+                Op::UpdateEvent {
+                    track, pos, before, ..
+                } => {
                     if let Some(t) = self.tracks.get_mut(*track) {
-                        if let Some(pos) = t.events.iter().position(|x| x.id == before.id) {
-                            t.events[pos] = before.clone();
-                            t.events.sort_by_key(|e| (e.tick, e.seq));
+                        if let Some(i) = t.events.iter().position(|x| x.id == before.id) {
+                            t.events.remove(i);
+                            // `pos` is where `before` sat before the op —
+                            // inserting there restores the exact original
+                            // order among same-key events
+                            let at = if *pos == usize::MAX {
+                                t.events
+                                    .binary_search_by_key(&(before.tick, before.seq), |x| {
+                                        (x.tick, x.seq)
+                                    })
+                                    .unwrap_or_else(|p| p)
+                            } else {
+                                (*pos).min(t.events.len())
+                            };
+                            t.events.insert(at, before.clone());
                         }
                     }
                 }
@@ -438,6 +480,7 @@ impl Document {
                             after.seq = u32::MAX;
                             after.raw_body = None;
                             ops.push(Op::UpdateEvent {
+                                pos: usize::MAX,
                                 track: ti,
                                 before,
                                 after,
@@ -963,7 +1006,12 @@ fn apply_op(
     tracks: &mut Vec<Track>,
     op: &Op,
     touched: &mut std::collections::BTreeSet<usize>,
-) -> Result<(), ApplyError> {
+) -> Result<Vec<usize>, ApplyError> {
+    // resolved apply-time positions written into the effective transaction
+    // for position-exact undo: UpdateEvent -> [before's index],
+    // RemoveEvents -> each removed event's index at removal time
+    // (usize::MAX = the event wasn't found)
+    let mut resolved = Vec::new();
     match op {
         Op::InsertEvents { track, events } => {
             let t = tracks
@@ -981,6 +1029,18 @@ fn apply_op(
             let t = tracks
                 .get_mut(*track)
                 .ok_or(ApplyError::UnknownTrack(*track))?;
+            // resolve every target's position BEFORE removing any — the
+            // recorded index is the slot the event occupied when this op
+            // applied, which is exactly where undo must put it back
+            resolved = removed
+                .iter()
+                .map(|(_, e)| {
+                    t.events
+                        .iter()
+                        .position(|x| x.id == e.id)
+                        .unwrap_or(usize::MAX)
+                })
+                .collect();
             for (_, e) in removed {
                 if let Some(pos) = t.events.iter().position(|x| x.id == e.id) {
                     t.events.remove(pos);
@@ -1000,6 +1060,7 @@ fn apply_op(
                 }
                 t.events[pos] = after;
                 t.events.sort_by_key(|e| (e.tick, e.seq));
+                resolved = vec![pos];
             }
         }
         Op::InsertTrack { index, track } => {
@@ -1036,7 +1097,7 @@ fn apply_op(
             touched.insert(ti);
         }
     }
-    Ok(())
+    Ok(resolved)
 }
 
 /// Ops that restore a touched track's structural terminator: exactly one
@@ -1109,6 +1170,7 @@ fn eot_normalize_ops(ti: usize, t: &Track, next_id: &mut EventId) -> Vec<Op> {
                     ..before.clone()
                 };
                 ops.push(Op::UpdateEvent {
+                    pos: usize::MAX,
                     track: ti,
                     before,
                     after,

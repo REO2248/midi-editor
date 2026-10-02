@@ -570,6 +570,7 @@ fn build_ops(doc: &mut Document, ops: &[serde_json::Value]) -> Result<Vec<Op>, P
                     }
                     after.raw_body = None;
                     Ok(Op::UpdateEvent {
+                        pos: usize::MAX,
                         track: et,
                         before,
                         after,
@@ -608,6 +609,7 @@ fn build_ops(doc: &mut Document, ops: &[serde_json::Value]) -> Result<Vec<Op>, P
                         };
                         after.raw_body = None;
                         out.push(Op::UpdateEvent {
+                            pos: usize::MAX,
                             track: 0,
                             before: e.clone(),
                             after,

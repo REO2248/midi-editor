@@ -610,6 +610,7 @@ fn corrupt_channel_data_is_filtered() {
         label: "corrupt".into(),
         base: doc.revision(),
         ops: vec![Op::UpdateEvent {
+            pos: usize::MAX,
             track: 0,
             before,
             after,

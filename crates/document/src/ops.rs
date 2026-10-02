@@ -69,6 +69,7 @@ impl Document {
                     let mut after = self.tracks[ti].events[ei].clone();
                     after.tick = after.tick.saturating_add_signed(delta);
                     ops.push(Op::UpdateEvent {
+                        pos: usize::MAX,
                         track: ti,
                         before: self.tracks[ti].events[ei].clone(),
                         after,
@@ -103,6 +104,7 @@ impl Document {
                         data[0] = new_key;
                     }
                     ops.push(Op::UpdateEvent {
+                        pos: usize::MAX,
                         track: ti,
                         before,
                         after,
@@ -132,6 +134,7 @@ impl Document {
                     data[1] = nv;
                 }
                 ops.push(Op::UpdateEvent {
+                    pos: usize::MAX,
                     track: ti,
                     before,
                     after,
@@ -200,6 +203,7 @@ impl Document {
                         }
                     }
                     ops.push(Op::UpdateEvent {
+                        pos: usize::MAX,
                         track: ti,
                         before,
                         after,
@@ -238,6 +242,7 @@ impl Document {
                 let mut after = before.clone();
                 after.tick = new_end;
                 ops.push(Op::UpdateEvent {
+                    pos: usize::MAX,
                     track: ti,
                     before,
                     after,
@@ -286,6 +291,7 @@ impl Document {
                     let mut after = before.clone();
                     after.tick = after.tick.saturating_add_signed(delta);
                     ops.push(Op::UpdateEvent {
+                        pos: usize::MAX,
                         track: ti,
                         before,
                         after,
@@ -326,6 +332,7 @@ impl Document {
             let mut off_after = off_before.clone();
             off_after.tick = at;
             ops.push(Op::UpdateEvent {
+                pos: usize::MAX,
                 track: oti,
                 before: off_before.clone(),
                 after: off_after,
@@ -401,6 +408,7 @@ impl Document {
                             let mut after = before.clone();
                             after.tick = end;
                             ops.push(Op::UpdateEvent {
+                                pos: usize::MAX,
                                 track: ti,
                                 before,
                                 after,
@@ -468,6 +476,7 @@ impl Document {
                 }
             }
             ops.push(Op::UpdateEvent {
+                pos: usize::MAX,
                 track: ti,
                 before,
                 after,
@@ -493,6 +502,7 @@ impl Document {
                 let mut after = before.clone();
                 after.tick = new_end;
                 ops.push(Op::UpdateEvent {
+                    pos: usize::MAX,
                     track: ti,
                     before,
                     after,
@@ -520,6 +530,7 @@ impl Document {
                     data[1] = vel.clamp(1, 127);
                 }
                 ops.push(Op::UpdateEvent {
+                    pos: usize::MAX,
                     track: ti,
                     before,
                     after,
@@ -564,6 +575,7 @@ impl Document {
                     data[1] = vel;
                 }
                 ops.push(Op::UpdateEvent {
+                    pos: usize::MAX,
                     track: ti,
                     before,
                     after,
@@ -593,6 +605,7 @@ impl Document {
                     *status = (*status & 0xF0) | (channel & 0x0F);
                 }
                 ops.push(Op::UpdateEvent {
+                    pos: usize::MAX,
                     track,
                     before: e.clone(),
                     after,
@@ -947,6 +960,7 @@ impl Document {
                         data[1] = data_msb & 0x7F;
                     }
                     ops.push(Op::UpdateEvent {
+                        pos: usize::MAX,
                         track: ti,
                         before: self.tracks[ti].events[ei].clone(),
                         after,
@@ -963,6 +977,7 @@ impl Document {
                         data[1] = l & 0x7F;
                     }
                     ops.push(Op::UpdateEvent {
+                        pos: usize::MAX,
                         track: ti,
                         before: self.tracks[ti].events[ei].clone(),
                         after,
@@ -1027,6 +1042,7 @@ impl Document {
                 data[1] = val & 0x7F;
             }
             ops.push(Op::UpdateEvent {
+                pos: usize::MAX,
                 track: ti,
                 before: e.clone(),
                 after,
@@ -1104,6 +1120,7 @@ impl Document {
                 data,
             };
             return vec![Op::UpdateEvent {
+                pos: usize::MAX,
                 track,
                 before: e,
                 after,
@@ -1216,6 +1233,7 @@ impl Document {
                 data,
             };
             return vec![Op::UpdateEvent {
+                pos: usize::MAX,
                 track,
                 before: e,
                 after,
@@ -1256,6 +1274,7 @@ impl Document {
                 data: Bytes::copy_from_slice(&[channel & 0x0F]),
             };
             return vec![Op::UpdateEvent {
+                pos: usize::MAX,
                 track,
                 before: e,
                 after,
@@ -1475,6 +1494,7 @@ impl Document {
                 data: Bytes::copy_from_slice(name.as_bytes()),
             };
             return vec![Op::UpdateEvent {
+                pos: usize::MAX,
                 track,
                 before: e,
                 after,
@@ -1527,6 +1547,7 @@ impl Document {
             let mut after = e.clone();
             after.kind = EventKind::Meta { meta_type, data };
             return vec![Op::UpdateEvent {
+                pos: usize::MAX,
                 track,
                 before: e,
                 after,
@@ -1588,6 +1609,7 @@ impl Document {
                 data,
             };
             return vec![Op::UpdateEvent {
+                pos: usize::MAX,
                 track: 0,
                 before: e,
                 after,

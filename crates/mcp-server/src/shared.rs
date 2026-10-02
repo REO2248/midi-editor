@@ -485,6 +485,7 @@ pub fn change_summary(ops: &[Op]) -> ChangeSummary {
                 track,
                 before,
                 after,
+                ..
             } => {
                 tracks.insert(*track);
                 s.updated += 1;
