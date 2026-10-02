@@ -2250,9 +2250,9 @@ fn spawn_mcp(
 #[cfg(test)]
 mod tests {
     use crate::{
-        assemble_events, clip_from_item, clip_to_item, countin_clicks_of, empty_doc,
-        file_arg_from, is_midi_path, park_schedule, plugin_plan, route_events, track_audible,
-        Clip, ClipEvent, GlobalPrefs, PluginPlan, PluginState, Prefs,
+        assemble_events, clip_from_item, clip_to_item, countin_clicks_of, empty_doc, file_arg_from,
+        is_midi_path, park_schedule, plugin_plan, route_events, track_audible, Clip, ClipEvent,
+        GlobalPrefs, PluginPlan, PluginState, Prefs,
     };
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
@@ -3305,14 +3305,8 @@ mod tests {
     #[test]
     pub(crate) fn rec_gate_bounds_f0_and_f7_sysex_alike() {
         use crate::recording::{rec_gate, RecGate, MAX_REC_SYSEX};
-        assert_eq!(
-            rec_gate(0xF0, MAX_REC_SYSEX + 1, None),
-            RecGate::Oversized
-        );
-        assert_eq!(
-            rec_gate(0xF7, MAX_REC_SYSEX + 1, None),
-            RecGate::Oversized
-        );
+        assert_eq!(rec_gate(0xF0, MAX_REC_SYSEX + 1, None), RecGate::Oversized);
+        assert_eq!(rec_gate(0xF7, MAX_REC_SYSEX + 1, None), RecGate::Oversized);
         assert_eq!(rec_gate(0xF0, 64, None), RecGate::SysEx);
         assert_eq!(rec_gate(0xF7, 64, None), RecGate::SysEx);
         // channel filter touches voice only — SysEx is channel-less

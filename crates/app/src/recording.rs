@@ -49,9 +49,8 @@ impl EditorView {
         // SysEx policies ride atomics so toggling them while armed takes
         // effect live — the input callback never re-opens (#160)
         let sx_gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(self.rec_sysex));
-        let mon_sx_gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-            self.rec_mon_sysex,
-        ));
+        let mon_sx_gate =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(self.rec_mon_sysex));
         let (buf2, rec_flag, mon2, rt2, sx2, sx_gate2, mon_sx2) = (
             buf.clone(),
             recording.clone(),

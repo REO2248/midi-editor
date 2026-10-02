@@ -3061,10 +3061,8 @@ impl Render for EditorView {
                             |v, _e, _cx| {
                                 v.rec_sysex = !v.rec_sysex;
                                 if let Some(r) = v.rec.as_ref() {
-                                    r.sx_gate.store(
-                                        v.rec_sysex,
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    );
+                                    r.sx_gate
+                                        .store(v.rec_sysex, std::sync::atomic::Ordering::Relaxed);
                                 }
                                 v.save_global();
                             },
