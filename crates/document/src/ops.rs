@@ -1361,6 +1361,21 @@ impl Document {
             Some(t) => t,
             None => return vec![],
         };
+        // Notes whose release lands inside the range but whose onset lies
+        // before it straddle the cut: deleting the Note-Off alone leaves an
+        // unterminated Note-On ringing forever. Truncate those releases to
+        // `from` so the sounded portion before the cut survives (#210).
+        let straddling_offs: std::collections::BTreeSet<EventId> = self
+            .notes()
+            .into_iter()
+            .filter(|n| {
+                n.track == track
+                    && n.start_tick < from
+                    && n.end_tick.is_some_and(|e| e >= from && e < to)
+                    && channels.contains(&n.channel)
+            })
+            .filter_map(|n| n.off_id)
+            .collect();
         let mut ids: std::collections::BTreeSet<EventId> = t
             .events
             .iter()
@@ -1369,6 +1384,7 @@ impl Document {
                 EventKind::Channel { status, .. } => channels.contains(&(status & 0x0F)),
                 _ => false,
             })
+            .filter(|e| !straddling_offs.contains(&e.id))
             .map(|e| e.id)
             .collect();
         for n in self.notes().into_iter().filter(|n| {
@@ -1382,7 +1398,8 @@ impl Document {
                 ids.insert(o);
             }
         }
-        ids.into_iter()
+        let mut ops: Vec<Op> = ids
+            .into_iter()
             .filter_map(|id| {
                 self.by_id
                     .get(&id)
@@ -1392,7 +1409,22 @@ impl Document {
                         removed: vec![(ei, self.tracks[ti].events[ei].clone())],
                     })
             })
-            .collect()
+            .collect();
+        for id in straddling_offs {
+            if let Some((ti, ei)) = self.by_id.get(&id).copied() {
+                let mut after = self.tracks[ti].events[ei].clone();
+                if after.tick != from {
+                    after.tick = from;
+                    ops.push(Op::UpdateEvent {
+                        pos: usize::MAX,
+                        track: ti,
+                        before: self.tracks[ti].events[ei].clone(),
+                        after,
+                    });
+                }
+            }
+        }
+        ops
     }
 
     /// Append a fresh track (EOT at tick 0) and optionally a name meta.
