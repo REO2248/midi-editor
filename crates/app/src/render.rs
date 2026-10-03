@@ -1276,7 +1276,18 @@ impl Render for EditorView {
                                         })
                                         .cursor_pointer()
                                         .hover(|s| s.bg(rgba(theme::current().hover_wash)))
-                                        .child(events[i].text.clone())
+                                        // clip at the panel edge — a long row
+                                        // (RPN annotations, dense CC text)
+                                        // used to paint over its neighbors
+                                        // instead of truncating (#170); the
+                                        // fixed row height keeps one line
+                                        .overflow_hidden()
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .overflow_hidden()
+                                                .child(events[i].text.clone()),
+                                        )
                                         .on_mouse_down(MouseButton::Left, move |ev, w, cx| {
                                             view.update(cx, |this, cx| {
                                                 this.ev_row_click(
@@ -1578,7 +1589,7 @@ impl Render for EditorView {
                     .child(div().flex_1().min_w(px(0.0)).child(Input::new(&self.input)))
                     .child(Self::chip(
                         "rename",
-                        "rename",
+                        t("ui.rename_chip"),
                         t("a11y.rename"),
                         cx,
                         |v, _e, cx| {
@@ -3465,7 +3476,7 @@ impl Render for EditorView {
                         rows
                     }
                     Sub::Oct => {
-                        let opts = [("+1 octave", 12i32), ("-1 octave", -12)];
+                        let opts = [(t("edit.oct_up"), 12i32), (t("edit.oct_dn"), -12)];
                         opts.into_iter()
                             .enumerate()
                             .map(|(i, (label, st))| {
@@ -3634,7 +3645,7 @@ impl Render for EditorView {
                                 ("1/8".into(), ppq / 2),
                                 ("1/4".into(), ppq),
                                 (
-                                    "1 bar".into(),
+                                    t("edit.len_1bar").into(),
                                     self.doc(|d| {
                                         d.meter_map_for(self.sel_track)
                                             .bar_ticks_at(self.cursor_tick)
@@ -3645,11 +3656,11 @@ impl Render for EditorView {
                                 let f = td.cell_ticks();
                                 let s = td.bar_ticks();
                                 vec![
-                                    ("1 frame".into(), f),
-                                    ("5 frames".into(), f * 5),
-                                    ("10 frames".into(), f * 10),
-                                    ("1 s".into(), s),
-                                    ("5 s".into(), s * 5),
+                                    (t("edit.len_1frame").into(), f),
+                                    (t("edit.len_5frames").into(), f * 5),
+                                    (t("edit.len_10frames").into(), f * 10),
+                                    (t("edit.len_1s").into(), s),
+                                    (t("edit.len_5s").into(), s * 5),
                                 ]
                             }
                         };
@@ -3708,10 +3719,10 @@ impl Render for EditorView {
                     }
                     Sub::VelSet => {
                         let opts = [
-                            ("pianissimo (32)", 32u8),
-                            ("mezzo (72)", 72),
-                            ("forte (100)", 100),
-                            ("max (127)", 127),
+                            (t("edit.vel_pp"), 32u8),
+                            (t("edit.vel_mp"), 72),
+                            (t("edit.vel_f"), 100),
+                            (t("edit.vel_max"), 127),
                         ];
                         opts.into_iter()
                             .enumerate()
@@ -3735,10 +3746,10 @@ impl Render for EditorView {
                     // value upgrades a 0x90-vel0 off to a real 0x80
                     Sub::RelSet => {
                         let opts = [
-                            ("zero (0)", 0u8),
-                            ("soft (32)", 32),
-                            ("medium (64)", 64),
-                            ("hard (100)", 100),
+                            (t("edit.rel_zero"), 0u8),
+                            (t("edit.rel_soft"), 32),
+                            (t("edit.rel_med"), 64),
+                            (t("edit.rel_hard"), 100),
                         ];
                         opts.into_iter()
                             .enumerate()
@@ -3783,11 +3794,11 @@ impl Render for EditorView {
                                 Box::new(|d, tr, f, to| d.transpose_ops(tr, f, to, -1)),
                             ),
                             (
-                                "+1 octave".to_string(),
+                                t("edit.oct_up").to_string(),
                                 Box::new(|d, tr, f, to| d.transpose_ops(tr, f, to, 12)),
                             ),
                             (
-                                "-1 octave".to_string(),
+                                t("edit.oct_dn").to_string(),
                                 Box::new(|d, tr, f, to| d.transpose_ops(tr, f, to, -12)),
                             ),
                             (
