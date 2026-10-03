@@ -33,6 +33,7 @@ raw-window-handle = "0.6"
 # offer "MIDI files" + "All files" like a real Windows document app
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_System_Com",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
