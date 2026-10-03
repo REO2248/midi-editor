@@ -241,11 +241,12 @@ fn transaction_commit_is_one_undo_step() {
     let (err, v) = call(&sh, "begin_transaction", json!({"label": "fix chorus"}));
     assert!(!err);
     assert_eq!(v["base_revision"], rev0);
-    // stage two separate edits
+    let tx = v["tx_id"].as_u64().unwrap();
+    // stage two separate edits — each carries the batch's tx_id (#185)
     let (err, v) = call(
         &sh,
         "apply_patch",
-        json!({"ops": [{"op": "insert_note", "track": 1, "key": 62, "start": 0, "dur": 240}]}),
+        json!({"ops": [{"op": "insert_note", "track": 1, "key": 62, "start": 0, "dur": 240}], "tx_id": tx}),
     );
     assert!(!err);
     assert_eq!(v["staged"], true);
@@ -257,7 +258,11 @@ fn transaction_commit_is_one_undo_step() {
         1,
         "real document unchanged while staged"
     );
-    let (err, _) = call(&sh, "set_track_name", json!({"track": 1, "name": "Chorus"}));
+    let (err, _) = call(
+        &sh,
+        "set_track_name",
+        json!({"track": 1, "name": "Chorus", "tx_id": tx}),
+    );
     assert!(!err);
     // commit merges both calls into ONE undo step
     let (err, v) = call(&sh, "commit_transaction", json!({}));
@@ -279,13 +284,18 @@ fn rollback_leaves_document_unchanged() {
     let before = sh.lock().unwrap().doc.serialize(smf_core::WriteOptions {
         running_status: false,
     });
-    call(&sh, "begin_transaction", json!({"label": "experiment"}));
+    let (_, v) = call(&sh, "begin_transaction", json!({"label": "experiment"}));
+    let tx = v["tx_id"].as_u64().unwrap();
     call(
         &sh,
         "apply_patch",
-        json!({"ops": [{"op": "insert_note", "track": 1, "key": 65, "start": 0, "dur": 120}]}),
+        json!({"ops": [{"op": "insert_note", "track": 1, "key": 65, "start": 0, "dur": 120}], "tx_id": tx}),
     );
-    call(&sh, "set_tempo", json!({"tick": 0, "bpm": 90.0}));
+    call(
+        &sh,
+        "set_tempo",
+        json!({"tick": 0, "bpm": 90.0, "tx_id": tx}),
+    );
     let (err, v) = call(&sh, "rollback_transaction", json!({}));
     assert!(!err);
     assert_eq!(v["discarded_ops"], 2);
@@ -300,11 +310,12 @@ fn rollback_leaves_document_unchanged() {
 #[test]
 fn commit_reports_stale_conflict_on_concurrent_edit() {
     let sh = shared();
-    call(&sh, "begin_transaction", json!({"label": "agent work"}));
+    let (_, v) = call(&sh, "begin_transaction", json!({"label": "agent work"}));
+    let tx = v["tx_id"].as_u64().unwrap();
     call(
         &sh,
         "apply_patch",
-        json!({"ops": [{"op": "insert_note", "track": 1, "key": 60, "start": 960, "dur": 120}]}),
+        json!({"ops": [{"op": "insert_note", "track": 1, "key": 60, "start": 960, "dur": 120}], "tx_id": tx}),
     );
     // a GUI edit lands on the real document mid-batch
     let ops = sh.lock().unwrap().doc.add_track_ops(Some("gui track"));
@@ -322,11 +333,12 @@ fn commit_reports_stale_conflict_on_concurrent_edit() {
 #[test]
 fn dry_run_commit_validates_and_keeps_batch() {
     let sh = shared();
-    call(&sh, "begin_transaction", json!({}));
+    let (_, v) = call(&sh, "begin_transaction", json!({}));
+    let tx = v["tx_id"].as_u64().unwrap();
     call(
         &sh,
         "apply_patch",
-        json!({"ops": [{"op": "insert_note", "track": 1, "key": 60, "start": 0, "dur": 120}]}),
+        json!({"ops": [{"op": "insert_note", "track": 1, "key": 60, "start": 0, "dur": 120}], "tx_id": tx}),
     );
     let (err, v) = call(&sh, "commit_transaction", json!({"dry_run": true}));
     assert!(!err);
@@ -1479,4 +1491,152 @@ fn meta_tools_create_update_remove() {
     assert!(!e);
     let (_, m) = call(&sh, "get_meta", json!({"track": 0, "meta_type": 6}));
     assert_eq!(m["count"], 0);
+}
+
+#[test]
+fn token_fallback_path_is_per_user() {
+    use crate::http::token_file_path_with;
+    let la = token_file_path_with(
+        Some(r"C:\Users\re\AppData\Local".into()),
+        None,
+        Some("re".into()),
+    );
+    assert_eq!(
+        la,
+        std::path::PathBuf::from(r"C:\Users\re\AppData\Local")
+            .join("midi-editor")
+            .join("mcp-token")
+    );
+    let fb = token_file_path_with(None, None, Some("re".into()));
+    assert!(fb.to_string_lossy().contains("midi-editor-mcp-token-re"));
+    // hostile username chars can't traverse
+    let evil = token_file_path_with(None, None, Some("../admin".into()));
+    assert!(evil.to_string_lossy().contains("admin"));
+    assert!(!evil.to_string_lossy().contains(".."));
+}
+
+#[test]
+fn token_file_is_exclusive_and_owner_only() {
+    use crate::http::{ensure_token_file, read_token_file};
+    let dir = std::env::temp_dir().join(format!("midi-token-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("mcp-token");
+    ensure_token_file(&path).unwrap();
+    assert!(read_token_file(&path).is_some(), "token written");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "owner-only from creation");
+    }
+    // a pre-planted file at the path is NOT followed or overwritten by
+    // provisioning — but a corrupt one is regenerated
+    std::fs::write(
+        &path,
+        b"corrupt !!
+",
+    )
+    .unwrap(); // space+newline: invalid token text
+    ensure_token_file(&path).unwrap();
+    let t = read_token_file(&path).expect("corrupt token regenerated");
+    assert_ne!(
+        t,
+        "corrupt !!
+"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #186 — edit tools must compute ops against the staged copy inside an
+/// open transaction: notes inserted earlier in the same uncommitted batch
+/// are visible to every later edit tool.
+#[test]
+fn edit_tools_see_staged_events_inside_transaction() {
+    let sh = shared();
+    let (err, v) = call(
+        &sh,
+        "begin_transaction",
+        json!({"label": "staged edit chain"}),
+    );
+    assert!(!err);
+    let tx = v["tx_id"].as_u64().unwrap();
+    let (err, _) = call(
+        &sh,
+        "apply_patch",
+        json!({"ops": [
+            {"op": "insert_note", "track": 1, "key": 62, "start": 0, "dur": 960},
+            {"op": "insert_note", "track": 1, "key": 64, "start": 480, "dur": 480},
+        ], "tx_id": tx}),
+    );
+    assert!(!err);
+    // set_length + legato against the still-uncommitted notes
+    let (err, _) = call(
+        &sh,
+        "set_length",
+        json!({"track": 1, "from": 480, "to": 960, "ticks": 240, "tx_id": tx}),
+    );
+    assert!(!err, "set_length must see staged notes");
+    let (err, _) = call(
+        &sh,
+        "legato",
+        json!({"track": 1, "from": 0, "to": 960, "gap": 0, "tx_id": tx}),
+    );
+    assert!(!err, "legato must see staged notes");
+    // the staged view exposes the edited note before commit
+    let (err, v) = call(&sh, "list_notes", json!({"track": 1}));
+    assert!(!err);
+    let notes = v["notes"].as_array().cloned().unwrap_or_default();
+    // fixture key-60 + the two staged keys
+    assert_eq!(notes.len(), 3, "read tools see the staged copy");
+    let span = |key: u64| {
+        notes
+            .iter()
+            .find(|n| n["key"].as_u64() == Some(key))
+            .map(|n| n["end"].as_u64().unwrap_or(0) - n["start"].as_u64().unwrap_or(0))
+    };
+    assert_eq!(span(64), Some(240), "set_length edited the staged note");
+    assert!(
+        span(62).is_some_and(|s| s > 240),
+        "legato modified the staged note (span {})",
+        span(62).unwrap_or(0)
+    );
+    // commit folds everything into one revision bump
+    let rev0 = sh.lock().unwrap().doc.revision();
+    let (err, _) = call(&sh, "commit_transaction", json!({}));
+    assert!(!err);
+    let rev1 = sh.lock().unwrap().doc.revision();
+    assert_eq!(rev1, rev0 + 1, "one transaction = one revision step");
+}
+
+/// #185 — a stale session's open batch must not absorb another client's
+/// standalone edits, and lifecycle calls carrying a foreign tx_id are
+/// refused instead of committing someone else's staging area.
+#[test]
+fn stale_batch_cannot_hijack_standalone_edits() {
+    let sh = shared();
+    // session A opens a transaction and dies without committing
+    let (_, v) = call(&sh, "begin_transaction", json!({"label": "A"}));
+    let a_tx = v["tx_id"].as_u64().unwrap();
+    // session B's standalone edit (no tx_id) commits directly — it is
+    // NOT diverted into A's batch
+    let (err, v) = call(&sh, "set_tempo", json!({"tick": 0, "bpm": 100.0}));
+    assert!(!err);
+    assert!(
+        v["staged"].is_null(),
+        "standalone edit committed directly, was not staged"
+    );
+    assert_eq!(v["revision"], 1, "committed on the real document");
+    // a lifecycle call with a foreign tx_id is refused
+    let (err, v) = call(&sh, "commit_transaction", json!({"tx_id": a_tx + 999}));
+    assert!(err, "foreign tx_id must not commit someone else's batch");
+    assert_eq!(v["error"], "wrong_transaction");
+    // the batch survived; committing it now reports the real conflict
+    let (err, v) = call(&sh, "commit_transaction", json!({"tx_id": a_tx}));
+    assert!(err);
+    assert_eq!(v["error"], "stale_base");
+    // matching tx on rollback works and closes the batch
+    let (err, v) = call(&sh, "rollback_transaction", json!({"tx_id": a_tx}));
+    assert!(!err);
+    assert_eq!(v["rolled_back"], true);
 }

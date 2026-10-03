@@ -1,5 +1,5 @@
 {
-  "mcp_surface_version": 1,
+  "mcp_surface_version": 2,
   "tools": [
     {
       "deprecated": null,
@@ -11,12 +11,16 @@
           },
           "name": {
             "type": "string"
+          },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
           }
         },
         "type": "object"
       },
       "name": "add_track",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -37,16 +41,20 @@
               "type": "object"
             },
             "type": "array"
+          },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
           }
         },
         "type": "object"
       },
       "name": "apply_patch",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
-      "description": "Open a named checkpoint: every later edit tool stages on a private document copy (reads see staged state) until commit_transaction folds them into ONE undo step or rollback_transaction discards them. One open batch at a time; ~5min idle auto-rollback keeps abandoned sessions from pinning the document. Args: label?.",
+      "description": "Open a named checkpoint: pass the returned tx_id back on every edit you want staged on the private copy (reads see staged state either way) until commit_transaction folds them into ONE undo step or rollback_transaction discards them. Edits without the matching tx_id commit directly. One open batch at a time; ~5min idle auto-rollback. Args: label?.",
       "input_schema": {
         "properties": {
           "label": {
@@ -56,7 +64,7 @@
         "type": "object"
       },
       "name": "begin_transaction",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -79,12 +87,16 @@
         "properties": {
           "dry_run": {
             "type": "boolean"
+          },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
           }
         },
         "type": "object"
       },
       "name": "commit_transaction",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -102,12 +114,16 @@
           },
           "track": {
             "type": "integer"
+          },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
           }
         },
         "type": "object"
       },
       "name": "delete_range",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -145,12 +161,16 @@
           },
           "track": {
             "type": "integer"
+          },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
           }
         },
         "type": "object"
       },
       "name": "duplicate_range",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -178,12 +198,16 @@
           },
           "track": {
             "type": "integer"
+          },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
           }
         },
         "type": "object"
       },
       "name": "fix_overlaps",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -341,6 +365,10 @@
           "track": {
             "type": "integer"
           },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
+          },
           "vel": {
             "type": "integer"
           }
@@ -348,7 +376,7 @@
         "type": "object"
       },
       "name": "humanize",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -366,12 +394,16 @@
           },
           "track": {
             "type": "integer"
+          },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
           }
         },
         "type": "object"
       },
       "name": "join_notes",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -392,12 +424,16 @@
           },
           "track": {
             "type": "integer"
+          },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
           }
         },
         "type": "object"
       },
       "name": "legato",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -461,12 +497,16 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
           }
         },
         "type": "object"
       },
       "name": "normalize",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -490,12 +530,16 @@
           },
           "track": {
             "type": "integer"
+          },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
           }
         },
         "type": "object"
       },
       "name": "quantize",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -555,12 +599,16 @@
               "type": "integer"
             },
             "type": "array"
+          },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
           }
         },
         "type": "object"
       },
       "name": "remove_events",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -575,12 +623,16 @@
           },
           "track": {
             "type": "integer"
+          },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
           }
         },
         "type": "object"
       },
       "name": "remove_meta",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -592,22 +644,31 @@
           },
           "track": {
             "type": "integer"
+          },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
           }
         },
         "type": "object"
       },
       "name": "remove_track",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
       "description": "Discard the open transaction. The committed document is left exactly as it was at begin_transaction (byte-for-byte) — staged ops never touched it.",
       "input_schema": {
-        "properties": {},
+        "properties": {
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
+          }
+        },
         "type": "object"
       },
       "name": "rollback_transaction",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -642,12 +703,16 @@
           },
           "track": {
             "type": "integer"
+          },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
           }
         },
         "type": "object"
       },
       "name": "scale_velocity",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -675,6 +740,10 @@
           "track": {
             "type": "integer"
           },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
+          },
           "value": {
             "type": "integer"
           }
@@ -682,7 +751,7 @@
         "type": "object"
       },
       "name": "set_cc",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -703,12 +772,16 @@
           },
           "track": {
             "type": "integer"
+          },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
           }
         },
         "type": "object"
       },
       "name": "set_channel",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -733,6 +806,10 @@
           "track": {
             "type": "integer"
           },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
+          },
           "value": {
             "type": "integer"
           }
@@ -740,7 +817,7 @@
         "type": "object"
       },
       "name": "set_channel_pressure",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -758,12 +835,16 @@
           },
           "tick": {
             "type": "integer"
+          },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
           }
         },
         "type": "object"
       },
       "name": "set_key_signature",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -784,12 +865,16 @@
           },
           "track": {
             "type": "integer"
+          },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
           }
         },
         "type": "object"
       },
       "name": "set_length",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -816,12 +901,16 @@
           },
           "track": {
             "type": "integer"
+          },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
           }
         },
         "type": "object"
       },
       "name": "set_meta",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -840,6 +929,10 @@
           "track": {
             "type": "integer"
           },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
+          },
           "value": {
             "type": "integer"
           }
@@ -847,7 +940,7 @@
         "type": "object"
       },
       "name": "set_pitch_bend",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -875,6 +968,10 @@
           "track": {
             "type": "integer"
           },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
+          },
           "value": {
             "type": "integer"
           }
@@ -882,7 +979,7 @@
         "type": "object"
       },
       "name": "set_poly_pressure",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -909,12 +1006,16 @@
           },
           "track": {
             "type": "integer"
+          },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
           }
         },
         "type": "object"
       },
       "name": "set_program",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -933,6 +1034,10 @@
           "track": {
             "type": "integer"
           },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
+          },
           "vel": {
             "type": "integer"
           }
@@ -940,7 +1045,7 @@
         "type": "object"
       },
       "name": "set_release_velocity",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -973,12 +1078,16 @@
           },
           "track": {
             "type": "integer"
+          },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
           }
         },
         "type": "object"
       },
       "name": "set_rpn",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -996,12 +1105,16 @@
           },
           "track": {
             "type": "integer"
+          },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
           }
         },
         "type": "object"
       },
       "name": "set_tempo",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -1022,12 +1135,16 @@
           },
           "track": {
             "type": "integer"
+          },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
           }
         },
         "type": "object"
       },
       "name": "set_time_signature",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -1042,12 +1159,16 @@
           },
           "track": {
             "type": "integer"
+          },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
           }
         },
         "type": "object"
       },
       "name": "set_track_channel",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -1077,12 +1198,16 @@
           },
           "track": {
             "type": "integer"
+          },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
           }
         },
         "type": "object"
       },
       "name": "set_track_name",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -1103,12 +1228,16 @@
           },
           "track": {
             "type": "integer"
+          },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
           }
         },
         "type": "object"
       },
       "name": "split",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -1135,12 +1264,16 @@
           },
           "track": {
             "type": "integer"
+          },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
           }
         },
         "type": "object"
       },
       "name": "swing",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -1160,11 +1293,16 @@
       "deprecated": null,
       "description": "Open-transaction state: label, base/staged revisions, staged op count, age and time until auto-rollback.",
       "input_schema": {
-        "properties": {},
+        "properties": {
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
+          }
+        },
         "type": "object"
       },
       "name": "transaction_status",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -1208,12 +1346,16 @@
           },
           "track": {
             "type": "integer"
+          },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
           }
         },
         "type": "object"
       },
       "name": "transpose",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -1241,12 +1383,16 @@
           },
           "param_msb": {
             "type": "integer"
+          },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
           }
         },
         "type": "object"
       },
       "name": "update_rpn_param",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -1264,12 +1410,16 @@
           },
           "id": {
             "type": "integer"
+          },
+          "tx_id": {
+            "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction",
+            "type": "integer"
           }
         },
         "type": "object"
       },
       "name": "update_rpn_value",
-      "version": 1
+      "version": 2
     }
   ]
 }

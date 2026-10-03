@@ -11,6 +11,11 @@
 use super::*;
 
 pub struct Shared {
+    /// minted `Batch::tx_id` values; monotonically increasing per process
+    next_tx_id: u64,
+    /// the tx_id the in-flight dispatch carried (None = standalone edit):
+    /// `apply_or_stage` stages only when it matches the open batch
+    pub call_tx_id: Option<u64>,
     pub doc: Document,
     pub undo: UndoStack,
     pub path: Option<PathBuf>,
@@ -80,6 +85,10 @@ pub struct Shared {
 pub struct Batch {
     /// transaction label — becomes the single undo step's label on commit
     pub label: String,
+    /// unique id minted at begin; edit tools opt into staging by passing
+    /// it back — a stale session can no longer silently capture another
+    /// client's standalone edits (#185)
+    pub tx_id: u64,
     /// `doc.revision()` at begin; commit refuses when it no longer matches
     pub base: u64,
     pub staging: Document,
@@ -170,6 +179,8 @@ impl Shared {
         // starts on — identical bookkeeping for GUI, MCP, and stdio opens
         let saved_revision = doc.revision();
         Self {
+            next_tx_id: 1,
+            call_tx_id: None,
             doc,
             undo: UndoStack::new(512),
             path: None,
@@ -303,7 +314,7 @@ impl Shared {
     // the Err arm is the wire-level JSON-RPC error payload — it is the
     // value being returned, not overhead, so boxing it buys nothing
     #[allow(clippy::result_large_err)]
-    pub fn begin_batch(&mut self, label: String) -> Result<u64, CallToolResponse> {
+    pub fn begin_batch(&mut self, label: String) -> Result<(u64, u64), CallToolResponse> {
         if let Some(b) = &self.batch {
             return Err(err_json(
                 serde_json::json!({
@@ -316,14 +327,17 @@ impl Shared {
             ));
         }
         let base = self.doc.revision();
+        let tx_id = self.next_tx_id;
+        self.next_tx_id = self.next_tx_id.saturating_add(1);
         self.batch = Some(Batch {
             label,
+            tx_id,
             base,
             staging: self.doc.clone(),
             ops: Vec::new(),
             last_activity: Instant::now(),
         });
-        Ok(base)
+        Ok((base, tx_id))
     }
 
     /// Route an edit: stage into the open batch, or commit as one undo step.
@@ -334,7 +348,14 @@ impl Shared {
         label: &str,
         ops: Vec<Op>,
     ) -> Result<StageOutcome, ApplyError> {
-        if let Some(b) = &mut self.batch {
+        // stage only when this dispatch carried the open batch's tx_id —
+        // standalone edits (no id) and other sessions' ids commit directly
+        // instead of being silently absorbed by a dead client's batch (#185)
+        let wants_stage = self
+            .batch
+            .as_ref()
+            .is_some_and(|b| Some(b.tx_id) == self.call_tx_id);
+        if let (true, Some(b)) = (wants_stage, &mut self.batch) {
             let summary = change_summary(&ops);
             let tx = Transaction {
                 label: label.into(),
