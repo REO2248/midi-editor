@@ -219,3 +219,23 @@ mod tests {
         assert_eq!((x, y), (0.0, (127.0 - 84.0) * NOTE_H));
     }
 }
+
+/// Left cull bound for the roll's note window: sustained notes can start
+/// before the viewport and extend into it, so the binary-search entry
+/// moves left by the widest note duration (#188).
+pub(crate) fn cull_entry(entry: i64, widest_note: u64) -> i64 {
+    ((entry.max(0) as u64).saturating_sub(widest_note)) as i64
+}
+
+#[cfg(test)]
+mod cull_tests {
+    use super::cull_entry;
+
+    #[test]
+    fn cull_entry_opens_left_by_widest_note() {
+        assert_eq!(cull_entry(10_000, 3_840), 6_160);
+        // a note wider than the viewport keeps the whole prefix scanned
+        assert_eq!(cull_entry(10_000, u64::MAX), 0);
+        assert_eq!(cull_entry(0, 960), 0);
+    }
+}
