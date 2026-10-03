@@ -311,6 +311,7 @@ impl EditorView {
         // (pass, channel, event) — pass is the loop lap the event landed
         // on; channel is Some for channel voice, None for SysEx/escape
         let mut captured: Vec<(u64, Option<u8>, document::Event)> = Vec::new();
+        let mut punch_gate = PunchGate::new(punch);
         for (us, b) in msgs {
             if b.is_empty() {
                 continue;
@@ -327,25 +328,54 @@ impl EditorView {
             // the take lands on the armed track — for format 2 that
             // sequence's own tempo map converts live-us back to ticks
             let tick = sh.doc.tempo_map_for(track).us_to_tick(doc_us);
-            if let Some((a, b)) = punch {
-                if tick < a || tick >= b {
-                    continue;
-                }
-            }
             let Some((ch, kind)) = wire_to_kind(&b) else {
                 continue;
             };
+            // punch-in/out is note-aware (#209): a plain scalar tick filter
+            // chopped held notes into orphan offs (struck before punch-in)
+            // or unterminated ons (released after punch-out). The on must
+            // be inside the window to capture; its release clamps to the
+            // window end; releases for filtered/unknown ons are dropped.
+            if let Some(action) = punch_gate.admit(tick, ch, &kind, pass) {
+                captured.push((action.pass, ch, mk_event(&mut sh, action.tick, kind)));
+            }
+        }
+        // notes still held when the take ended inside a punch window: close
+        // them at the window end so nothing drones (#209)
+        for ((ch, key), (pass, on_tick)) in punch_gate.flush() {
+            let off_tick = punch
+                .map(|(_, b_end)| b_end.saturating_sub(1).max(on_tick))
+                .unwrap_or(on_tick);
             captured.push((
                 pass,
-                ch,
-                document::Event {
-                    id: sh.doc.alloc_event_id(),
-                    tick,
-                    seq: u32::MAX / 2,
-                    raw_body: None,
-                    kind,
-                },
+                Some(ch),
+                mk_event(
+                    &mut sh,
+                    off_tick,
+                    EventKind::Channel {
+                        status: 0x80 | ch,
+                        data: [key, 0],
+                        len: 2,
+                    },
+                ),
             ));
+        }
+        // loop straddle (#208): a note held across the loop wrap wraps its
+        // release back BEFORE its onset in tick order — unpairable. Split
+        // the hold per pass: the tail closes at the loop end, a fresh on
+        // re-strikes at the loop start, and full intermediate laps become
+        // their own whole-bar notes.
+        if let Some((s_us, e_us)) = rec.loop_span_us {
+            if e_us > s_us {
+                let (s_tick, e_tick) = (
+                    sh.doc.tempo_map_for(track).us_to_tick(s_us),
+                    sh.doc.tempo_map_for(track).us_to_tick(e_us),
+                );
+                if e_tick > s_tick {
+                    let mut next_id = || sh.doc.alloc_event_id();
+                    captured = split_loop_straddles(captured, s_tick, e_tick, &mut next_id);
+                }
+            }
         }
         // dropped-input tallies ride the completion status (#160)
         let (rt, sx) = (
@@ -603,6 +633,178 @@ pub(crate) fn mon_echoes(g: RecGate, mon_sx: bool) -> bool {
 /// wire F7 becomes an SMF F7 escape — a SysEx delivered in split chunks
 /// lands verbatim as F0 + F7 continuation events (#160). Channel voice
 /// carries its channel so replace-in-loop can key on it.
+fn mk_event(sh: &mut crate::Shared, tick: u64, kind: EventKind) -> document::Event {
+    document::Event {
+        id: sh.doc.alloc_event_id(),
+        tick,
+        seq: u32::MAX / 2,
+        raw_body: None,
+        kind,
+    }
+}
+
+/// One admitted capture: the tick to write (possibly clamped) and the
+/// pass the event belongs to (an off rejoins its on's pass).
+pub(crate) struct PunchAdmit {
+    pub(crate) tick: u64,
+    pub(crate) pass: u64,
+}
+
+/// Note-aware punch-in/out gating (#209). A note-on captures only inside
+/// `[a, b)`; its release clamps to `b - 1` even when it arrives after
+/// punch-out; releases whose on was filtered (or never seen) are orphan
+/// note-offs and are dropped. Non-note traffic keeps the scalar window.
+pub(crate) struct PunchGate {
+    window: Option<(u64, u64)>,
+    /// (channel, key) -> Some((pass, on_tick)) once its on was captured;
+    /// None when the on was filtered by the window
+    held: HashMap<(u8, u8), Option<(u64, u64)>>,
+}
+
+impl PunchGate {
+    pub(crate) fn new(window: Option<(u64, u64)>) -> Self {
+        Self {
+            window,
+            held: HashMap::new(),
+        }
+    }
+
+    /// Decide one incoming message. `None` = drop.
+    pub(crate) fn admit(
+        &mut self,
+        tick: u64,
+        ch: Option<u8>,
+        kind: &EventKind,
+        pass: u64,
+    ) -> Option<PunchAdmit> {
+        let (a, b) = self.window?;
+        let EventKind::Channel { status, data, .. } = kind else {
+            // SysEx/escape traffic: scalar window
+            return (tick >= a && tick < b).then_some(PunchAdmit { tick, pass });
+        };
+        let msg = status & 0xF0;
+        // note-on vel 0 is a release in disguise — it belongs to the note
+        // pairing path, not the scalar window
+        let is_on = msg == 0x90 && data[1] > 0;
+        let is_off = msg == 0x80 || (msg == 0x90 && data[1] == 0);
+        if !is_on && !is_off {
+            // non-note channel traffic (CC/PC/AT/bend): scalar window
+            return (tick >= a && tick < b).then_some(PunchAdmit { tick, pass });
+        }
+        let ch_v = ch.unwrap_or(status & 0x0F);
+        let key = data[0];
+        match msg {
+            0x90 => {
+                // a note-on (vel > 0 guaranteed above)
+                if tick < a || tick >= b {
+                    self.held.insert((ch_v, key), None);
+                    return None;
+                }
+                self.held.insert((ch_v, key), Some((pass, tick)));
+                Some(PunchAdmit { tick, pass })
+            }
+            _ => match self.held.remove(&(ch_v, key)) {
+                // on was captured: clamp the release into the window even
+                // when it arrives after punch-out
+                Some(Some((on_pass, _))) => Some(PunchAdmit {
+                    tick: tick.min(b.saturating_sub(1)),
+                    pass: on_pass,
+                }),
+                // on was filtered (before punch-in) or never seen
+                // (mid-hold at record start): orphan off — drop
+                _ => None,
+            },
+        }
+    }
+
+    /// Note-ons captured but never released when the take ended: close
+    /// them at the window end so nothing drones.
+    pub(crate) fn flush(&mut self) -> Vec<((u8, u8), (u64, u64))> {
+        self.held
+            .drain()
+            .filter_map(|(k, v)| v.map(|held| (k, held)))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod punch_gate_tests {
+    use super::PunchGate;
+    use smf_core::EventKind;
+
+    fn on(key: u8) -> EventKind {
+        EventKind::Channel {
+            status: 0x90,
+            data: [key, 100],
+            len: 2,
+        }
+    }
+    fn off(key: u8) -> EventKind {
+        EventKind::Channel {
+            status: 0x80,
+            data: [key, 0],
+            len: 2,
+        }
+    }
+
+    /// #209: an on inside the window released after punch-out clamps to
+    /// b-1 instead of being dropped (no unterminated on).
+    #[test]
+    fn release_after_punchout_clamps() {
+        let mut g = PunchGate::new(Some((1920, 3840)));
+        assert_eq!(
+            g.admit(3800, Some(0), &on(60), 0).map(|a| a.tick),
+            Some(3800)
+        );
+        let rel = g.admit(3900, Some(0), &off(60), 0);
+        assert_eq!(rel.map(|a| a.tick), Some(3839), "clamped to b-1");
+        assert!(g.flush().is_empty(), "nothing left held");
+    }
+
+    /// #209: a note struck before punch-in never enters the take; its
+    /// release inside the window is an orphan off and is suppressed.
+    #[test]
+    fn pre_punch_release_is_suppressed() {
+        let mut g = PunchGate::new(Some((1920, 3840)));
+        assert!(g.admit(1000, Some(0), &on(60), 0).is_none());
+        assert!(
+            g.admit(2000, Some(0), &off(60), 0).is_none(),
+            "orphan off dropped"
+        );
+    }
+
+    /// #209: a release for a note never seen (held at record start) is
+    /// also an orphan and is suppressed.
+    #[test]
+    fn unknown_release_is_suppressed() {
+        let mut g = PunchGate::new(Some((1920, 3840)));
+        assert!(g.admit(2000, Some(0), &off(61), 0).is_none());
+    }
+
+    /// #209: a note still held when the take ends closes at the window
+    /// end (flush) so it cannot drone.
+    #[test]
+    fn held_at_take_end_flushes() {
+        let mut g = PunchGate::new(Some((1920, 3840)));
+        g.admit(2000, Some(0), &on(62), 3);
+        let flushed = g.flush();
+        assert_eq!(flushed, vec![((0, 62), (3, 2000))]);
+    }
+
+    /// non-note traffic keeps the scalar window
+    #[test]
+    fn cc_keeps_scalar_window() {
+        let mut g = PunchGate::new(Some((1920, 3840)));
+        let cc = EventKind::Channel {
+            status: 0xB0,
+            data: [7, 100],
+            len: 2,
+        };
+        assert!(g.admit(1000, Some(0), &cc, 0).is_none());
+        assert_eq!(g.admit(2000, Some(0), &cc, 0).map(|a| a.tick), Some(2000));
+    }
+}
+
 pub(crate) fn wire_to_kind(b: &[u8]) -> Option<(Option<u8>, EventKind)> {
     if b.is_empty() {
         return None;
@@ -721,5 +923,231 @@ mod tests {
         assert_eq!(loop_wrap(123, None), (123, 0));
         assert_eq!(loop_wrap(123, Some((5, 5))), (123, 0));
         assert_eq!(loop_wrap(123, Some((9, 5))), (123, 0));
+    }
+}
+
+/// Split notes held across loop-wrap boundaries (#208). `captured` is in
+/// wall-clock order; a release whose pass exceeds its onset's pass wrapped.
+/// The onset's tail gets a synthetic off at `e_tick - 1`, a fresh on at
+/// `s_tick` carries the hold into the new pass, and full intermediate laps
+/// become whole-span notes of their own.
+pub(crate) fn split_loop_straddles(
+    captured: Vec<(u64, Option<u8>, document::Event)>,
+    s_tick: u64,
+    e_tick: u64,
+    next_id: &mut dyn FnMut() -> document::EventId,
+) -> Vec<(u64, Option<u8>, document::Event)> {
+    let end_off = e_tick.saturating_sub(1).max(s_tick);
+    let mut out: Vec<(u64, Option<u8>, document::Event)> = Vec::new();
+    // (channel, key) -> (vel, on_pass)
+    let mut held: HashMap<(u8, u8), (u8, u64)> = HashMap::new();
+    for (pass, ch, ev) in captured {
+        let Some(ch_v) = ch else {
+            out.push((pass, ch, ev));
+            continue;
+        };
+        let pair = match &ev.kind {
+            EventKind::Channel { status, data, .. } => match status & 0xF0 {
+                0x90 if data[1] > 0 => Some(((data[0], true), data[1])),
+                0x90 | 0x80 => Some(((data[0], false), 0)),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(((key, is_on), vel)) = pair else {
+            out.push((pass, ch, ev));
+            continue;
+        };
+        if is_on {
+            held.insert((ch_v, key), (vel, pass));
+            out.push((pass, ch, ev));
+            continue;
+        }
+        match held.remove(&(ch_v, key)) {
+            Some((on_vel, on_pass)) if pass > on_pass && e_tick > s_tick => {
+                // close the straddling tail at the loop end...
+                out.push((
+                    on_pass,
+                    ch,
+                    document::Event {
+                        id: next_id(),
+                        tick: end_off,
+                        seq: u32::MAX / 2,
+                        raw_body: None,
+                        kind: EventKind::Channel {
+                            status: 0x80 | ch_v,
+                            data: [key, 0],
+                            len: 2,
+                        },
+                    },
+                ));
+                // ...full intermediate laps sound the whole span...
+                for p in on_pass + 1..pass {
+                    for (status, data1) in [(0x90u8, on_vel), (0x80u8, 0u8)] {
+                        out.push((
+                            p,
+                            ch,
+                            document::Event {
+                                id: next_id(),
+                                tick: if status == 0x90 { s_tick } else { end_off },
+                                seq: u32::MAX / 2,
+                                raw_body: None,
+                                kind: EventKind::Channel {
+                                    status: status | ch_v,
+                                    data: [key, data1],
+                                    len: 2,
+                                },
+                            },
+                        ));
+                    }
+                }
+                // ...and the hold re-strikes at the loop start, ending at
+                // the release the musician actually played
+                out.push((
+                    pass,
+                    ch,
+                    document::Event {
+                        id: next_id(),
+                        tick: s_tick,
+                        seq: u32::MAX / 2,
+                        raw_body: None,
+                        kind: EventKind::Channel {
+                            status: 0x90 | ch_v,
+                            data: [key, on_vel],
+                            len: 2,
+                        },
+                    },
+                ));
+                out.push((pass, ch, ev));
+            }
+            _ => out.push((pass, ch, ev)),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod straddle_tests {
+    use super::split_loop_straddles;
+    use document::Event as DocEvent;
+    use document::EventId;
+    use smf_core::EventKind;
+
+    fn note(id: EventId, tick: u64, status: u8, key: u8, vel: u8) -> DocEvent {
+        DocEvent {
+            id,
+            tick,
+            seq: u32::MAX / 2,
+            raw_body: None,
+            kind: EventKind::Channel {
+                status,
+                data: [key, vel],
+                len: 2,
+            },
+        }
+    }
+
+    /// After the split every ordering pairs up: walking the events
+    /// tick-sorted, an on for (ch,key) always precedes its off.
+    fn pairs_cleanly(evts: &[DocEvent]) -> bool {
+        let mut sorted: Vec<&DocEvent> = evts.iter().collect();
+        sorted.sort_by_key(|e| (e.tick, e.seq));
+        // LIFO like the document's own pairing: on pushes, off pops
+        let mut open: std::collections::HashMap<(u8, u8), usize> = std::collections::HashMap::new();
+        for e in sorted {
+            if let EventKind::Channel { status, data, .. } = &e.kind {
+                let k = (status & 0x0F, data[0]);
+                match status & 0xF0 {
+                    0x90 if data[1] > 0 => {
+                        *open.entry(k).or_insert(0) += 1;
+                    }
+                    0x90 | 0x80 => match open.get_mut(&k) {
+                        Some(n) if *n > 0 => *n -= 1,
+                        _ => return false,
+                    },
+                    _ => {}
+                }
+            }
+        }
+        open.values().all(|n| *n == 0)
+    }
+
+    #[test]
+    fn overdub_straddle_splits_into_two_notes() {
+        // #208 repro: on at 3800 (pass 0), off wrapped to 2000 (pass 1),
+        // loop [1920, 3840)
+        let mut id = 0u64;
+        let mut next_id = || {
+            id += 1;
+            id
+        };
+        let captured = vec![
+            (0u64, Some(0u8), note(100, 3800, 0x90, 60, 100)),
+            (1, Some(0), note(101, 2000, 0x80, 60, 0)),
+        ];
+        let out = split_loop_straddles(captured, 1920, 3840, &mut next_id);
+        let evts: Vec<DocEvent> = out.iter().map(|(_, _, e)| e.clone()).collect();
+        assert!(
+            pairs_cleanly(&evts),
+            "split must leave every note paired: {evts:?}"
+        );
+        // tail closes at the loop end; the new pass re-strikes at the start
+        assert!(evts
+            .iter()
+            .any(|e| e.tick == 3839 && matches!(e.kind, EventKind::Channel { status: 0x80, .. })));
+        assert!(evts.iter().any(|e| e.tick == 1920
+            && matches!(
+                e.kind,
+                EventKind::Channel {
+                    data: [60, 100],
+                    ..
+                }
+            )));
+        assert!(evts
+            .iter()
+            .any(|e| e.tick == 2000 && matches!(e.kind, EventKind::Channel { status: 0x80, .. })));
+    }
+
+    #[test]
+    fn multi_lap_hold_gets_full_intermediate_laps() {
+        let mut id = 0u64;
+        let mut next_id = || {
+            id += 1;
+            id
+        };
+        // held across TWO wraps (pass 0 -> pass 2)
+        let captured = vec![
+            (0u64, Some(0u8), note(100, 3000, 0x90, 64, 90)),
+            (2, Some(0), note(101, 2100, 0x80, 64, 0)),
+        ];
+        let out = split_loop_straddles(captured, 1920, 3840, &mut next_id);
+        let evts: Vec<DocEvent> = out.iter().map(|(_, _, e)| e.clone()).collect();
+        assert!(pairs_cleanly(&evts), "multi-lap: {evts:?}");
+        // three soundings: tail [3000,3839], lap 1 full, head [1920,2100]
+        let ons = evts
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    EventKind::Channel {
+                        status: 0x90,
+                        data: [64, 90],
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(ons, 3, "tail + intermediate lap + re-strike");
+    }
+
+    #[test]
+    fn same_pass_and_non_notes_pass_through() {
+        let mut next_id = || 0u64;
+        let captured = vec![
+            (0u64, Some(0u8), note(100, 0, 0x90, 60, 100)),
+            (0, Some(0), note(101, 480, 0x80, 60, 0)),
+        ];
+        let out = split_loop_straddles(captured, 1920, 3840, &mut next_id);
+        assert_eq!(out.len(), 2, "unwrapped notes pass through untouched");
     }
 }
