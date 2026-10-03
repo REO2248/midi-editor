@@ -1069,7 +1069,6 @@ pub(crate) fn metronome_clicks(mm: &document::MeterMap, end_tick: u64) -> Vec<u6
 #[cfg(test)]
 mod metronome_tests {
     use super::metronome_clicks;
-    use crate::empty_doc;
     use document::MeterMap;
 
     fn mm_of(sig: &[(u64, u8, u8)], ppq: u16) -> MeterMap {
