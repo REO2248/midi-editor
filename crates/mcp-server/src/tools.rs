@@ -57,7 +57,7 @@ pub(crate) const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// response field) don't require a bump — but the checked-in schema
 /// snapshot test still fails on every surface diff, so even additive
 /// changes are deliberate.
-pub const MCP_SURFACE_VERSION: u32 = 1;
+pub const MCP_SURFACE_VERSION: u32 = 2;
 
 /// One tool's contract metadata as advertised by `editor_info` and covered
 /// by the schema snapshot test. `version` starts at 1 and is bumped when
@@ -96,10 +96,41 @@ pub(crate) fn roots_from_env(var: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Reject Windows-hostile file names before any filesystem touch (#205):
+/// NTFS Alternate Data Streams (`song.mid:hidden`), DOS device names
+/// (`CON`, `NUL.mid`, `COM1`…), and trailing dots/spaces the Win32 layer
+/// silently strips. On `\`-separated targets the colon check applies on
+/// every platform a Windows share could be mounted from.
+fn validate_file_name(path: &std::path::Path) -> Result<(), String> {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return Ok(()); // no name component (e.g. a root) — containment still applies
+    };
+    if name.contains(':') {
+        return Err(format!(
+            "{name:?}: ':' in a file name denotes an NTFS alternate data stream"
+        ));
+    }
+    if name.ends_with('.') || name.ends_with(' ') {
+        return Err(format!(
+            "{name:?}: trailing dots/spaces are stripped by Windows and cannot be stored"
+        ));
+    }
+    let stem = name.split('.').next().unwrap_or("");
+    const DEVICES: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    if DEVICES.iter().any(|d| stem.eq_ignore_ascii_case(d)) {
+        return Err(format!("{name:?}: reserved DOS device name"));
+    }
+    Ok(())
+}
+
 /// Canonicalize a write target: an existing file resolves fully (symlinks,
 /// junctions, `..` — everything); a new file resolves through its parent so
 /// a link inside the parent can't smuggle the write elsewhere.
 fn canonical_for_write(path: &std::path::Path) -> Result<PathBuf, String> {
+    validate_file_name(path)?;
     if let Ok(c) = std::fs::canonicalize(path) {
         return Ok(c);
     }
@@ -705,6 +736,36 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         deprecated: None,
         tool: tool(name, description, schema),
     };
+    // v2 edit tools: accept the begin_transaction tx_id to opt into
+    // staging. A call without it (or with a stale id) commits directly —
+    // a dead session's open batch can no longer absorb it (#185).
+    // begin_transaction v2: the response now carries the batch's tx_id
+    // (inputs unchanged).
+    let begin_spec = |name: &'static str, description: &str, schema: serde_json::Value| ToolSpec {
+        name,
+        version: 2,
+        deprecated: None,
+        tool: tool(name, description, schema),
+    };
+    let edit_spec = |name: &'static str, description: &str, mut schema: serde_json::Value| {
+        ToolSpec {
+            name,
+            version: 2,
+            deprecated: None,
+            tool: {
+                if let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut()) {
+                    props.insert(
+                    "tx_id".to_string(),
+                    serde_json::json!({
+                        "type": "integer",
+                        "description": "tx_id from begin_transaction — pass to stage this edit inside the open transaction"
+                    }),
+                );
+                }
+                tool(name, description, schema)
+            },
+        }
+    };
     vec![
         spec(
             "editor_info",
@@ -716,26 +777,26 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             "JSON summary: format/division, per-track names+counts, note count, duration, revision, dirty flag",
             object_schema(serde_json::json!({})),
         ),
-        spec(
+        begin_spec(
             "begin_transaction",
-            "Open a named checkpoint: every later edit tool stages on a private document copy (reads see staged state) until commit_transaction folds them into ONE undo step or rollback_transaction discards them. One open batch at a time; ~5min idle auto-rollback keeps abandoned sessions from pinning the document. Args: label?.",
+            "Open a named checkpoint: pass the returned tx_id back on every edit you want staged on the private copy (reads see staged state either way) until commit_transaction folds them into ONE undo step or rollback_transaction discards them. Edits without the matching tx_id commit directly. One open batch at a time; ~5min idle auto-rollback. Args: label?.",
             object_schema(serde_json::json!({
                 "label": {"type": "string"},
             })),
         ),
-        spec(
+        edit_spec(
             "commit_transaction",
             "Fold the open transaction's staged ops into a single undo step labelled with the checkpoint name. dry_run:true validates the merged ops against the committed document without applying and keeps the transaction open. Errors with stale_base when the document changed since begin (concurrent edit) — the batch stays open for rollback/re-plan.",
             object_schema(serde_json::json!({
                 "dry_run": {"type": "boolean"},
             })),
         ),
-        spec(
+        edit_spec(
             "rollback_transaction",
             "Discard the open transaction. The committed document is left exactly as it was at begin_transaction (byte-for-byte) — staged ops never touched it.",
             object_schema(serde_json::json!({})),
         ),
-        spec(
+        edit_spec(
             "transaction_status",
             "Open-transaction state: label, base/staged revisions, staged op count, age and time until auto-rollback.",
             object_schema(serde_json::json!({})),
@@ -784,12 +845,12 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             "Import-quality findings over the raw event layer: dangling noteOn, zero-length notes, missing End-of-Track, tempo events outside the conductor track, overlapping (retriggered) noteOns. Each has code/track/tick/event_id + detail. Note pairing is deterministic LIFO per (channel,key); overlapping-noteon marks where that choice was ambiguous.",
             object_schema(serde_json::json!({})),
         ),
-        spec(
+        edit_spec(
             "normalize",
             "Resolve import-quality findings as one undo step. Args: codes? (array of diagnostic codes; omitted = fix all). Returns resolved/failed counts. overlapping-noteon is reported but never auto-resolved — ambiguous performance data is preserved.",
             object_schema(serde_json::json!({"codes": {"type": "array", "items": {"type": "string"}}})),
         ),
-        spec(
+        edit_spec(
             "apply_patch",
             "Atomic edit as one undo step. Optional base_revision: when given it must match document_summary.revision (optimistic concurrency). \
              dry_run:true returns the op breakdown without applying. ops: insert_note {track,key,vel,start,dur,channel,off_vel?,off_form?} | \
@@ -836,7 +897,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "fields": {"type": "array", "items": {"type": "string"}},
             })),
         ),
-        spec(
+        edit_spec(
             "set_meta",
             "Create/update a text meta (0x01-0x0F: text, copyright, track/instrument name, lyric, marker, cue). Args: track? (0), tick, meta_type (1-15), text, id? (event id to overwrite), enc? (utf8|sjis|latin1, default utf8). Optional base_revision.",
             object_schema(serde_json::json!({
@@ -849,7 +910,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "base_revision": {"type": "integer"},
             })),
         ),
-        spec(
+        edit_spec(
             "remove_meta",
             "Delete one meta event by id. Args: track, id. Optional base_revision.",
             object_schema(serde_json::json!({
@@ -857,7 +918,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "base_revision": {"type": "integer"},
             })),
         ),
-        spec(
+        edit_spec(
             "set_key_signature",
             "Set the song key signature (FF59). Args: sf (-7..7, negative = flats), mi (0 major / 1 minor), tick? (0). Optional base_revision.",
             object_schema(serde_json::json!({
@@ -909,7 +970,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "end": {"type": "integer"},
             })))
         },
-        spec(
+        edit_spec(
             "quantize",
             "Snap note onsets to a grid (duration preserved). Args: track? (all when omitted), from?, to?, grid? (ticks, default ppq/4 metrical / one frame SMPTE), strength? (0-100, default 100). Optional base_revision.",
             object_schema(serde_json::json!({
@@ -918,7 +979,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "base_revision": {"type": "integer"},
             })),
         ),
-        spec(
+        edit_spec(
             "transpose",
             "Shift note pitch. Args: track?, from?, to?, semitones (+/-). Notes leaving 0..127 are skipped. Optional base_revision.",
             object_schema(serde_json::json!({
@@ -926,7 +987,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "semitones": {"type": "integer"}, "base_revision": {"type": "integer"},
             })),
         ),
-        spec(
+        edit_spec(
             "scale_velocity",
             "Multiply note velocities. Args: track?, from?, to?, factor (e.g. 1.2 = +20%). Optional base_revision.",
             object_schema(serde_json::json!({
@@ -934,7 +995,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "factor": {"type": "number"}, "base_revision": {"type": "integer"},
             })),
         ),
-        spec(
+        edit_spec(
             "set_release_velocity",
             "Set note-OFF (release) velocities. Args: track?, from?, to?, vel (0-127). vel>0 upgrades NoteOn-vel0 offs to real 0x80 note-offs; vel=0 keeps the stored form. Optional base_revision.",
             object_schema(serde_json::json!({
@@ -942,7 +1003,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "vel": {"type": "integer"}, "base_revision": {"type": "integer"},
             })),
         ),
-        spec(
+        edit_spec(
             "set_channel",
             "Retarget all channel events in range to one channel. Args: track, from?, to?, channel (1-16). Optional base_revision.",
             object_schema(serde_json::json!({
@@ -950,7 +1011,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "channel": {"type": "integer"}, "base_revision": {"type": "integer"},
             })),
         ),
-        spec(
+        edit_spec(
             "set_program",
             "Program change (with optional bank CC0/CC32) on a track. Args: track, tick, program (0-127), channel? (default track channel), bank_msb?, bank_lsb?. Optional base_revision.",
             object_schema(serde_json::json!({
@@ -960,7 +1021,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "base_revision": {"type": "integer"},
             })),
         ),
-        spec(
+        edit_spec(
             "set_cc",
             "Insert controller events. Args: track, channel? (default track channel), points: [{tick, cc, value}] — or scalar {tick, cc, value}. Optional base_revision.",
             object_schema(serde_json::json!({
@@ -970,7 +1031,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "base_revision": {"type": "integer"},
             })),
         ),
-        spec(
+        edit_spec(
             "set_pitch_bend",
             "Insert a pitch-bend event. Args: track, tick, value (0..16383, 8192=center), channel?. Optional base_revision.",
             object_schema(serde_json::json!({
@@ -987,7 +1048,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                     "kind": {"type": "string"}, "key": {"type": "integer"},
                 }))
         ),
-        spec(
+        edit_spec(
             "set_channel_pressure",
                 "Insert channel-pressure (aftertouch 0xD0) events. Args: track, channel? (default track channel), points: [{tick, value}] — or scalar {tick, value}. Optional base_revision.",
                 object_schema(serde_json::json!({
@@ -997,7 +1058,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                     "base_revision": {"type": "integer"},
                 }))
         ),
-        spec(
+        edit_spec(
             "set_poly_pressure",
                 "Insert polyphonic key-pressure (aftertouch 0xA0) events. Args: track, channel? (default track channel), key? (default 60), points: [{tick, key, value}] — or scalar {tick, key, value}. Optional base_revision.",
                 object_schema(serde_json::json!({
@@ -1017,7 +1078,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "param_msb": {"type": "integer"}, "param_lsb": {"type": "integer"},
             })),
         ),
-        spec(
+        edit_spec(
             "set_rpn",
             "Write a full RPN/NRPN sequence in valid order (selector MSB, selector LSB, data MSB, optional data LSB). Args: track, tick, kind? (\"rpn\"|\"nrpn\", default rpn), param_msb, param_lsb (0x7F/0x7F = null reset, no data written), data_msb, data_lsb?, channel?. Optional base_revision.",
             object_schema(serde_json::json!({
@@ -1029,7 +1090,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "base_revision": {"type": "integer"},
             })),
         ),
-        spec(
+        edit_spec(
             "update_rpn_value",
             "Rewrite the data-entry of an existing RPN/NRPN entry (selector order preserved). Args: id (any event id from get_rpn ids), data_msb, data_lsb? (omit = 7-bit, drops the LSB event). Optional base_revision.",
             object_schema(serde_json::json!({
@@ -1038,7 +1099,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "base_revision": {"type": "integer"},
             })),
         ),
-        spec(
+        edit_spec(
             "update_rpn_param",
             "Retarget an existing RPN/NRPN entry to a new parameter number (selectors rewritten, data preserved). Args: id, param_msb, param_lsb. Optional base_revision.",
             object_schema(serde_json::json!({
@@ -1052,7 +1113,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             "Instrument context: detected synth mode (gm1/gm2/gs/xg from reset SysEx) + every program change with effective bank MSB/LSB and friendly name (GM table; GS/XG drum kits on channel 10). Names are display-only — unknown banks return null names and stay numeric. No args.",
             object_schema(serde_json::json!({})),
         ),
-        spec(
+        edit_spec(
             "remove_events",
                 "Delete events by id (lane/event-list deletes). Args: ids: [event-id]. Optional base_revision.",
                 object_schema(serde_json::json!({
@@ -1060,7 +1121,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                     "base_revision": {"type": "integer"},
                 }))
         ),
-        spec(
+        edit_spec(
             "set_tempo",
             "Set/replace tempo at a tick. Args: tick, bpm, track? (default 0 = conductor; for format-2 files pass the sequence's track). Optional base_revision.",
             object_schema(serde_json::json!({
@@ -1069,7 +1130,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "base_revision": {"type": "integer"},
             })),
         ),
-        spec(
+        edit_spec(
             "set_time_signature",
             "Set/replace time signature at a tick. Args: tick, num (beats/bar), den (beat value 4=quarter,8=eighth), track? (default 0; pass the sequence's track for format-2). Optional base_revision.",
             object_schema(serde_json::json!({
@@ -1078,7 +1139,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "base_revision": {"type": "integer"},
             })),
         ),
-        spec(
+        edit_spec(
             "set_track_channel",
             "Set the track's channel-prefix meta (FF 20): a hint players/editors may honor, NOT a reroute — per-event channels rule playback. To retarget existing events use set_channel. Args: track, channel (1-16). Optional base_revision.",
             object_schema(serde_json::json!({
@@ -1086,7 +1147,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "base_revision": {"type": "integer"},
             })),
         ),
-        spec(
+        edit_spec(
             "set_track_name",
             "Set track name (UTF-8 meta 0x03). Args: track, name. Optional base_revision.",
             object_schema(serde_json::json!({
@@ -1094,21 +1155,21 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "base_revision": {"type": "integer"},
             })),
         ),
-        spec(
+        edit_spec(
             "add_track",
             "Append a track (with optional name). Args: name?. Optional base_revision.",
             object_schema(serde_json::json!({
                 "name": {"type": "string"}, "base_revision": {"type": "integer"},
             })),
         ),
-        spec(
+        edit_spec(
             "remove_track",
             "Remove a track entirely. Args: track. Optional base_revision.",
             object_schema(serde_json::json!({
                 "track": {"type": "integer"}, "base_revision": {"type": "integer"},
             })),
         ),
-        spec(
+        edit_spec(
             "delete_range",
             "Delete channel events in [from,to) (notes delete whole). Args: track, from, to. Optional base_revision.",
             object_schema(serde_json::json!({
@@ -1116,7 +1177,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "base_revision": {"type": "integer"},
             })),
         ),
-        spec(
+        edit_spec(
             "duplicate_range",
             "Copy channel events in [from,to) to start at `to`. Args: track, from, to. Optional base_revision.",
             object_schema(serde_json::json!({
@@ -1124,7 +1185,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "base_revision": {"type": "integer"},
             })),
         ),
-        spec(
+        edit_spec(
             "split",
             "Split every note spanning `at` into two at that tick. Args: track?, from?, to? (scope = notes starting in range), at (tick, required). Optional base_revision.",
             object_schema(serde_json::json!({
@@ -1132,7 +1193,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "at": {"type": "integer"}, "base_revision": {"type": "integer"},
             })),
         ),
-        spec(
+        edit_spec(
             "join_notes",
             "Merge runs of same-pitch+channel notes that overlap or touch: the earliest NoteOn survives, the NoteOff moves to the run's end, interior events are removed. Args: track?, from?, to?. Optional base_revision.",
             object_schema(serde_json::json!({
@@ -1140,7 +1201,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "base_revision": {"type": "integer"},
             })),
         ),
-        spec(
+        edit_spec(
             "fix_overlaps",
             "Shorten notes overlapping the next same-pitch+channel note so they end at its start; event ids are preserved. Args: track?, from?, to?. Optional base_revision.",
             object_schema(serde_json::json!({
@@ -1148,7 +1209,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "base_revision": {"type": "integer"},
             })),
         ),
-        spec(
+        edit_spec(
             "legato",
             "Extend each note's end toward the next same-pitch+channel note's start. Args: track?, from?, to?, gap? (ticks; 0 = touch, >0 leaves a gap, <0 overlaps). Optional base_revision.",
             object_schema(serde_json::json!({
@@ -1156,7 +1217,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "gap": {"type": "integer"}, "base_revision": {"type": "integer"},
             })),
         ),
-        spec(
+        edit_spec(
             "set_length",
             "Set every note starting in range to exactly `ticks` long. Args: track?, from?, to?, ticks (required). Optional base_revision.",
             object_schema(serde_json::json!({
@@ -1164,7 +1225,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "ticks": {"type": "integer"}, "base_revision": {"type": "integer"},
             })),
         ),
-        spec(
+        edit_spec(
             "swing",
             "Swing: shift notes landing on odd `grid` cells later by `amount`% of a cell. Args: track?, from?, to?, grid (ticks, required), amount 0-100, dry_run? (preview summary without applying). Optional base_revision.",
             object_schema(serde_json::json!({
@@ -1173,7 +1234,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "dry_run": {"type": "boolean"}, "base_revision": {"type": "integer"},
             })),
         ),
-        spec(
+        edit_spec(
             "humanize",
             "Deterministic seeded jitter on note starts and velocities. Args: track?, from?, to?, timing (max |tick|), vel (max |dv|), seed (integer; same seed+settings = identical output, recorded in the tx label), dry_run?. Optional base_revision.",
             object_schema(serde_json::json!({
@@ -1194,6 +1255,12 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
     // must not take down every later request
     let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
     sh.expire_batch();
+    // per-call staging intent (#185): an edit carrying the open batch's
+    // tx_id stages; a standalone edit (or a stale session's id) commits
+    // directly and can no longer be absorbed by a dead client's batch.
+    // No reset afterwards — `call_tx_id` is only consulted inside a
+    // dispatch (the save arm below drops the guard entirely).
+    sh.call_tx_id = args["tx_id"].as_u64();
     match name {
         "editor_info" => ok_json(editor_info_json(&sh)),
         "document_summary" => {
@@ -1212,10 +1279,12 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
                 .unwrap_or("mcp transaction")
                 .to_string();
             match sh.begin_batch(label) {
-                Ok(base) => {
+                Ok((base, tx_id)) => {
                     let b = sh.batch.as_ref().unwrap();
                     ok_json(serde_json::json!({
                         "open": true, "label": b.label, "base_revision": base,
+                        "tx_id": tx_id,
+                        "hint": "pass tx_id back on every edit you want staged in this transaction",
                         "ttl_seconds": BATCH_TTL.as_secs(),
                     }))
                 }
@@ -1223,31 +1292,45 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
             }
         }
         "commit_transaction" => {
+            if let Some(r) = tx_guard(&sh, args) {
+                return r;
+            }
             let dry = args["dry_run"].as_bool().unwrap_or(false);
             match sh.commit_batch(dry) {
                 Ok(v) => ok_json(v),
                 Err(r) => r,
             }
         }
-        "rollback_transaction" => match sh.batch.take() {
-            Some(b) => ok_json(serde_json::json!({
-                "rolled_back": true, "label": b.label,
-                "discarded_ops": b.ops.len(),
-            })),
-            None => err_json("no open transaction"),
-        },
-        "transaction_status" => match &sh.batch {
-            Some(b) => ok_json(serde_json::json!({
-                "open": true,
-                "label": b.label,
-                "base_revision": b.base,
-                "staged_ops": b.ops.len(),
-                "staged_revision": b.staging.revision(),
-                "age_s": b.last_activity.elapsed().as_secs(),
-                "expires_in_s": BATCH_TTL.saturating_sub(b.last_activity.elapsed()).as_secs(),
-            })),
-            None => ok_json(serde_json::json!({"open": false})),
-        },
+        "rollback_transaction" => {
+            if let Some(r) = tx_guard(&sh, args) {
+                return r;
+            }
+            match sh.batch.take() {
+                Some(b) => ok_json(serde_json::json!({
+                    "rolled_back": true, "label": b.label,
+                    "discarded_ops": b.ops.len(),
+                })),
+                None => err_json("no open transaction"),
+            }
+        }
+        "transaction_status" => {
+            if let Some(r) = tx_guard(&sh, args) {
+                return r;
+            }
+            match &sh.batch {
+                Some(b) => ok_json(serde_json::json!({
+                    "open": true,
+                    "label": b.label,
+                    "tx_id": b.tx_id,
+                    "base_revision": b.base,
+                    "staged_ops": b.ops.len(),
+                    "staged_revision": b.staging.revision(),
+                    "age_s": b.last_activity.elapsed().as_secs(),
+                    "expires_in_s": BATCH_TTL.saturating_sub(b.last_activity.elapsed()).as_secs(),
+                })),
+                None => ok_json(serde_json::json!({"open": false})),
+            }
+        }
         "diagnostics" => {
             let diags = sh.view().diagnose();
             ok_json(serde_json::json!({
@@ -1521,7 +1604,7 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
             let Some(from) = args["revision"].as_u64() else {
                 return err_json("'revision' is required");
             };
-            let cur = sh.doc.revision();
+            let cur = sh.view().revision();
             if from > cur {
                 return err_json(
                     serde_json::json!({
@@ -1768,7 +1851,7 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
             let kind = args["kind"].as_str();
             let key = args["key"].as_u64().map(|v| v as u8);
             let mut out = Vec::new();
-            for (ti, t) in sh.doc.tracks.iter().enumerate() {
+            for (ti, t) in sh.view().tracks.iter().enumerate() {
                 if track.is_some() && track != Some(ti) {
                     continue;
                 }
@@ -1947,7 +2030,7 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
             };
             let mut ops = Vec::new();
             for t in tracks {
-                ops.extend(sh.doc.set_release_velocity_ops(t, from, to, vel));
+                ops.extend(sh.view_mut().set_release_velocity_ops(t, from, to, vel));
             }
             apply_ops(&mut sh, "set release velocity", ops)
         }
@@ -2073,11 +2156,17 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
             let ch = args["channel"]
                 .as_u64()
                 .map(|c| (c.clamp(1, 16) - 1) as u8)
-                .unwrap_or_else(|| sh.doc.tracks.get(track).map(|t| t.out_channel).unwrap_or(0));
+                .unwrap_or_else(|| {
+                    sh.view()
+                        .tracks
+                        .get(track)
+                        .map(|t| t.out_channel)
+                        .unwrap_or(0)
+                });
             let mut ops = Vec::new();
             if let Some(points) = args["points"].as_array() {
                 for p in points {
-                    ops.extend(sh.doc.set_channel_pressure_ops(
+                    ops.extend(sh.view_mut().set_channel_pressure_ops(
                         track,
                         p["tick"].as_u64().unwrap_or(0),
                         ch,
@@ -2085,7 +2174,7 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
                     ));
                 }
             } else {
-                ops.extend(sh.doc.set_channel_pressure_ops(
+                ops.extend(sh.view_mut().set_channel_pressure_ops(
                     track,
                     args["tick"].as_u64().unwrap_or(0),
                     ch,
@@ -2105,7 +2194,13 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
             let ch = args["channel"]
                 .as_u64()
                 .map(|c| (c.clamp(1, 16) - 1) as u8)
-                .unwrap_or_else(|| sh.doc.tracks.get(track).map(|t| t.out_channel).unwrap_or(0));
+                .unwrap_or_else(|| {
+                    sh.view()
+                        .tracks
+                        .get(track)
+                        .map(|t| t.out_channel)
+                        .unwrap_or(0)
+                });
             let mut ops = Vec::new();
             let emit = |doc: &mut Document, p: &serde_json::Value| {
                 doc.set_poly_pressure_ops(
@@ -2118,10 +2213,10 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
             };
             if let Some(points) = args["points"].as_array() {
                 for p in points {
-                    ops.extend(emit(&mut sh.doc, p));
+                    ops.extend(emit(sh.view_mut(), p));
                 }
             } else {
-                ops.extend(emit(&mut sh.doc, args));
+                ops.extend(emit(sh.view_mut(), args));
             }
             apply_ops(&mut sh, "poly pressure", ops)
         }
@@ -2136,7 +2231,7 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
             if ids.is_empty() {
                 return err_json("ids required");
             }
-            let ops = sh.doc.remove_events_ops(&ids);
+            let ops = sh.view_mut().remove_events_ops(&ids);
             if ops.is_empty() {
                 return err_json("no matching events");
             }
@@ -2186,7 +2281,13 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
             let ch = args["channel"]
                 .as_u64()
                 .map(|c| (c.clamp(1, 16) - 1) as u8)
-                .unwrap_or_else(|| sh.doc.tracks.get(track).map(|t| t.out_channel).unwrap_or(0));
+                .unwrap_or_else(|| {
+                    sh.view()
+                        .tracks
+                        .get(track)
+                        .map(|t| t.out_channel)
+                        .unwrap_or(0)
+                });
             let (Some(pm), Some(pl), Some(dm)) = (
                 args["param_msb"].as_u64(),
                 args["param_lsb"].as_u64(),
@@ -2194,7 +2295,7 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
             ) else {
                 return err_json("param_msb, param_lsb, data_msb required");
             };
-            let ops = sh.doc.set_rpn_ops(
+            let ops = sh.view_mut().set_rpn_ops(
                 track,
                 args["tick"].as_u64().unwrap_or(0),
                 ch,
@@ -2217,10 +2318,10 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
             let Some(dm) = args["data_msb"].as_u64() else {
                 return err_json("data_msb required");
             };
-            let Some(entry) = sh.doc.rpn_entry_containing(id) else {
+            let Some(entry) = sh.view().rpn_entry_containing(id) else {
                 return err_json(format!("no RPN/NRPN entry contains event {id}"));
             };
-            let ops = sh.doc.update_rpn_value_ops(
+            let ops = sh.view_mut().update_rpn_value_ops(
                 &entry,
                 dm as u8,
                 args["data_lsb"].as_u64().map(|v| v as u8),
@@ -2239,15 +2340,17 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
             else {
                 return err_json("param_msb, param_lsb required");
             };
-            let Some(entry) = sh.doc.rpn_entry_containing(id) else {
+            let Some(entry) = sh.view().rpn_entry_containing(id) else {
                 return err_json(format!("no RPN/NRPN entry contains event {id}"));
             };
-            let ops = sh.doc.update_rpn_param_ops(&entry, pm as u8, pl as u8);
+            let ops = sh
+                .view_mut()
+                .update_rpn_param_ops(&entry, pm as u8, pl as u8);
             apply_ops(&mut sh, "update rpn param", ops)
         }
         "get_instruments" => {
-            let mode = sh.doc.synth_mode();
-            let pcs = sh.doc.program_changes();
+            let mode = sh.view().synth_mode();
+            let pcs = sh.view().program_changes();
             ok_json(serde_json::json!({
                 "mode": mode.map(|m| m.label()),
                 "count": pcs.len(),
@@ -2255,7 +2358,7 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
                     "track": p.track, "channel": p.channel + 1, "tick": p.tick,
                     "bank_msb": p.bank_msb, "bank_lsb": p.bank_lsb,
                     "program": p.program,
-                    "name": sh.doc.program_name(p),
+                    "name": sh.view().program_name(p),
                     "id": p.id,
                 })).collect::<Vec<_>>(),
             }))
@@ -2300,7 +2403,7 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
                 "latin1" | "latin-1" => smf_core::TextEncoding::Latin1,
                 _ => smf_core::TextEncoding::Utf8,
             };
-            let ops = sh.doc.set_meta_text_ops(
+            let ops = sh.view_mut().set_meta_text_ops(
                 track,
                 args["tick"].as_u64().unwrap_or(0),
                 meta_type,
@@ -2327,7 +2430,7 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
             if let Some(r) = check_base(&sh, args) {
                 return r;
             }
-            let ops = sh.doc.set_key_sig_ops(
+            let ops = sh.view_mut().set_key_sig_ops(
                 args["tick"].as_u64().unwrap_or(0),
                 args["sf"].as_i64().unwrap_or(0).clamp(-7, 7) as i8,
                 args["mi"].as_u64().unwrap_or(0).min(1) as u8,
@@ -2422,7 +2525,7 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
             };
             let mut ops = Vec::new();
             for t in tracks {
-                ops.extend(sh.doc.split_ops(t, from, to, at));
+                ops.extend(sh.view_mut().split_ops(t, from, to, at));
             }
             apply_ops(&mut sh, "split", ops)
         }
@@ -2437,7 +2540,7 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
             };
             let mut ops = Vec::new();
             for t in tracks {
-                ops.extend(sh.doc.join_ops(t, from, to));
+                ops.extend(sh.view_mut().join_ops(t, from, to));
             }
             apply_ops(&mut sh, "join notes", ops)
         }
@@ -2452,7 +2555,7 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
             };
             let mut ops = Vec::new();
             for t in tracks {
-                ops.extend(sh.doc.fix_overlaps_ops(t, from, to));
+                ops.extend(sh.view_mut().fix_overlaps_ops(t, from, to));
             }
             apply_ops(&mut sh, "fix overlaps", ops)
         }
@@ -2468,7 +2571,7 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
             };
             let mut ops = Vec::new();
             for t in tracks {
-                ops.extend(sh.doc.legato_ops(t, from, to, gap));
+                ops.extend(sh.view_mut().legato_ops(t, from, to, gap));
             }
             apply_ops(&mut sh, "legato", ops)
         }
@@ -2486,7 +2589,7 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
             };
             let mut ops = Vec::new();
             for t in tracks {
-                ops.extend(sh.doc.set_length_ops(t, from, to, ticks));
+                ops.extend(sh.view_mut().set_length_ops(t, from, to, ticks));
             }
             apply_ops(&mut sh, "set length", ops)
         }
@@ -2505,7 +2608,7 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
             };
             let mut ops = Vec::new();
             for t in tracks {
-                ops.extend(sh.doc.swing_ops(t, from, to, grid, amount));
+                ops.extend(sh.view_mut().swing_ops(t, from, to, grid, amount));
             }
             dry_or_apply(
                 &mut sh,
@@ -2528,7 +2631,7 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
             };
             let mut ops = Vec::new();
             for t in tracks {
-                ops.extend(sh.doc.humanize_ops(t, from, to, timing, vel, seed));
+                ops.extend(sh.view_mut().humanize_ops(t, from, to, timing, vel, seed));
             }
             // seed rides in the label so the history/undo entry is
             // self-describing and reproducible
@@ -2540,6 +2643,24 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
             )
         }
         _ => err_json(format!("unknown tool '{name}'")),
+    }
+}
+
+/// A transaction-lifecycle call carrying a `tx_id` that doesn't match the
+/// open batch is another session poking at our checkpoint — refuse it
+/// instead of committing/rolling back someone else's staging area (#185).
+fn tx_guard(sh: &Shared, args: &serde_json::Value) -> Option<CallToolResponse> {
+    match (args["tx_id"].as_u64(), sh.batch.as_ref()) {
+        (Some(want), Some(b)) if want != b.tx_id => Some(err_json(
+            serde_json::json!({
+                "error": "wrong_transaction",
+                "given_tx_id": want,
+                "open_tx_id": b.tx_id,
+                "hint": "this batch belongs to another session; use your own begin_transaction tx_id",
+            })
+            .to_string(),
+        )),
+        _ => None,
     }
 }
 
@@ -2707,4 +2828,55 @@ pub async fn serve_stdio(doc: SharedDoc) -> anyhow::Result<()> {
         .await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod write_validation_tests {
+    use super::canonical_for_write;
+
+    fn err(path: &str) -> String {
+        canonical_for_write(std::path::Path::new(path)).unwrap_err()
+    }
+
+    #[test]
+    fn alternate_data_streams_rejected() {
+        for p in [
+            r"C:\music\song.mid:hidden",
+            r"C:\music\song.mid::$DATA",
+            "/tmp/song.mid:stream",
+        ] {
+            let e = err(p);
+            assert!(e.contains(':'), "{p} must be rejected as ADS: {e}");
+        }
+    }
+
+    #[test]
+    fn dos_device_names_rejected() {
+        for p in [
+            r"C:\music\CON",
+            r"C:\music\con.mid",
+            r"C:\music\NUL.mid",
+            r"C:\music\com1",
+            r"C:\music\LPT9.mid",
+        ] {
+            assert!(err(p).contains("device"), "{p} must be rejected");
+        }
+    }
+
+    #[test]
+    fn trailing_dots_and_spaces_rejected() {
+        assert!(err(r"C:\music\song.mid.").contains("trailing"));
+        assert!(err(r#"C:\music\song.mid "#).contains("trailing"));
+    }
+
+    #[test]
+    fn ordinary_names_pass_validation() {
+        // validation runs before any fs touch, so a nonexistent-but-legal
+        // path fails only at the parent-canonicalize step, with a
+        // different (resolution) error — not a validation error
+        let e = canonical_for_write(std::path::Path::new(r"C:\no\such\dir\song.mid")).unwrap_err();
+        assert!(!e.contains(':') || e.contains("cannot resolve"));
+        assert!(!e.contains("device"));
+        assert!(!e.contains("trailing"));
+    }
 }

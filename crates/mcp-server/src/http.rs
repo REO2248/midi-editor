@@ -148,14 +148,37 @@ pub enum HttpAuth {
 /// a directory only the owning user can read, so other local accounts cannot
 /// steal the credential.
 pub fn token_file_path() -> PathBuf {
-    for var in ["LOCALAPPDATA", "APPDATA"] {
-        if let Ok(d) = std::env::var(var) {
-            if !d.is_empty() {
-                return PathBuf::from(d).join("midi-editor").join("mcp-token");
-            }
-        }
+    token_file_path_with(
+        std::env::var("LOCALAPPDATA").ok().filter(|v| !v.is_empty()),
+        std::env::var("APPDATA").ok().filter(|v| !v.is_empty()),
+        std::env::var("USERNAME")
+            .or_else(|_| std::env::var("USER"))
+            .ok(),
+    )
+}
+
+/// Pure resolver behind `token_file_path` (env reads are process-global,
+/// so tests inject them). The temp fallback carries the user name: a
+/// shared temp directory must not host one static, guessable name every
+/// account writes to (#206).
+pub(crate) fn token_file_path_with(
+    localappdata: Option<String>,
+    appdata: Option<String>,
+    user: Option<String>,
+) -> PathBuf {
+    if let Some(d) = localappdata.or(appdata) {
+        return PathBuf::from(d).join("midi-editor").join("mcp-token");
     }
-    std::env::temp_dir().join("midi-editor-mcp-token")
+    let user = user
+        .map(|u| {
+            u.chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .take(32)
+                .collect::<String>()
+        })
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| "anon".to_string());
+    std::env::temp_dir().join(format!("midi-editor-mcp-token-{user}"))
 }
 
 /// Generated tokens are 64 lowercase hex; a file/env-provided token just has
@@ -171,8 +194,26 @@ pub(crate) fn read_token_file(path: &std::path::Path) -> Option<String> {
 
 /// Provision the token file on first launch; reuse it afterwards. Never
 /// overwrites a healthy file, and regenerates a corrupt/empty one.
+///
+/// Security posture (#206):
+/// - created exclusively (`create_new`) — a pre-planted symlink/hardlink
+///   at the path fails loudly instead of being followed;
+/// - owner-only permissions from the first byte (0600 on Unix; on Windows
+///   the canonical %LOCALAPPDATA% home is already user-ACL'd);
+/// - an existing file with group/world bits set (written by an older
+///   build) is tightened on startup.
 pub(crate) fn ensure_token_file(path: &std::path::Path) -> std::io::Result<()> {
     if read_token_file(path).is_some() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(path)?.permissions().mode();
+            if mode & 0o077 != 0 {
+                let mut p = std::fs::metadata(path)?.permissions();
+                p.set_mode(0o600);
+                std::fs::set_permissions(path, p)?;
+            }
+        }
         return Ok(());
     }
     if let Some(dir) = path.parent() {
@@ -180,7 +221,44 @@ pub(crate) fn ensure_token_file(path: &std::path::Path) -> std::io::Result<()> {
     }
     let mut raw = [0u8; 32];
     getrandom::fill(&mut raw).map_err(std::io::Error::other)?;
-    write_atomic(path, bytes_hex(&raw).as_bytes()).map_err(std::io::Error::other)
+    let body = bytes_hex(&raw);
+    match write_token_exclusive(path, body.as_bytes()) {
+        Ok(()) => Ok(()),
+        // a corrupt/empty leftover from an older build: replace it once
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(path);
+            write_token_exclusive(path, body.as_bytes())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Create the token file with owner-only permissions or fail trying —
+/// never follows a link someone else planted at the path.
+fn write_token_exclusive(path: &std::path::Path, body: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(body)?;
+        f.sync_all()?;
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        f.write_all(body)?;
+        f.sync_all()?;
+        Ok(())
+    }
 }
 
 /// The stored auto-provisioned token, for `mcp-bridge` to pass through when
@@ -421,6 +499,24 @@ pub async fn serve_http(
     auth: HttpAuth,
     shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
+    // Active batch reaper (#185): idle batches expire on the next dispatch
+    // anyway, but a client that goes silent entirely leaves its staging
+    // visible to reads and blocking new begins until something calls in.
+    // A lightweight ticker drops expired batches on its own.
+    {
+        let weak = std::sync::Arc::downgrade(&doc);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                tick.tick().await;
+                let Some(doc) = weak.upgrade() else { break };
+                if let Ok(mut sh) = doc.lock() {
+                    sh.expire_batch();
+                }
+                drop(doc);
+            }
+        });
+    }
     let app = mcp_http_router(doc, addr, auth);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!("mcp http listening on {addr}");
