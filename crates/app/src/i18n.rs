@@ -1058,9 +1058,10 @@ fn detect_lang() -> &'static str {
         // LCID returned by GetUserDefaultUILanguage
         let lcid = unsafe { windows::Win32::Globalization::GetUserDefaultUILanguage() };
         if lcid & 0xFF == 0x11 {
-            return "ja";
+            "ja"
+        } else {
+            "en"
         }
-        return "en";
     }
     #[cfg(not(windows))]
     {
