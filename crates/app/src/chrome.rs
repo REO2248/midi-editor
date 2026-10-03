@@ -306,11 +306,19 @@ impl EditorView {
                     let t1 = t0 + (w / zoom).max(0.0) as i64 + 2;
                     match mode {
                         LaneMode::Velocity => {
-                            for n in lane_notes.iter().filter(|n| n.track == lane_sel_track) {
-                                let x = bounds.origin.x + px(n.start_tick as f32 * zoom - scroll_x);
-                                if x < bounds.origin.x || x > bounds.origin.x + px(w) {
+                            // binary-search the visible window like the
+                            // roll does — a linear filter over every note
+                            // on every frame stuttered large projects
+                            // (#189)
+                            let first = lane_notes.partition_point(|n| (n.start_tick as i64) < t0);
+                            for n in &lane_notes[first..] {
+                                if n.start_tick > t1 as u64 {
+                                    break;
+                                }
+                                if n.track != lane_sel_track {
                                     continue;
                                 }
+                                let x = bounds.origin.x + px(n.start_tick as f32 * zoom - scroll_x);
                                 let mut vel = n.vel as f32 / 127.0;
                                 if let Some((DragMode::Velocity, d_on, dkey)) = drag_v {
                                     if d_on == n.on_id {
