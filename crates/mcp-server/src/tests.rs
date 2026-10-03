@@ -224,11 +224,13 @@ fn duplicate_range_defaults_to_song_end() {
             _ => None,
         })
         .collect();
-    // original on/off at 0/480 plus the copy on/off at 480/960 (the
-    // copy-on shares tick+seq with the original off — inserted first)
+    // original on/off at 0/480 plus the copy on/off at 480/960. The
+    // copy-on shares tick+seq with the original off and now inserts
+    // AFTER it (#187): a boundary-tick NoteOn follows the release it
+    // succeeds, so pairing and wire order stay musical.
     assert_eq!(
         ticks,
-        vec![(0, 0x90), (480, 0x90), (480, 0x80), (960, 0x80)]
+        vec![(0, 0x90), (480, 0x80), (480, 0x90), (960, 0x80)]
     );
 }
 

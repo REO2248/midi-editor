@@ -627,8 +627,12 @@ pub struct WriteOptions {
     pub running_status: bool,
 }
 
-pub fn write_vlq(mut v: u64, out: &mut Vec<u8>) {
-    let mut buf = [0u8; 10];
+pub fn write_vlq(v: u64, out: &mut Vec<u8>) {
+    // SMF VLQs are 1–4 bytes / 28 bits max (spec §1). Deltas beyond
+    // 0x0FFF_FFFF can't be represented — clamp to the maximum instead of
+    // emitting 5–10 byte quantities strict parsers reject (#193).
+    let mut v = v.min(0x0FFF_FFFF);
+    let mut buf = [0u8; 4];
     let mut i = buf.len();
     loop {
         i -= 1;
@@ -642,6 +646,30 @@ pub fn write_vlq(mut v: u64, out: &mut Vec<u8>) {
         out.push(b | 0x80);
     }
     out.push(buf[buf.len() - 1]);
+}
+
+#[cfg(test)]
+mod vlq_tests {
+    use super::write_vlq;
+
+    #[test]
+    fn vlq_never_exceeds_four_bytes() {
+        for v in [0u64, 0x7F, 0x80, 0x3FFF, 0x4000, 0x1F_FFFF, 0x20_0000] {
+            let mut out = Vec::new();
+            write_vlq(v, &mut out);
+            assert!(out.len() <= 4, "{v:#x} encoded as {out:?}");
+        }
+        // the spec maximum round-trips as 4 bytes
+        let mut out = Vec::new();
+        write_vlq(0x0FFF_FFFF, &mut out);
+        assert_eq!(out, vec![0xFF, 0xFF, 0xFF, 0x7F]);
+        // anything larger clamps to it — never a non-conforming 5th byte
+        for v in [0x1000_0000u64, u64::MAX / 2, u64::MAX] {
+            let mut out = Vec::new();
+            write_vlq(v, &mut out);
+            assert_eq!(out, vec![0xFF, 0xFF, 0xFF, 0x7F], "{v:#x}");
+        }
+    }
 }
 
 fn encode_body(kind: &EventKind, out: &mut Vec<u8>) {

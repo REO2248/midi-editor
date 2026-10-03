@@ -428,6 +428,14 @@ fn build_ops(doc: &mut Document, ops: &[serde_json::Value]) -> Result<Vec<Op>, P
                 let vel = op["vel"].as_u64().unwrap_or(100).clamp(1, 127) as u8;
                 let start = op["start"].as_u64().unwrap_or(0);
                 let dur = op["dur"].as_u64().unwrap_or(480);
+                // a zero-duration note would place NoteOff at the NoteOn's
+                // exact (tick, seq) — corrupting pairing (#187)
+                if dur == 0 {
+                    return Err(PatchError::Msg(
+                        "'dur' must be at least 1 tick (zero-duration notes cannot be encoded)"
+                            .into(),
+                    ));
+                }
                 let ch = op["channel"].as_u64().unwrap_or(0).clamp(0, 15) as u8;
                 // release velocity needs the real 0x80 off form — 0x90v0
                 // has no byte to carry it in
