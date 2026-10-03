@@ -467,8 +467,8 @@ impl NoteLen {
 
     fn label(self) -> String {
         match self {
-            Self::Grid => "Grid".to_string(),
-            Self::LastUsed => "Last used".to_string(),
+            Self::Grid => t("edit.len_grid").to_string(),
+            Self::LastUsed => t("edit.len_last").to_string(),
             Self::Fixed { den, trip, dot } => {
                 format!(
                     "1/{}{}{}",
@@ -1984,10 +1984,14 @@ impl EditorView {
                             format!("Tempo   {:.2} bpm", 60_000_000.0 / mpq as f64)
                         }
                         0x2F => "EndOfTrack".to_string(),
+                        // SMF stores the denominator as a power of two
+                        // (dd=2 means /4) — display the real value (#169)
                         0x58 => format!(
                             "TimeSig {}/{}",
                             data.first().copied().unwrap_or(4),
-                            data.get(1).copied().unwrap_or(4)
+                            data.get(1)
+                                .and_then(|dd| u32::checked_shl(1, u32::from(*dd).min(31)))
+                                .unwrap_or(4)
                         ),
                         0x59 => "KeySig".to_string(),
                         other @ 0x01..=0x09 => {
