@@ -24,7 +24,7 @@ static EN: &[(&str, &str)] = &[
     ("menu.undo", "Undo"),
     ("menu.redo", "Redo"),
     ("menu.add_track", "Add Track"),
-    ("transport.met", "met"),
+    ("transport.met", "Metronome"),
     ("status.no_port", "no MIDI out"),
     ("status.plugin_fail", "plugin unavailable"),
     ("status.no_file", "untitled"),
@@ -133,6 +133,24 @@ static EN: &[(&str, &str)] = &[
     ("ins_vel.last", "Last used ({v})"),
     ("edit.transpose_up", "Transpose +1"),
     ("edit.transpose_dn", "Transpose -1"),
+    ("edit.oct_up", "+1 octave"),
+    ("edit.oct_dn", "-1 octave"),
+    ("edit.len_grid", "Grid"),
+    ("edit.len_last", "Last used"),
+    ("edit.len_1bar", "1 bar"),
+    ("edit.len_1frame", "1 frame"),
+    ("edit.len_5frames", "5 frames"),
+    ("edit.len_10frames", "10 frames"),
+    ("edit.len_1s", "1 s"),
+    ("edit.len_5s", "5 s"),
+    ("edit.vel_pp", "pianissimo (32)"),
+    ("edit.vel_mp", "mezzo (72)"),
+    ("edit.vel_f", "forte (100)"),
+    ("edit.vel_max", "max (127)"),
+    ("edit.rel_zero", "zero (0)"),
+    ("edit.rel_soft", "soft (32)"),
+    ("edit.rel_med", "medium (64)"),
+    ("edit.rel_hard", "hard (100)"),
     ("edit.vel_up", "Velocity +25%"),
     ("edit.vel_dn", "Velocity -20%"),
     // View
@@ -263,7 +281,7 @@ static EN: &[(&str, &str)] = &[
     ("transport.discard_take", "Discard Take"),
     ("transport.quant_take", "Quantize Last Take"),
     ("status.no_take", "no take"),
-    ("help.shortcuts", "Keyboard Shortcuts"),
+    ("help.shortcuts", "Shortcut Reference"),
     ("status.copied", "copied {n} note(s)"),
     ("status.nosel", "no selection"),
     ("status.split_none", "split: no note spans the playhead"),
@@ -471,6 +489,7 @@ static EN: &[(&str, &str)] = &[
     ("a11y.editor", "MIDI editor"),
     ("a11y.sig", "Time signature {sig}"),
     ("a11y.rename", "Rename selected track"),
+    ("ui.rename_chip", "rename"),
     ("a11y.enc", "Text encoding: {enc}"),
     // focused region names (status bar)
     ("focus.label", "focus"),
@@ -495,6 +514,9 @@ static EN: &[(&str, &str)] = &[
     ("help.g_seek", "Seek playhead"),
     ("help.g_playfrom", "Play from here"),
     ("help.g_minimap", "Jump to position"),
+    ("help.g_marker_click", "Jump to marker"),
+    ("help.g_marker_nav", "Cycle markers"),
+    ("help.g_meta_edit", "Edit meta / event at cursor"),
     ("help.g_zoom", "Zoom timeline"),
     ("help.g_drop", "Drop to open"),
     ("nav.left", "Nudge left (grid)"),
@@ -630,6 +652,24 @@ static JA: &[(&str, &str)] = &[
     ("ins_vel.last", "前回の値 ({v})"),
     ("edit.transpose_up", "半音上げ"),
     ("edit.transpose_dn", "半音下げ"),
+    ("edit.oct_up", "+1 オクターブ"),
+    ("edit.oct_dn", "-1 オクターブ"),
+    ("edit.len_grid", "グリッド"),
+    ("edit.len_last", "最後の使用値"),
+    ("edit.len_1bar", "1 小節"),
+    ("edit.len_1frame", "1 フレーム"),
+    ("edit.len_5frames", "5 フレーム"),
+    ("edit.len_10frames", "10 フレーム"),
+    ("edit.len_1s", "1 秒"),
+    ("edit.len_5s", "5 秒"),
+    ("edit.vel_pp", "ピアニッシモ (32)"),
+    ("edit.vel_mp", "メッゾ (72)"),
+    ("edit.vel_f", "フォルテ (100)"),
+    ("edit.vel_max", "最大 (127)"),
+    ("edit.rel_zero", "ゼロ (0)"),
+    ("edit.rel_soft", "ソフト (32)"),
+    ("edit.rel_med", "ミディアム (64)"),
+    ("edit.rel_hard", "ハード (100)"),
     ("edit.vel_up", "ベロシティ +25%"),
     ("edit.vel_dn", "ベロシティ -20%"),
     ("view.events", "イベントリスト"),
@@ -814,7 +854,7 @@ static JA: &[(&str, &str)] = &[
     ("transport.discard_take", "テイクを破棄"),
     ("transport.quant_take", "直前のテイクをクオンタイズ"),
     ("status.no_take", "テイクなし"),
-    ("help.shortcuts", "キーボードショートカット"),
+    ("help.shortcuts", "ショートカット一覧"),
     ("status.copied", "{n}個のノートをコピー"),
     ("status.nosel", "選択がありません"),
     ("status.split_none", "分割: 再生ヘッド上にノートがありません"),
@@ -955,6 +995,7 @@ static JA: &[(&str, &str)] = &[
     ("a11y.editor", "MIDIエディタ"),
     ("a11y.sig", "拍子 {sig}"),
     ("a11y.rename", "選択トラック名を変更"),
+    ("ui.rename_chip", "改名"),
     ("a11y.enc", "テキストエンコーディング: {enc}"),
     // フォーカス中の領域名(ステータスバー)
     ("focus.label", "フォーカス"),
@@ -979,6 +1020,9 @@ static JA: &[(&str, &str)] = &[
     ("help.g_seek", "再生位置を移動"),
     ("help.g_playfrom", "ここから再生"),
     ("help.g_minimap", "その位置へジャンプ"),
+    ("help.g_marker_click", "マーカーへジャンプ"),
+    ("help.g_marker_nav", "マーカー間を移動"),
+    ("help.g_meta_edit", "カーソル位置のメタ／イベントを編集"),
     ("help.g_zoom", "タイムラインをズーム"),
     ("help.g_drop", "ドロップで開く"),
     ("nav.left", "左へ移動（グリッド）"),
@@ -1005,12 +1049,27 @@ fn detect_lang() -> &'static str {
         }
         return "en";
     }
-    // OS UI language — coarse prefix match is enough for shipped locales
-    let lang = std::env::var("LANG").unwrap_or_default();
-    if lang.starts_with("ja") {
-        "ja"
-    } else {
-        "en"
+    // OS UI language — coarse prefix match is enough for shipped locales.
+    // Windows never defines LANG, so consult the native UI language there
+    // (#182); elsewhere LANG carries the locale.
+    #[cfg(windows)]
+    {
+        // LANG_JAPANESE primary language id (0x11) — the low byte of the
+        // LCID returned by GetUserDefaultUILanguage
+        let lcid = unsafe { windows::Win32::Globalization::GetUserDefaultUILanguage() };
+        if lcid & 0xFF == 0x11 {
+            return "ja";
+        }
+        return "en";
+    }
+    #[cfg(not(windows))]
+    {
+        let lang = std::env::var("LANG").unwrap_or_default();
+        if lang.starts_with("ja") {
+            "ja"
+        } else {
+            "en"
+        }
     }
 }
 
@@ -1098,6 +1157,35 @@ mod tests {
         for (name, table) in [("EN", EN), ("JA", JA)] {
             let set: HashSet<_> = table.iter().map(|(k, _)| *k).collect();
             assert_eq!(set.len(), table.len(), "{name} has duplicate keys");
+        }
+    }
+
+    /// #172: the F1 reference and the binding editor must be
+    /// distinguishable menu labels; #171/#184 cover the rest of the sweep.
+    #[test]
+    fn help_reference_and_editor_labels_differ() {
+        let en = |k: &str| {
+            EN.iter()
+                .find(|(e, _)| *e == k)
+                .unwrap_or_else(|| panic!("{k} missing from EN"))
+                .1
+        };
+        assert_ne!(
+            en("help.shortcuts"),
+            en("ui.keys"),
+            "F1 reference vs binding editor labels must differ"
+        );
+        assert_eq!(en("transport.met"), "Metronome");
+        // F1 gesture rows resolve to real text in both locales (#184)
+        for k in [
+            "help.g_marker_click",
+            "help.g_marker_nav",
+            "help.g_meta_edit",
+        ] {
+            assert!(
+                JA.iter().any(|(e, v)| *e == k && !v.is_empty()),
+                "{k} missing from JA"
+            );
         }
     }
 
