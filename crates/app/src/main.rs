@@ -684,6 +684,10 @@ struct EditorView {
     /// DocUi add the viewed sequence (format 2 scopes them per sequence).
     doc_epoch: u64,
     notes_key: (u64, u64),
+    /// Widest note duration in the cached `notes` view — the roll's cull
+    /// window opens left by this much so sustained notes whose start
+    /// scrolled off-screen stay visible until their release does (#188)
+    notes_span: u64,
     notes: Arc<Vec<Note>>,
     ev_key: (u64, u64, usize, u64),
     events: Arc<Vec<EvRow>>,
@@ -1256,6 +1260,7 @@ impl EditorView {
             shared,
             doc_epoch: 0,
             notes_key: (u64::MAX, u64::MAX),
+            notes_span: 0,
             notes: Arc::new(vec![]),
             ev_key: (u64::MAX, u64::MAX, usize::MAX, u64::MAX),
             ev_filter: EvFilter::default(),
@@ -1628,7 +1633,13 @@ impl EditorView {
     pub(crate) fn refresh_derived_sh(&mut self, sh: &mut Shared) {
         let key = (self.doc_epoch, sh.doc.revision());
         if self.notes_key != key {
-            self.notes = Arc::new(sh.doc.notes());
+            let notes = sh.doc.notes();
+            self.notes_span = notes
+                .iter()
+                .map(|n| n.end_tick.unwrap_or(n.start_tick) - n.start_tick)
+                .max()
+                .unwrap_or(0);
+            self.notes = Arc::new(notes);
             self.notes_key = key;
         }
         // format 2: event rows and document chrome are scoped to the
