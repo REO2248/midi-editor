@@ -536,24 +536,31 @@ impl EditorView {
                 let td = self.td();
                 let mm = self.doc(|d| d.meter_map_for(self.sel_track));
                 let end_us = events.iter().map(|e| e.0).max().unwrap_or(0);
-                let mut t = 0u64;
-                loop {
+                let end_tick = self.doc(|d| d.tempo_map_for(self.sel_track).us_to_tick(end_us));
+                // bar-relative click grid (#212): the accent lands on every
+                // measure downbeat and subdivisions stay inside their bar —
+                // an accumulator walking a fixed interval skipped 7/8 and
+                // 5/8 downbeats entirely
+                let click_ticks: Vec<u64> = match td {
+                    TimeDisplay::Metrical { .. } => metronome_clicks(&mm, end_tick),
+                    // one click per displayed second — every click a bar
+                    TimeDisplay::Smpte { .. } => {
+                        let step = td.click_ticks().max(1);
+                        (0..=end_tick / step).map(|i| i * step).collect()
+                    }
+                };
+                for t in click_ticks {
                     let us = self.doc(|d| d.tempo_map_for(self.sel_track).tick_to_us(t));
                     if us > end_us {
                         break;
                     }
                     let accent = match td {
                         TimeDisplay::Metrical { .. } => mm.bar_start_tick(t) == t,
-                        // one click per displayed second — every click a bar
                         TimeDisplay::Smpte { .. } => true,
                     };
                     let note = if accent { 76 } else { 77 };
                     events.push((us, s, vec![0x99, note, 110]));
                     events.push((us + 20_000, s, vec![0x99, note, 0]));
-                    t += match td {
-                        TimeDisplay::Metrical { .. } => mm.click_ticks_at(t),
-                        TimeDisplay::Smpte { .. } => td.click_ticks(),
-                    };
                 }
             }
         }
@@ -1034,5 +1041,112 @@ impl EditorView {
     pub(crate) fn audition_off(&mut self) {
         self.scrub_key = None;
         self.audition.all_off();
+    }
+}
+
+/// Metronome click grid: one accented click per measure downbeat plus
+/// unaccented subdivisions at the meter's `cc` click interval, strictly
+/// inside each bar (#212). Bar-relative, so odd meters (7/8, 5/8) keep
+/// their downbeats instead of drifting past them.
+pub(crate) fn metronome_clicks(mm: &document::MeterMap, end_tick: u64) -> Vec<u64> {
+    let mut out = Vec::new();
+    for bs in mm.bar_starts_between(0, end_tick.saturating_add(1)) {
+        if bs > end_tick {
+            break;
+        }
+        out.push(bs);
+        let click = mm.click_ticks_at(bs).max(1);
+        let bar_end = mm.next_bar_start(bs);
+        let mut t = bs.saturating_add(click);
+        while t < bar_end && t <= end_tick {
+            out.push(t);
+            t = t.saturating_add(click);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod metronome_tests {
+    use super::metronome_clicks;
+    use document::MeterMap;
+
+    fn mm_of(sig: &[(u64, u8, u8)], ppq: u16) -> MeterMap {
+        mm_of_cc(
+            &sig.iter()
+                .map(|&(t, n, d)| (t, n, d, 24u8))
+                .collect::<Vec<_>>(),
+            ppq,
+        )
+    }
+
+    fn mm_of_cc(sig: &[(u64, u8, u8, u8)], ppq: u16) -> MeterMap {
+        // one-track doc carrying FF58 events at the given ticks
+        let mut events: Vec<document::Event> = sig
+            .iter()
+            .enumerate()
+            .map(|(i, &(tick, num, den, cc))| document::Event {
+                id: i as document::EventId,
+                tick,
+                seq: 0,
+                raw_body: None,
+                kind: smf_core::EventKind::Meta {
+                    meta_type: 0x58,
+                    data: bytes::Bytes::from(vec![num, den, cc, 8]),
+                },
+            })
+            .collect();
+        events.sort_by_key(|e| e.tick);
+        MeterMap::build(
+            &[document::Track {
+                events,
+                name: None,
+                out_port: 0,
+                out_channel: 0,
+            }],
+            smf_core::Division::Metrical(ppq),
+        )
+    }
+
+    #[test]
+    fn quarter_meter_clicks_every_beat() {
+        // 4/4 @480: accents at 0/1920/3840, unaccented at 480/960/1440…
+        let mm = mm_of(&[(0, 4, 4)], 480);
+        let clicks = metronome_clicks(&mm, 1920);
+        assert_eq!(clicks, vec![0, 480, 960, 1440, 1920]);
+    }
+
+    #[test]
+    fn seven_eight_keeps_every_downbeat() {
+        // #212 repro: 7/8 bars are 1680 ticks; the old accumulator at
+        // 480-tick spacing landed on 1920 and skipped the 1680 downbeat
+        let mm = mm_of(&[(0, 7, 3)], 480);
+        let clicks = metronome_clicks(&mm, 2 * 1680);
+        assert_eq!(
+            clicks,
+            vec![0, 480, 960, 1440, 1680, 2160, 2640, 3120, 3360]
+        );
+    }
+
+    #[test]
+    fn five_eight_and_meter_change() {
+        let mm = mm_of(&[(0, 5, 3), (1200, 4, 2)], 480);
+        let clicks = metronome_clicks(&mm, 1200 + 1920);
+        // bar 1 = [0,1200): clicks at 0,480,960; then 4/4 from 1200
+        assert_eq!(clicks, vec![0, 480, 960, 1200, 1680, 2160, 2640, 3120]);
+    }
+
+    #[test]
+    fn compound_meter_clicks_dotted_quarters() {
+        // 6/8 @480: cc=36 → dotted-quarter clicks (720 ticks), 2 per bar
+        let mm = mm_of_cc(&[(0, 6, 3, 36)], 480);
+        let clicks = metronome_clicks(&mm, 1440);
+        assert_eq!(clicks, vec![0, 720, 1440]);
+    }
+
+    #[test]
+    fn zero_end_is_single_click() {
+        let mm = mm_of(&[(0, 4, 4)], 480);
+        assert_eq!(metronome_clicks(&mm, 0), vec![0]);
     }
 }

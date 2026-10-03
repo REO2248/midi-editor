@@ -402,19 +402,24 @@ impl Timebase {
         raw.saturating_sub(self.latency_us)
     }
 
-    /// Stream clock reading at call time — µs since `new()` under arrival
-    /// stamping; once a device timestamp anchors the map, advances by host
-    /// time from the anchor (the backend clock can't be queried outside the
-    /// callback). Used to rebase a take's zero when recording starts long
-    /// after the input opened (#159 arm-vs-record split).
+    /// Stream clock reading at call time, in the same latency-compensated
+    /// domain `stamp()` reports — µs since `new()` under arrival stamping;
+    /// once a device timestamp anchors the map, advances by host time from
+    /// the anchor (the backend clock can't be queried outside the callback).
+    /// Used to rebase a take's zero when recording starts long after the
+    /// input opened (#159 arm-vs-record split). Sharing `stamp()`'s
+    /// compensated timebase keeps the take anchor comparable to stamped
+    /// events: an uncompensated `now_us` made the first `latency_us` of a
+    /// take clamp to zero and drop count-in strikes (#220).
     pub fn now_us(&self) -> u64 {
-        match self.anchor {
+        let raw = match self.anchor {
             Some((_, i0)) => {
                 let base = i0.saturating_duration_since(self.t0).as_micros() as u64;
                 base.saturating_add(i0.elapsed().as_micros() as u64)
             }
             None => self.t0.elapsed().as_micros() as u64,
-        }
+        };
+        raw.saturating_sub(self.latency_us)
     }
 }
 
@@ -2655,5 +2660,35 @@ mod tests {
         let on62 = sent.iter().position(|b| *b == vec![0x90, 62, 100]).unwrap();
         let panic_at = sent.iter().position(|b| *b == vec![0xB0, 121, 0]).unwrap();
         assert!(on60 < panic_at && panic_at < on62);
+    }
+}
+
+#[cfg(test)]
+mod now_us_tests {
+    use super::Timebase;
+    use std::time::Duration;
+
+    /// #220 — `now_us` shares `stamp()`'s latency-compensated timebase, so
+    /// the take anchor and stamped events are comparable and a strike in
+    /// the first latency window is not clamped away.
+    #[test]
+    fn now_us_subtracts_input_latency() {
+        let t0 = std::time::Instant::now();
+        let tb = Timebase::new_at(1_000, None, t0);
+        std::thread::sleep(Duration::from_millis(20));
+        let raw = t0.elapsed().as_micros() as u64;
+        let n = tb.now_us();
+        let d = raw.saturating_sub(n);
+        assert!(
+            (500..=1_500).contains(&d),
+            "now_us must sit ~1000µs (the latency) below the raw clock, got {d}"
+        );
+    }
+
+    #[test]
+    fn now_us_saturates_at_zero() {
+        let t0 = std::time::Instant::now();
+        let tb = Timebase::new_at(1_000_000, None, t0);
+        assert_eq!(tb.now_us(), 0, "before the latency window: clamps at zero");
     }
 }
