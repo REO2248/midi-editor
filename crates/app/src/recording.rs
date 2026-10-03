@@ -323,13 +323,7 @@ impl EditorView {
             let doc_us = rec.base_us + (rel - rec.cin_us);
             // armed inside a loop: input that arrives on later passes wraps
             // back into the span instead of spilling past the loop end
-            let (doc_us, pass) = match rec.loop_span_us {
-                Some((s, e)) if e > s && doc_us >= e => {
-                    (s + (doc_us - s) % (e - s), (doc_us - s) / (e - s))
-                }
-                Some((s, e)) if e > s => (doc_us, (doc_us - s) / (e - s)),
-                _ => (doc_us, 0),
-            };
+            let (doc_us, pass) = loop_wrap(doc_us, rec.loop_span_us);
             // the take lands on the armed track — for format 2 that
             // sequence's own tempo map converts live-us back to ticks
             let tick = sh.doc.tempo_map_for(track).us_to_tick(doc_us);
@@ -670,5 +664,62 @@ impl MonMode {
             "in" => Some(Self::In),
             _ => None,
         }
+    }
+}
+
+/// Map a take-relative timestamp onto an armed loop span, returning the
+/// (possibly wrapped) document timestamp and the zero-based lap ("pass")
+/// it landed on. Input timestamped before the loop start (count-in edges,
+/// late-started takes) belongs to pass 0 unwrapped — computing
+/// `doc_us - s` on u64 there would underflow and panic (#207).
+pub(crate) fn loop_wrap(doc_us: u64, span: Option<(u64, u64)>) -> (u64, u64) {
+    match span {
+        Some((s, e)) if e > s && doc_us >= e => {
+            (s + (doc_us - s) % (e - s), (doc_us - s) / (e - s))
+        }
+        // doc_us < e: inside (or before) the first lap — pass is 0 by
+        // definition, never `doc_us - s` (underflows when doc_us < s)
+        _ => (doc_us, 0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::loop_wrap;
+
+    #[test]
+    fn loop_wrap_before_start_is_pass_zero() {
+        // underflow reproduced the #207 panic before the guard existed
+        assert_eq!(loop_wrap(0, Some((1_000_000, 2_000_000))), (0, 0));
+        assert_eq!(
+            loop_wrap(999_999, Some((1_000_000, 2_000_000))),
+            (999_999, 0)
+        );
+    }
+
+    #[test]
+    fn loop_wrap_inside_first_pass() {
+        assert_eq!(
+            loop_wrap(1_500_000, Some((1_000_000, 2_000_000))),
+            (1_500_000, 0)
+        );
+    }
+
+    #[test]
+    fn loop_wrap_wraps_later_passes() {
+        let span = Some((1_000_000u64, 2_000_000u64));
+        // exactly one full lap past the start: wraps onto the start
+        assert_eq!(loop_wrap(2_000_000, span), (1_000_000, 1));
+        // mid second lap
+        assert_eq!(loop_wrap(2_500_000, span), (1_500_000, 1));
+        // third lap
+        assert_eq!(loop_wrap(3_200_000, span), (1_200_000, 2));
+    }
+
+    #[test]
+    fn loop_wrap_degenerate_and_absent_spans() {
+        assert_eq!(loop_wrap(123, None), (123, 0));
+        assert_eq!(loop_wrap(123, Some((5, 5))), (123, 0));
+        assert_eq!(loop_wrap(123, Some((9, 5))), (123, 0));
     }
 }
