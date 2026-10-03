@@ -1087,3 +1087,39 @@ fn paste_single_track_targets_active(cx: &mut TestAppContext) {
     })
     .unwrap();
 }
+
+/// #179 — paste anchors at the visible playhead. Seeking the ruler moves
+/// the playhead without touching the hidden edit cursor; Ctrl+V used to
+/// land at `cursor_tick` (usually 0) instead.
+#[gpui_kit::test]
+fn paste_anchors_at_playhead(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, fixture_doc());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        let sel_track = view.read(cx).sel_track;
+        view.update(cx, |v, cx| {
+            let on_id = v.doc(|d| {
+                d.notes()
+                    .into_iter()
+                    .find(|n| n.track == sel_track)
+                    .unwrap()
+                    .on_id
+            });
+            v.selection.insert(on_id);
+            v.copy_selected(false, w, cx);
+            // playhead at 1920 ticks (2_000_000 µs at the default 120 bpm),
+            // edit cursor deliberately left at 0
+            v.play_us = 2_000_000;
+            v.cursor_tick = 0;
+            v.paste(cx);
+            let landed = v.doc(|d| {
+                d.notes()
+                    .into_iter()
+                    .any(|n| n.track == sel_track && n.start_tick == 1920)
+            });
+            assert!(landed, "pasted note must land at the playhead tick");
+        });
+    })
+    .unwrap();
+}

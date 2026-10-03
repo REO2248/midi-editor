@@ -1883,7 +1883,10 @@ impl EditorView {
             cx.notify();
             return;
         };
-        let anchor = self.cursor_tick;
+        // anchor at the visible playhead, not the hidden edit cursor —
+        // clicking the ruler moves the playhead without touching
+        // cursor_tick, so pasting there must follow the playhead (#179)
+        let anchor = self.doc(|d| d.tempo_map.us_to_tick(self.play_us));
         self.insert_clip(&clip, anchor, "paste", cx);
     }
 
