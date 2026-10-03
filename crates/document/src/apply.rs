@@ -1018,10 +1018,27 @@ fn apply_op(
                 .get_mut(*track)
                 .ok_or(ApplyError::UnknownTrack(*track))?;
             for e in events {
-                let pos = t
+                // insert after any same-(tick, seq) run: an event sharing
+                // another's exact key (e.g. a NoteOff on its NoteOn's tick)
+                // must follow it, never precede it (#187). The End-of-Track
+                // is exempt — it must stay last even under a key tie (EOTs
+                // carry seq = u32::MAX, which next_seq can saturate to)
+                let mut pos = t
                     .events
                     .binary_search_by_key(&(e.tick, e.seq), |x| (x.tick, x.seq))
                     .unwrap_or_else(|p| p);
+                while pos < t.events.len()
+                    && (t.events[pos].tick, t.events[pos].seq) == (e.tick, e.seq)
+                    && !matches!(
+                        t.events[pos].kind,
+                        EventKind::Meta {
+                            meta_type: 0x2F,
+                            ..
+                        }
+                    )
+                {
+                    pos += 1;
+                }
                 t.events.insert(pos, e.clone());
             }
         }

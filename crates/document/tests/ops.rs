@@ -1614,3 +1614,90 @@ fn split_fmt0_by_channel_ops() {
     assert_eq!(d.tracks.len(), 1);
     assert_eq!(d.tracks[0].events.len(), 4);
 }
+
+#[test]
+fn delete_range_truncates_note_straddling_range_start() {
+    // #210: a note beginning before the cut and releasing inside it must
+    // not lose its Note-Off alone — that leaves an infinite drone. The
+    // release truncates to the range start instead.
+    let mut d = doc(vec![vec![
+        chan(800, 0x90, 60, 100),
+        chan(1100, 0x90, 62, 100),
+        chan(1200, 0x80, 60, 0),
+        chan(1400, 0x80, 62, 0),
+        chan(1500, 0xB0, 7, 100),
+    ]]);
+    let chans: std::collections::BTreeSet<u8> = [0u8].into_iter().collect();
+    let ops = d.delete_range_channel_ops(0, 1000, 2000, &chans);
+    apply(&mut d, ops);
+    let notes = notes_on(&d, 0);
+    // the fully-inside note and the CC are gone
+    assert_eq!(notes.len(), 1);
+    let n = &notes[0];
+    assert_eq!(n.key, 60);
+    // the straddling note survives, truncated at the cut
+    assert_eq!(n.start_tick, 800);
+    assert_eq!(n.end_tick, Some(1000));
+    assert!(n.off_id.is_some(), "note must stay paired — no drone");
+}
+
+#[test]
+fn delete_range_straddling_truncation_undoes() {
+    // realistic file layout: non-decreasing ticks, EOT last
+    let mut d = doc(vec![vec![
+        meta(0, 0x03, b"t".to_vec()),
+        chan(800, 0x90, 60, 100),
+        chan(1200, 0x80, 60, 0),
+        meta(1920, 0x2F, vec![]),
+    ]]);
+    let chans: std::collections::BTreeSet<u8> = [0u8].into_iter().collect();
+    let ops = d.delete_range_channel_ops(0, 1000, 2000, &chans);
+    let tx = apply(&mut d, ops);
+    assert_eq!(notes_on(&d, 0)[0].end_tick, Some(1000));
+    d.revert(&tx);
+    assert_eq!(notes_on(&d, 0)[0].end_tick, Some(1200));
+}
+
+#[test]
+fn insert_noteoff_after_equal_key_noteon() {
+    // #187: a NoteOff sharing the NoteOn's exact (tick, seq) must insert
+    // after it — before it, pairing drops the off and drones the on.
+    let mut d = doc(vec![vec![meta(0, 0x2F, vec![])]]);
+    let mk = |d: &mut Document, status: u8| Event {
+        id: d.alloc_event_id(),
+        tick: 480,
+        seq: u32::MAX / 2,
+        raw_body: None,
+        kind: EventKind::Channel {
+            status,
+            data: [60, if status & 0xF0 == 0x90 { 100 } else { 0 }],
+            len: 2,
+        },
+    };
+    let on = mk(&mut d, 0x90);
+    let off = mk(&mut d, 0x80);
+    apply(
+        &mut d,
+        vec![Op::InsertEvents {
+            track: 0,
+            events: vec![on, off],
+        }],
+    );
+    let evs: Vec<_> = d.tracks[0]
+        .events
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::Channel { .. }))
+        .collect();
+    assert_eq!(evs.len(), 2);
+    // the on precedes the off in event order even at identical (tick, seq)
+    assert!(matches!(
+        evs[0].kind,
+        EventKind::Channel { status: 0x90, .. }
+    ));
+    assert!(matches!(
+        evs[1].kind,
+        EventKind::Channel { status: 0x80, .. }
+    ));
+    let n = &notes_on(&d, 0)[0];
+    assert_eq!(n.end_tick, Some(480));
+}
