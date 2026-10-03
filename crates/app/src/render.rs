@@ -247,6 +247,7 @@ impl Render for EditorView {
 
         // --- piano roll canvas -------------------------------------------------
         let notes = self.notes.clone();
+        let notes_span = self.notes_span;
         let (scroll_x, scroll_y, zoom) = (self.scroll_x, self.scroll_y, self.zoom);
         let selection = self.selection.clone();
         let drag = self
@@ -416,6 +417,10 @@ impl Render for EditorView {
                     _ => 0,
                 };
                 let (entry, exit) = drag_window(vt0, vt1, move_dtick);
+                // widen the entry bound by the widest note: a sustained
+                // note whose start scrolled past the left edge must stay
+                // visible until its release follows (#188)
+                let entry = crate::geometry::cull_entry(entry, notes_span);
                 let first = notes.partition_point(|n| (n.start_tick as i64) < entry);
                 for n in &notes[first..] {
                     if (n.start_tick as i64) > exit {
@@ -1994,10 +1999,18 @@ impl Render for EditorView {
                                     let mut sh = crate::lock_shared(&this.shared);
                                     match which {
                                         crate::LoopDrag::Start => {
-                                            sh.loop_start = Some(tick);
+                                            sh.loop_start = Some(crate::nav::clamp_loop_locator(
+                                                tick,
+                                                sh.loop_end,
+                                                true,
+                                            ));
                                         }
                                         crate::LoopDrag::End => {
-                                            sh.loop_end = Some(tick);
+                                            sh.loop_end = Some(crate::nav::clamp_loop_locator(
+                                                tick,
+                                                sh.loop_start,
+                                                false,
+                                            ));
                                         }
                                     }
                                 }
@@ -4891,12 +4904,23 @@ impl Render for EditorView {
                     }
                 };
                 if k == "escape" && !ctrl {
-                    // dismiss overlays + clear selection — modal, not a
-                    // registry command
+                    // layered dismissal (#178): close the topmost overlay
+                    // first and keep the selection — Esc-ing a menu or the
+                    // F1 overlay used to wipe a chord selection too. Only a
+                    // bare Esc (nothing open) clears the selection.
+                    let had_overlay = this.open_menu.is_some()
+                        || this.open_sub.is_some()
+                        || this.help_open
+                        || this.show_output_status
+                        || this.meta_edit.is_some();
                     this.open_menu = None;
                     this.open_sub = None;
                     this.help_open = false;
                     this.show_output_status = false;
+                    if !crate::nav::escape_clears_selection(had_overlay) {
+                        cx.notify();
+                        return;
+                    }
                     this.selection.clear();
                     this.sel_events.clear();
                     this.meta_sel = None;

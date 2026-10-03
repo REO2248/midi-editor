@@ -1332,3 +1332,61 @@ impl EditorView {
             .on_click(cx.listener(move |this, ev, _w, cx| on(this, ev, cx)))
     }
 }
+
+/// A locator drag may never invert the loop span (#173): dragging the
+/// start past the end (or vice versa) used to leave a vanished band with
+/// two crossed handles stuck on the ruler. The start clamps to the
+/// current end; the end clamps to the current start.
+pub(crate) fn clamp_loop_locator(tick: u64, other: Option<u64>, is_start: bool) -> u64 {
+    match (is_start, other) {
+        (true, Some(end)) => tick.min(end),
+        (false, Some(start)) => tick.max(start),
+        _ => tick,
+    }
+}
+
+#[cfg(test)]
+mod loop_locator_tests {
+    use super::clamp_loop_locator;
+
+    #[test]
+    fn start_handle_never_crosses_end() {
+        assert_eq!(clamp_loop_locator(500, Some(1920), true), 500);
+        assert_eq!(clamp_loop_locator(3000, Some(1920), true), 1920);
+        assert_eq!(clamp_loop_locator(1920, Some(1920), true), 1920);
+    }
+
+    #[test]
+    fn end_handle_never_crosses_start() {
+        assert_eq!(clamp_loop_locator(2000, Some(1920), false), 2000);
+        assert_eq!(clamp_loop_locator(100, Some(1920), false), 1920);
+    }
+
+    #[test]
+    fn single_locator_moves_freely() {
+        assert_eq!(clamp_loop_locator(9000, None, true), 9000);
+        assert_eq!(clamp_loop_locator(0, None, false), 0);
+    }
+}
+
+/// Layered Escape (#178): with any overlay open (menu, submenu, F1 help,
+/// output status, meta dialog) the key only closes the overlay — the
+/// note/event selection survives. A bare Esc clears the selection.
+pub(crate) fn escape_clears_selection(any_overlay_open: bool) -> bool {
+    !any_overlay_open
+}
+
+#[cfg(test)]
+mod escape_tests {
+    use super::escape_clears_selection;
+
+    #[test]
+    fn overlay_open_keeps_selection() {
+        assert!(!escape_clears_selection(true));
+    }
+
+    #[test]
+    fn bare_escape_clears_selection() {
+        assert!(escape_clears_selection(false));
+    }
+}
