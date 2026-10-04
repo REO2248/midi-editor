@@ -3413,7 +3413,7 @@ impl Render for EditorView {
                     Sub::Snap => SNAPS
                         .iter()
                         .enumerate()
-                        .map(|(i, (_div, _trip, label))| {
+                        .map(|(i, (_div, _kind, label))| {
                             Self::mi_leaf(
                                 ("snap", i),
                                 snap_label(label, td),

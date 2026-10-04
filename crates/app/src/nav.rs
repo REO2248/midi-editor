@@ -106,19 +106,59 @@ pub(crate) fn keysig_root(sf: i8, minor: bool) -> u8 {
     (if minor { maj + 9 } else { maj } % 12) as u8
 }
 
-/// Snap grid divisors of a whole note; 0 = snap off.
-pub(crate) const SNAPS: [(u32, bool, &str); 10] = [
-    (0, false, "off"),
-    (1, false, "1"),
-    (2, false, "1/2"),
-    (4, false, "1/4"),
-    (4, true, "1/4T"),
-    (8, false, "1/8"),
-    (8, true, "1/8T"),
-    (16, false, "1/16"),
-    (16, true, "1/16T"),
-    (32, false, "1/32"),
+/// How a snap entry scales its note value: straight, triplet (2/3 of
+/// the duple cell) or dotted (3/2).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapKind {
+    Straight,
+    Triplet,
+    Dotted,
+}
+
+impl SnapKind {
+    /// Scale a straight grid length by this kind.
+    pub(crate) fn apply(self, base: i64) -> i64 {
+        match self {
+            Self::Straight => base,
+            Self::Triplet => base * 2 / 3,
+            Self::Dotted => base * 3 / 2,
+        }
+    }
+}
+
+/// Snap grid divisors of a whole note; 0 = snap off. Dotted values are
+/// appended after "1/32" so persisted snap/quantize indices (stored as
+/// table positions in the sidecar) keep their meaning (#218).
+pub(crate) const SNAPS: [(u32, SnapKind, &str); 13] = [
+    (0, SnapKind::Straight, "off"),
+    (1, SnapKind::Straight, "1"),
+    (2, SnapKind::Straight, "1/2"),
+    (4, SnapKind::Straight, "1/4"),
+    (4, SnapKind::Triplet, "1/4T"),
+    (8, SnapKind::Straight, "1/8"),
+    (8, SnapKind::Triplet, "1/8T"),
+    (16, SnapKind::Straight, "1/16"),
+    (16, SnapKind::Triplet, "1/16T"),
+    (32, SnapKind::Straight, "1/32"),
+    (4, SnapKind::Dotted, "1/4D"),
+    (8, SnapKind::Dotted, "1/8D"),
+    (16, SnapKind::Dotted, "1/16D"),
 ];
+
+/// (floor, ceil) bar-relative grid positions around `t` for the bar /
+/// half-bar snap entries (`div` 1 or 2), taken from the document's real
+/// bar lines — a 3/4 or 6/8 bar's boundary is where the snap lands, not
+/// the 4/4 stride (#218). `None` for any other divisor or negative `t`.
+pub(crate) fn bar_grid_at(mm: &document::MeterMap, div: u32, t: i64) -> Option<(i64, i64)> {
+    if div == 0 || div > 2 || t < 0 {
+        return None;
+    }
+    let t = t as u64;
+    let bs = mm.bar_start_tick(t);
+    let step = (mm.bar_ticks_at(bs) / div as u64).max(1);
+    let fl = bs + (t - bs) / step * step;
+    Some((fl as i64, fl.saturating_add(step) as i64))
+}
 
 impl EditorView {
     /// Select everything in the focused context (#152): the event list
@@ -368,51 +408,89 @@ impl EditorView {
 
     /// The quantize grid in ticks — a dedicated setting (#139), not the
     /// draw snap. Shares the SNAPS table so its label language matches.
+    /// Bar entries ("1"/"1/2") are sized by the meter in force at the
+    /// playhead; `quantize_ops` re-anchors the grid on each bar (#218).
     pub(crate) fn quantize_grid(&self) -> u64 {
-        let (div, trip, _) = SNAPS[self.q_snap.min(SNAPS.len() - 1)];
+        let (div, kind, _) = SNAPS[self.q_snap.min(SNAPS.len() - 1)];
         if div == 0 {
             // "off" quantize = 1-tick grid (no visible movement)
             return 1;
         }
-        let base = self.td().snap_base_ticks() / div as u64;
-        if trip {
-            (base * 2 / 3).max(1)
+        let base = self.snap_base(div);
+        kind.apply(base as i64).max(1) as u64
+    }
+
+    /// Straight grid length for a SNAPS divisor: the whole-note base,
+    /// except bar units on metrical docs, which take their length from
+    /// the meter actually in force (#218).
+    fn snap_base(&self, div: u32) -> u64 {
+        if div <= 2 && !self.td().is_smpte() {
+            self.doc(|d| {
+                let tick = d.tempo_map.us_to_tick(self.play_us);
+                d.meter_map_for(self.sel_track)
+                    .bar_ticks_at(tick)
+                    .max(div as u64)
+                    / div as u64
+            })
         } else {
-            base.max(1)
+            self.td().snap_base_ticks() / div as u64
         }
+    }
+
+    /// SNAPS divisor when the current snap entry is a bar unit ("1"/"1/2")
+    /// on a metrical document — the entries whose snap points must follow
+    /// the document's real bar lines (#218) instead of the 4/4 stride.
+    fn bar_snap_div(&self) -> Option<u32> {
+        if self.td().is_smpte() {
+            return None;
+        }
+        let (div, kind, _) = SNAPS[self.snap_idx.min(SNAPS.len() - 1)];
+        (div > 0 && div <= 2 && kind == SnapKind::Straight).then_some(div)
     }
 
     pub(crate) fn snap_ticks(&self) -> i64 {
-        let (div, trip, _) = SNAPS[self.snap_idx];
+        let (div, kind, _) = SNAPS[self.snap_idx.min(SNAPS.len() - 1)];
         if div == 0 {
             return 0;
         }
-        let base = self.td().snap_base_ticks() as i64 / div as i64;
-        if trip {
-            base * 2 / 3
-        } else {
-            base
-        }
+        let base = self.snap_base(div) as i64;
+        kind.apply(base).max(1)
     }
 
-    /// floor `t` onto the snap grid (used for note starts)
+    /// floor `t` onto the snap grid (used for note starts); bar and
+    /// half-bar snaps floor onto the document's real bar-line grid
+    /// (#218) — in 3/4 that means multiples of the actual bar, not 4/4.
     pub(crate) fn snap_down(&self, t: i64) -> i64 {
         let s = self.snap_ticks();
         if s <= 0 {
-            t
-        } else {
-            t - t.rem_euclid(s)
+            return t;
         }
+        if let Some(div) = self.bar_snap_div() {
+            if let Some((fl, _)) =
+                self.doc(|d| bar_grid_at(&d.meter_map_for(self.sel_track), div, t))
+            {
+                return fl;
+            }
+        }
+        t - t.rem_euclid(s)
     }
 
-    /// nearest grid point (used for note ends / dragged positions)
+    /// nearest grid point (used for note ends / dragged positions); bar
+    /// and half-bar snaps choose between the surrounding real bar-line
+    /// grid points, ties rounding up like the flat grid (#218).
     pub(crate) fn snap_round(&self, t: i64) -> i64 {
         let s = self.snap_ticks();
         if s <= 0 {
-            t
-        } else {
-            ((t.max(0) + s / 2) / s) * s
+            return t;
         }
+        if let Some(div) = self.bar_snap_div() {
+            if let Some((fl, ce)) =
+                self.doc(|d| bar_grid_at(&d.meter_map_for(self.sel_track), div, t))
+            {
+                return if ce - t <= t - fl { ce } else { fl };
+            }
+        }
+        ((t.max(0) + s / 2) / s) * s
     }
 
     pub(crate) fn set_tool(&mut self, tool: Tool, cx: &mut Context<Self>) {
@@ -1388,5 +1466,67 @@ mod escape_tests {
     #[test]
     fn bare_escape_clears_selection() {
         assert!(escape_clears_selection(false));
+    }
+}
+
+#[cfg(test)]
+mod snap_tests {
+    use super::{bar_grid_at, SnapKind, SNAPS};
+    use document::Document;
+
+    /// Meter map of a file whose first bar opens on the given signature.
+    fn meter_doc(n: u8, den_pow: u8) -> document::MeterMap {
+        let d = Document::from_file(smf_core::File {
+            format: 1,
+            division: smf_core::Division::Metrical(480),
+            tracks: vec![smf_core::Track {
+                events: vec![smf_core::Event {
+                    tick: 0,
+                    seq: 0,
+                    raw_body: None,
+                    kind: smf_core::EventKind::Meta {
+                        meta_type: 0x58,
+                        data: bytes::Bytes::from(vec![n, den_pow, 24, 8]),
+                    },
+                }],
+            }],
+            warnings: vec![],
+        });
+        d.meter_map
+    }
+
+    /// #218 — bar/half-bar snaps land on the document's real bar lines,
+    /// not the hard-coded 4/4 stride.
+    #[test]
+    fn bar_grid_follows_the_real_meter() {
+        // 3/4: bars of 1440 — a note dragged near 1900 must offer the
+        // 1440 boundary, which the 1920-stride grid skipped entirely
+        let mm = meter_doc(3, 2);
+        assert_eq!(bar_grid_at(&mm, 1, 1900), Some((1440, 2880)));
+        assert_eq!(bar_grid_at(&mm, 1, 100), Some((0, 1440)));
+        // half-bar: 720-tick cells anchored at each bar start
+        assert_eq!(bar_grid_at(&mm, 2, 1900), Some((1440, 2160)));
+        assert_eq!(bar_grid_at(&mm, 2, 2200), Some((2160, 2880)));
+        // note-value divisors and negative ticks are not bar grids
+        assert_eq!(bar_grid_at(&mm, 4, 100), None);
+        assert_eq!(bar_grid_at(&mm, 1, -5), None);
+        // compound 6/8 bar (1440) hits its boundary too
+        assert_eq!(bar_grid_at(&meter_doc(6, 3), 1, 1500), Some((1440, 2880)));
+    }
+
+    /// #218 — dotted resolutions scale their note value by 3/2 and sit
+    /// in the table after the straight/triplet entries so persisted
+    /// snap indices keep their meaning.
+    #[test]
+    fn dotted_snap_values_extend_the_grid() {
+        assert_eq!(SnapKind::Dotted.apply(480), 720); // dotted quarter
+        assert_eq!(SnapKind::Triplet.apply(480), 320);
+        assert_eq!(SnapKind::Straight.apply(480), 480);
+        assert!(SNAPS.iter().any(|s| s.2 == "1/4D" && s.0 == 4));
+        assert!(SNAPS.iter().any(|s| s.2 == "1/8D" && s.0 == 8));
+        assert!(SNAPS.iter().any(|s| s.2 == "1/16D" && s.0 == 16));
+        // the pre-dotted entries keep their historical positions
+        assert_eq!(SNAPS[7].2, "1/16");
+        assert_eq!(SNAPS[9].2, "1/32");
     }
 }
