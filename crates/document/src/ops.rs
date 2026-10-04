@@ -1309,6 +1309,37 @@ impl Document {
         }]
     }
 
+    /// Rewrite every channel event's status channel in `track` to
+    /// `channel` — the destructive counterpart of playback-time
+    /// re-channelization (#221): it edits the events themselves, so it
+    /// survives export to other tools. Events already on the channel
+    /// produce no op; metas/SysEx are untouched.
+    pub fn rechannelize_ops(&mut self, track: usize, channel: u8) -> Vec<Op> {
+        let mut ops = Vec::new();
+        let Some(t) = self.tracks.get(track) else {
+            return ops;
+        };
+        for e in &t.events {
+            if let EventKind::Channel { status, .. } = &e.kind {
+                let new_status = (*status & 0xF0) | (channel & 0x0F);
+                if new_status == *status {
+                    continue;
+                }
+                let mut after = e.clone();
+                if let EventKind::Channel { status, .. } = &mut after.kind {
+                    *status = new_status;
+                }
+                ops.push(Op::UpdateEvent {
+                    pos: usize::MAX,
+                    track,
+                    before: e.clone(),
+                    after,
+                });
+            }
+        }
+        ops
+    }
+
     /// Clone every channel event in [from,to) shifted to start at `to`.
     /// Notes keep their NoteOff even when it sits outside the range — a
     /// duplicated note must not hang. (Meta events stay behind — duplicating

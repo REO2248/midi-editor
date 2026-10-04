@@ -2738,6 +2738,7 @@ impl Render for EditorView {
                         self.mi_cmd("track.solo", Some(soloed_set.contains(&self.sel_track)), cx),
                         Self::msep(),
                         Self::mi_sub("t.chan", t("track.channel"), Sub::Chan, cx),
+                        Self::mi_sub("t.rechan", t("track.rechan"), Sub::Rechan, cx),
                         Self::mi_sub("t.dest", t("track.dest"), Sub::Dest, cx),
                     ];
                     if sel_is_plugin {
@@ -3025,6 +3026,28 @@ impl Render for EditorView {
                                     };
                                     v.audition_off();
                                     v.apply_tx("set track channel", ops);
+                                },
+                            )
+                        })
+                        .collect(),
+                    // #221: destructive rewrite of the events themselves —
+                    // unlike the prefix above, the change survives export
+                    Sub::Rechan => (0u8..16)
+                        .map(|ch| {
+                            Self::mi_leaf(
+                                ("rechan", ch as usize),
+                                format!("Channel {}", ch + 1),
+                                "",
+                                None,
+                                cx,
+                                move |v, _e, _cx| {
+                                    let tr = v.sel_track;
+                                    let ops = {
+                                        let mut sh = crate::lock_shared(&v.shared);
+                                        sh.doc.rechannelize_ops(tr, ch)
+                                    };
+                                    v.audition_off();
+                                    v.apply_tx("rechannelize", ops);
                                 },
                             )
                         })

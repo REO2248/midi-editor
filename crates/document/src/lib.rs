@@ -38,6 +38,26 @@ pub struct Track {
     pub events: Vec<Event>,
 }
 
+impl Track {
+    /// Channel assigned by an explicit `FF 20` channel-prefix meta, when
+    /// the track carries one — the track-level channel playback
+    /// re-channelizes voice messages to (#221). Tracks without the meta
+    /// (e.g. multichannel format-0 performances) keep each event's own
+    /// channel.
+    pub fn explicit_channel(&self) -> Option<u8> {
+        let has = self.events.iter().any(|e| {
+            matches!(
+                &e.kind,
+                EventKind::Meta {
+                    meta_type: 0x20,
+                    ..
+                }
+            )
+        });
+        has.then_some(self.out_channel & 0x0F)
+    }
+}
+
 /// One import diagnostic finding.
 #[derive(Debug, Clone)]
 pub struct Diagnostic {

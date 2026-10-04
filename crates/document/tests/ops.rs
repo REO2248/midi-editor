@@ -476,6 +476,68 @@ fn set_track_channel_writes_meta_and_field() {
 }
 
 #[test]
+fn rechannelize_rewrites_only_channel_statuses() {
+    // #221: the destructive rewrite touches every channel event's status
+    // nibble and nothing else — metas keep their bytes, events already on
+    // the target produce no op
+    let mut d = doc(vec![vec![
+        chan(0, 0x90, 60, 100),
+        chan(480, 0x80, 60, 0),
+        chan(240, 0xB1, 7, 100), // channel 2 CC
+        sig_like_meta(),
+    ]]);
+    let ops = d.rechannelize_ops(0, 9);
+    let n = ops.len();
+    let tx = apply(&mut d, ops);
+    let statuses: Vec<u8> = d.tracks[0]
+        .events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::Channel { status, .. } => Some(*status),
+            _ => None,
+        })
+        .collect();
+    // events are tick-ordered: 0 (on), 240 (CC), 480 (off)
+    assert_eq!(statuses, vec![0x99, 0xB9, 0x89]);
+    assert_eq!(n, 3, "all three channel events moved");
+    // undo restores the exact original channels
+    d.revert(&tx);
+    let statuses: Vec<u8> = d.tracks[0]
+        .events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::Channel { status, .. } => Some(*status),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(statuses, vec![0x90, 0xB1, 0x80]);
+}
+
+#[test]
+fn explicit_channel_requires_ff20_meta() {
+    // #221: playback only re-channelizes tracks with an explicit FF 20 —
+    // multichannel performances without the prefix keep per-event channels
+    let mut d = doc(vec![vec![chan(0, 0x90, 60, 100)]]);
+    assert_eq!(d.tracks[0].explicit_channel(), None);
+    let ops = d.set_track_channel_ops(0, 3);
+    apply(&mut d, ops);
+    assert_eq!(d.tracks[0].explicit_channel(), Some(3));
+}
+
+/// one non-channel event so rechannelize has something to leave alone
+fn sig_like_meta() -> smf_core::Event {
+    smf_core::Event {
+        tick: 100,
+        seq: 0,
+        raw_body: None,
+        kind: EventKind::Meta {
+            meta_type: 0x58,
+            data: vec![4, 2, 24, 8].into(),
+        },
+    }
+}
+
+#[test]
 fn delete_range_removes_whole_notes() {
     let mut d = doc(vec![vec![
         chan(100, 0x90, 60, 100),
