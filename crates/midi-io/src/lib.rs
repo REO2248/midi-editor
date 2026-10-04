@@ -288,10 +288,14 @@ impl Output {
     }
 
     /// All-notes-off + reset all controllers on every channel (panic).
+    /// Damper pedal off goes first — a held pedal catches the notes-off
+    /// and keeps ringing — and the wheel is re-centered after (#215).
     pub fn panic(&mut self) {
         for ch in 0u8..16 {
+            let _ = self.send(&[0xB0 | ch, 64, 0]); // Damper off
             let _ = self.send(&[0xB0 | ch, 123, 0]); // All Notes Off
             let _ = self.send(&[0xB0 | ch, 121, 0]); // Reset All Controllers
+            let _ = self.send(&[0xE0 | ch, 0, 64]); // bend center
             let _ = self.send(&[0xB0 | ch, 120, 0]); // All Sound Off
         }
     }
@@ -771,7 +775,12 @@ pub trait EventSink: Send {
     /// loop boundaries, where chased state follows immediately.
     fn notes_off(&mut self) {
         for ch in 0u8..16 {
+            // damper off first — a held pedal catches the notes-off and
+            // keeps the notes ringing through the pause (#215); the wheel
+            // re-centers so a bend doesn't hold its detune into the stop
+            self.send_at(&[0xB0 | ch, 64, 0], 0);
             self.send_at(&[0xB0 | ch, 123, 0], 0);
+            self.send_at(&[0xE0 | ch, 0, 64], 0);
         }
     }
 }

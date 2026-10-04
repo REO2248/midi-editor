@@ -542,7 +542,10 @@ fn chase_pedal_up_clears_sustained() {
         ev(600, 0xB0, 64, 0),
     ]);
     let chase = d.chase_events(d.tempo_map.tick_to_us(720));
-    assert_eq!(bytes_of(&chase), vec![vec![0xB0, 64, 0]]);
+    assert_eq!(
+        bytes_of(&chase),
+        vec![vec![0xB0, 64, 0], vec![0xE0, 0, 64]] // wheel re-centered
+    );
 }
 
 #[test]
@@ -558,7 +561,12 @@ fn chase_cc121_clears_controllers_but_not_bank_program() {
     let chase = d.chase_events(d.tempo_map.tick_to_us(720));
     assert_eq!(
         bytes_of(&chase),
-        vec![vec![0xB0, 0, 1], vec![0xB0, 32, 2], vec![0xC0, 5]]
+        vec![
+            vec![0xB0, 0, 1],
+            vec![0xB0, 32, 2],
+            vec![0xC0, 5],
+            vec![0xE0, 0, 64], // bend cleared by 121 -> chased centered
+        ]
     );
 }
 
@@ -566,7 +574,11 @@ fn chase_cc121_clears_controllers_but_not_bank_program() {
 fn chase_mode_messages_drop_notes_and_are_not_chased() {
     // all-notes-off releases held notes (no pedal): nothing to restrike
     let d = chase_doc(vec![ev(100, 0x90, 60, 100), ev(600, 0xB0, 123, 0)]);
-    assert!(d.chase_events(d.tempo_map.tick_to_us(720)).is_empty());
+    // only the wheel re-center survives: no notes, no controllers
+    assert_eq!(
+        bytes_of(&d.chase_events(d.tempo_map.tick_to_us(720))),
+        vec![vec![0xE0, 0, 64]]
+    );
     // all-sound-off kills even pedal-caught notes
     let d = chase_doc(vec![
         ev(10, 0xB0, 64, 127),
@@ -576,12 +588,16 @@ fn chase_mode_messages_drop_notes_and_are_not_chased() {
     ]);
     assert_eq!(
         bytes_of(&d.chase_events(d.tempo_map.tick_to_us(720))),
-        vec![vec![0xB0, 64, 127]]
+        vec![vec![0xB0, 64, 127], vec![0xE0, 0, 64]]
     );
 }
 
 #[test]
-fn chase_rpn_nrpn_selector_then_data() {
+fn chase_rpn_nrpn_keeps_every_parameter_then_nulls() {
+    // #215: two tuned parameters (one RPN, one NRPN) must BOTH be chased
+    // from a per-selector map — the old single-slot state kept only the
+    // last one — and the chase ends with RPN Null so the synth's data
+    // entry can't keep writing into the last parameter
     let d = chase_doc(vec![
         ev(10, 0xB0, 101, 0), // RPN 0,0 (pitch bend sensitivity)
         ev(11, 0xB0, 100, 0),
@@ -593,18 +609,49 @@ fn chase_rpn_nrpn_selector_then_data() {
     assert_eq!(
         bytes_of(&d.chase_events(d.tempo_map.tick_to_us(720))),
         vec![
-            vec![0xB0, 99, 1], // NRPN msb first, then lsb...
+            vec![0xB0, 101, 0], // RPN 0,0 + its data
+            vec![0xB0, 100, 0],
+            vec![0xB0, 6, 2],
+            vec![0xB0, 99, 1], // NRPN 1,3 + its data
             vec![0xB0, 98, 3],
-            vec![0xB0, 6, 2], // ...then data entry
             vec![0xB0, 38, 5],
+            vec![0xB0, 101, 127], // RPN Null deactivates the selector
+            vec![0xB0, 100, 127],
+            vec![0xE0, 0, 64], // wheel centered: no bend in the prefix
         ]
     );
-    // all-zero RPN (the common case) must still be chased
-    let d = chase_doc(vec![ev(10, 0xB0, 101, 0), ev(11, 0xB0, 100, 0)]);
+    // all-zero RPN with a zero value (the common case) is still chased
+    let d = chase_doc(vec![
+        ev(10, 0xB0, 101, 0),
+        ev(11, 0xB0, 100, 0),
+        ev(12, 0xB0, 6, 0),
+    ]);
     assert_eq!(
         bytes_of(&d.chase_events(d.tempo_map.tick_to_us(720))),
-        vec![vec![0xB0, 101, 0], vec![0xB0, 100, 0]]
+        vec![
+            vec![0xB0, 101, 0],
+            vec![0xB0, 100, 0],
+            vec![0xB0, 6, 0],
+            vec![0xB0, 101, 127],
+            vec![0xB0, 100, 127],
+            vec![0xE0, 0, 64],
+        ]
     );
+    // #215 cross-contamination: two RPNs both keep their own data entry
+    let d = chase_doc(vec![
+        ev(10, 0xB0, 101, 0), // RPN 0,0 sensitivity
+        ev(11, 0xB0, 100, 0),
+        ev(12, 0xB0, 6, 2),
+        ev(20, 0xB0, 101, 0), // RPN 0,1 fine tuning
+        ev(21, 0xB0, 100, 1),
+        ev(22, 0xB0, 6, 40),
+    ]);
+    let bytes = bytes_of(&d.chase_events(d.tempo_map.tick_to_us(720)));
+    assert!(bytes.contains(&vec![0xB0, 101, 0]));
+    assert!(bytes.contains(&vec![0xB0, 100, 0]));
+    assert!(bytes.contains(&vec![0xB0, 6, 2]));
+    assert!(bytes.contains(&vec![0xB0, 100, 1]));
+    assert!(bytes.contains(&vec![0xB0, 6, 40]));
 }
 
 #[test]
@@ -615,7 +662,10 @@ fn chase_excludes_events_at_the_play_position() {
     ]);
     let start = d.tempo_map.tick_to_us(30);
     let chase = d.chase_events(start);
-    assert_eq!(bytes_of(&chase), vec![vec![0xB0, 7, 100]]);
+    assert_eq!(
+        bytes_of(&chase),
+        vec![vec![0xB0, 7, 100], vec![0xE0, 0, 64]]
+    );
 }
 
 #[test]
@@ -639,7 +689,9 @@ fn chase_is_per_track() {
         chase,
         vec![
             (d.tempo_map.tick_to_us(720), 0, vec![0xB0, 7, 10]),
+            (d.tempo_map.tick_to_us(720), 0, vec![0xE0, 0, 64]),
             (d.tempo_map.tick_to_us(720), 1, vec![0xB0, 7, 20]),
+            (d.tempo_map.tick_to_us(720), 1, vec![0xE0, 0, 64]),
         ]
     );
 }
@@ -649,7 +701,23 @@ fn chase_dangling_noteon_is_held() {
     let d = chase_doc(vec![ev(100, 0x91, 64, 90)]);
     assert_eq!(
         bytes_of(&d.chase_events(d.tempo_map.tick_to_us(720))),
-        vec![vec![0x91, 64, 90]]
+        vec![vec![0xE1, 0, 64], vec![0x91, 64, 90]]
+    );
+}
+
+#[test]
+fn chase_recenters_wheel_when_bend_comes_later() {
+    // #215: seek before the file's first bend — the prefix has no bend
+    // state, and the chase must still center the wheel so a bend left
+    // ringing from an earlier pass can't detune the new one
+    let d = chase_doc(vec![
+        ev(10, 0x90, 60, 100), // held note before the seek point
+        ev(30, 0xE0, 0, 76),   // bend AFTER it — not in the prefix
+    ]);
+    let chase = d.chase_events(d.tempo_map.tick_to_us(20));
+    assert_eq!(
+        bytes_of(&chase),
+        vec![vec![0xE0, 0, 64], vec![0x90, 60, 100]]
     );
 }
 
