@@ -35,7 +35,9 @@ impl Document {
             .saturating_add(1)
     }
 
-    /// Quantize note starts inside [from,to) to `grid` ticks.
+    /// Quantize note starts inside [from,to) to `grid` ticks, with grid
+    /// lines laid from each bar's downbeat per the document's meter map
+    /// (so meter changes and pickup bars keep their own boundaries).
     /// `strength` 0..=100 interpolates between the original and the grid point;
     /// the note's duration is preserved (on+off shift together).
     pub fn quantize_ops(
@@ -49,6 +51,10 @@ impl Document {
         // i128 intermediates: u64-range ticks and grids never overflow
         let grid = grid.max(1) as i128;
         let str_f = strength.min(100) as f64 / 100.0;
+        // grid lines are laid from each bar's downbeat (#217): absolute
+        // tick-0 math misses measure boundaries once a meter change or
+        // pickup bar shifts the bar lines off the global grid
+        let mm = self.meter_map_for(track);
         let mut ops = Vec::new();
         for n in self
             .notes()
@@ -56,7 +62,8 @@ impl Document {
             .filter(|n| n.track == track && n.start_tick >= from && n.start_tick < to)
         {
             let start = n.start_tick as i128;
-            let snapped = ((start + grid / 2) / grid) * grid;
+            let bar = mm.bar_start_tick(n.start_tick) as i128;
+            let snapped = bar + (((start - bar) + grid / 2) / grid) * grid;
             let new_start = (start as f64 + (snapped - start) as f64 * str_f).round() as i128;
             let delta = new_start - start;
             if delta == 0 {
@@ -252,10 +259,11 @@ impl Document {
         ops
     }
 
-    /// Swing: notes whose start snaps to an odd `grid` index are pushed
-    /// later by `amount`% of one grid cell (0..=100). On and off move
-    /// together so durations hold; notes more than a grid cell from the
-    /// swung line, or already swung, are left alone.
+    /// Swing: notes whose start snaps to an odd `grid` index — counted
+    /// from their bar's downbeat, so downbeats are never swung — are
+    /// pushed later by `amount`% of one grid cell (0..=100). On and off
+    /// move together so durations hold; notes more than a grid cell from
+    /// the swung line, or already swung, are left alone.
     pub fn swing_ops(
         &mut self,
         track: usize,
@@ -269,6 +277,11 @@ impl Document {
         if shift == 0 {
             return Vec::new();
         }
+        // parity counts grid cells from the bar's downbeat (#217): after
+        // an odd-length bar the next downbeat sits on an odd absolute
+        // index, and tick-0 parity would delay it while leaving the real
+        // off-beats on the grid — inverting the groove
+        let mm = self.meter_map_for(track);
         let mut ops = Vec::new();
         for n in self
             .notes()
@@ -276,11 +289,12 @@ impl Document {
             .filter(|n| n.track == track && n.start_tick >= from && n.start_tick < to)
         {
             let start = n.start_tick as i64;
-            let idx = start / grid;
+            let bar = mm.bar_start_tick(n.start_tick) as i64;
+            let idx = (start - bar) / grid;
             if idx % 2 == 0 {
                 continue;
             }
-            let swung = idx * grid + shift;
+            let swung = bar + idx * grid + shift;
             let delta = swung - start;
             if delta == 0 || delta.abs() > grid {
                 continue;
