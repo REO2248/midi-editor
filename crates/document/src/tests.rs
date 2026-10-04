@@ -201,6 +201,74 @@ fn tempo_map_basic() {
 }
 
 #[test]
+fn tempo_map_dense_ramp_keeps_fractional_us_exact() {
+    // #224: a dense tempo grid (one event every 10 ticks) truncates <1µs
+    // per segment when converting ticks to µs; over thousands of ramp
+    // segments that accumulates into milliseconds of drift. The
+    // fractional-remainder carry keeps every breakpoint at the exact
+    // rational time (floor), never more than 1µs short.
+    let step = 10u64;
+    let count = 3000u64;
+    let mpq = 100_000u32; // µs/quarter — 1041.666…µs per tick at 96ppq
+    let events: Vec<smf_core::Event> = (0..=count)
+        .map(|k| smf_core::Event {
+            tick: k * step,
+            seq: k as u32,
+            raw_body: None,
+            kind: EventKind::Meta {
+                meta_type: 0x51,
+                data: mpq.to_be_bytes()[1..].to_vec().into(),
+            },
+        })
+        .collect();
+    let f = smf_core::File {
+        format: 1,
+        division: Division::Metrical(96),
+        tracks: vec![smf_core::Track { events }],
+        warnings: vec![],
+    };
+    let d = Document::from_file(f);
+    // last breakpoint: 30000 ticks * 100000µs / 96 = 31_250_000 exactly —
+    // the truncating accumulator landed at 31_248_000 (2ms early)
+    let last = d.tempo_map.points().last().unwrap();
+    assert_eq!((last.0, last.2), (count * step, 31_250_000));
+    // mid-ramp breakpoint off an exact µs boundary stays within 1µs;
+    // per-segment truncation was already 1000µs behind here
+    let mid = d.tempo_map.points()[1501];
+    let exact = 1501 * step * mpq as u64;
+    assert!((mid.2 as i128 - (exact / 96) as i128).abs() < 1);
+    assert_eq!(d.tempo_map.tick_to_us(mid.0), mid.2);
+}
+
+#[test]
+fn tempo_map_saturates_on_hostile_tick_deltas() {
+    // VLQ-scaled deltas can push a segment's µs past u64; breakpoints
+    // must pin at u64::MAX ("far future") instead of wrapping
+    let mk = |tick: u64, seq: u32| smf_core::Event {
+        tick,
+        seq,
+        raw_body: None,
+        kind: EventKind::Meta {
+            meta_type: 0x51,
+            data: 500_000u32.to_be_bytes()[1..].to_vec().into(),
+        },
+    };
+    let f = smf_core::File {
+        format: 1,
+        division: Division::Metrical(1),
+        tracks: vec![smf_core::Track {
+            events: vec![mk(0, 0), mk(u64::MAX / 2, 1), mk(u64::MAX, 2)],
+        }],
+        warnings: vec![],
+    };
+    let d = Document::from_file(f);
+    let pts = d.tempo_map.points();
+    assert_eq!(pts[0].2, 0);
+    assert_eq!(pts[1].2, u64::MAX);
+    assert_eq!(pts[2].2, u64::MAX);
+}
+
+#[test]
 fn premature_eot_collapses_on_edit_and_undo_restores() {
     // imported file whose stored EOT sits before later content: the doc
     // keeps it verbatim until a transaction touches the track, then the

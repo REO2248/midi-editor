@@ -287,14 +287,20 @@ impl TempoMap {
         let mut cum: u64 = 0;
         let mut prev_tick = 0u64;
         let mut prev_mpq = 500_000u32; // default 120bpm
+                                       // fractional-µs remainder carried between segments (#224): dense
+                                       // tempo ramps (50–100 events/bar, Δtick 5–10) lose <1µs per segment
+                                       // to integer division, which accumulates to multi-millisecond
+                                       // drift over a cue — the remainder keeps every segment exact
+        let mut rem: u128 = 0;
         for (tick, mpq) in tempos {
             if let Division::Metrical(ppq) = division {
                 if ppq > 0 {
                     // ticks can reach u64-scale via hostile VLQ deltas;
                     // saturate at "far future" instead of overflowing
-                    cum = cum.saturating_add(
-                        (tick - prev_tick).saturating_mul(prev_mpq as u64) / ppq as u64,
-                    );
+                    let prod = (tick - prev_tick) as u128 * prev_mpq as u128 + rem;
+                    let whole = prod / ppq as u128;
+                    cum = cum.saturating_add(u64::try_from(whole).unwrap_or(u64::MAX));
+                    rem = prod % ppq as u128;
                 }
             }
             points.push((tick, mpq, cum));
