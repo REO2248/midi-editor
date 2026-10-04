@@ -1179,6 +1179,27 @@ fn drain_updates(
 /// replay — ends with `notes_off()` on every sink, or `panic()` when
 /// `panic_on_stop` (reset-on-stop) is set. `pos` is updated as the
 /// schedule advances so the UI can draw a playhead.
+/// Indices of `events[from..]` sorted by WAKE time — event µs minus the
+/// target sink's lead. Sinks with lookahead (VST3 latency) must be fed
+/// `lead_us` early; when leads differ across sinks the wake order is not
+/// the event order, and dispatching in event order made late high-lead
+/// events miss their earlier wake deadlines (head-of-line blocking,
+/// #192). Ties keep event order (µs, then original index) so same-time
+/// semantics — SysEx before channel before clicks — survive within a sink.
+fn wake_order(
+    events: &[(u64, usize, Vec<u8>)],
+    sinks: &[Box<dyn EventSink>],
+    from: usize,
+) -> Vec<u32> {
+    let mut order: Vec<u32> = (from as u32..events.len() as u32).collect();
+    order.sort_by_key(|&ix| {
+        let (us, sink_idx, _) = &events[ix as usize];
+        let lead = sinks.get(*sink_idx).map(|s| s.lead_us()).unwrap_or(0);
+        (us.saturating_sub(lead), *us, ix)
+    });
+    order
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_schedule(
     clock: &mut impl Clock,
@@ -1197,6 +1218,10 @@ pub fn run_schedule(
     let mut base_us = start_us;
     let mut epoch0_us = clock.now_us();
     let mut i = events.partition_point(|(us, _, _)| *us < base_us);
+    // dispatch walks WAKE order, not event order (#192); rebuilt whenever
+    // a patch splices the timeline or swaps sinks (leads change with them)
+    let mut order: Vec<u32> = wake_order(&events, sinks, i);
+    let mut j = 0usize;
     // (sink, channel) -> note-ons delivered without their note-off yet.
     // Schedule patches consult it so orphaned notes get a channel-scoped
     // All Notes Off instead of hanging.
@@ -1206,12 +1231,7 @@ pub fn run_schedule(
         // the pass ends at the right locator when one is set — recomputed
         // per event so a patch moving the bound applies mid-pass; an empty
         // or inverted range is ignored so a degenerate loop can't starve
-        while i < events.len()
-            && events[i].0
-                < loop_end_us
-                    .filter(|le| loop_from_us.is_none_or(|ls| *le > ls))
-                    .unwrap_or(u64::MAX)
-        {
+        while j < order.len() {
             if stop.load(Relaxed) {
                 break 'outer;
             }
@@ -1232,13 +1252,25 @@ pub fn run_schedule(
                     base_us,
                 ) {
                     i = events.partition_point(|(us, _, _)| *us < base_us);
+                    order = wake_order(&events, sinks, i);
+                    j = 0;
                     pos.store(base_us, Relaxed);
                 }
                 continue;
             }
-            let (us, sink_idx, bytes) = &events[i];
-            i += 1;
+            let ix = order[j] as usize;
+            j += 1;
+            let (us, sink_idx, bytes) = &events[ix];
             let us = *us;
+            // the pass ends at the right locator — recomputed per event so
+            // a patch moving the bound applies mid-pass; an empty or
+            // inverted range is ignored so a degenerate loop can't starve.
+            // Events at/after it belong to the next cycle: not dispatched.
+            if let Some(le) = loop_end_us.filter(|le| loop_from_us.is_none_or(|ls| *le > ls)) {
+                if us >= le {
+                    continue;
+                }
+            }
             let Some(sink) = sinks.get_mut(*sink_idx) else {
                 continue;
             };
@@ -1272,6 +1304,8 @@ pub fn run_schedule(
                 base_us,
             ) {
                 i = events.partition_point(|(us, _, _)| *us < base_us);
+                order = wake_order(&events, sinks, i);
+                j = 0;
                 pos.store(base_us, Relaxed);
                 continue 'outer;
             }
@@ -1309,6 +1343,8 @@ pub fn run_schedule(
                 base_us = ls;
                 epoch0_us = clock.now_us();
                 i = ni;
+                order = wake_order(&events, sinks, i);
+                j = 0;
                 pos.store(ls, Relaxed);
             }
             None => break,
@@ -1636,6 +1672,42 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+    }
+
+    /// #192 — sinks with different leads must be fed in WAKE order:
+    /// the plugin event (later in event time, 450ms with 200ms lead,
+    /// wake 250ms) is dispatched before the port event (300ms, lead 0).
+    /// Event-time dispatch slept to 300ms first and the plugin's wake
+    /// deadline was already 50ms past — rem clamped to 0 and the note
+    /// emerged from the plugin ~50ms late, out of phase with the port.
+    #[test]
+    fn mixed_lead_sinks_dispatch_in_wake_order() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let events = vec![
+            (300_000u64, 0usize, vec![0x90, 60, 100]), // port sink, lead 0
+            (450_000u64, 1usize, vec![0x91, 62, 100]), // plugin sink, lead 200ms
+        ];
+        let mut pb = Playback::start(
+            vec![
+                Box::new(TimingSink(log.clone(), 0)),
+                Box::new(TimingSink(log.clone(), 200_000)),
+            ],
+            events,
+            0,
+            None,
+            None,
+            false,
+        );
+        let snap = wait_for(&log, 2);
+        pb.stop();
+        assert_eq!(snap[0].0, vec![0x91, 62, 100], "plugin event wakes first");
+        assert!(
+            snap[0].1 > 150_000,
+            "plugin event delivered early (rem={}, want ≈200ms)",
+            snap[0].1
+        );
+        assert_eq!(snap[1].0, vec![0x90, 60, 100]);
+        assert!(snap[1].1 < 50_000, "port event near its deadline");
     }
 
     /// A sink waking `lead_us` early sees `rem ≈ lead` at delivery — the
