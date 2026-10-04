@@ -1554,6 +1554,92 @@ fn swing_amount_zero_is_noop_and_hundred_clamps() {
     assert_eq!(notes_on(&d, 0)[0].start_tick, 240 + 239);
 }
 
+/// FF 58 time signature for meter-aware op tests (#217).
+fn sig(tick: u64, num: u8, den_pow: u8) -> smf_core::Event {
+    smf_core::Event {
+        tick,
+        seq: 0,
+        raw_body: None,
+        kind: EventKind::Meta {
+            meta_type: 0x58,
+            data: Bytes::from(vec![num, den_pow, 24, 8]),
+        },
+    }
+}
+
+#[test]
+fn quantize_snaps_to_bar_anchored_grid_across_meter_changes() {
+    // #217: 3/4 bar [0,1440) then 4/4 from 1440 — with a half-note grid
+    // the old tick-0 math offered 960/1920 and missed the 1440 downbeat
+    let mut d = doc(vec![vec![
+        sig(0, 3, 2),
+        sig(1440, 4, 2),
+        chan(500, 0x90, 60, 100),
+        chan(700, 0x80, 60, 0),
+        chan(1450, 0x90, 62, 100),
+        chan(1650, 0x80, 62, 0),
+        chan(2450, 0x90, 64, 100),
+        chan(2650, 0x80, 64, 0),
+    ]]);
+    let ops = d.quantize_ops(0, 0, u64::MAX, 960, 100);
+    apply(&mut d, ops);
+    let ns = notes_on(&d, 0);
+    let at = |key: u8| ns.iter().find(|n| n.key == key).unwrap().start_tick;
+    // inside the 3/4 bar: half-note lines at 0/960 from its downbeat
+    assert_eq!(at(60), 960);
+    // just after the 4/4 downbeat snaps back TO it (old code: 1920)
+    assert_eq!(at(62), 1440);
+    // mid 4/4 bar lands on 1440+960 (old absolute grid had nothing there)
+    assert_eq!(at(64), 2400);
+}
+
+#[test]
+fn quantize_honors_pickup_bar_alignment() {
+    // a one-beat pickup bar [0,480) before 4/4: the full bar's half-note
+    // grid runs 480/1440/…, not 0/960/…
+    let mut d = doc(vec![vec![
+        sig(0, 1, 2),
+        sig(480, 4, 2),
+        chan(1490, 0x90, 60, 100),
+        chan(1690, 0x80, 60, 0),
+    ]]);
+    let ops = d.quantize_ops(0, 0, u64::MAX, 960, 100);
+    apply(&mut d, ops);
+    assert_eq!(notes_on(&d, 0)[0].start_tick, 1440);
+}
+
+#[test]
+fn swing_parity_counts_from_the_bar_downbeat() {
+    // #217: 3/4 throughout — after each 1440-tick bar the next downbeat
+    // lands on an odd absolute quarter index; tick-0 parity delayed the
+    // downbeats and left the real off-beats (beat 2) unswung
+    let mut d = doc(vec![vec![
+        sig(0, 3, 2),
+        chan(0, 0x90, 60, 100),
+        chan(200, 0x80, 60, 0),
+        chan(480, 0x90, 62, 90),
+        chan(680, 0x80, 62, 0),
+        chan(960, 0x90, 64, 80),
+        chan(1160, 0x80, 64, 0),
+        chan(1440, 0x90, 65, 70),
+        chan(1640, 0x80, 65, 0),
+        chan(1920, 0x90, 67, 70),
+        chan(2120, 0x80, 67, 0),
+        chan(2400, 0x90, 69, 70),
+        chan(2600, 0x80, 69, 0),
+    ]]);
+    // 50% swing on the quarter grid: shift = 240
+    let ops = d.swing_ops(0, 0, u64::MAX, 480, 50);
+    apply(&mut d, ops);
+    let ns = notes_on(&d, 0);
+    let at = |key: u8| ns.iter().find(|n| n.key == key).unwrap().start_tick;
+    // bar 1: beat 2 (the only off-beat) swings; beats 1/3 stay
+    assert_eq!((at(60), at(62), at(64)), (0, 720, 960));
+    // bar 2: downbeat 1440 stays (old tick-0 parity moved it to 1680),
+    // beat 2 at 1920 swings (old code left it), beat 3 at 2400 stays
+    assert_eq!((at(65), at(67), at(69)), (1440, 2160, 2400));
+}
+
 /// #162 — the Format-0 split offers ops only for genuinely multichannel
 /// files, routes each channel to its own Format-1 track, and keeps the
 /// meta/EOT shell in track 0.

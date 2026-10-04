@@ -10,6 +10,20 @@
 
 use smf_core::{Division, EventKind};
 
+/// Exact SMPTE tick rate as a rational `(numerator, denominator)` —
+/// ticks per second equals `num / den`. Every standard rate is integral
+/// except the SMF `-29` division, which encodes 29.97 drop-frame =
+/// 30000/1001 fps: computing it as literal `29 * ticks_per_frame`
+/// undercounts the rate by 3.24% and drags playback proportionally
+/// slow (#211).
+pub fn smpte_rate(fps: u8, ticks_per_frame: u8) -> (u64, u64) {
+    let tpf = ticks_per_frame.max(1) as u64;
+    match fps {
+        29 => (30_000 * tpf, 1001),
+        f => (f.max(1) as u64 * tpf, 1),
+    }
+}
+
 /// Presentation model for the document's [`Division`]. Everything the
 /// chrome (ruler, grid, event rows, playhead readout, snap/quantize
 /// menus, metronome) needs to draw time correctly derives from this —
@@ -43,14 +57,19 @@ impl TimeDisplay {
         matches!(self, Self::Smpte { .. })
     }
 
-    /// Ticks per real wall-clock second — matches `TempoMap::smpte_tps`
-    /// (`fps * ticks_per_frame`). `0` for metrical.
+    /// Ticks per real wall-clock second, floored from the exact rational
+    /// rate (`smpte_rate`) — `30000/1001 * ticks_per_frame` for the
+    /// -29 drop-frame division, so 29.97/100 tpf reads 2997, not 2900.
+    /// `0` for metrical.
     pub fn ticks_per_second(self) -> u64 {
         match self {
             Self::Smpte {
                 fps,
                 ticks_per_frame,
-            } => fps.max(1) as u64 * ticks_per_frame.max(1) as u64,
+            } => {
+                let (num, den) = smpte_rate(fps, ticks_per_frame);
+                num / den.max(1)
+            }
             Self::Metrical { .. } => 0,
         }
     }
@@ -201,12 +220,36 @@ impl MeterEvent {
     /// convention: dotted quarter (36 clocks) in compound meter, quarter
     /// otherwise — what Cubase/REAPER emit for 6/8, 9/8, 12/8.
     pub fn default_click_clocks(num: u8, den_pow: u8) -> u8 {
-        if den_pow >= 3 && num > 3 && num.is_multiple_of(3) {
+        if is_compound_meter(num, den_pow) {
             36
         } else {
             24
         }
     }
+
+    /// Compound meter (6/8, 9/8, 12/8, …): more than three denominator
+    /// units grouped in threes — the meter pulses in dotted beats.
+    pub fn is_compound(&self) -> bool {
+        is_compound_meter(self.num, self.den_pow)
+    }
+
+    /// Musical beats per bar: `num` denominator units, or `num / 3`
+    /// dotted beats in compound meter (2 in 6/8, 3 in 9/8) — what the
+    /// metronome clicks and DAWs count, not the subdivision count.
+    pub fn beat_count(&self) -> u64 {
+        if self.is_compound() {
+            (self.num as u64 / 3).max(1)
+        } else {
+            self.num as u64
+        }
+    }
+}
+
+/// The compound-meter predicate shared by the click convention and the
+/// beat math: `6/8`, `9/8`, `12/8` and friends (`den_pow >= 3`, more
+/// than three units, divisible by three).
+fn is_compound_meter(num: u8, den_pow: u8) -> bool {
+    den_pow >= 3 && num > 3 && num.is_multiple_of(3)
 }
 
 /// The document's time-signature map: sorted `FF 58` breakpoints plus the
@@ -267,7 +310,10 @@ impl MeterMap {
             Division::Smpte {
                 fps,
                 ticks_per_frame,
-            } => (fps.max(1) as u64 * ticks_per_frame.max(1) as u64 / 4).max(1),
+            } => {
+                let (num, den) = smpte_rate(fps, ticks_per_frame);
+                (num / (4 * den.max(1))).max(1)
+            }
         }
     }
 
@@ -281,15 +327,29 @@ impl MeterMap {
         }
     }
 
-    /// Ticks per beat under `meter` (a whole note = 4 quarters).
-    pub fn beat_ticks_of(&self, meter: MeterEvent) -> u64 {
+    /// Ticks of one denominator unit — the notated beat value (an eighth
+    /// in 6/8, a quarter in 3/4). Bar lengths are `num` of these whatever
+    /// the grouping.
+    pub fn unit_ticks_of(&self, meter: MeterEvent) -> u64 {
         ((self.quarter_ticks() * 4) >> meter.den_pow.min(6)).max(1)
+    }
+
+    /// Ticks of one musical beat under `meter`: the denominator unit, or
+    /// three units (a dotted note) in compound meter — the interval the
+    /// metronome clicks, so BBT counts what the user hears (#216).
+    pub fn beat_ticks_of(&self, meter: MeterEvent) -> u64 {
+        let unit = self.unit_ticks_of(meter);
+        if meter.is_compound() {
+            unit * 3
+        } else {
+            unit
+        }
     }
 
     /// Ticks per bar under the meter in force at `tick`.
     pub fn bar_ticks_at(&self, tick: u64) -> u64 {
         let m = self.meter_at(tick);
-        self.beat_ticks_of(m) * m.num as u64
+        self.unit_ticks_of(m) * m.num as u64
     }
 
     /// Metronome click interval in ticks at `tick` — from the stored `cc`
@@ -300,8 +360,11 @@ impl MeterMap {
     }
 
     /// Walk the map and return (bar, beat, tick-in-beat) for `tick`,
-    /// 1-based on the first two. A meter change that lands mid-bar starts
-    /// a new bar — the truncated remainder counts as a full bar.
+    /// 1-based on the first two. `beat` counts musical beats — dotted
+    /// beats in compound meter (2 in 6/8, matching the metronome), with
+    /// the subdivision carried in the tick field. A meter change that
+    /// lands mid-bar starts a new bar — the truncated remainder counts
+    /// as a full bar.
     pub fn tick_to_bbt(&self, tick: u64) -> (u64, u64, u64) {
         let mut pos = 0u64;
         let mut bar = 0u64;
@@ -314,13 +377,13 @@ impl MeterMap {
             if pt > tick {
                 break;
             }
-            let bar_t = self.beat_ticks_of(m) * m.num as u64;
+            let bar_t = self.unit_ticks_of(m) * m.num as u64;
             bar += (pt - pos).div_ceil(bar_t);
             pos = pt;
             m = pm;
         }
         let bt = self.beat_ticks_of(m);
-        let bar_t = bt * m.num as u64;
+        let bar_t = self.unit_ticks_of(m) * m.num as u64;
         bar += (tick - pos) / bar_t;
         let rem = (tick - pos) % bar_t;
         (bar + 1, rem / bt + 1, rem % bt)
@@ -345,7 +408,7 @@ impl MeterMap {
             pos = pt;
             m = pm;
         }
-        let bar_t = self.beat_ticks_of(m) * m.num as u64;
+        let bar_t = self.unit_ticks_of(m) * m.num as u64;
         start + ((tick - pos) / bar_t) * bar_t
     }
 
@@ -354,7 +417,7 @@ impl MeterMap {
     /// natural span ends it early — the new meter opens a fresh bar.
     fn bar_end_at(&self, start: u64) -> u64 {
         let m = self.meter_at(start);
-        let natural = start + self.beat_ticks_of(m) * m.num as u64;
+        let natural = start + self.unit_ticks_of(m) * m.num as u64;
         match self
             .points
             .iter()
@@ -434,23 +497,26 @@ impl MeterMap {
         out
     }
 
-    /// Beat-line ticks in `[from, to)` as `(tick, is_downbeat)` — the
-    /// minor grid for roll/ruler drawing. A bar truncated by a mid-bar
-    /// meter change emits only the beats inside its short span; the new
-    /// signature's own bar start is the next downbeat.
+    /// Beat-line ticks in `[from, to)` as `(tick, is_accent)` — the
+    /// minor grid for roll/ruler drawing, one line per denominator unit.
+    /// Accents mark bar downbeats and, in compound meter, the secondary
+    /// strong beats opening each dotted beat (eighth 4 in 6/8) (#216).
+    /// A bar truncated by a mid-bar meter change emits only the beats
+    /// inside its short span; the new signature's own bar start is the
+    /// next downbeat.
     pub fn beat_lines_between(&self, from: u64, to: u64) -> Vec<(u64, bool)> {
         let mut out = Vec::new();
         for bs in self.bar_starts_between(from, to) {
             let m = self.meter_at(bs);
-            let beat = self.beat_ticks_of(m);
+            let unit = self.unit_ticks_of(m);
             let end = self.next_bar_start(bs);
             for i in 0..m.num as u64 {
-                let t = bs + i * beat;
+                let t = bs + i * unit;
                 if t >= end || t >= to {
                     break;
                 }
                 if t >= from {
-                    out.push((t, i == 0));
+                    out.push((t, i == 0 || (m.is_compound() && i % 3 == 0)));
                 }
             }
         }
@@ -572,11 +638,63 @@ mod tests {
         );
         assert_eq!(mm.format_bbt(0), "1.1.  0");
         assert_eq!(mm.format_bbt(1920), "2.1.  0");
-        // sixth eighth-note beat of bar 2 — inside the bar, not "bar 2.5"
-        assert_eq!(mm.format_bbt(1920 + 5 * 240), "2.6.  0");
+        // fifth eighth of bar 2 = inside dotted beat 2 (tick 480 of 720) —
+        // compound meters count musical beats, not subdivisions (#216)
+        assert_eq!(mm.format_bbt(1920 + 5 * 240), "2.2.480");
         // 1440 ticks after the change = 6/8 bar 2 done exactly (6*240) →
         // wait, 6*240=1440: bar 3 starts at 1920+1440=3360
         assert_eq!(mm.format_bbt(3360), "3.1.  0");
+    }
+
+    /// #216 — compound meters count musical (dotted) beats, agreeing
+    /// with the metronome's click convention; bar lengths stay `num`
+    /// denominator units and the grid accents the secondary strong
+    /// beats instead of leaving all subdivisions identical.
+    #[test]
+    fn compound_meters_count_dotted_beats() {
+        let mk = |num: u8| {
+            let mut evs = Vec::new();
+            sig(&mut evs, 1, 0, num, 3);
+            MeterMap::build(
+                &[crate::Track {
+                    name: None,
+                    out_port: 0,
+                    out_channel: 0,
+                    events: evs,
+                }],
+                Division::Metrical(480),
+            )
+        };
+        // 6/8: two dotted-quarter beats of 720; bar = 1440
+        let mm = mk(6);
+        assert_eq!(mm.meter_at(0).beat_count(), 2);
+        assert_eq!(mm.beat_ticks_of(mm.meter_at(0)), 720);
+        assert_eq!(mm.bar_ticks_at(0), 1440);
+        assert_eq!(mm.tick_to_bbt(0), (1, 1, 0));
+        assert_eq!(mm.tick_to_bbt(719), (1, 1, 719));
+        assert_eq!(mm.tick_to_bbt(720), (1, 2, 0));
+        assert_eq!(mm.tick_to_bbt(1439), (1, 2, 719));
+        assert_eq!(mm.tick_to_bbt(1440), (2, 1, 0));
+        // 9/8: three beats; 12/8: four
+        assert_eq!(mk(9).meter_at(0).beat_count(), 3);
+        assert_eq!(mk(12).meter_at(0).beat_count(), 4);
+        // 3/8 is simple, not compound — three eighth beats
+        let mm38 = mk(3);
+        assert_eq!(mm38.meter_at(0).beat_count(), 3);
+        assert_eq!(mm38.beat_ticks_of(mm38.meter_at(0)), 240);
+        // grid: one line per eighth; accents on the downbeat and the
+        // secondary strong beat opening beat 2 (eighth 4)
+        assert_eq!(
+            mm.beat_lines_between(0, 1440),
+            vec![
+                (0, true),
+                (240, false),
+                (480, false),
+                (720, true),
+                (960, false),
+                (1200, false),
+            ]
+        );
     }
 
     #[test]
@@ -706,12 +824,13 @@ mod tests {
         assert_eq!(sm.min_grid_ticks(), 100);
         assert_eq!(sm.click_ticks(), 3000);
         assert_eq!(sm.nudge_ticks(), 100);
-        // the -29 division's displayed second is the nominal 30 frames
+        // the -29 division's displayed second is the nominal 30 frames;
+        // its real rate is 30000/1001 fps → 2997.003 ticks/second
         let df = TimeDisplay::of(Division::Smpte {
             fps: 29,
             ticks_per_frame: 100,
         });
-        assert_eq!(df.ticks_per_second(), 2900); // wall-clock rate
+        assert_eq!(df.ticks_per_second(), 2997); // floor of the exact rate
         assert_eq!(df.bar_ticks(), 3000); // timecode second
         assert_eq!(df.format_tick(df.bar_ticks()), "00:00:01.00");
     }

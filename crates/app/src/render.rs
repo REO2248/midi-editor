@@ -372,8 +372,10 @@ impl Render for EditorView {
                     PositionFormat::Bbt(mm) => {
                         let tick1 = tick0 + (f32::from(w) / zoom) as u64 + mm.bar_ticks_at(tick0);
                         // minor beat lines collapse into bar-only when
-                        // they'd draw too close — same rule as SMPTE
-                        let min_beat_px = mm.beat_ticks_of(mm.meter_at(tick0)) as f32 * zoom;
+                        // they'd draw too close — same rule as SMPTE;
+                        // spacing is the denominator unit (one line per
+                        // subdivision, accented on compound beats)
+                        let min_beat_px = mm.unit_ticks_of(mm.meter_at(tick0)) as f32 * zoom;
                         for (t, down) in mm.beat_lines_between(tick0, tick1) {
                             if !down && min_beat_px < 4.0 {
                                 continue;
@@ -3411,7 +3413,7 @@ impl Render for EditorView {
                     Sub::Snap => SNAPS
                         .iter()
                         .enumerate()
-                        .map(|(i, (_div, _trip, label))| {
+                        .map(|(i, (_div, _kind, label))| {
                             Self::mi_leaf(
                                 ("snap", i),
                                 snap_label(label, td),
