@@ -10,6 +10,20 @@
 
 use smf_core::{Division, EventKind};
 
+/// Exact SMPTE tick rate as a rational `(numerator, denominator)` —
+/// ticks per second equals `num / den`. Every standard rate is integral
+/// except the SMF `-29` division, which encodes 29.97 drop-frame =
+/// 30000/1001 fps: computing it as literal `29 * ticks_per_frame`
+/// undercounts the rate by 3.24% and drags playback proportionally
+/// slow (#211).
+pub fn smpte_rate(fps: u8, ticks_per_frame: u8) -> (u64, u64) {
+    let tpf = ticks_per_frame.max(1) as u64;
+    match fps {
+        29 => (30_000 * tpf, 1001),
+        f => (f.max(1) as u64 * tpf, 1),
+    }
+}
+
 /// Presentation model for the document's [`Division`]. Everything the
 /// chrome (ruler, grid, event rows, playhead readout, snap/quantize
 /// menus, metronome) needs to draw time correctly derives from this —
@@ -43,14 +57,19 @@ impl TimeDisplay {
         matches!(self, Self::Smpte { .. })
     }
 
-    /// Ticks per real wall-clock second — matches `TempoMap::smpte_tps`
-    /// (`fps * ticks_per_frame`). `0` for metrical.
+    /// Ticks per real wall-clock second, floored from the exact rational
+    /// rate (`smpte_rate`) — `30000/1001 * ticks_per_frame` for the
+    /// -29 drop-frame division, so 29.97/100 tpf reads 2997, not 2900.
+    /// `0` for metrical.
     pub fn ticks_per_second(self) -> u64 {
         match self {
             Self::Smpte {
                 fps,
                 ticks_per_frame,
-            } => fps.max(1) as u64 * ticks_per_frame.max(1) as u64,
+            } => {
+                let (num, den) = smpte_rate(fps, ticks_per_frame);
+                num / den.max(1)
+            }
             Self::Metrical { .. } => 0,
         }
     }
@@ -267,7 +286,10 @@ impl MeterMap {
             Division::Smpte {
                 fps,
                 ticks_per_frame,
-            } => (fps.max(1) as u64 * ticks_per_frame.max(1) as u64 / 4).max(1),
+            } => {
+                let (num, den) = smpte_rate(fps, ticks_per_frame);
+                (num / (4 * den.max(1))).max(1)
+            }
         }
     }
 
@@ -706,12 +728,13 @@ mod tests {
         assert_eq!(sm.min_grid_ticks(), 100);
         assert_eq!(sm.click_ticks(), 3000);
         assert_eq!(sm.nudge_ticks(), 100);
-        // the -29 division's displayed second is the nominal 30 frames
+        // the -29 division's displayed second is the nominal 30 frames;
+        // its real rate is 30000/1001 fps → 2997.003 ticks/second
         let df = TimeDisplay::of(Division::Smpte {
             fps: 29,
             ticks_per_frame: 100,
         });
-        assert_eq!(df.ticks_per_second(), 2900); // wall-clock rate
+        assert_eq!(df.ticks_per_second(), 2997); // floor of the exact rate
         assert_eq!(df.bar_ticks(), 3000); // timecode second
         assert_eq!(df.format_tick(df.bar_ticks()), "00:00:01.00");
     }

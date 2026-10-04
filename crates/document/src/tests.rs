@@ -269,6 +269,32 @@ fn tempo_map_saturates_on_hostile_tick_deltas() {
 }
 
 #[test]
+fn smpte_dropframe_runs_at_30000_over_1001() {
+    // #211: the SMF -29 division is 29.97 drop-frame = 30000/1001 fps.
+    // Integer `29 * ticks_per_frame` math undercounted the tick rate by
+    // 3.24%, dragging playback proportionally slow (~2s per minute).
+    let f = smf_core::File {
+        format: 1,
+        division: Division::Smpte {
+            fps: 29,
+            ticks_per_frame: 100,
+        },
+        tracks: vec![smf_core::Track { events: vec![] }],
+        warnings: vec![],
+    };
+    let d = Document::from_file(f);
+    // 2997 ticks = 2997 * 1001 / 3000 seconds-worth of µs: 999_999 —
+    // the old 2900 tps rate put 2997 ticks a full 1_033_448µs out
+    assert_eq!(d.tempo_map.tick_to_us(2997), 999_999);
+    assert_eq!(d.tempo_map.us_to_tick(999_999), 2997);
+    // one real second is 3000000/1001 = 2997.003 ticks — floor
+    assert_eq!(d.tempo_map.us_to_tick(1_000_000), 2997);
+    // 3M ticks = 30_000 frames = exactly 1001 wall-clock seconds at
+    // 30000/1001 fps (the old integer rate claimed 1034.5s — 3.4% slow)
+    assert_eq!(d.tempo_map.tick_to_us(3_000_000), 1_001_000_000);
+}
+
+#[test]
 fn premature_eot_collapses_on_edit_and_undo_restores() {
     // imported file whose stored EOT sits before later content: the doc
     // keeps it verbatim until a transaction touches the track, then the

@@ -1709,12 +1709,15 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
                 })
             } else {
                 serde_json::json!({
-                    // None for SMPTE: there is no quarter note — use
-                    // fps*ticks_per_frame for tick<->time math instead
+                    // None for SMPTE: there is no quarter note — use the
+                    // reported ticks_per_second (exact 30000/1001 rate for
+                    // the -29 drop-frame division) for tick<->time math
                     "ppq": tm.ppq(),
                     "fps": fps,
                     "ticks_per_frame": tpf,
-                    "ticks_per_second": fps.map(|f| f as u64 * tpf.unwrap_or(1) as u64),
+                    "ticks_per_second": fps.map(|_| {
+                        document::TimeDisplay::of(sh.view().division).ticks_per_second()
+                    }),
                     "points": tm.points().iter().map(point).collect::<Vec<_>>(),
                 })
             })

@@ -327,20 +327,23 @@ impl TempoMap {
         }
     }
 
-    /// Ticks per second for SMPTE timing (tempo events don't apply there).
-    fn smpte_tps(&self) -> u64 {
+    /// Exact SMPTE tick rate as `(numerator, denominator)` ticks/second
+    /// (tempo events don't apply there). The `-29` division is 29.97
+    /// drop-frame — 30000/1001 fps, not literal 29 (#211).
+    fn smpte_rate(&self) -> (u64, u64) {
         match self.division {
             Division::Smpte {
                 fps,
                 ticks_per_frame,
-            } => fps.max(1) as u64 * ticks_per_frame.max(1) as u64,
-            Division::Metrical(_) => 0,
+            } => timing::smpte_rate(fps, ticks_per_frame),
+            Division::Metrical(_) => (0, 1),
         }
     }
 
     pub fn tick_to_us(&self, tick: u64) -> u64 {
         if let Division::Smpte { .. } = self.division {
-            return (((tick as u128) * 1_000_000) / self.smpte_tps() as u128).min(u64::MAX as u128)
+            let (num, den) = self.smpte_rate();
+            return (((tick as u128) * 1_000_000 * den as u128) / num as u128).min(u64::MAX as u128)
                 as u64;
         }
         let ppq = match self.division {
@@ -358,7 +361,8 @@ impl TempoMap {
     /// Inverse of `tick_to_us` — for playhead positioning.
     pub fn us_to_tick(&self, us: u64) -> u64 {
         if let Division::Smpte { .. } = self.division {
-            return (((us as u128) * self.smpte_tps() as u128) / 1_000_000).min(u64::MAX as u128)
+            let (num, den) = self.smpte_rate();
+            return (((us as u128) * num as u128) / (1_000_000 * den as u128)).min(u64::MAX as u128)
                 as u64;
         }
         let ppq = match self.division {
