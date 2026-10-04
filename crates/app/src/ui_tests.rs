@@ -198,6 +198,7 @@ fn dump(window: &Window, v: &EditorView) -> String {
             Sub::LenSet => "LenSet",
             Sub::VelSet => "VelSet",
             Sub::Chan => "Chan",
+            Sub::Rechan => "Rechan",
             Sub::Dest => "Dest",
             Sub::EvFType => "EvFType",
             Sub::EvFChan => "EvFChan",

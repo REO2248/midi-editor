@@ -15,17 +15,31 @@ pub(crate) fn track_audible(tr: usize, muted: &HashSet<usize>, soloed: &HashSet<
 
 /// Filter a per-track timeline to audible tracks and remap each event's
 /// track onto its sink index; events whose destination has no open sink
-/// (failed port, unavailable plugin) are dropped.
+/// (failed port, unavailable plugin) are dropped. Tracks with an explicit
+/// `FF 20` channel assignment are re-channelized: voice-message status
+/// bytes carry the track's channel, not the channel they were recorded
+/// on (#221).
 pub(crate) fn route_events(
     timeline: Vec<(u64, usize, Vec<u8>)>,
     audible: impl Fn(usize) -> bool,
     dest_of: impl Fn(usize) -> usize,
+    chan_of: impl Fn(usize) -> Option<u8>,
     sink_of: &HashMap<usize, usize>,
 ) -> Vec<(u64, usize, Vec<u8>)> {
     timeline
         .into_iter()
         .filter(|(_, tr, _)| audible(*tr))
-        .filter_map(|(us, tr, b)| sink_of.get(&dest_of(tr)).map(|&s| (us, s, b)))
+        .filter_map(|(us, tr, mut b)| {
+            let sink = *sink_of.get(&dest_of(tr))?;
+            if let Some(ch) = chan_of(tr) {
+                if let Some(st) = b.first_mut() {
+                    if (0x80..=0xEF).contains(st) {
+                        *st = (*st & 0xF0) | (ch & 0x0F);
+                    }
+                }
+            }
+            Some((us, sink, b))
+        })
         .collect()
 }
 
@@ -508,6 +522,9 @@ impl EditorView {
     ) -> Vec<(u64, usize, Vec<u8>)> {
         let audible = self.live_audible(ctx);
         let dest_of = |t: usize| ctx.dest_of_track.get(&t).copied().unwrap_or(0);
+        // explicit FF 20 channel assignment: playback re-channelizes the
+        // track's voice messages to it (#221)
+        let chan_of = |t: usize| self.doc(|d| d.tracks.get(t).and_then(|tr| tr.explicit_channel()));
         let tagged: Vec<(u64, usize, Vec<u8>)> = self
             .doc(|d| d.timeline_tagged())
             .into_iter()
@@ -517,9 +534,14 @@ impl EditorView {
         // patch dumps) must land before notes struck at the same instant.
         // assemble_events' stable sort keeps sysex < channel < click at
         // equal µs.
-        let mut events: Vec<(u64, usize, Vec<u8>)> =
-            route_events(self.doc(|d| d.timeline_sysex()), &audible, dest_of, sink_of);
-        events.extend(route_events(tagged, &audible, dest_of, sink_of));
+        let mut events: Vec<(u64, usize, Vec<u8>)> = route_events(
+            self.doc(|d| d.timeline_sysex()),
+            &audible,
+            dest_of,
+            chan_of,
+            sink_of,
+        );
+        events.extend(route_events(tagged, &audible, dest_of, chan_of, sink_of));
         // count-in hold: with `cin` > 0 the song is parked — every event
         // at or after the pass start is deferred by `cin` below, and the
         // hold window is filled by the pre-region's own clicks (#137)
@@ -586,6 +608,7 @@ impl EditorView {
             self.doc(|d| d.chase_events(start_us)),
             &audible,
             dest_of,
+            chan_of,
             sink_of,
         );
         // opt-in SysEx chase
@@ -594,6 +617,7 @@ impl EditorView {
                 self.doc(|d| d.chase_sysex(start_us)),
                 &audible,
                 dest_of,
+                chan_of,
                 sink_of,
             )
         } else {
@@ -614,11 +638,23 @@ impl EditorView {
         // pass a locator before the record point folds into the boundary
         // chase — no schedule µs exists for it during the hold.
         if let Some(ls) = loop_ls_us.filter(|&ls| ls != start_us && (cin == 0 || ls > start_us)) {
-            let mut lc = route_events(self.doc(|d| d.chase_events(ls)), &audible, dest_of, sink_of);
+            let mut lc = route_events(
+                self.doc(|d| d.chase_events(ls)),
+                &audible,
+                dest_of,
+                chan_of,
+                sink_of,
+            );
             if ctx.chase_sysex {
                 lc.splice(
                     0..0,
-                    route_events(self.doc(|d| d.chase_sysex(ls)), &audible, dest_of, sink_of),
+                    route_events(
+                        self.doc(|d| d.chase_sysex(ls)),
+                        &audible,
+                        dest_of,
+                        chan_of,
+                        sink_of,
+                    ),
                 );
             }
             for &s in transport_lanes {
@@ -1068,6 +1104,37 @@ pub(crate) fn metronome_clicks(mm: &document::MeterMap, end_tick: u64) -> Vec<u6
 
 #[cfg(test)]
 mod metronome_tests {
+    use super::route_events;
+    use std::collections::HashMap;
+
+    /// #221 — a track with an explicit FF 20 channel plays back on that
+    /// channel; without it each event keeps its recorded channel.
+    #[test]
+    fn route_events_rechannelizes_to_explicit_track_channel() {
+        let tl = vec![
+            (0u64, 0usize, vec![0x90, 60, 100]),
+            (100u64, 0usize, vec![0xE5, 62, 90]), // channel-6 bend also moves
+            (200u64, 1usize, vec![0x90, 64, 80]), // track 1: no FF 20
+        ];
+        let mut sinks = HashMap::new();
+        sinks.insert(0usize, 0usize);
+        let out = route_events(
+            tl,
+            |t| t < 2,
+            |_| 0,
+            |t| if t == 0 { Some(1u8) } else { None },
+            &sinks,
+        );
+        assert_eq!(
+            out,
+            vec![
+                (0, 0, vec![0x91, 60, 100]),
+                (100, 0, vec![0xE1, 62, 90]),
+                (200, 0, vec![0x90, 64, 80]),
+            ]
+        );
+    }
+
     use super::metronome_clicks;
     use document::MeterMap;
 

@@ -294,6 +294,8 @@ impl TopMenu {
 #[derive(Clone, Copy, PartialEq)]
 enum Sub {
     Chan,
+    /// Track ▸ Rechannelize Events (rewrite event channels)
+    Rechan,
     Dest,
     DefDest,
     InPort,
@@ -2988,6 +2990,7 @@ mod tests {
             timeline,
             |tr| tr != 1,       // audible = "not track 1"
             |tr| [0, 1, 0][tr], // dest_of
+            |_| None,           // no explicit track channels
             &sink_of,
         );
         // t0→d0→sink0, t2→d0→sink0; a d2 event would map to sink1
@@ -2998,6 +3001,7 @@ mod tests {
             vec![(10, 0, note(60)), (20, 3, note(62))],
             |_| true,
             |_| 0, // every track targets dest 0
+            |_| None,
             &sink_of2,
         );
         assert!(got2.is_empty());

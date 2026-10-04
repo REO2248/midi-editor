@@ -1050,16 +1050,24 @@ impl EditorView {
         self.persist();
     }
 
-    /// Cycle the track's insert/edit channel — editor state, not a file
-    /// write. The `FF 20` channel-prefix meta is only touched through the
-    /// explicit Track ▸ Channel Prefix command (or MCP); playback always
-    /// follows each event's own channel.
+    /// Cycle the track's channel chip. The assignment is real: it writes
+    /// the track's `FF 20` channel prefix through an undoable transaction
+    /// (#221), so playback re-channelizes the track's voice messages to
+    /// the new channel and the insert channel follows it. Plain event
+    /// rewrites stay behind Track ▸ Rechannelize.
     pub(crate) fn cycle_chan(&mut self, i: usize) {
         let cur = self.edit_channel_of(
             i,
             self.doc(|d| d.tracks.get(i).map(|t| t.out_channel).unwrap_or(0)),
         );
-        self.edit_ch.insert(i, (cur + 1) % 16);
+        let next = (cur + 1) % 16;
+        let ops = {
+            let mut sh = crate::lock_shared(&self.shared);
+            sh.doc.set_track_channel_ops(i, next)
+        };
+        self.edit_ch.insert(i, next);
+        self.audition_off();
+        self.apply_tx("set track channel", ops);
         self.persist();
     }
 

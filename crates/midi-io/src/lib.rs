@@ -288,10 +288,14 @@ impl Output {
     }
 
     /// All-notes-off + reset all controllers on every channel (panic).
+    /// Damper pedal off goes first — a held pedal catches the notes-off
+    /// and keeps ringing — and the wheel is re-centered after (#215).
     pub fn panic(&mut self) {
         for ch in 0u8..16 {
+            let _ = self.send(&[0xB0 | ch, 64, 0]); // Damper off
             let _ = self.send(&[0xB0 | ch, 123, 0]); // All Notes Off
             let _ = self.send(&[0xB0 | ch, 121, 0]); // Reset All Controllers
+            let _ = self.send(&[0xE0 | ch, 0, 64]); // bend center
             let _ = self.send(&[0xB0 | ch, 120, 0]); // All Sound Off
         }
     }
@@ -569,12 +573,16 @@ impl Input {
 pub enum SysexPolicy {
     /// Send everything on the playback thread (default, deterministic):
     /// a long dump delays the events scheduled after it on that sink.
+    /// Long messages are paced (wire time + gap) so hardware synth input
+    /// FIFOs don't overflow (#214).
     Serialize,
-    /// Long messages move to a per-sink worker thread holding a second
-    /// connection to the same port; channel timing stays predictable.
-    /// Ordering between a deferred dump and later channel events is not
-    /// preserved — that is the point of the mode. Falls back to
-    /// `Serialize` when the backend refuses a second connection.
+    /// Deprecated alias of `Serialize` (#214): the second OS port
+    /// connection this mode used to open fails outright on Windows
+    /// exclusive drivers (`MMSYSERR_ALLOCATED`) and, where a multi-client
+    /// driver allows it, concurrently transmitting two handles violates
+    /// MIDI 1.0 serial framing. Long messages now serialize on the single
+    /// unified connection — same pacing as `Serialize`. Kept (and still
+    /// selectable) so existing sidecar preferences keep loading.
     Background,
     /// Drop messages over `inline_max` during playback, with a diagnostic —
     /// for rigs where a dump must never stall channel playback at all.
@@ -619,6 +627,9 @@ pub struct SysexConfig {
     /// Bound on bytes parked in the background lane of one sink; further
     /// messages are dropped with a diagnostic instead of growing memory.
     pub max_queue_bytes: usize,
+    /// Inter-packet pause after each paced SysEx message, in ms — the
+    /// processing time a hardware synth MCU needs between messages (#214).
+    pub gap_ms: u64,
 }
 
 impl Default for SysexConfig {
@@ -628,8 +639,15 @@ impl Default for SysexConfig {
             inline_max: 256,
             max_bytes: 1 << 20,
             max_queue_bytes: 4 << 20,
+            gap_ms: 30,
         }
     }
+}
+
+/// MIDI 1.0 DIN wire time: 31,250 baud at 10 bits per byte (start +
+/// 8 data + stop) = 3,125 bytes/s = 320µs per byte (#214).
+fn wire_time_us(len: usize) -> u64 {
+    len as u64 * 320
 }
 
 /// What `SysexConfig` decided for one message.
@@ -706,7 +724,11 @@ struct SysexLane {
 }
 
 impl SysexLane {
-    fn spawn<F>(mut send: F, stats: std::sync::Arc<SysexStats>) -> Self
+    /// Production callers were removed with the deprecated background
+    /// connection (#214); the bounded lane and its baud-rate pacing stay
+    /// exercised by tests for the day a single-connection lane returns.
+    #[allow(dead_code)]
+    fn spawn<F>(mut send: F, stats: std::sync::Arc<SysexStats>, gap_us: u64) -> Self
     where
         F: FnMut(&[u8]) + Send + 'static,
     {
@@ -720,6 +742,13 @@ impl SysexLane {
                 send(&msg);
                 stats.note_send(t0.elapsed());
                 q2.fetch_sub(msg.len(), Relaxed);
+                // baud-rate pacing (#214): OS USB buffers dump bursts at
+                // USB speed into the adapter, overflowing the small input
+                // FIFOs of hardware synths — hold for the wire time plus
+                // the inter-packet gap the device MCU needs to process
+                std::thread::sleep(std::time::Duration::from_micros(
+                    wire_time_us(msg.len()) + gap_us,
+                ));
             }
         });
         Self {
@@ -771,7 +800,12 @@ pub trait EventSink: Send {
     /// loop boundaries, where chased state follows immediately.
     fn notes_off(&mut self) {
         for ch in 0u8..16 {
+            // damper off first — a held pedal catches the notes-off and
+            // keeps the notes ringing through the pause (#215); the wheel
+            // re-centers so a bend doesn't hold its detune into the stop
+            self.send_at(&[0xB0 | ch, 64, 0], 0);
             self.send_at(&[0xB0 | ch, 123, 0], 0);
+            self.send_at(&[0xE0 | ch, 0, 64], 0);
         }
     }
 }
@@ -804,39 +838,12 @@ impl PortSink {
     }
 
     /// `cfg.policy` picks how messages over `inline_max` leave the sink.
-    /// `Background` opens a second connection to the same port for the
-    /// worker lane; when the backend refuses, the sink stays serialized
-    /// and reports `has_lane() == false`.
+    /// Since #214 no policy opens a second OS connection: `Background`
+    /// used to try one (failing on Windows exclusive drivers, and
+    /// corrupting serial framing where multi-client drivers allowed it)
+    /// and now serializes on this single connection with pacing.
     pub fn with_config(out: Output, cfg: SysexConfig) -> Self {
         let stats = std::sync::Arc::new(SysexStats::default());
-        let lane = if cfg.policy == SysexPolicy::Background {
-            match Output::open_named(&out.name) {
-                Ok(lane_out) => {
-                    let stats2 = stats.clone();
-                    let mut lane_out = Some(lane_out);
-                    Some(SysexLane::spawn(
-                        move |b: &[u8]| {
-                            if let Some(o) = lane_out.as_mut() {
-                                if let Err(e) = o.send(b) {
-                                    tracing::warn!("sysex lane on '{}': {e}", o.name);
-                                    lane_out = None;
-                                }
-                            }
-                        },
-                        stats2,
-                    ))
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "sysex background lane on '{}' unavailable ({e}) — serializing",
-                        out.name
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
         Self {
             name: out.name.clone(),
             ord: out.ord,
@@ -844,7 +851,7 @@ impl PortSink {
             dead: false,
             next_retry: std::time::Instant::now(),
             cfg,
-            lane,
+            lane: None,
             stats,
             warned_drop: false,
         }
@@ -870,8 +877,9 @@ impl PortSink {
         }
     }
 
-    /// True when the background SysEx lane is live (policy honored);
-    /// false means `Background` fell back to serialized sends.
+    /// True when the background SysEx lane is live. Always false since
+    /// #214 deprecated the second connection — the API stays so callers
+    /// (and tests) can keep asking.
     pub fn has_lane(&self) -> bool {
         self.lane.is_some()
     }
@@ -948,6 +956,16 @@ impl EventSink for PortSink {
                     let t0 = std::time::Instant::now();
                     self.send_or_mark_dead(bytes);
                     self.stats.note_send(t0.elapsed());
+                    // long dumps are paced even on the serialized path:
+                    // a driver that returns before the wire drains would
+                    // otherwise hand the device the next burst instantly
+                    // (#214). Small setup SysEx (≤ inline_max) keeps its
+                    // deterministic same-tick ordering un-delayed.
+                    if bytes.len() > self.cfg.inline_max {
+                        std::thread::sleep(std::time::Duration::from_micros(
+                            wire_time_us(bytes.len()) + self.cfg.gap_ms * 1_000,
+                        ));
+                    }
                     return;
                 }
             }
@@ -1170,6 +1188,27 @@ fn drain_updates(
 /// replay — ends with `notes_off()` on every sink, or `panic()` when
 /// `panic_on_stop` (reset-on-stop) is set. `pos` is updated as the
 /// schedule advances so the UI can draw a playhead.
+/// Indices of `events[from..]` sorted by WAKE time — event µs minus the
+/// target sink's lead. Sinks with lookahead (VST3 latency) must be fed
+/// `lead_us` early; when leads differ across sinks the wake order is not
+/// the event order, and dispatching in event order made late high-lead
+/// events miss their earlier wake deadlines (head-of-line blocking,
+/// #192). Ties keep event order (µs, then original index) so same-time
+/// semantics — SysEx before channel before clicks — survive within a sink.
+fn wake_order(
+    events: &[(u64, usize, Vec<u8>)],
+    sinks: &[Box<dyn EventSink>],
+    from: usize,
+) -> Vec<u32> {
+    let mut order: Vec<u32> = (from as u32..events.len() as u32).collect();
+    order.sort_by_key(|&ix| {
+        let (us, sink_idx, _) = &events[ix as usize];
+        let lead = sinks.get(*sink_idx).map(|s| s.lead_us()).unwrap_or(0);
+        (us.saturating_sub(lead), *us, ix)
+    });
+    order
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_schedule(
     clock: &mut impl Clock,
@@ -1188,6 +1227,10 @@ pub fn run_schedule(
     let mut base_us = start_us;
     let mut epoch0_us = clock.now_us();
     let mut i = events.partition_point(|(us, _, _)| *us < base_us);
+    // dispatch walks WAKE order, not event order (#192); rebuilt whenever
+    // a patch splices the timeline or swaps sinks (leads change with them)
+    let mut order: Vec<u32> = wake_order(&events, sinks, i);
+    let mut j = 0usize;
     // (sink, channel) -> note-ons delivered without their note-off yet.
     // Schedule patches consult it so orphaned notes get a channel-scoped
     // All Notes Off instead of hanging.
@@ -1197,12 +1240,7 @@ pub fn run_schedule(
         // the pass ends at the right locator when one is set — recomputed
         // per event so a patch moving the bound applies mid-pass; an empty
         // or inverted range is ignored so a degenerate loop can't starve
-        while i < events.len()
-            && events[i].0
-                < loop_end_us
-                    .filter(|le| loop_from_us.is_none_or(|ls| *le > ls))
-                    .unwrap_or(u64::MAX)
-        {
+        while j < order.len() {
             if stop.load(Relaxed) {
                 break 'outer;
             }
@@ -1223,13 +1261,25 @@ pub fn run_schedule(
                     base_us,
                 ) {
                     i = events.partition_point(|(us, _, _)| *us < base_us);
+                    order = wake_order(&events, sinks, i);
+                    j = 0;
                     pos.store(base_us, Relaxed);
                 }
                 continue;
             }
-            let (us, sink_idx, bytes) = &events[i];
-            i += 1;
+            let ix = order[j] as usize;
+            j += 1;
+            let (us, sink_idx, bytes) = &events[ix];
             let us = *us;
+            // the pass ends at the right locator — recomputed per event so
+            // a patch moving the bound applies mid-pass; an empty or
+            // inverted range is ignored so a degenerate loop can't starve.
+            // Events at/after it belong to the next cycle: not dispatched.
+            if let Some(le) = loop_end_us.filter(|le| loop_from_us.is_none_or(|ls| *le > ls)) {
+                if us >= le {
+                    continue;
+                }
+            }
             let Some(sink) = sinks.get_mut(*sink_idx) else {
                 continue;
             };
@@ -1263,6 +1313,8 @@ pub fn run_schedule(
                 base_us,
             ) {
                 i = events.partition_point(|(us, _, _)| *us < base_us);
+                order = wake_order(&events, sinks, i);
+                j = 0;
                 pos.store(base_us, Relaxed);
                 continue 'outer;
             }
@@ -1300,6 +1352,8 @@ pub fn run_schedule(
                 base_us = ls;
                 epoch0_us = clock.now_us();
                 i = ni;
+                order = wake_order(&events, sinks, i);
+                j = 0;
                 pos.store(ls, Relaxed);
             }
             None => break,
@@ -1627,6 +1681,42 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+    }
+
+    /// #192 — sinks with different leads must be fed in WAKE order:
+    /// the plugin event (later in event time, 450ms with 200ms lead,
+    /// wake 250ms) is dispatched before the port event (300ms, lead 0).
+    /// Event-time dispatch slept to 300ms first and the plugin's wake
+    /// deadline was already 50ms past — rem clamped to 0 and the note
+    /// emerged from the plugin ~50ms late, out of phase with the port.
+    #[test]
+    fn mixed_lead_sinks_dispatch_in_wake_order() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let events = vec![
+            (300_000u64, 0usize, vec![0x90, 60, 100]), // port sink, lead 0
+            (450_000u64, 1usize, vec![0x91, 62, 100]), // plugin sink, lead 200ms
+        ];
+        let mut pb = Playback::start(
+            vec![
+                Box::new(TimingSink(log.clone(), 0)),
+                Box::new(TimingSink(log.clone(), 200_000)),
+            ],
+            events,
+            0,
+            None,
+            None,
+            false,
+        );
+        let snap = wait_for(&log, 2);
+        pb.stop();
+        assert_eq!(snap[0].0, vec![0x91, 62, 100], "plugin event wakes first");
+        assert!(
+            snap[0].1 > 150_000,
+            "plugin event delivered early (rem={}, want ≈200ms)",
+            snap[0].1
+        );
+        assert_eq!(snap[1].0, vec![0x90, 60, 100]);
+        assert!(snap[1].1 < 50_000, "port event near its deadline");
     }
 
     /// A sink waking `lead_us` early sees `rem ≈ lead` at delivery — the
@@ -2230,6 +2320,7 @@ mod tests {
             inline_max: 256,
             max_bytes: 1 << 20,
             max_queue_bytes: 4096,
+            gap_ms: 0, // queue-bound tests measure pacing separately
         }
     }
 
@@ -2252,8 +2343,9 @@ mod tests {
         let big = 4 * 1024; // a multi-kilobyte dump
         assert_eq!(gate(&cfg(SysexPolicy::Serialize), big, false), Gate::Inline);
         assert_eq!(gate(&cfg(SysexPolicy::Skip), big, false), Gate::Drop);
+        // the Defer arm stays for lane-capable sinks; since #214 no
+        // PortSink opens one, so Background in practice serializes
         assert_eq!(gate(&cfg(SysexPolicy::Background), big, true), Gate::Defer);
-        // a Background sink whose lane failed to open serializes instead
         assert_eq!(
             gate(&cfg(SysexPolicy::Background), big, false),
             Gate::Inline
@@ -2285,6 +2377,7 @@ mod tests {
                 let _ = release_rx.recv();
             },
             stats.clone(),
+            0,
         );
         let msg = vec![0xF0u8; 1024]; // 1 KiB each, bound is 4 KiB
         for _ in 0..4 {
@@ -2320,6 +2413,7 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             },
             stats.clone(),
+            0,
         );
         assert!(lane.try_enqueue(vec![0xF0u8; 512], 4096));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -2332,6 +2426,41 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         assert!(stats.max_send_us.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    }
+
+    /// #214 — the lane paces dispatches: after each SysEx the worker
+    /// holds for the 31.25kbaud wire time plus the configured inter-packet
+    /// gap, so a burst can't overflow a hardware synth's input FIFO.
+    #[test]
+    fn lane_paces_sends_to_wire_rate_plus_gap() {
+        let stats = Arc::new(SysexStats::default());
+        let times = Arc::new(Mutex::new(Vec::new()));
+        let times2 = times.clone();
+        let lane = SysexLane::spawn(
+            move |_: &[u8]| {
+                times2.lock().unwrap().push(std::time::Instant::now());
+            },
+            stats,
+            50_000, // 50ms inter-packet gap
+        );
+        assert!(lane.try_enqueue(vec![0xF0u8; 100], 4096)); // 32ms wire
+        assert!(lane.try_enqueue(vec![0xF0u8; 100], 4096));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while times.lock().unwrap().len() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "second send never ran"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let times = times.lock().unwrap().clone();
+        let between = times[1].duration_since(times[0]);
+        // ≥ wire (100B × 320µs = 32ms) + gap (50ms); coarse floor dodges
+        // scheduler jitter. Without pacing the gap is ~0.
+        assert!(
+            between >= std::time::Duration::from_millis(75),
+            "inter-send gap {between:?} < wire+gap"
+        );
     }
 
     /// End-to-end through `Playback`: under Skip, a huge SysEx must not

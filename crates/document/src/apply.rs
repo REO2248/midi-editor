@@ -745,17 +745,22 @@ impl Document {
                     (0xB0, ctl, v) => match ctl {
                         0 => st.bank_msb = Some(v),
                         32 => st.bank_lsb = Some(v),
-                        6 => st.data_msb = Some(v),
-                        38 => st.data_lsb = Some(v),
-                        98 | 99 => {
-                            st.sel_seen = true;
-                            st.sel_nrpn = true;
-                            st.sel_vals[(ctl - 98) as usize] = v;
+                        6 | 38 => {
+                            // data entry lands in the active parameter's
+                            // slot — every tuned RPN/NRPN is kept, not just
+                            // the last-selected one (#215)
+                            if let Some(k) = st.active_param() {
+                                let e = st.params.entry(k).or_default();
+                                if ctl == 6 {
+                                    e.0 = Some(v);
+                                } else {
+                                    e.1 = Some(v);
+                                }
+                            }
                         }
-                        100 | 101 => {
-                            st.sel_seen = true;
-                            st.sel_nrpn = false;
-                            st.sel_vals[(ctl - 98) as usize] = v;
+                        98..=101 => {
+                            st.sel_vals[(ctl - 98) as usize] = Some(v);
+                            st.sel_nrpn = ctl <= 99;
                         }
                         64 => {
                             st.pedal_down = v >= 64;
@@ -771,11 +776,9 @@ impl Document {
                         121 => {
                             // RP-015: controllers to default; bank/program survive
                             st.cc = std::array::from_fn(|_| None);
-                            st.data_msb = None;
-                            st.data_lsb = None;
-                            st.sel_seen = false;
+                            st.params.clear();
+                            st.sel_vals = std::array::from_fn(|_| None);
                             st.sel_nrpn = false;
-                            st.sel_vals = [0; 4];
                             st.bend = None;
                             st.pressure = None;
                             st.poly = std::array::from_fn(|_| None);
@@ -830,23 +833,30 @@ impl Document {
                         push!([0xB0 | ch, ctl as u8, *v]);
                     }
                 }
-                if st.sel_seen {
-                    let (msb, lsb) = if st.sel_nrpn {
-                        (99u8, 98u8)
-                    } else {
-                        (101, 100)
-                    };
-                    push!([0xB0 | ch, msb, st.sel_vals[(msb - 98) as usize]]);
-                    push!([0xB0 | ch, lsb, st.sel_vals[(lsb - 98) as usize]]);
-                    if let Some(v) = st.data_msb {
+                // RPN/NRPN: chase every tuned parameter, then null the
+                // selector so later data-entry on the synth can't keep
+                // writing into the last one (#215)
+                for (&(nrpn, m, l), &(dmsb, dlsb)) in &st.params {
+                    let (msb_cc, lsb_cc) = if nrpn { (99u8, 98u8) } else { (101, 100) };
+                    push!([0xB0 | ch, msb_cc, m]);
+                    push!([0xB0 | ch, lsb_cc, l]);
+                    if let Some(v) = dmsb {
                         push!([0xB0 | ch, 6, v]);
                     }
-                    if let Some(v) = st.data_lsb {
+                    if let Some(v) = dlsb {
                         push!([0xB0 | ch, 38, v]);
                     }
                 }
-                if let Some([lsb, msb]) = st.bend {
-                    push!([0xE0 | ch, lsb, msb]);
+                if !st.params.is_empty() {
+                    // RPN Null (127/127) deactivates the parameter
+                    push!([0xB0 | ch, 101, 127]);
+                    push!([0xB0 | ch, 100, 127]);
+                }
+                match st.bend {
+                    Some([lsb, msb]) => push!([0xE0 | ch, lsb, msb]),
+                    // no bend in the prefix → re-center: a bend left from an
+                    // earlier pass must not detune the seek target (#215)
+                    None => push!([0xE0 | ch, 0, 64]),
                 }
                 if let Some(v) = st.pressure {
                     push!([0xD0 | ch, v]);
@@ -1218,6 +1228,11 @@ fn refresh_track_meta(tracks: &mut [Track], ti: usize) {
     }
 }
 
+/// Tuned RPN/NRPN parameter values: (nrpn?, selector msb, selector lsb)
+/// → (data msb, data lsb). One entry per selector so chasing restores
+/// every tuned parameter, not just the last one selected (#215).
+type ParamTuning = std::collections::BTreeMap<(bool, u8, u8), (Option<u8>, Option<u8>)>;
+
 /// Per-(track, channel) state reconstructed by `Document::chase_events` while
 /// scanning the prefix before the play position. `None` = never set (or reset
 /// by CC121) → nothing is emitted for that slot.
@@ -1228,13 +1243,15 @@ struct ChaseState {
     bank_msb: Option<u8>,
     bank_lsb: Option<u8>,
     prog: Option<u8>,
-    data_msb: Option<u8>,
-    data_lsb: Option<u8>,
-    /// any RPN/NRPN selector seen; NRPN vs RPN is whichever group wrote last
-    sel_seen: bool,
+    /// RPN/NRPN parameter values: (nrpn?, msb, lsb) → (data msb, data lsb).
+    /// One map per selector — chasing must restore EVERY tuned parameter,
+    /// not just the one whose selectors happened to come last (#215).
+    params: ParamTuning,
+    /// the parameter data entry currently writes into, and the selector
+    /// nibbles seen so far (CC98-101 by `cc - 98`); the active group is
+    /// whichever of RPN/NRPN wrote last
+    sel_vals: [Option<u8>; 4],
     sel_nrpn: bool,
-    /// CC98, CC99, CC100, CC101 values by `cc - 98`
-    sel_vals: [u8; 4],
     bend: Option<[u8; 2]>,
     pressure: Option<u8>,
     poly: [Option<u8>; 128],
@@ -1245,19 +1262,32 @@ struct ChaseState {
     sustained: Vec<(u8, u8)>,
 }
 
+impl ChaseState {
+    /// The fully-specified parameter data entry writes into, if any.
+    fn active_param(&self) -> Option<(bool, u8, u8)> {
+        let (msb, lsb) = if self.sel_nrpn {
+            (self.sel_vals[1], self.sel_vals[0])
+        } else {
+            (self.sel_vals[3], self.sel_vals[2])
+        };
+        match (msb, lsb) {
+            (Some(m), Some(l)) => Some((self.sel_nrpn, m, l)),
+            _ => None,
+        }
+    }
+}
+
 impl Default for ChaseState {
     fn default() -> Self {
         Self {
             cc: std::array::from_fn(|_| None),
             poly: std::array::from_fn(|_| None),
             pending: std::array::from_fn(|_| Vec::new()),
-            sel_vals: [0; 4],
+            sel_vals: std::array::from_fn(|_| None),
+            params: ParamTuning::new(),
             bank_msb: None,
             bank_lsb: None,
             prog: None,
-            data_msb: None,
-            data_lsb: None,
-            sel_seen: false,
             sel_nrpn: false,
             bend: None,
             pressure: None,
