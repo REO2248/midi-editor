@@ -776,15 +776,40 @@ impl Render for EditorView {
                 },
             ))
             .child(Self::vsep())
-            // transport
+            // transport — deck order per DAW convention (#168): loop,
+            // rewind, play, stop, record, click. The play button keeps the
+            // ▶ glyph while playing (the green tint shows the state) so it
+            // never masquerades as a second Stop next to `i.stop`; Space
+            // still toggles play/stop through `toggle_play`.
+            .child(self.ibtn_c(
+                window,
+                "i.loop",
+                "repeat",
+                t("tip.loop"),
+                loop_en,
+                theme::current().accent,
+                cx,
+                |v, _e, _cx| {
+                    {
+                        let mut sh = crate::lock_shared(&v.shared);
+                        sh.loop_enabled = !sh.loop_enabled;
+                    }
+                    v.persist();
+                },
+            ))
+            .child(self.ibtn(
+                window,
+                "i.start",
+                "skip_previous",
+                t("tip.go_start"),
+                false,
+                cx,
+                |v, _e, cx| v.go_to_start(cx),
+            ))
             .child(self.ibtn_c(
                 window,
                 "i.play",
-                if self.playback.is_some() {
-                    "stop"
-                } else {
-                    "play_arrow"
-                },
+                "play_arrow",
                 t("tip.play"),
                 self.playback.is_some(),
                 theme::current().ok,
@@ -800,15 +825,6 @@ impl Render for EditorView {
                 cx,
                 |v, _e, cx| v.transport_stop(cx),
             ))
-            .child(self.ibtn(
-                window,
-                "i.start",
-                "skip_previous",
-                t("tip.go_start"),
-                false,
-                cx,
-                |v, _e, cx| v.go_to_start(cx),
-            ))
             .child(self.ibtn_c(
                 window,
                 "i.rec",
@@ -821,24 +837,8 @@ impl Render for EditorView {
             ))
             .child(self.ibtn_c(
                 window,
-                "i.loop",
-                "loop",
-                t("tip.loop"),
-                loop_en,
-                theme::current().accent,
-                cx,
-                |v, _e, _cx| {
-                    {
-                        let mut sh = crate::lock_shared(&v.shared);
-                        sh.loop_enabled = !sh.loop_enabled;
-                    }
-                    v.persist();
-                },
-            ))
-            .child(self.ibtn_c(
-                window,
                 "i.met",
-                "timer",
+                "metronome",
                 t("tip.met"),
                 met_en,
                 theme::current().accent,
