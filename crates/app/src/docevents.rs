@@ -297,22 +297,30 @@ pub(crate) fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
                     if let Some(pw) = &v.plugin_window {
                         let _ = pw.service_platform_events();
                         // live param sync: forward the editor's edits into
-                        // the playing instance (best-effort each tick)
+                        // the playing instance (best-effort each tick).
+                        // #190: only drain when the playing instance's
+                        // mutex is free — `take_parameter_edits` empties
+                        // the editor's queue, so draining before a failed
+                        // try_lock would DROP the edits instead of
+                        // deferring them; left queued they simply retry
+                        // on the next tick.
                         if let Some((d, editor)) = v.editor_plugin.clone() {
-                            let edits = editor
-                                .lock()
-                                .map(|mut e| e.take_parameter_edits())
-                                .unwrap_or_default();
-                            if !edits.is_empty() {
-                                if let Some(slot) = v.plugin_slots.get(&d) {
-                                    if let Ok(mut p) = slot.plugin.try_lock() {
-                                        for ed in edits {
-                                            if let Some(val) = ed.value {
-                                                let _ = p.set_parameter(ed.id, val);
-                                            }
+                            let mut applied_edits = 0usize;
+                            if let Some(slot) = v.plugin_slots.get(&d) {
+                                if let Ok(mut p) = slot.plugin.try_lock() {
+                                    let edits = editor
+                                        .lock()
+                                        .map(|mut e| e.take_parameter_edits())
+                                        .unwrap_or_default();
+                                    applied_edits = edits.len();
+                                    for ed in edits {
+                                        if let Some(val) = ed.value {
+                                            let _ = p.set_parameter(ed.id, val);
                                         }
                                     }
                                 }
+                            }
+                            if applied_edits > 0 {
                                 // the playing slot's state changed — queue a
                                 // capture; the throttled flush below bounds
                                 // the write rate while a knob is dragged
