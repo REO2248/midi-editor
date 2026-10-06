@@ -2102,31 +2102,77 @@ impl EditorView {
                 cx.notify();
                 return;
             }
-            DragMode::Resize => {
+            DragMode::Resize | DragMode::ResizeStart => {
                 if d.dtick == 0 {
                     return;
                 }
-                let Some(orig_end) = d.orig_end else { return };
-                let new_end = (self
-                    .snap_round(orig_end as i64 + d.dtick)
-                    .max(d.orig_start as i64 + 1)) as u64;
+                let grab_start = d.mode == DragMode::ResizeStart;
                 let sh = lock_shared(&self.shared);
                 let mut ops = Vec::new();
-                if let Some(off_id) = d.off_id {
-                    // the track may be gone (MCP remove/undo during the drag)
-                    if let Some(track) = sh.doc.tracks.get(d.track) {
-                        for e in &track.events {
-                            if e.id == off_id {
-                                let mut after = e.clone();
-                                after.tick = new_end;
-                                ops.push(Op::UpdateEvent {
-                                    pos: usize::MAX,
-                                    track: d.track,
-                                    before: e.clone(),
-                                    after,
-                                });
+                // multi-selection (#180): a grabbed edge on a selected note
+                // resizes every selected note together; the notes snapshot
+                // is drag-start state — nothing applies until commit
+                let multi = self.selection.len() > 1 && self.selection.contains(&d.on_id);
+                let targets: Vec<document::Note> = if multi {
+                    self.notes
+                        .iter()
+                        .filter(|n| self.selection.contains(&n.on_id))
+                        .cloned()
+                        .collect()
+                } else {
+                    self.notes
+                        .iter()
+                        .filter(|n| n.on_id == d.on_id)
+                        .cloned()
+                        .collect()
+                };
+                for n in targets {
+                    match (grab_start, n.end_tick) {
+                        // left edge: the start moves, the end stays anchored
+                        (true, Some(end)) => {
+                            let new_start = self
+                                .snap_round(n.start_tick as i64 + d.dtick)
+                                .clamp(0, end as i64 - 1)
+                                as u64;
+                            if let Some(track) = sh.doc.tracks.get(n.track) {
+                                for e in &track.events {
+                                    if e.id == n.on_id {
+                                        let mut after = e.clone();
+                                        after.tick = new_start;
+                                        ops.push(Op::UpdateEvent {
+                                            pos: usize::MAX,
+                                            track: n.track,
+                                            before: e.clone(),
+                                            after,
+                                        });
+                                    }
+                                }
                             }
                         }
+                        // right edge: the end moves, the start stays put
+                        (false, Some(_)) => {
+                            let Some(off_id) = n.off_id else { continue };
+                            let new_end = (self
+                                .snap_round(n.end_tick.unwrap() as i64 + d.dtick)
+                                .max(n.start_tick as i64 + 1))
+                                as u64;
+                            // the track may be gone (MCP remove/undo during the drag)
+                            if let Some(track) = sh.doc.tracks.get(n.track) {
+                                for e in &track.events {
+                                    if e.id == off_id {
+                                        let mut after = e.clone();
+                                        after.tick = new_end;
+                                        ops.push(Op::UpdateEvent {
+                                            pos: usize::MAX,
+                                            track: n.track,
+                                            before: e.clone(),
+                                            after,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 drop(sh);
@@ -2140,19 +2186,49 @@ impl EditorView {
                 let vel = d.dkey.clamp(1, 127) as u8;
                 let sh = lock_shared(&self.shared);
                 let mut ops = Vec::new();
-                if let Some(track) = sh.doc.tracks.get(d.track) {
-                    for e in &track.events {
-                        if e.id == d.on_id {
-                            let mut after = e.clone();
-                            if let EventKind::Channel { data, .. } = &mut after.kind {
-                                data[1] = vel;
+                // multi-selection (#181): the drag offsets every selected
+                // note's velocity by the grabbed stalk's delta, preserving
+                // their relative differences
+                let multi = self.selection.len() > 1 && self.selection.contains(&d.on_id);
+                let grabbed_orig = self
+                    .notes
+                    .iter()
+                    .find(|n| n.on_id == d.on_id)
+                    .map(|n| n.vel);
+                let targets: Vec<document::Note> = if multi {
+                    self.notes
+                        .iter()
+                        .filter(|n| self.selection.contains(&n.on_id))
+                        .cloned()
+                        .collect()
+                } else {
+                    self.notes
+                        .iter()
+                        .filter(|n| n.on_id == d.on_id)
+                        .cloned()
+                        .collect()
+                };
+                for n in targets {
+                    let new_vel = if multi {
+                        let off = grabbed_orig.map(|v| vel as i32 - v as i32).unwrap_or(0);
+                        (n.vel as i32 + off).clamp(1, 127) as u8
+                    } else {
+                        vel
+                    };
+                    if let Some(track) = sh.doc.tracks.get(n.track) {
+                        for e in &track.events {
+                            if e.id == n.on_id {
+                                let mut after = e.clone();
+                                if let EventKind::Channel { data, .. } = &mut after.kind {
+                                    data[1] = new_vel;
+                                }
+                                ops.push(Op::UpdateEvent {
+                                    pos: usize::MAX,
+                                    track: n.track,
+                                    before: e.clone(),
+                                    after,
+                                });
                             }
-                            ops.push(Op::UpdateEvent {
-                                pos: usize::MAX,
-                                track: d.track,
-                                before: e.clone(),
-                                after,
-                            });
                         }
                     }
                 }
@@ -2378,6 +2454,156 @@ impl EditorView {
                 ops,
             );
         }
+        cx.notify();
+    }
+}
+
+impl EditorView {
+    /// Shift every per-track sidecar map up one slot from `at` — tracks at
+    /// or after the insertion point move down by one (#202 duplicate).
+    pub(crate) fn shift_track_maps_for_insert(&mut self, at: usize) {
+        let mut sh = crate::lock_shared(&self.shared);
+        sh.track_dest = sh
+            .track_dest
+            .iter()
+            .map(|(k, v)| (if *k >= at { *k + 1 } else { *k }, *v))
+            .collect();
+        sh.muted = sh
+            .muted
+            .iter()
+            .map(|k| if *k >= at { *k + 1 } else { *k })
+            .collect();
+        sh.soloed = sh
+            .soloed
+            .iter()
+            .map(|k| if *k >= at { *k + 1 } else { *k })
+            .collect();
+        drop(sh);
+        self.edit_ch = self
+            .edit_ch
+            .iter()
+            .map(|(k, v)| (if *k >= at { *k + 1 } else { *k }, *v))
+            .collect();
+    }
+
+    /// Shift every per-track sidecar map down one slot past `at`, dropping
+    /// the removed track's entries (#202 delete).
+    pub(crate) fn shift_track_maps_for_remove(&mut self, at: usize) {
+        let mut sh = crate::lock_shared(&self.shared);
+        sh.track_dest = sh
+            .track_dest
+            .iter()
+            .filter(|(k, _)| **k != at)
+            .map(|(k, v)| (if *k > at { *k - 1 } else { *k }, *v))
+            .collect();
+        sh.muted = sh
+            .muted
+            .iter()
+            .filter(|k| **k != at)
+            .map(|k| if *k > at { *k - 1 } else { *k })
+            .collect();
+        sh.soloed = sh
+            .soloed
+            .iter()
+            .filter(|k| **k != at)
+            .map(|k| if *k > at { *k - 1 } else { *k })
+            .collect();
+        drop(sh);
+        self.edit_ch = self
+            .edit_ch
+            .iter()
+            .filter(|(k, _)| **k != at)
+            .map(|(k, v)| (if *k > at { *k - 1 } else { *k }, *v))
+            .collect();
+    }
+
+    /// Track ▸ Delete Track (#202): asks for confirmation when the track
+    /// holds anything beyond its End-of-Track terminator, then removes it
+    /// through the transaction path (one undo step). The last track cannot
+    /// be removed.
+    pub(crate) fn prompt_delete_track(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (track, n_events) = self.doc(|d| {
+            (
+                d.tracks.len(),
+                d.tracks
+                    .get(self.sel_track)
+                    .map(|t| t.events.len())
+                    .unwrap_or(0),
+            )
+        });
+        if track <= 1 {
+            self.status = t("track.last_track").into();
+            cx.notify();
+            return;
+        }
+        if self.prompt_active {
+            return;
+        }
+        self.prompt_active = true;
+        let name = self.doc(|d| {
+            d.tracks
+                .get(self.sel_track)
+                .and_then(|t| {
+                    t.events
+                        .iter()
+                        .find(|e| {
+                            matches!(
+                                e.kind,
+                                EventKind::Meta {
+                                    meta_type: 0x03,
+                                    ..
+                                }
+                            )
+                        })
+                        .map(|e| match &e.kind {
+                            EventKind::Meta { data, .. } => {
+                                smf_core::decode_text(data, self.enc_override)
+                            }
+                            _ => String::new(),
+                        })
+                })
+                .unwrap_or_else(|| t("doc.untitled").to_string())
+        });
+        let detail = tf(
+            "track.delete_detail",
+            &[("name", &name), ("n", &n_events.to_string())],
+        );
+        let rx = window.prompt(
+            PromptLevel::Warning,
+            t("track.delete_title"),
+            Some(&detail),
+            &[
+                PromptButton::Ok(t("track.delete").into()),
+                PromptButton::Cancel(t("guard.cancel").into()),
+            ],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let idx = rx.await.unwrap_or(usize::MAX);
+            if idx == 0 {
+                this.update(cx, |v, cx| v.delete_selected_track(cx)).ok();
+            }
+            this.update(cx, |v, _cx| v.prompt_active = false).ok();
+        })
+        .detach();
+    }
+
+    /// The confirmed half of Track ▸ Delete Track (#202).
+    pub(crate) fn delete_selected_track(&mut self, cx: &mut Context<Self>) {
+        let at = self.sel_track;
+        let (n_tracks, ops) = {
+            let mut sh = crate::lock_shared(&self.shared);
+            (sh.doc.tracks.len(), sh.doc.remove_track_ops(at))
+        };
+        if n_tracks <= 1 || ops.is_empty() {
+            self.status = t("track.last_track").into();
+            cx.notify();
+            return;
+        }
+        self.shift_track_maps_for_remove(at);
+        self.apply_tx("delete track", ops);
+        self.sel_track = at.min(self.doc(|d| d.tracks.len() - 1));
+        self.status = t("status.track_deleted").into();
         cx.notify();
     }
 }

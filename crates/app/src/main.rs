@@ -90,6 +90,8 @@ enum DragMode {
     Move,
     /// stretch the note's right edge (duration)
     Resize,
+    /// drag the note's start (left edge) — end stays anchored (#180)
+    ResizeStart,
     /// rubber-band select on empty canvas
     Marquee,
     /// vertical drag in the velocity lane; `dkey` carries the new velocity
@@ -562,6 +564,9 @@ const NOTE_H_MAX: f32 = 40.0;
 struct Drag {
     mode: DragMode,
     on_id: EventId,
+    /// still captured at drag start; the resize commit reads per-note
+    /// offs from the selection snapshot instead (#180)
+    #[allow(dead_code)]
     off_id: Option<EventId>,
     track: usize,
     orig_start: u64,
@@ -788,6 +793,10 @@ struct EditorView {
     /// 0..=11 = manual root (with `scale_minor` picking the mode)
     scale_sel: i8,
     scale_minor: bool,
+    /// index into `SCALES` — 0 = major, 1 = natural minor (#219)
+    scale_kind: u8,
+    /// Scale Fold (#219): restrict the roll to in-scale keys only
+    scale_fold: bool,
     /// visible row→key map (identity = all 128); rebuilt by refresh_derived
     vis_keys: Vec<u8>,
     /// reverse of `vis_keys`: key→row, -1 when folded out
@@ -795,7 +804,7 @@ struct EditorView {
     /// pitch classes painted as scale-member rows (None = highlight off)
     scale_pcs: Option<[bool; 12]>,
     /// cache key for the view-derived fields above
-    view_key: (u64, u64, bool, bool, usize, i8, bool),
+    view_key: (u64, u64, bool, bool, usize, i8, bool, u8, bool),
     /// key signature hint parsed from meta 0x59 at the playhead
     keysig: Option<(i8, bool)>,
     /// Plugin instances kept warm on the host worker thread, keyed by dest
@@ -1333,6 +1342,8 @@ impl EditorView {
             drum: false,
             scale_sel: -2,
             scale_minor: false,
+            scale_kind: 0,
+            scale_fold: false,
             vis_keys: all_keys(),
             row_of: {
                 let mut r = [-1i32; 128];
@@ -1342,7 +1353,17 @@ impl EditorView {
                 r
             },
             scale_pcs: None,
-            view_key: (u64::MAX, u64::MAX, false, false, 0, i8::MAX, false),
+            view_key: (
+                u64::MAX,
+                u64::MAX,
+                false,
+                false,
+                0,
+                i8::MAX,
+                false,
+                0,
+                false,
+            ),
             keysig: None,
             plugin_slots: HashMap::new(),
             plugin_state: HashMap::new(),
@@ -1700,10 +1721,18 @@ impl EditorView {
             self.sel_track,
             self.scale_sel,
             self.scale_minor,
+            self.scale_kind,
+            self.scale_fold,
         );
         if self.view_key != vkey {
             self.vis_keys = if self.drum {
                 used_keys(&self.notes, true, self.sel_track)
+            } else if self.scale_fold && self.scale_sel >= 0 {
+                // Scale Fold (#219): only in-scale keys — drawing into the
+                // folded rows keeps every note in-key. Needs an explicit
+                // scale; Auto falls back to the used-keys view.
+                let pcs = self.scale_pcs.unwrap_or([true; 12]);
+                scale_keys(pcs)
             } else if self.fold {
                 used_keys(&self.notes, false, self.sel_track)
             } else {
@@ -1719,8 +1748,8 @@ impl EditorView {
                 -1 => None,
                 -2 => self
                     .keysig
-                    .map(|(sf, m)| scale_pcs_of(keysig_root(sf, m), m)),
-                r => Some(scale_pcs_of(r as u8, self.scale_minor)),
+                    .map(|(sf, m)| scale_pcs_of(keysig_root(sf, m), m as usize)),
+                r => Some(scale_pcs_of(r as u8, self.scale_kind as usize)),
             };
             self.view_key = vkey;
         }
