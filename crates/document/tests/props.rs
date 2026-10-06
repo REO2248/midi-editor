@@ -245,7 +245,7 @@ pub fn build_ops(doc: &mut Document, spec: &OpSpec) -> Vec<Op> {
         return match *spec {
             OpSpec::SetTempo { tick, bpm } => doc.set_tempo_ops(0, tick, bpm),
             OpSpec::SetTimeSig { tick, num, den } => doc.set_time_sig_ops(0, tick, num, den),
-            OpSpec::AddTrack { ref name } => doc.add_track_ops(name.as_deref()),
+            OpSpec::AddTrack { ref name } => doc.add_track_ops(name.as_deref(), None),
             _ => vec![],
         };
     }
@@ -328,9 +328,9 @@ pub fn build_ops(doc: &mut Document, spec: &OpSpec) -> Vec<Op> {
         OpSpec::SetTrackChannel { track, channel } => doc.set_track_channel_ops(track % n, channel),
         OpSpec::DuplicateRange { track, from, to } => doc.duplicate_range_ops(track % n, from, to),
         OpSpec::DeleteRange { track, from, to } => doc.delete_range_ops(track % n, from, to),
-        OpSpec::AddTrack { ref name } => doc.add_track_ops(name.as_deref()),
+        OpSpec::AddTrack { ref name } => doc.add_track_ops(name.as_deref(), None),
         OpSpec::RemoveTrack { index } => doc.remove_track_ops(index % n),
-        OpSpec::SetTrackName { track, ref name } => doc.set_track_name_ops(track % n, name),
+        OpSpec::SetTrackName { track, ref name } => doc.set_track_name_ops(track % n, name, None),
     }
 }
 

@@ -1057,3 +1057,112 @@ fn program_names_and_mode_hints() {
     d.synth_mode();
     assert_eq!(d.tracks[0].events.len(), n);
 }
+
+#[test]
+fn track_rename_writes_file_charset_not_raw_utf8() {
+    // #176: renaming a track in a Shift-JIS file must emit Shift-JIS bytes —
+    // raw UTF-8 would garble the name in legacy Japanese sequencers AND in
+    // this editor's own Shift-JIS decode path
+    let mut d = doc_with_note();
+    let apply = |d: &mut Document, ops: Vec<Op>| {
+        let base = d.revision();
+        d.apply(Transaction {
+            label: "t".into(),
+            base,
+            ops,
+        })
+        .unwrap();
+    };
+    // no existing name meta: insert path
+    let ops = d.set_track_name_ops(0, "メロディー", Some(smf_core::TextEncoding::ShiftJis));
+    apply(&mut d, ops);
+    let expected = smf_core::encode_text("メロディー", smf_core::TextEncoding::ShiftJis);
+    let name = d.tracks[0]
+        .events
+        .iter()
+        .find(|e| {
+            matches!(
+                e.kind,
+                EventKind::Meta {
+                    meta_type: 0x03,
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    assert!(
+        matches!(&name.kind, EventKind::Meta { data, .. } if data.as_ref() == expected.as_slice()),
+        "Shift-JIS bytes must be written, not UTF-8"
+    );
+    assert_ne!(
+        expected,
+        "メロディー".as_bytes(),
+        "test is only meaningful when the encodings actually differ"
+    );
+    // update-in-place path keeps the same encoding
+    let ops = d.set_track_name_ops(0, "ベース", Some(smf_core::TextEncoding::ShiftJis));
+    apply(&mut d, ops);
+    let expected2 = smf_core::encode_text("ベース", smf_core::TextEncoding::ShiftJis);
+    let name = d.tracks[0]
+        .events
+        .iter()
+        .find(|e| {
+            matches!(
+                e.kind,
+                EventKind::Meta {
+                    meta_type: 0x03,
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    assert!(
+        matches!(&name.kind, EventKind::Meta { data, .. } if data.as_ref() == expected2.as_slice())
+    );
+    // decoded through the Shift-JIS path the name reads back exactly
+    if let EventKind::Meta { data, .. } = &name.kind {
+        assert_eq!(
+            smf_core::decode_text(data, Some(smf_core::TextEncoding::ShiftJis)),
+            "ベース"
+        );
+    }
+    // default (None) stays UTF-8 — callers decide, the document never guesses
+    let ops = d.set_track_name_ops(0, "Plain", None);
+    apply(&mut d, ops);
+    let name = d.tracks[0]
+        .events
+        .iter()
+        .find(|e| {
+            matches!(
+                e.kind,
+                EventKind::Meta {
+                    meta_type: 0x03,
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    assert!(matches!(&name.kind, EventKind::Meta { data, .. } if data.as_ref() == b"Plain"));
+}
+
+#[test]
+fn add_track_name_respects_encoding() {
+    let mut d = doc_with_note();
+    let ops = d.add_track_ops(Some("ドラム"), Some(smf_core::TextEncoding::ShiftJis));
+    let base = d.revision();
+    d.apply(Transaction {
+        label: "t".into(),
+        base,
+        ops,
+    })
+    .unwrap();
+    let expected = smf_core::encode_text("ドラム", smf_core::TextEncoding::ShiftJis);
+    let t = d.tracks.last().unwrap();
+    assert_eq!(
+        t.name.as_ref().map(|b| b.as_ref()),
+        Some(expected.as_slice())
+    );
+    assert!(t.events.iter().any(
+        |e| matches!(e.kind, EventKind::Meta { meta_type: 0x03, ref data } if data.as_ref() == expected.as_slice())
+    ));
+}

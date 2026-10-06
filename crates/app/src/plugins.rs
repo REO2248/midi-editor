@@ -5,6 +5,16 @@
 
 use super::*;
 
+/// Does the companion state file need a write now? Dirty records always
+/// write (`plugin_states.save` no-ops for an empty store, so no file is
+/// created for songs without plugins). A clean store still writes when its
+/// companion file was last written for a different path — Save As renamed
+/// the song, and the new name must not silently lose every instrument
+/// patch (#175).
+fn needs_state_write(dirty: bool, written_for: Option<&Path>, target: &Path) -> bool {
+    dirty || written_for != Some(target)
+}
+
 pub(crate) enum PluginState {
     Loading {
         path: PathBuf,
@@ -613,24 +623,27 @@ impl EditorView {
         for d in pending {
             self.capture_plugin_state(d);
         }
-        if !self.state_file_dirty {
-            return;
-        }
         let doc_path = lock_shared(&self.shared).path.clone();
         let Some(doc_path) = doc_path else {
             // untitled document: keep records in memory until Save As gives
             // the song (and its sidecars) a home
             return;
         };
+        let target = plugin_state::state_path(&doc_path);
+        if !needs_state_write(
+            self.state_file_dirty,
+            self.state_path_written.as_deref(),
+            &target,
+        ) {
+            return;
+        }
         if !force && self.last_state_write.elapsed() < std::time::Duration::from_secs(1) {
             return;
         }
-        match self
-            .plugin_states
-            .save(&plugin_state::state_path(&doc_path))
-        {
+        match self.plugin_states.save(&target) {
             Ok(_) => {
                 self.state_file_dirty = false;
+                self.state_path_written = Some(target);
                 self.last_state_write = std::time::Instant::now();
             }
             Err(e) => tracing::warn!("plugin state write failed: {e}"),
@@ -768,5 +781,26 @@ impl EditorView {
             }
         }
         changed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::needs_state_write;
+    use std::path::Path;
+
+    #[test]
+    fn state_write_decides_by_dirty_and_path() {
+        let a = Path::new(r"C:\songs\a.editor.state");
+        let b = Path::new(r"C:\songs\b.editor.state");
+        // clean and already written for this path — nothing to do
+        assert!(!needs_state_write(false, Some(a), a));
+        // dirty — always write
+        assert!(needs_state_write(true, Some(a), a));
+        // #175: Save As renamed the song — the clean store must still be
+        // re-derived under the new name or every patch is lost
+        assert!(needs_state_write(false, Some(a), b));
+        // no companion file written yet for any path
+        assert!(needs_state_write(false, None, a));
     }
 }

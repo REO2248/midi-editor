@@ -507,6 +507,9 @@ impl EditorView {
         self.plugin_states =
             plugin_state::PluginStateStore::load(&plugin_state::state_path(doc_path));
         self.state_file_dirty = false;
+        // this song's companion file is the one just loaded — no pending
+        // path change for the flush decision (#175)
+        self.state_path_written = Some(plugin_state::state_path(doc_path));
         self.state_restored.clear();
         if let Some(h) = p.note_h {
             if h.is_finite() && h > 0.0 {

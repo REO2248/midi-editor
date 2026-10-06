@@ -87,6 +87,38 @@ fn encode(meta: &SnapshotMeta, payload: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Emergency snapshot for the panic hook (#200): best-effort, non-blocking.
+/// Uses `try_lock` — a panic while the document lock is held (or any
+/// contention) skips the write instead of deadlocking the crash path.
+/// Files land next to autosaves with an `emergency-` prefix so the startup
+/// restore prompt offers them like any other snapshot.
+pub(crate) fn write_emergency_snapshot(shared: &SharedDoc, dir: &Path) -> Option<PathBuf> {
+    let Ok(sh) = shared.try_lock() else {
+        return None;
+    };
+    let (payload, meta) = {
+        let payload = sh.doc.serialize(smf_core::WriteOptions {
+            running_status: false,
+        });
+        let now = std::time::SystemTime::now();
+        let meta = SnapshotMeta {
+            v: FORMAT_VERSION,
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            source_path: sh.path.clone(),
+            saved_revision: sh.saved_revision,
+            current_revision: sh.doc.revision(),
+            timestamp: unix_secs(now),
+            payload_len: payload.len() as u64,
+            payload_hash: fnv1a(&payload),
+        };
+        (payload, meta)
+    };
+    std::fs::create_dir_all(dir).ok()?;
+    let path = dir.join(format!("emergency-{}.snap", meta.timestamp));
+    mcp_server::write_atomic(&path, &encode(&meta, &payload)).ok()?;
+    Some(path)
+}
+
 /// Split and validate an encoded snapshot. Fails safely on anything odd:
 /// no header line, malformed JSON, wrong format version, or a payload that
 /// doesn't match its declared length/hash (truncated writes).
@@ -208,12 +240,26 @@ pub(crate) fn find_candidate(
     None
 }
 
-/// Delete every snapshot file (verified save, explicit discard, or the
-/// user chose Discard at the startup prompt).
-pub(crate) fn clear_snapshots(dir: &Path) {
+/// Delete only the snapshots belonging to one document identity — those
+/// whose `source_path` equals `source` (`None` matches untitled-lineage
+/// snapshots). Snapshots of other songs survive saves, opens, and new-file
+/// operations (#174): choosing "Later" on a recovery prompt keeps the
+/// snapshot on disk until it is explicitly resolved or aged out.
+pub(crate) fn clear_snapshots_for(dir: &Path, source: Option<&Path>) {
     for p in list_snapshots(dir) {
-        let _ = std::fs::remove_file(p);
+        let matches = load_snapshot(&p)
+            .map(|(meta, _)| meta.source_path.as_deref() == source)
+            .unwrap_or(false);
+        if matches {
+            let _ = std::fs::remove_file(p);
+        }
     }
+}
+
+/// Convenience wrapper: clear the snapshots of the given document identity
+/// in the default recovery dir.
+pub(crate) fn clear_recovery_for(source: Option<&Path>) {
+    clear_snapshots_for(&recovery_dir(), source);
 }
 
 /// Bounded retention: drop stale/overflow snapshots. Runs once on startup
@@ -228,11 +274,6 @@ pub(crate) fn cleanup_stale(dir: &Path, keep: usize, max_age: Duration, now: Sys
             let _ = std::fs::remove_file(&p);
         }
     }
-}
-
-/// Convenience wrapper used by the app.
-pub(crate) fn clear_recovery() {
-    clear_snapshots(&recovery_dir());
 }
 
 #[cfg(test)]
@@ -417,5 +458,71 @@ mod tests {
         assert_eq!(found.1.source_path.as_deref(), Some(src.as_path()));
         // an argv path for a different file finds nothing
         assert!(find_candidate(&dir, Some(&dir.join("other.mid"))).is_none());
+    }
+
+    #[test]
+    fn clear_snapshots_for_spares_other_songs() {
+        // #174: opening/saving Song B must not delete Song A's snapshots —
+        // deletion is scoped to the document identity being resolved
+        let dir = tmpdir("scoped");
+        let song_a = dir.join("a.mid");
+        let song_b = dir.join("b.mid");
+        let payload = b"payload".to_vec();
+        let mk = |src: Option<PathBuf>, ts: u64| {
+            let m = SnapshotMeta {
+                source_path: src,
+                timestamp: ts,
+                ..meta(ts)
+            };
+            let m = SnapshotMeta {
+                payload_len: payload.len() as u64,
+                payload_hash: fnv1a(&payload),
+                ..m
+            };
+            encode(&m, &payload)
+        };
+        std::fs::write(dir.join("a1.snap"), mk(Some(song_a.clone()), 1)).unwrap();
+        std::fs::write(dir.join("a2.snap"), mk(Some(song_a.clone()), 2)).unwrap();
+        std::fs::write(dir.join("b1.snap"), mk(Some(song_b.clone()), 3)).unwrap();
+        std::fs::write(dir.join("u1.snap"), mk(None, 4)).unwrap();
+        // saving/opening Song B clears only Song B's lineage
+        clear_snapshots_for(&dir, Some(&song_b));
+        let left = list_snapshots(&dir);
+        assert_eq!(left.len(), 3);
+        assert!(left.iter().all(|p| !p.ends_with("b1.snap")));
+        // an untitled doc's save/new clears only untitled-lineage snapshots
+        clear_snapshots_for(&dir, None);
+        let left = list_snapshots(&dir);
+        assert_eq!(left.len(), 2);
+        assert!(left.iter().all(|p| !p.ends_with("u1.snap")));
+        // Song A's snapshots survive every other document's lifecycle
+        assert!(left.iter().any(|p| p.ends_with("a1.snap")));
+        assert!(left.iter().any(|p| p.ends_with("a2.snap")));
+    }
+
+    #[test]
+    fn emergency_snapshot_writes_and_offers() {
+        // #200: the panic hook's snapshot lands in the recovery dir as a valid
+        // *.snap the startup candidate search can offer
+        let dir = tmpdir("emergency");
+        let sh = shared();
+        let path = write_emergency_snapshot(&sh, &dir).unwrap();
+        assert!(path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("emergency-"));
+        let (m, payload) = load_snapshot(&path).unwrap();
+        assert_eq!(m.current_revision, 0);
+        assert!(!payload.is_empty());
+        // the emergency file is a candidate: newest, valid, newer than source
+        let found = find_candidate(&dir, None).unwrap();
+        assert_eq!(found.0, path);
+        // a document lock held elsewhere must not deadlock the crash path:
+        // the write is skipped instead
+        let g = lock_shared(&sh);
+        assert!(write_emergency_snapshot(&sh, &dir).is_none());
+        drop(g);
+        assert!(write_emergency_snapshot(&sh, &dir).is_some());
     }
 }

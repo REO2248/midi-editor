@@ -843,6 +843,10 @@ struct EditorView {
     pending_state_capture: BTreeSet<usize>,
     /// in-memory records changed since the companion file was last written
     state_file_dirty: bool,
+    /// document path the companion state file was last written/loaded for —
+    /// a Save As that changes the doc path must re-derive the state file
+    /// under the new name even when nothing is dirty (#175)
+    state_path_written: Option<PathBuf>,
     /// last companion-file write — tick-driven flushes throttle to ~1/s so a
     /// knob drag can't turn into a disk-write loop
     last_state_write: std::time::Instant,
@@ -1258,6 +1262,9 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) -> Self {
         let shared = Arc::new(Mutex::new(sh));
+        // the panic hook needs a handle to the active document so a crash
+        // can still write an emergency recovery snapshot (#200)
+        diagnostics::register_crash_doc(&shared);
         let mut v = Self {
             shared,
             doc_epoch: 0,
@@ -1368,6 +1375,7 @@ impl EditorView {
             plugin_states: plugin_state::PluginStateStore::default(),
             pending_state_capture: BTreeSet::new(),
             state_file_dirty: false,
+            state_path_written: None,
             last_state_write: std::time::Instant::now(),
             state_restored: std::collections::HashSet::new(),
             plugin_window: None,
@@ -1513,7 +1521,7 @@ impl EditorView {
             .as_ref()
             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
             .unwrap_or_else(|| t("doc.untitled").to_string());
-        let dirty = sh.doc.revision() != sh.saved_revision;
+        let dirty = sh.is_dirty();
         format!("{}{} — midi-editor", name, if dirty { "*" } else { "" })
     }
 

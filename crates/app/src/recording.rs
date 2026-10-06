@@ -300,7 +300,7 @@ impl EditorView {
         let mode = self.rec_mode;
         let mut sh = lock_shared(&self.shared);
         if sh.doc.tracks.is_empty() {
-            let ops = sh.doc.add_track_ops(None);
+            let ops = sh.doc.add_track_ops(None, None);
             if let Err(e) = sh.apply("add track", ops) {
                 drop(sh);
                 self.status = tf("status.apply_failed", &[("e", &e.to_string())]).into();

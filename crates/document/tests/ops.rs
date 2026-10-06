@@ -606,14 +606,14 @@ fn delete_range_ops_covers_all_channels() {
 #[test]
 fn track_ops_roundtrip_and_revert() {
     let mut d = doc(vec![vec![chan(0, 0x90, 60, 100)]]);
-    let __ops = d.add_track_ops(Some("Bass"));
+    let __ops = d.add_track_ops(Some("Bass"), None);
     let add = apply(&mut d, __ops);
     assert_eq!(d.tracks.len(), 2);
     assert_eq!(d.tracks[1].name.as_deref(), Some(b"Bass" as &[u8]));
     d.revert(&add);
     assert_eq!(d.tracks.len(), 1);
 
-    let __ops = d.set_track_name_ops(0, "Piano");
+    let __ops = d.set_track_name_ops(0, "Piano", None);
     let ren = apply(&mut d, __ops);
     assert_eq!(d.tracks[0].name.as_deref(), Some(b"Piano" as &[u8]));
     d.revert(&ren);
@@ -804,7 +804,7 @@ fn tempo_and_name_replace_survive_save_reload() {
     let mut d = parsed_doc();
     let ops = d.set_tempo_ops(0, 0, 240.0); // replaces the tick-0 tempo
     apply(&mut d, ops);
-    let ops = d.set_track_name_ops(1, "Bass");
+    let ops = d.set_track_name_ops(1, "Bass", None);
     apply(&mut d, ops);
 
     let re = save_reload(&d);

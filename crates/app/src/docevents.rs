@@ -150,7 +150,9 @@ pub(crate) fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
             {
                 let sh = lock_shared(&shared);
                 let rev = sh.doc.revision();
-                let doc_dirty = rev != sh.saved_revision;
+                // save-point aware (#177): undoing back to the saved state
+                // stops snapshotting just like a real save does
+                let doc_dirty = sh.is_dirty();
                 drop(sh);
                 if doc_dirty
                     && last_snap_rev != Some(rev)
@@ -238,11 +240,15 @@ pub(crate) fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
                                     // the canonical path moves only after a
                                     // durable write — Save-As to a failed
                                     // target never steals it (#158)
+                                    // clear the snapshots of the identity the
+                                    // document had while dirty: its own
+                                    // pre-save path, or the untitled lineage
+                                    // it was just saved out of (#174)
+                                    let old = lock_shared(&v.shared).path.clone();
                                     v.adopt_saved_path(&out.path);
                                     v.status = t("status.saved").into();
                                     v.persist();
-                                    // a verified normal save clears recovery
-                                    recovery::clear_recovery();
+                                    recovery::clear_recovery_for(old.as_deref());
                                     // the just-written file is the new
                                     // identity baseline for external-watch
                                     v.file_stamp = watch::stat_file(&out.path);
@@ -383,12 +389,16 @@ impl EditorView {
         // an armed recording belongs to the document being replaced — drop
         // it with a warning instead of silently losing the take
         let rec_discarded = self.rec.take().is_some();
+        // the outgoing document's identity, captured before the swap — its
+        // snapshots stop applying once the doc is replaced (#174)
+        let outgoing = lock_shared(&self.shared).path.clone();
         self.stop_playback();
         // the outgoing song keeps its plugin state — flush before the path
         // and the state table are dropped with the document
         self.flush_plugin_states(true);
         self.plugin_states = plugin_state::PluginStateStore::default();
         self.state_file_dirty = false;
+        self.state_path_written = None;
         self.pending_state_capture.clear();
         mcp_server::service::swap_document(&self.shared, empty_doc(), None);
         self.last_take = None;
@@ -405,8 +415,14 @@ impl EditorView {
         self.play_start_us = 0;
         self.refresh_derived();
         self.reset_view_to_content();
-        // the replaced document's snapshots no longer apply
-        recovery::clear_recovery();
+        // clear the replaced document's snapshots — but only its own:
+        // snapshots belonging to other songs (e.g. a "Later" dismissal at
+        // startup) must survive (#174). An untitled outgoing doc keeps its
+        // lineage — it cannot be told apart from other untitled snapshots,
+        // and conserving them is the safe side.
+        if let Some(p) = &outgoing {
+            recovery::clear_recovery_for(Some(p));
+        }
         // untitled has no backing file to watch
         self.file_stamp = None;
         self.ext_prompted = false;
@@ -591,7 +607,9 @@ impl EditorView {
             Ok(_) => {
                 self.status = t("status.saved").into();
                 self.persist();
-                recovery::clear_recovery();
+                // a verified save resolves this document's own snapshots
+                // only — other songs' stay (#174)
+                recovery::clear_recovery_for(path.as_deref());
                 if let Some(p) = &path {
                     self.file_stamp = watch::stat_file(p);
                 }
@@ -612,6 +630,9 @@ impl EditorView {
     /// Save-As path. The canonical path adopts only after the write
     /// lands; a failed Save-As leaves the old one alone (#158).
     pub(crate) fn try_save_to(&mut self, path: &std::path::Path, cx: &mut Context<Self>) -> bool {
+        // the identity the document had while dirty — captured before the
+        // Save-As adopts the new path (#174)
+        let old = lock_shared(&self.shared).path.clone();
         let ok = match mcp_server::service::save_document(
             &self.shared,
             mcp_server::service::SaveRequest {
@@ -623,7 +644,7 @@ impl EditorView {
                 self.adopt_saved_path(&out.path);
                 self.status = t("status.saved").into();
                 self.persist();
-                recovery::clear_recovery();
+                recovery::clear_recovery_for(old.as_deref());
                 self.file_stamp = watch::stat_file(&out.path);
                 self.ext_prompted = false;
                 true
@@ -810,7 +831,7 @@ impl EditorView {
         };
         let dirty = {
             let sh = lock_shared(&self.shared);
-            sh.doc.revision() != sh.saved_revision
+            sh.is_dirty()
         };
         let name = p.display().to_string();
         let (title, detail, answers) = match (ev, dirty) {
@@ -1179,6 +1200,9 @@ impl EditorView {
                 // an armed recording belongs to the previous document —
                 // drop it with a warning instead of silently losing the take
                 let rec_discarded = self.rec.take().is_some();
+                // the replaced document's identity, captured before the swap —
+                // its snapshots stop applying once it is replaced (#174)
+                let outgoing = lock_shared(&self.shared).path.clone();
                 self.stop_playback();
                 // flush plugin state while the outgoing song's path (and its
                 // state file) is still the active one — `apply_prefs` loads
@@ -1214,8 +1238,15 @@ impl EditorView {
                 self.ext_prompted = false;
                 let pref_diags = self.apply_prefs(&path);
                 self.push_recent(&path);
-                // the previous document's snapshots no longer apply
-                recovery::clear_recovery();
+                // the opened file supersedes its own stale snapshots and the
+                // replaced document's — other songs' snapshots survive (#174).
+                // An untitled outgoing doc keeps its lineage: it cannot be
+                // told apart from other untitled snapshots, and conserving
+                // them is the safe side.
+                if let Some(prev) = &outgoing {
+                    recovery::clear_recovery_for(Some(prev.as_path()));
+                }
+                recovery::clear_recovery_for(Some(path.as_path()));
                 let mut status = if load_warnings.is_empty() {
                     t("status.loaded").to_string()
                 } else {

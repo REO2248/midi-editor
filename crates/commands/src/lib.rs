@@ -8,8 +8,28 @@ use document::{Document, Transaction};
 pub struct UndoStack {
     done: Vec<Transaction>,
     undone: Vec<Transaction>,
+    /// ids parallel to `done` — assigned on push, stable through undo/redo,
+    /// so the done list's identity (not just its length) can be compared
+    done_ids: Vec<u64>,
+    /// ids parallel to `undone`
+    undone_ids: Vec<u64>,
+    next_id: u64,
     /// max undo entries kept; oldest are dropped first
     cap: usize,
+    /// transactions dropped from `done`'s front by the cap — permanently
+    /// applied, no longer undoable
+    evicted: usize,
+    /// The stack shape at the last verified save: (evicted, done.len(),
+    /// top id). Content is a pure function of `base` plus the done list —
+    /// `undone` holds only reverted transactions — so matching this triple
+    /// reproduces the saved bytes exactly, even though the revision kept
+    /// climbing (#177). The id is what distinguishes "undo + fresh edit of
+    /// the same length" from the real saved shape. `None` = no known save
+    /// point (snapshot restore): the caller falls back to comparing
+    /// revisions. Cap eviction after a save raises `evicted` past the
+    /// recorded value, which (conservatively) reports dirty — the saved
+    /// shape is no longer reachable.
+    saved: Option<(usize, usize, u64)>,
 }
 
 impl UndoStack {
@@ -22,10 +42,46 @@ impl UndoStack {
 
     pub fn push(&mut self, tx: Transaction) {
         self.undone.clear();
+        self.undone_ids.clear();
+        let id = self.next_id;
+        self.next_id += 1;
         self.done.push(tx);
+        self.done_ids.push(id);
         if self.done.len() > self.cap {
             self.done.remove(0);
+            self.done_ids.remove(0);
+            self.evicted += 1;
         }
+    }
+
+    /// Record the current stack shape as the saved state — called after a
+    /// verified save and when a fresh document is installed (#177).
+    pub fn mark_saved(&mut self) {
+        self.saved = Some(self.shape());
+    }
+
+    /// Drop the save marker (a save committed at a different revision than
+    /// the live document — the caller's revision comparison decides).
+    pub fn clear_saved(&mut self) {
+        self.saved = None;
+    }
+
+    pub fn has_saved_point(&self) -> bool {
+        self.saved.is_some()
+    }
+
+    /// True when the document content equals the last saved state: the
+    /// stack shape matches the recorded save point.
+    pub fn is_at_saved_point(&self) -> bool {
+        self.saved == Some(self.shape())
+    }
+
+    fn shape(&self) -> (usize, usize, u64) {
+        (
+            self.evicted,
+            self.done.len(),
+            self.done_ids.last().copied().unwrap_or(0),
+        )
     }
 
     /// The transaction `undo()` would revert — lets callers summarize it
@@ -41,14 +97,17 @@ impl UndoStack {
 
     pub fn undo(&mut self, doc: &mut Document) -> Option<String> {
         let tx = self.done.pop()?;
+        let id = self.done_ids.pop().unwrap_or_default();
         doc.revert(&tx);
         let label = tx.label.clone();
         self.undone.push(tx);
+        self.undone_ids.push(id);
         Some(label)
     }
 
     pub fn redo(&mut self, doc: &mut Document) -> Option<String> {
         let tx = self.undone.pop()?;
+        let id = self.undone_ids.pop().unwrap_or_default();
         let label = tx.label.clone();
         // replay ops at current revision
         let replay = Transaction {
@@ -59,6 +118,7 @@ impl UndoStack {
         match doc.apply(replay) {
             Ok(_) => {
                 self.done.push(tx);
+                self.done_ids.push(id);
                 Some(label)
             }
             // keep the entry redoable — dropping it would silently skip a
@@ -66,6 +126,7 @@ impl UndoStack {
             // `Document::apply` is atomic)
             Err(_) => {
                 self.undone.push(tx);
+                self.undone_ids.push(id);
                 None
             }
         }
@@ -180,6 +241,75 @@ mod tests {
         assert_eq!(stack.undo(&mut doc).as_deref(), Some("insert 62"));
         assert_eq!(stack.undo(&mut doc).as_deref(), Some("insert 61"));
         assert_eq!(stack.undo(&mut doc), None, "oldest was evicted");
+    }
+
+    #[test]
+    fn undo_back_to_saved_point_is_clean() {
+        // #177: save after one edit, make a second edit, undo it — the
+        // content is byte-identical to the saved state, so the save marker
+        // must say clean even though the revision kept climbing
+        let mut doc = note_doc();
+        let mut stack = UndoStack::new(512);
+        stack.mark_saved(); // fresh document is clean
+        let tx = insert_tx(&mut doc, 0, 64);
+        apply(&mut doc, &mut stack, tx);
+        assert!(!stack.is_at_saved_point(), "edit 1 is dirty");
+        stack.mark_saved(); // verified save after edit 1
+        let tx = insert_tx(&mut doc, 0, 67);
+        apply(&mut doc, &mut stack, tx);
+        assert!(!stack.is_at_saved_point(), "edit 2 is dirty");
+        stack.undo(&mut doc);
+        assert!(stack.is_at_saved_point(), "undo back to save is clean");
+        // redoing the edit marks dirty again
+        stack.redo(&mut doc);
+        assert!(!stack.is_at_saved_point(), "redo is dirty");
+        // undo again lands on the save point once more
+        stack.undo(&mut doc);
+        assert!(stack.is_at_saved_point());
+    }
+
+    #[test]
+    fn new_edit_after_undo_is_never_mistaken_for_saved() {
+        // the trap #177's fix must avoid: undo + a fresh edit leaves the
+        // stack at the same length as the save point but with a different
+        // transaction — the id comparison must catch it
+        let mut doc = note_doc();
+        let mut stack = UndoStack::new(512);
+        let tx = insert_tx(&mut doc, 0, 64);
+        apply(&mut doc, &mut stack, tx);
+        stack.mark_saved(); // saved content = base + edit 64
+        stack.undo(&mut doc);
+        assert!(!stack.is_at_saved_point(), "undoing past the save is dirty");
+        let tx = insert_tx(&mut doc, 0, 67);
+        apply(&mut doc, &mut stack, tx);
+        assert!(
+            !stack.is_at_saved_point(),
+            "a fresh edit at the same depth is still dirty"
+        );
+        assert!(stack.redo(&mut doc).is_none(), "redo cleared by new edit");
+    }
+
+    #[test]
+    fn eviction_after_save_reports_dirty_conservatively() {
+        // cap=2: save with one entry, then overflow the stack — the saved
+        // stack shape is no longer reachable, so the marker must stop
+        // claiming clean (falling back to the caller's revision check)
+        let mut doc = note_doc();
+        let mut stack = UndoStack::new(2);
+        let tx = insert_tx(&mut doc, 0, 60);
+        apply(&mut doc, &mut stack, tx);
+        stack.mark_saved();
+        assert!(stack.is_at_saved_point(), "marked at the save point");
+        let tx = insert_tx(&mut doc, 0, 61);
+        apply(&mut doc, &mut stack, tx);
+        assert!(!stack.is_at_saved_point(), "edit after save is dirty");
+        let tx = insert_tx(&mut doc, 0, 62);
+        apply(&mut doc, &mut stack, tx);
+        assert!(!stack.is_at_saved_point(), "evicted save shape stays dirty");
+        // undoing everything still cannot reach the evicted save shape
+        stack.undo(&mut doc);
+        stack.undo(&mut doc);
+        assert!(!stack.is_at_saved_point());
     }
 
     #[test]

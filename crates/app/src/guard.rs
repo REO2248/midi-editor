@@ -71,10 +71,10 @@ pub(crate) fn verdict_for(choice: GuardChoice, save_ok: bool) -> GuardVerdict {
 }
 
 impl EditorView {
-    /// `saved_revision != revision` means edits happened since the last save.
+    /// Dirty for save-prompt purposes — the undo-stack save point decides
+    /// (#177): undoing back to the saved content is clean again.
     pub(crate) fn is_dirty(&self) -> bool {
-        let sh = lock_shared(&self.shared);
-        sh.doc.revision() != sh.saved_revision
+        lock_shared(&self.shared).is_dirty()
     }
 
     /// True when a document-replacing or exit action would lose work.

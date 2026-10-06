@@ -318,7 +318,11 @@ fn commit_reports_stale_conflict_on_concurrent_edit() {
         json!({"ops": [{"op": "insert_note", "track": 1, "key": 60, "start": 960, "dur": 120}], "tx_id": tx}),
     );
     // a GUI edit lands on the real document mid-batch
-    let ops = sh.lock().unwrap().doc.add_track_ops(Some("gui track"));
+    let ops = sh
+        .lock()
+        .unwrap()
+        .doc
+        .add_track_ops(Some("gui track"), None);
     sh.lock().unwrap().apply("gui edit", ops).unwrap();
     let (err, v) = call(&sh, "commit_transaction", json!({}));
     assert!(err);
@@ -444,7 +448,7 @@ fn history_and_changes_since_revision() {
 #[test]
 fn gui_apply_is_not_attributed_to_mcp() {
     let sh = shared();
-    let ops = sh.lock().unwrap().doc.add_track_ops(Some("gui"));
+    let ops = sh.lock().unwrap().doc.add_track_ops(Some("gui"), None);
     sh.lock().unwrap().apply("gui edit", ops).unwrap();
     let (_, v) = call(&sh, "transaction_history", json!({}));
     assert_eq!(v["transactions"][0]["origin"], "gui");
@@ -1639,4 +1643,114 @@ fn stale_batch_cannot_hijack_standalone_edits() {
     let (err, v) = call(&sh, "rollback_transaction", json!({"tx_id": a_tx}));
     assert!(!err);
     assert_eq!(v["rolled_back"], true);
+}
+
+#[test]
+fn undo_back_to_saved_state_is_clean() {
+    // #177: revision climbs on undo too, so `revision != saved_revision`
+    // would report a byte-identical document as dirty forever. The save
+    // marker in the undo stack decides instead.
+    let sh = shared();
+    let insert = |sh: &SharedDoc, tick: u64| {
+        let mut g = sh.lock().unwrap();
+        let ev = document::Event {
+            id: g.doc.alloc_event_id(),
+            tick,
+            seq: 0,
+            raw_body: None,
+            kind: EventKind::Channel {
+                status: 0x90,
+                data: [72, 100],
+                len: 2,
+            },
+        };
+        let ops = vec![document::Op::InsertEvents {
+            track: 1,
+            events: vec![ev],
+        }];
+        g.apply("edit", ops).unwrap();
+    };
+    insert(&sh, 960);
+    // save at this point (through the shared save core, like the GUI guard)
+    let file = std::env::temp_dir().join(format!("dirty-undo-{}.mid", std::process::id()));
+    let _ = std::fs::remove_file(&file);
+    service::save_document(
+        &sh,
+        service::SaveRequest {
+            path: Some(&file),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(!sh.lock().unwrap().is_dirty());
+    // edit 2 → dirty
+    insert(&sh, 1440);
+    assert!(sh.lock().unwrap().is_dirty());
+    // undo edit 2 → content equals the saved state, so clean (#177)
+    let mut g = sh.lock().unwrap();
+    let Shared { doc, undo, .. } = &mut *g;
+    undo.undo(doc);
+    drop(g);
+    assert!(
+        !sh.lock().unwrap().is_dirty(),
+        "undo back to the saved state must be clean"
+    );
+    // redo → dirty again
+    let mut g = sh.lock().unwrap();
+    let Shared { doc, undo, .. } = &mut *g;
+    undo.redo(doc);
+    drop(g);
+    assert!(sh.lock().unwrap().is_dirty());
+}
+
+#[test]
+fn set_track_name_writes_file_hint_encoding() {
+    // #176: with no explicit enc, a file carrying the Shift-JIS hint (FF 09
+    // "JP" marker) keeps its charset when renamed
+    let mk_meta = |mt: u8, data: &[u8]| smf_core::Event {
+        tick: 0,
+        seq: 0,
+        raw_body: None,
+        kind: EventKind::Meta {
+            meta_type: mt,
+            data: bytes::Bytes::copy_from_slice(data),
+        },
+    };
+    let f = smf_core::File {
+        format: 1,
+        division: smf_core::Division::Metrical(480),
+        tracks: vec![smf_core::Track {
+            events: vec![
+                mk_meta(0x09, b"JP"),
+                mk_meta(0x03, "Shift-JIS曲名".as_bytes()),
+            ],
+        }],
+        warnings: vec![],
+    };
+    let sh = Arc::new(Mutex::new(Shared::new(Document::from_file(f))));
+    let (err, v) = call(
+        &sh,
+        "set_track_name",
+        json!({"track": 0, "name": "新しい名前"}),
+    );
+    assert!(!err, "set_track_name failed: {v}");
+    let g = sh.lock().unwrap();
+    let name_event = g.doc.tracks[0]
+        .events
+        .iter()
+        .find(|e| {
+            matches!(
+                e.kind,
+                EventKind::Meta {
+                    meta_type: 0x03,
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    let expected = smf_core::encode_text("新しい名前", smf_core::TextEncoding::ShiftJis);
+    assert!(
+        matches!(&name_event.kind, EventKind::Meta { data, .. } if data.as_ref() == expected.as_slice()),
+        "hinted file must keep Shift-JIS bytes"
+    );
 }

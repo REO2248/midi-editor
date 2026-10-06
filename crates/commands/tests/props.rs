@@ -151,7 +151,7 @@ proptest! {
                     committed = commit(&mut doc, &mut stack, ops, "remove_track");
                 }
                 Action::AddTrack => {
-                    let ops = doc.add_track_ops(Some("gen"));
+                    let ops = doc.add_track_ops(Some("gen"), None);
                     committed = commit(&mut doc, &mut stack, ops, "add_track");
                 }
                 Action::Undo => {
@@ -205,13 +205,13 @@ proptest! {
         let mut doc = Document::from_file(file);
         let mut stack = UndoStack::new(64);
         for i in 0..n_undo + 1 {
-            let ops = doc.add_track_ops(Some(&format!("t{i}")));
+            let ops = doc.add_track_ops(Some(&format!("t{i}")), None);
             prop_assert!(commit(&mut doc, &mut stack, ops, "add"));
         }
         for _ in 0..n_undo {
             stack.undo(&mut doc).expect("all entries undoable");
         }
-        let ops = doc.add_track_ops(Some("fork"));
+        let ops = doc.add_track_ops(Some("fork"), None);
         prop_assert!(commit(&mut doc, &mut stack, ops, "fork"));
         prop_assert!(stack.redo(&mut doc).is_none(), "stale redo must be cleared");
     }
