@@ -1473,7 +1473,14 @@ impl Document {
     }
 
     /// Append a fresh track (EOT at tick 0) and optionally a name meta.
-    pub fn add_track_ops(&mut self, name: Option<&str>) -> Vec<Op> {
+    /// `enc` selects the name's write encoding (`None` = UTF-8, #176).
+    pub fn add_track_ops(
+        &mut self,
+        name: Option<&str>,
+        enc: Option<smf_core::TextEncoding>,
+    ) -> Vec<Op> {
+        let enc = enc.unwrap_or(smf_core::TextEncoding::Utf8);
+        let name_bytes = |n: &str| Bytes::copy_from_slice(&smf_core::encode_text(n, enc));
         let mut events = vec![Event {
             id: self.alloc_event_id(),
             tick: 0,
@@ -1494,7 +1501,7 @@ impl Document {
                     raw_body: None,
                     kind: EventKind::Meta {
                         meta_type: 0x03,
-                        data: Bytes::copy_from_slice(n.as_bytes()),
+                        data: name_bytes(n),
                     },
                 },
             );
@@ -1502,7 +1509,7 @@ impl Document {
         let mut ops = vec![Op::InsertTrack {
             index: self.tracks.len(),
             track: Track {
-                name: name.map(|n| Bytes::copy_from_slice(n.as_bytes())),
+                name: name.map(name_bytes),
                 out_port: 0,
                 out_channel: 0,
                 events,
@@ -1547,8 +1554,18 @@ impl Document {
         }]
     }
 
-    /// Set/replace the track name meta (0x03) at tick 0.
-    pub fn set_track_name_ops(&mut self, track: usize, name: &str) -> Vec<Op> {
+    /// Set/replace the track name meta (0x03) at tick 0. `enc` selects the
+    /// write encoding (`None` = UTF-8); callers pass the editor's override
+    /// or the file's own charset hint so a legacy Shift-JIS file keeps its
+    /// encoding instead of being silently rewritten as UTF-8 (#176).
+    pub fn set_track_name_ops(
+        &mut self,
+        track: usize,
+        name: &str,
+        enc: Option<smf_core::TextEncoding>,
+    ) -> Vec<Op> {
+        let enc = enc.unwrap_or(smf_core::TextEncoding::Utf8);
+        let data = Bytes::copy_from_slice(&smf_core::encode_text(name, enc));
         if let Some(e) = self
             .tracks
             .get(track)
@@ -1568,7 +1585,7 @@ impl Document {
             let mut after = e.clone();
             after.kind = EventKind::Meta {
                 meta_type: 0x03,
-                data: Bytes::copy_from_slice(name.as_bytes()),
+                data,
             };
             return vec![Op::UpdateEvent {
                 pos: usize::MAX,
@@ -1586,7 +1603,7 @@ impl Document {
                 raw_body: None,
                 kind: EventKind::Meta {
                     meta_type: 0x03,
-                    data: Bytes::copy_from_slice(name.as_bytes()),
+                    data,
                 },
             }],
         }]

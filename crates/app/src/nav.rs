@@ -1079,7 +1079,11 @@ impl EditorView {
         }
         let ops = {
             let mut sh = lock_shared(&self.shared);
-            sh.doc.set_track_name_ops(self.sel_track, &name)
+            // write the name in the file's own charset — the display
+            // override, else the file's XF hint; UTF-8 only as last resort
+            // so a Shift-JIS file is not silently rewritten (#176)
+            let enc = self.enc_override.or(sh.doc.text_encoding_hint());
+            sh.doc.set_track_name_ops(self.sel_track, &name, enc)
         };
         self.apply_tx("set track name", ops);
     }

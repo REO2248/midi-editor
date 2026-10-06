@@ -28,6 +28,41 @@ const BUNDLE_TAIL_BYTES: u64 = 256 * 1024;
 
 static LOG_GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::new();
 
+/// The active document, registered by the app at startup so the panic hook
+/// can write an emergency recovery snapshot (#200). A weak reference: the
+/// hook never keeps a closed document alive.
+static CRASH_DOC: std::sync::Mutex<Option<std::sync::Weak<std::sync::Mutex<mcp_server::Shared>>>> =
+    std::sync::Mutex::new(None);
+
+/// Register the active shared document for the panic hook (#200). Call once
+/// after the doc is created; reopening re-registers over the old handle.
+pub(crate) fn register_crash_doc(shared: &mcp_server::SharedDoc) {
+    if let Ok(mut slot) = CRASH_DOC.lock() {
+        *slot = Some(std::sync::Arc::downgrade(shared));
+    }
+}
+
+/// Append one panic record to `panic.log` next to the rolling logs —
+/// synchronous, no buffering: the non-blocking tracing writer's queued
+/// records are routinely lost when the process dies mid-panic, so the
+/// on-disk panic reason and backtrace cannot depend on it (#200).
+fn append_panic_log(loc: &str, msg: &str, bt: &str) {
+    let path = log_dir().join("panic.log");
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = format!("panic at {ts}s {loc}: {msg}\n{bt}\n");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+    {
+        use std::io::Write;
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 pub(crate) fn app_data_dir() -> PathBuf {
     std::env::var("APPDATA")
         .map(PathBuf::from)
@@ -75,8 +110,13 @@ pub(crate) fn init_logging() -> PathBuf {
     dir
 }
 
-/// Panic location + backtrace land in the rolling log; stderr stays as
-/// before. Survives restarts — the log outlives the process.
+/// Panic location + backtrace land in the rolling log AND in a dedicated
+/// `panic.log` written synchronously (the buffered tracing writer can lose
+/// its tail when the process dies). Before returning, the hook writes a
+/// best-effort emergency recovery snapshot of the active document (#200) —
+/// at most one panic of work is lost instead of everything since the last
+/// autosave tick. Every step is individually infallible: a failing write
+/// must never panic inside the hook.
 pub(crate) fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         let loc = info
@@ -84,7 +124,19 @@ pub(crate) fn install_panic_hook() {
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_else(|| "unknown".into());
         let bt = std::backtrace::Backtrace::capture();
+        // the emergency snapshot first — it is the unsaved work
+        if let Ok(slot) = CRASH_DOC.lock() {
+            if let Some(shared) = slot.as_ref().and_then(|w| w.upgrade()) {
+                if let Some(path) = crate::recovery::write_emergency_snapshot(
+                    &shared,
+                    &crate::recovery::recovery_dir(),
+                ) {
+                    eprintln!("emergency snapshot written: {}", path.display());
+                }
+            }
+        }
         tracing::error!(target: "panic", location = %loc, "{info}\n{bt}");
+        append_panic_log(&loc, &format!("{info}"), &bt.to_string());
         eprintln!("panic at {loc}: {info}\n{bt}");
     }));
 }

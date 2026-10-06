@@ -150,6 +150,15 @@ pub fn finish_save(ticket: SaveTicket) -> Result<SaveOutcome, SaveError> {
     let committed = sh.generation == ticket.generation;
     if committed {
         sh.saved_revision = ticket.revision;
+        // record the save point for dirty tracking (#177). An edit landing
+        // after begin_save leaves the live document past the written
+        // revision — the marker is dropped so the revision comparison
+        // keeps the document dirty.
+        if sh.doc.revision() == ticket.revision {
+            sh.undo.mark_saved();
+        } else {
+            sh.undo.clear_saved();
+        }
     }
     let leftovers = persist::temp_siblings(&ticket.path);
     drop(sh);
@@ -177,6 +186,7 @@ pub fn swap_document(shared: &SharedDoc, doc: Document, path: Option<PathBuf>) {
     let mut sh = lock(shared);
     sh.doc = doc;
     sh.undo = UndoStack::new(512);
+    sh.undo.mark_saved();
     sh.path = path;
     sh.saved_revision = sh.doc.revision();
     sh.generation += 1;

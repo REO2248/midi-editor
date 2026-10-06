@@ -178,7 +178,7 @@ impl Shared {
         // a freshly opened document is saved at whatever revision it
         // starts on — identical bookkeeping for GUI, MCP, and stdio opens
         let saved_revision = doc.revision();
-        Self {
+        let mut s = Self {
             next_tx_id: 1,
             call_tx_id: None,
             doc,
@@ -207,7 +207,27 @@ impl Shared {
             history: std::collections::VecDeque::new(),
             last_mcp_tx: None,
             fs_scope: FsScope::Http,
+        };
+        // a fresh document starts clean at its stack's empty shape (#177)
+        s.undo.mark_saved();
+        s
+    }
+
+    /// Save-prompt dirty state (#177). A verified save records the undo
+    /// stack's shape, so undoing back to it is clean even though the
+    /// revision kept climbing (revision is a monotonic cache key, not a
+    /// content identity). Without a recorded save point — a snapshot
+    /// restore — the revision comparison decides: the restore deliberately
+    /// sets an unreachable `saved_revision` so the document stays dirty
+    /// until an explicit save.
+    pub fn is_dirty(&self) -> bool {
+        if self.undo.is_at_saved_point() {
+            return false;
         }
+        if self.undo.has_saved_point() {
+            return true;
+        }
+        self.doc.revision() != self.saved_revision
     }
 
     /// Index into `dests` for `dest`, appending a fresh entry when absent.

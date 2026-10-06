@@ -407,7 +407,7 @@ fn summary_json(d: &Document, sh: &Shared) -> serde_json::Value {
         }),
         "revision": d.revision(),
         "path": sh.path,
-        "dirty": d.revision() != sh.saved_revision,
+        "dirty": sh.is_dirty(),
         // auth posture only — never the credential itself
         "mcp_auth": {
             "mode": sh.mcp_security.auth_mode.as_str(),
@@ -1149,17 +1149,22 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ),
         edit_spec(
             "set_track_name",
-            "Set track name (UTF-8 meta 0x03). Args: track, name. Optional base_revision.",
+            "Set track name (meta 0x03). Written in the file's charset by default (UTF-8 unless the file carries a Shift-JIS hint); pass enc to force one. Args: track, name, enc? (utf8|sjis|latin1). Optional base_revision.",
             object_schema(serde_json::json!({
                 "track": {"type": "integer"}, "name": {"type": "string"},
+                "enc": {"type": "string", "enum": ["utf8", "sjis", "latin1"],
+                        "description": "Write encoding; default = file's own hint, else UTF-8"},
                 "base_revision": {"type": "integer"},
             })),
         ),
         edit_spec(
             "add_track",
-            "Append a track (with optional name). Args: name?. Optional base_revision.",
+            "Append a track (with optional name, encoded like set_track_name). Args: name?, enc? (utf8|sjis|latin1). Optional base_revision.",
             object_schema(serde_json::json!({
-                "name": {"type": "string"}, "base_revision": {"type": "integer"},
+                "name": {"type": "string"},
+                "enc": {"type": "string", "enum": ["utf8", "sjis", "latin1"],
+                        "description": "Write encoding for the name; default = file's own hint, else UTF-8"},
+                "base_revision": {"type": "integer"},
             })),
         ),
         edit_spec(
@@ -1245,6 +1250,16 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             })),
         ),
     ]
+    .into_iter()
+    .map(|mut t| {
+        // v3: optional `enc` write-encoding parameter (file-hint default,
+        // #176) — additive, so only the two affected tools bump
+        if matches!(t.name, "set_track_name" | "add_track") {
+            t.version = 3;
+        }
+        t
+    })
+    .collect()
 }
 
 /// Dispatch one MCP tool call by name, the same path `call_tool` takes.
@@ -2462,16 +2477,35 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
                 Ok(t) => t,
                 Err(r) => return r,
             };
-            let ops = sh
-                .view_mut()
-                .set_track_name_ops(track, args["name"].as_str().unwrap_or(""));
+            // encoding: an explicit `enc` wins; absent, the file's own
+            // charset hint (XF "JP" marker) keeps legacy files consistent —
+            // UTF-8 is the last resort, never a silent rewrite (#176)
+            let enc = match args["enc"].as_str() {
+                Some("utf8") => Some(smf_core::TextEncoding::Utf8),
+                Some("sjis") | Some("shiftjis") | Some("shift_jis") => {
+                    Some(smf_core::TextEncoding::ShiftJis)
+                }
+                Some("latin1") | Some("latin-1") => Some(smf_core::TextEncoding::Latin1),
+                _ => sh.doc.text_encoding_hint(),
+            };
+            let ops =
+                sh.view_mut()
+                    .set_track_name_ops(track, args["name"].as_str().unwrap_or(""), enc);
             apply_ops(&mut sh, "set track name", ops)
         }
         "add_track" => {
             if let Some(r) = check_base(&sh, args) {
                 return r;
             }
-            let ops = sh.view_mut().add_track_ops(args["name"].as_str());
+            let enc = match args["enc"].as_str() {
+                Some("utf8") => Some(smf_core::TextEncoding::Utf8),
+                Some("sjis") | Some("shiftjis") | Some("shift_jis") => {
+                    Some(smf_core::TextEncoding::ShiftJis)
+                }
+                Some("latin1") | Some("latin-1") => Some(smf_core::TextEncoding::Latin1),
+                _ => sh.doc.text_encoding_hint(),
+            };
+            let ops = sh.view_mut().add_track_ops(args["name"].as_str(), enc);
             apply_ops(&mut sh, "add track", ops)
         }
         "remove_track" => {

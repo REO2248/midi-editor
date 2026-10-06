@@ -3,11 +3,20 @@
   "tools": [
     {
       "deprecated": null,
-      "description": "Append a track (with optional name). Args: name?. Optional base_revision.",
+      "description": "Append a track (with optional name, encoded like set_track_name). Args: name?, enc? (utf8|sjis|latin1). Optional base_revision.",
       "input_schema": {
         "properties": {
           "base_revision": {
             "type": "integer"
+          },
+          "enc": {
+            "description": "Write encoding for the name; default = file's own hint, else UTF-8",
+            "enum": [
+              "utf8",
+              "sjis",
+              "latin1"
+            ],
+            "type": "string"
           },
           "name": {
             "type": "string"
@@ -20,7 +29,7 @@
         "type": "object"
       },
       "name": "add_track",
-      "version": 2
+      "version": 3
     },
     {
       "deprecated": null,
@@ -1187,11 +1196,20 @@
     },
     {
       "deprecated": null,
-      "description": "Set track name (UTF-8 meta 0x03). Args: track, name. Optional base_revision.",
+      "description": "Set track name (meta 0x03). Written in the file's charset by default (UTF-8 unless the file carries a Shift-JIS hint); pass enc to force one. Args: track, name, enc? (utf8|sjis|latin1). Optional base_revision.",
       "input_schema": {
         "properties": {
           "base_revision": {
             "type": "integer"
+          },
+          "enc": {
+            "description": "Write encoding; default = file's own hint, else UTF-8",
+            "enum": [
+              "utf8",
+              "sjis",
+              "latin1"
+            ],
+            "type": "string"
           },
           "name": {
             "type": "string"
@@ -1207,7 +1225,7 @@
         "type": "object"
       },
       "name": "set_track_name",
-      "version": 2
+      "version": 3
     },
     {
       "deprecated": null,
