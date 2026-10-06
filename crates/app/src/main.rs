@@ -681,6 +681,20 @@ type LaneCache =
 
 type EvRowOut = (Vec<EvRow>, Vec<Option<(usize, usize, EventId)>>);
 
+/// Element ids of every focusable toolbar control, in visual (left →
+/// right) paint order — which is exactly the Tab order once each id's
+/// focus handle is a tab stop (#183). Groups, in order: file ops and
+/// history; transport in deck order (#168); readout spinbutton and chips;
+/// edit tools; snap; selection ops, zoom, plugin gui. The position LCD
+/// and the timing-mode badge are static labels, not controls.
+/// `i.seq`/`i.gui` render conditionally — their handles exist regardless;
+/// unused handles cost nothing.
+const TOOLBAR_IDS: &[&str] = &[
+    "i.new", "i.open", "i.save", "i.undo", "i.redo", "i.loop", "i.start", "i.play", "i.stop",
+    "i.rec", "i.met", "bpm", "sig", "seq", "i.sel", "i.draw", "i.erase", "snap", "i.quant",
+    "i.trdn", "i.trup", "i.vel", "i.zout", "i.zin", "i.gui",
+];
+
 struct EditorView {
     shared: SharedDoc,
     /// Bumped every time the whole document is swapped in (open / new file).
@@ -723,6 +737,11 @@ struct EditorView {
     roll_fh: FocusHandle,
     lane_fh: FocusHandle,
     events_fh: FocusHandle,
+    /// per-control focus handles for the toolbar (#183) — every leaf
+    /// control is its own tab stop, keyed by element id so the builders
+    /// (`ibtn*`, `chip`, the bpm/snap spinbuttons) can register themselves.
+    /// `TOOLBAR_IDS` lists them in visual order, which is the Tab order.
+    toolbar_fhs: HashMap<&'static str, FocusHandle>,
     /// highlighted menubar label while the bar holds keyboard focus
     menu_bar_sel: usize,
     /// last non-menubar focus region — commands restore focus to it so a
@@ -1295,6 +1314,10 @@ impl EditorView {
             roll_fh: cx.focus_handle().tab_stop(true),
             lane_fh: cx.focus_handle().tab_stop(true),
             events_fh: cx.focus_handle().tab_stop(true),
+            toolbar_fhs: TOOLBAR_IDS
+                .iter()
+                .map(|id| (*id, cx.focus_handle().tab_stop(true)))
+                .collect(),
             menu_bar_sel: 0,
             last_area: FocusArea::Roll,
             menu_sel: None,

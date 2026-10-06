@@ -25,8 +25,8 @@ use gpui_kit::component::input::InputState;
 use gpui_kit::component::Root;
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
-    point, px, size, AnyWindowHandle, AppContext as _, Bounds, Entity, Pixels, ScrollDelta,
-    TestAppContext, Window,
+    point, px, size, AnyWindowHandle, App, AppContext as _, Bounds, Entity, InputEvent, KeyUpEvent,
+    Keystroke, Pixels, ScrollDelta, TestAppContext, Window,
 };
 use smf_core::{Division, Event as SmfEvent, EventKind};
 use std::fmt::Write as _;
@@ -1290,6 +1290,123 @@ fn paste_anchors_at_playhead(cx: &mut TestAppContext) {
             });
             assert!(landed, "pasted note must land at the playhead tick");
         });
+    })
+    .unwrap();
+}
+
+// --- toolbar keyboard access (#183) -------------------------------------------
+
+/// Dispatch the key-up half of a keystroke; `press` sends only key-down,
+/// and GPUI's keyboard click fires on key-up of an unmodified Enter/Space.
+fn release(w: &mut Window, key: &str, cx: &mut App) {
+    let keystroke = Keystroke::parse(key).unwrap();
+    w.render_frame(cx);
+    w.dispatch_event(KeyUpEvent { keystroke }.to_platform_input(), cx);
+    w.render_frame(cx);
+}
+
+/// Tab walks into the toolbar in visual order and Shift+Tab walks back
+/// out; from the root the first stop is the menu bar, the next ones are
+/// the toolbar's leaf controls left → right.
+#[gpui_kit::test]
+fn toolbar_tab_traversal(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, fixture_doc());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.press("tab", cx);
+        assert!(
+            view.read(cx).menu_fh.is_focused(w),
+            "first Tab must reach the menu bar"
+        );
+        w.press("tab", cx);
+        assert!(
+            view.read(cx).toolbar_fhs["i.new"].is_focused(w),
+            "second Tab must reach the first toolbar control"
+        );
+        w.press("tab", cx);
+        assert!(
+            view.read(cx).toolbar_fhs["i.open"].is_focused(w),
+            "Tab must follow the visual left-to-right order"
+        );
+        w.press("shift-tab", cx);
+        assert!(
+            view.read(cx).toolbar_fhs["i.new"].is_focused(w),
+            "Shift+Tab must walk back through the toolbar"
+        );
+    })
+    .unwrap();
+}
+
+/// Enter/Space on a focused toolbar control activates it through the same
+/// click path the mouse uses — and the root Space binding (play/stop) is
+/// suppressed while a control holds focus.
+#[gpui_kit::test]
+fn toolbar_keyboard_activation(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, fixture_doc());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        let loop_fh = view.read(cx).toolbar_fh("i.loop");
+        let was_on = crate::lock_shared(&view.read(cx).shared).loop_enabled;
+        w.focus(&loop_fh, cx);
+        w.render_frame(cx);
+        // Enter toggles loop playback
+        w.press("enter", cx);
+        release(w, "enter", cx);
+        assert_eq!(
+            crate::lock_shared(&view.read(cx).shared).loop_enabled,
+            !was_on,
+            "Enter must toggle the focused loop button"
+        );
+        // Space toggles it back — and must NOT hit the global play/stop
+        // binding, so playback stays off
+        w.press("space", cx);
+        release(w, "space", cx);
+        assert_eq!(
+            crate::lock_shared(&view.read(cx).shared).loop_enabled,
+            was_on,
+            "Space must toggle the focused loop button"
+        );
+        assert!(
+            view.read(cx).playback.is_none(),
+            "Space on a focused toolbar control must not trigger play/stop"
+        );
+    })
+    .unwrap();
+}
+
+/// The bpm readout is a spinbutton: Up/Down step the tempo like its a11y
+/// Increment/Decrement actions.
+#[gpui_kit::test]
+fn toolbar_bpm_arrows(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, fixture_doc());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        let bpm_fh = view.read(cx).toolbar_fh("bpm");
+        w.focus(&bpm_fh, cx);
+        w.render_frame(cx);
+        // tempo_track() itself takes the shared lock — resolve it outside
+        // the doc() closure or the mutex re-entrant-locks (see render)
+        let tempo_at = |v: &EditorView| {
+            let tr = v.tempo_track();
+            v.doc(|d| crate::edit_ops::tempo_bpm_at(d, tr, d.tempo_map.us_to_tick(v.play_us)))
+        };
+        let before = view.update(cx, |v, _| tempo_at(v));
+        w.press("up", cx);
+        let after = view.update(cx, |v, _| tempo_at(v));
+        assert!(
+            after - before >= 0.5,
+            "Up on the focused bpm readout must raise the tempo ({before} → {after})"
+        );
+        w.press("down", cx);
+        w.press("down", cx);
+        let after = view.update(cx, |v, _| tempo_at(v));
+        assert!(
+            before - after >= 0.5,
+            "Down on the focused bpm readout must lower the tempo ({before} → {after})"
+        );
     })
     .unwrap();
 }

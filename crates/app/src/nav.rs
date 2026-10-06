@@ -1511,6 +1511,29 @@ impl EditorView {
             .child(label.into())
             .on_click(cx.listener(move |this, ev, _w, cx| on(this, ev, cx)))
     }
+
+    /// Toolbar variant of `chip`: keyboard-reachable like the toolbar icon
+    /// buttons (#183). Chips carry no border, so focus paints the accent
+    /// tint instead of a ring (a ring border would shift layout).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn tchip(
+        &self,
+        window: &Window,
+        id: &'static str,
+        label: impl Into<SharedString>,
+        a11y_name: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+        on: impl Fn(&mut Self, &ClickEvent, &mut Context<Self>) + 'static,
+    ) -> ObservedElement<Stateful<Div>> {
+        let th = theme::current();
+        let fh = self.toolbar_fh(id);
+        let focused = fh.is_focused(window);
+        Self::chip(id, label, a11y_name, cx, on)
+            .bg(rgb(if focused { th.accent_bg } else { th.bg_chip }))
+            .text_color(rgb(if focused { th.text_bright } else { th.accent }))
+            .track_focus(&fh)
+            .on_key_down(cx.listener(Self::toolbar_key_gate))
+    }
 }
 
 /// A locator drag may never invert the loop span (#173): dragging the
