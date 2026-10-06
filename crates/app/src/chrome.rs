@@ -1282,6 +1282,36 @@ impl Render for Tip {
 }
 
 impl EditorView {
+    /// Focus handle for a toolbar control, pre-registered as a tab stop in
+    /// `build` (#183). Panics on an unknown id — the id list and the paint
+    /// site must stay in sync.
+    pub(crate) fn toolbar_fh(&self, id: &str) -> FocusHandle {
+        self.toolbar_fhs[id].clone()
+    }
+
+    /// Keyboard gate shared by every focusable toolbar control (#183).
+    /// While a toolbar control holds focus, an unmodified Enter/Space is
+    /// *its* activation key — the click arrives from GPUI's native
+    /// keyboard-click on key-up. Swallowing the key-down here stops it
+    /// from also bubbling to the root handler, where Space is bound to
+    /// play/stop and would fire the global binding alongside the button.
+    /// Overlays that own the keyboard (palette, menus, meta dialog) let
+    /// the key through to their handlers.
+    pub(crate) fn toolbar_key_gate(
+        &mut self,
+        ev: &KeyDownEvent,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.palette.is_some() || self.open_menu.is_some() || self.meta_edit.is_some() {
+            return;
+        }
+        let k = ev.keystroke.key.as_str();
+        if (k == "enter" || k == "space" || k == " ") && !ev.keystroke.modifiers.modified() {
+            cx.stop_propagation();
+        }
+    }
+
     /// 1px vertical separator between toolbar icon groups.
     pub(crate) fn vsep() -> Div {
         div()
@@ -1293,7 +1323,12 @@ impl EditorView {
 
     /// Icon button: 26px square, tooltip, neutral gray icon.
     /// Screen readers get `tip` as the name and the on/off state as a toggle.
+    /// Keyboard-reachable: a tab stop whose focus paints the accent ring;
+    /// Enter/Space activate through the native keyboard click (#183).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn ibtn(
+        &self,
+        window: &Window,
         id: &'static str,
         ic: &'static str,
         tip: &'static str,
@@ -1302,6 +1337,8 @@ impl EditorView {
         f: impl Fn(&mut Self, &ClickEvent, &mut Context<Self>) + 'static,
     ) -> ObservedElement<Stateful<Div>> {
         let th = theme::current();
+        let fh = self.toolbar_fh(id);
+        let focused = fh.is_focused(window);
         div()
             .id(id)
             .test_support()
@@ -1321,7 +1358,9 @@ impl EditorView {
                 rgb(th.bg_panel)
             })
             .border_1()
-            .border_color(if on {
+            .border_color(if focused {
+                rgb(th.accent)
+            } else if on {
                 rgb(th.accent_edge)
             } else {
                 rgb(th.bg_panel)
@@ -1329,6 +1368,8 @@ impl EditorView {
             .hover(move |s| s.bg(rgb(th.bg_hover)))
             .tooltip(move |_w, cx| cx.new(|_| Tip(tip.into())).into())
             .child(icon(ic, 16.0, if on { th.accent } else { th.icon_off }))
+            .track_focus(&fh)
+            .on_key_down(cx.listener(Self::toolbar_key_gate))
             .on_click(cx.listener(move |v, e, _w, cx| {
                 f(v, e, cx);
                 cx.notify();
@@ -1337,7 +1378,10 @@ impl EditorView {
 
     /// `ibtn` whose handler also receives the window — needed by actions
     /// that open a window-level prompt such as the discard guard.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn ibtn_w(
+        &self,
+        window: &Window,
         id: &'static str,
         ic: &'static str,
         tip: &'static str,
@@ -1346,6 +1390,8 @@ impl EditorView {
         f: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> Stateful<Div> {
         let th = theme::current();
+        let fh = self.toolbar_fh(id);
+        let focused = fh.is_focused(window);
         div()
             .id(id)
             .w(px(metrics::ICON_BTN))
@@ -1361,7 +1407,9 @@ impl EditorView {
                 rgb(th.bg_panel)
             })
             .border_1()
-            .border_color(if on {
+            .border_color(if focused {
+                rgb(th.accent)
+            } else if on {
                 rgb(th.accent_edge)
             } else {
                 rgb(th.bg_panel)
@@ -1369,6 +1417,8 @@ impl EditorView {
             .hover(move |s| s.bg(rgb(th.bg_hover)))
             .tooltip(move |_w, cx| cx.new(|_| Tip(tip.into())).into())
             .child(icon(ic, 16.0, if on { th.accent } else { th.icon_off }))
+            .track_focus(&fh)
+            .on_key_down(cx.listener(Self::toolbar_key_gate))
             .on_click(cx.listener(move |v, _e, w, cx| {
                 f(v, w, cx);
                 cx.notify();
@@ -1376,7 +1426,10 @@ impl EditorView {
     }
 
     /// Icon button whose active state gets a custom accent color.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn ibtn_c(
+        &self,
+        window: &Window,
         id: &'static str,
         ic: &'static str,
         tip: &'static str,
@@ -1386,6 +1439,8 @@ impl EditorView {
         f: impl Fn(&mut Self, &ClickEvent, &mut Context<Self>) + 'static,
     ) -> ObservedElement<Stateful<Div>> {
         let th = theme::current();
+        let fh = self.toolbar_fh(id);
+        let focused = fh.is_focused(window);
         div()
             .id(id)
             .test_support()
@@ -1405,7 +1460,9 @@ impl EditorView {
                 rgb(th.bg_panel)
             })
             .border_1()
-            .border_color(if on {
+            .border_color(if focused {
+                rgb(th.accent)
+            } else if on {
                 rgb(th.accent_edge)
             } else {
                 rgb(th.bg_panel)
@@ -1413,6 +1470,8 @@ impl EditorView {
             .hover(move |s| s.bg(rgb(th.bg_hover)))
             .tooltip(move |_w, cx| cx.new(|_| Tip(tip.into())).into())
             .child(icon(ic, 16.0, if on { accent } else { th.icon_off }))
+            .track_focus(&fh)
+            .on_key_down(cx.listener(Self::toolbar_key_gate))
             .on_click(cx.listener(move |v, e, _w, cx| {
                 f(v, e, cx);
                 cx.notify();

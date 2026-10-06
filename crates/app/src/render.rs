@@ -215,6 +215,11 @@ impl Render for EditorView {
             let m = d.meter_map_for(self.sel_track).meter_at(playhead_tick);
             format!("{}/{}", m.num, 1u32 << m.den_pow.min(15))
         });
+        // toolbar spinbutton focus state (#183) — the ring reads live focus
+        let bpm_fh = self.toolbar_fh("bpm");
+        let bpm_focused = bpm_fh.is_focused(window);
+        let snap_fh = self.toolbar_fh("snap");
+        let snap_focused = snap_fh.is_focused(window);
         let track_names = doc_ui.track_names.clone();
         let track_chs = doc_ui.track_chs.clone();
         let markers = &doc_ui.markers;
@@ -713,7 +718,8 @@ impl Render for EditorView {
             .border_b_1()
             .border_color(rgb(theme::current().border))
             // file ops
-            .child(Self::ibtn_w(
+            .child(self.ibtn_w(
+                window,
                 "i.new",
                 "note_add",
                 t("tip.new"),
@@ -723,7 +729,8 @@ impl Render for EditorView {
                     v.confirm_discard_or_save(PendingAction::NewFile, w, cx);
                 },
             ))
-            .child(Self::ibtn_w(
+            .child(self.ibtn_w(
+                window,
                 "i.open",
                 "folder_open",
                 t("tip.open"),
@@ -733,7 +740,8 @@ impl Render for EditorView {
                     v.confirm_discard_or_save(PendingAction::OpenDialog, w, cx);
                 },
             ))
-            .child(Self::ibtn(
+            .child(self.ibtn(
+                window,
                 "i.save",
                 "save",
                 t("tip.save"),
@@ -745,7 +753,8 @@ impl Render for EditorView {
             ))
             .child(Self::vsep())
             // history
-            .child(Self::ibtn(
+            .child(self.ibtn(
+                window,
                 "i.undo",
                 "undo",
                 t("tip.undo"),
@@ -755,7 +764,8 @@ impl Render for EditorView {
                     v.undo(cx);
                 },
             ))
-            .child(Self::ibtn(
+            .child(self.ibtn(
+                window,
                 "i.redo",
                 "redo",
                 t("tip.redo"),
@@ -767,7 +777,8 @@ impl Render for EditorView {
             ))
             .child(Self::vsep())
             // transport
-            .child(Self::ibtn_c(
+            .child(self.ibtn_c(
+                window,
                 "i.play",
                 if self.playback.is_some() {
                     "stop"
@@ -780,7 +791,8 @@ impl Render for EditorView {
                 cx,
                 |v, _e, cx| v.toggle_play(cx),
             ))
-            .child(Self::ibtn(
+            .child(self.ibtn(
+                window,
                 "i.stop",
                 "stop",
                 t("tip.stop"),
@@ -788,7 +800,8 @@ impl Render for EditorView {
                 cx,
                 |v, _e, cx| v.transport_stop(cx),
             ))
-            .child(Self::ibtn(
+            .child(self.ibtn(
+                window,
                 "i.start",
                 "skip_previous",
                 t("tip.go_start"),
@@ -796,7 +809,8 @@ impl Render for EditorView {
                 cx,
                 |v, _e, cx| v.go_to_start(cx),
             ))
-            .child(Self::ibtn_c(
+            .child(self.ibtn_c(
+                window,
                 "i.rec",
                 "fiber_manual_record",
                 t("tip.rec"),
@@ -805,7 +819,8 @@ impl Render for EditorView {
                 cx,
                 |v, _e, cx| v.transport_record(cx),
             ))
-            .child(Self::ibtn_c(
+            .child(self.ibtn_c(
+                window,
                 "i.loop",
                 "loop",
                 t("tip.loop"),
@@ -820,7 +835,8 @@ impl Render for EditorView {
                     v.persist();
                 },
             ))
-            .child(Self::ibtn_c(
+            .child(self.ibtn_c(
+                window,
                 "i.met",
                 "timer",
                 t("tip.met"),
@@ -918,7 +934,7 @@ impl Render for EditorView {
                     .items_center()
                     .bg(rgb(theme::current().bg_input))
                     .border_1()
-                    .border_color(rgb(theme::current().border))
+                    .border_color(rgb(if bpm_focused { th.accent } else { th.border }))
                     .rounded_sm()
                     .cursor_pointer()
                     .text_color(rgb(th.lcd))
@@ -927,6 +943,24 @@ impl Render for EditorView {
                     .whitespace_nowrap()
                     .tooltip(move |_w, cx| cx.new(|_| Tip(t("tip.tempo").into())).into())
                     .child(format!("{tempo0:.0}♩"))
+                    .track_focus(&bpm_fh)
+                    // spinbutton keys: Up/Down step like the a11y
+                    // Increment/Decrement actions; Enter/Space click (#183)
+                    .on_key_down(cx.listener(|v, ev: &KeyDownEvent, w, cx| {
+                        match ev.keystroke.key.as_str() {
+                            "up" if !ev.keystroke.modifiers.modified() => {
+                                v.bump_tempo(1.0);
+                                cx.stop_propagation();
+                                cx.notify();
+                            }
+                            "down" if !ev.keystroke.modifiers.modified() => {
+                                v.bump_tempo(-1.0);
+                                cx.stop_propagation();
+                                cx.notify();
+                            }
+                            _ => v.toolbar_key_gate(ev, w, cx),
+                        }
+                    }))
                     .on_click(cx.listener(|v, e: &ClickEvent, _w, cx| {
                         v.bump_tempo(if e.modifiers().shift { -10.0 } else { 1.0 });
                         cx.notify();
@@ -939,7 +973,8 @@ impl Render for EditorView {
                         }),
                     ),
             )
-            .child(Self::chip(
+            .child(self.tchip(
+                window,
                 "sig",
                 sig.clone(),
                 tf("a11y.sig", &[("sig", sig.as_str())]),
@@ -955,14 +990,15 @@ impl Render for EditorView {
                 let i = (self.sel_track + 1).to_string();
                 let n = n_tracks.to_string();
                 let label = tf("chip.seq", &[("i", i.as_str()), ("n", n.as_str())]);
-                Self::chip("seq", label.clone(), label, cx, move |v, _e, cx| {
+                self.tchip(window, "seq", label.clone(), label, cx, move |v, _e, cx| {
                     v.select_track((v.sel_track + 1) % n_tracks.max(1), cx);
                     cx.notify();
                 })
             }))
             .child(Self::vsep())
             // edit tools
-            .child(Self::ibtn_c(
+            .child(self.ibtn_c(
+                window,
                 "i.sel",
                 "arrow_selector_tool",
                 t("tip.sel"),
@@ -971,7 +1007,8 @@ impl Render for EditorView {
                 cx,
                 |v, _e, cx| v.set_tool(Tool::Select, cx),
             ))
-            .child(Self::ibtn_c(
+            .child(self.ibtn_c(
+                window,
                 "i.draw",
                 "edit",
                 t("tip.draw"),
@@ -980,7 +1017,8 @@ impl Render for EditorView {
                 cx,
                 |v, _e, cx| v.set_tool(Tool::Draw, cx),
             ))
-            .child(Self::ibtn_c(
+            .child(self.ibtn_c(
+                window,
                 "i.erase",
                 "ink_eraser",
                 t("tip.erase"),
@@ -1030,7 +1068,9 @@ impl Render for EditorView {
                         theme::current().bg_off
                     }))
                     .border_1()
-                    .border_color(rgb(if SNAPS[self.snap_idx].0 > 0 {
+                    .border_color(rgb(if snap_focused {
+                        th.accent
+                    } else if SNAPS[self.snap_idx].0 > 0 {
                         theme::current().accent_edge
                     } else {
                         theme::current().border
@@ -1060,11 +1100,30 @@ impl Render for EditorView {
                             .whitespace_nowrap()
                             .child(snap_label(SNAPS[self.snap_idx].2, td)),
                     )
+                    .track_focus(&snap_fh)
+                    // spinbutton keys: Up/Down step like the a11y
+                    // Increment/Decrement actions; Enter/Space click (#183)
+                    .on_key_down(cx.listener(|v, ev: &KeyDownEvent, w, cx| {
+                        match ev.keystroke.key.as_str() {
+                            "up" if !ev.keystroke.modifiers.modified() => {
+                                v.cycle_snap(cx);
+                                cx.stop_propagation();
+                            }
+                            "down" if !ev.keystroke.modifiers.modified() => {
+                                v.snap_idx = (v.snap_idx + SNAPS.len() - 1) % SNAPS.len();
+                                v.persist();
+                                cx.stop_propagation();
+                                cx.notify();
+                            }
+                            _ => v.toolbar_key_gate(ev, w, cx),
+                        }
+                    }))
                     .on_click(cx.listener(|v, _e, _w, cx| v.cycle_snap(cx))),
             )
             .child(Self::vsep())
             // selection ops (selection range, else whole track)
-            .child(Self::ibtn(
+            .child(self.ibtn(
+                window,
                 "i.quant",
                 "compress",
                 t(if td.is_smpte() {
@@ -1083,7 +1142,8 @@ impl Render for EditorView {
                     cx.notify();
                 },
             ))
-            .child(Self::ibtn(
+            .child(self.ibtn(
+                window,
                 "i.trdn",
                 "arrow_downward",
                 t("tip.trdn"),
@@ -1096,7 +1156,8 @@ impl Render for EditorView {
                     cx.notify();
                 },
             ))
-            .child(Self::ibtn(
+            .child(self.ibtn(
+                window,
                 "i.trup",
                 "arrow_upward",
                 t("tip.trup"),
@@ -1109,7 +1170,8 @@ impl Render for EditorView {
                     cx.notify();
                 },
             ))
-            .child(Self::ibtn(
+            .child(self.ibtn(
+                window,
                 "i.vel",
                 "tune",
                 t("tip.vel"),
@@ -1130,7 +1192,8 @@ impl Render for EditorView {
             ))
             .child(div().flex_1())
             // zoom
-            .child(Self::ibtn(
+            .child(self.ibtn(
+                window,
                 "i.zout",
                 "zoom_out",
                 t("tip.zout"),
@@ -1140,7 +1203,8 @@ impl Render for EditorView {
                     v.zoom_by(1.0 / 1.3, cx);
                 },
             ))
-            .child(Self::ibtn(
+            .child(self.ibtn(
+                window,
                 "i.zin",
                 "zoom_in",
                 t("tip.zin"),
@@ -1151,10 +1215,18 @@ impl Render for EditorView {
                 },
             ))
             .children(sel_is_plugin.then(|| {
-                Self::ibtn("i.gui", "piano", t("tip.gui"), false, cx, |v, _e, cx| {
-                    v.open_plugin_gui();
-                    cx.notify();
-                })
+                self.ibtn(
+                    window,
+                    "i.gui",
+                    "piano",
+                    t("tip.gui"),
+                    false,
+                    cx,
+                    |v, _e, cx| {
+                        v.open_plugin_gui();
+                        cx.notify();
+                    },
+                )
             }));
         // --- event list: right-docked panel -------------------------------------
         let events_focused = area == FocusArea::Events;
