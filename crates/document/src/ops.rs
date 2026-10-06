@@ -107,7 +107,7 @@ impl Document {
             }
             merged.push(None); // placeholder for the existing event
         }
-        while let Some(b) = batch_iter.next() {
+        for b in batch_iter {
             merged.push(Some(b));
         }
         // renumber densely; collect renumbering + insert ops
@@ -174,7 +174,7 @@ impl Document {
             n.track == track
                 && n.start_tick >= from
                 && n.start_tick < to
-                && channel.map_or(true, |c| n.channel == c)
+                && channel.is_none_or(|c| n.channel == c)
         }) {
             let start = n.start_tick as i128;
             let bar = mm.bar_start_tick(n.start_tick) as i128;
@@ -218,7 +218,7 @@ impl Document {
             n.track == track
                 && n.start_tick >= from
                 && n.start_tick < to
-                && channel.map_or(true, |c| n.channel == c)
+                && channel.is_none_or(|c| n.channel == c)
         }) {
             let Some(new_key) = (n.key as i32 + semitones)
                 .try_into()
@@ -261,7 +261,7 @@ impl Document {
             n.track == track
                 && n.start_tick >= from
                 && n.start_tick < to
-                && channel.map_or(true, |c| n.channel == c)
+                && channel.is_none_or(|c| n.channel == c)
         }) {
             let nv = ((n.vel as f64 * factor).round() as i64).clamp(1, 127) as u8;
             if nv == n.vel {

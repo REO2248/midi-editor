@@ -1798,7 +1798,7 @@ fn session_ops_undo_and_redo_in_user_order() {
     let mut g = sh.lock().unwrap();
     let (session, _) = g.undo_any().expect("undo reverts the edit");
     assert!(!session);
-    assert_eq!(g.muted.contains(&1), false);
+    assert!(!g.muted.contains(&1));
     assert_eq!(
         g.doc.notes().len(),
         1,
