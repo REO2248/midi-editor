@@ -109,10 +109,14 @@
     },
     {
       "deprecated": null,
-      "description": "Delete channel events in [from,to) (notes delete whole). Args: track, from, to. Optional base_revision.",
+      "description": "Delete channel events in [from,to) (notes delete whole). Args: track, from, to, channel? (1-16, scope inside a track — Format 0 files). Optional base_revision.",
       "input_schema": {
         "properties": {
           "base_revision": {
+            "type": "integer"
+          },
+          "channel": {
+            "description": "1-16: only this channel's events; default all",
             "type": "integer"
           },
           "from": {
@@ -132,7 +136,7 @@
         "type": "object"
       },
       "name": "delete_range",
-      "version": 2
+      "version": 3
     },
     {
       "deprecated": null,
@@ -519,10 +523,14 @@
     },
     {
       "deprecated": null,
-      "description": "Snap note onsets to a grid (duration preserved). Args: track? (all when omitted), from?, to?, grid? (ticks, default ppq/4 metrical / one frame SMPTE), strength? (0-100, default 100). Optional base_revision.",
+      "description": "Snap note onsets to a grid (duration preserved). Args: track? (all when omitted), from?, to?, grid? (ticks, default ppq/4 metrical / one frame SMPTE), strength? (0-100, default 100), channel? (1-16, scope inside a track — Format 0 files). Optional base_revision.",
       "input_schema": {
         "properties": {
           "base_revision": {
+            "type": "integer"
+          },
+          "channel": {
+            "description": "1-16: only notes on this channel; default all",
             "type": "integer"
           },
           "from": {
@@ -548,7 +556,7 @@
         "type": "object"
       },
       "name": "quantize",
-      "version": 2
+      "version": 3
     },
     {
       "deprecated": null,
@@ -695,10 +703,14 @@
     },
     {
       "deprecated": null,
-      "description": "Multiply note velocities. Args: track?, from?, to?, factor (e.g. 1.2 = +20%). Optional base_revision.",
+      "description": "Multiply note velocities. Args: track?, from?, to?, factor (e.g. 1.2 = +20%), channel? (1-16, scope inside a track — Format 0 files). Optional base_revision.",
       "input_schema": {
         "properties": {
           "base_revision": {
+            "type": "integer"
+          },
+          "channel": {
+            "description": "1-16: only notes on this channel; default all",
             "type": "integer"
           },
           "factor": {
@@ -721,7 +733,7 @@
         "type": "object"
       },
       "name": "scale_velocity",
-      "version": 2
+      "version": 3
     },
     {
       "deprecated": null,
@@ -1347,10 +1359,14 @@
     },
     {
       "deprecated": null,
-      "description": "Shift note pitch. Args: track?, from?, to?, semitones (+/-). Notes leaving 0..127 are skipped. Optional base_revision.",
+      "description": "Shift note pitch. Args: track?, from?, to?, semitones (+/-), channel? (1-16, scope inside a track — Format 0 files). Notes leaving 0..127 are skipped. Optional base_revision.",
       "input_schema": {
         "properties": {
           "base_revision": {
+            "type": "integer"
+          },
+          "channel": {
+            "description": "1-16: only notes on this channel; default all",
             "type": "integer"
           },
           "from": {
@@ -1373,7 +1389,7 @@
         "type": "object"
       },
       "name": "transpose",
-      "version": 2
+      "version": 3
     },
     {
       "deprecated": null,

@@ -1074,8 +1074,8 @@ impl Render for EditorView {
                 |v, _e, cx| {
                     let g = v.quantize_grid();
                     let st = v.q_str;
-                    v.apply_region_op("quantize", move |d, tr, f, to| {
-                        d.quantize_ops(tr, f, to, g, st)
+                    v.apply_region_op("quantize", move |d, tr, f, to, ch| {
+                        d.quantize_ops(tr, f, to, g, st, ch)
                     });
                     cx.notify();
                 },
@@ -1087,7 +1087,9 @@ impl Render for EditorView {
                 false,
                 cx,
                 |v, _e, cx| {
-                    v.apply_region_op("transpose -1", |d, t, f, to| d.transpose_ops(t, f, to, -1));
+                    v.apply_region_op("transpose -1", |d, t, f, to, ch| {
+                        d.transpose_ops(t, f, to, -1, ch)
+                    });
                     cx.notify();
                 },
             ))
@@ -1098,7 +1100,9 @@ impl Render for EditorView {
                 false,
                 cx,
                 |v, _e, cx| {
-                    v.apply_region_op("transpose +1", |d, t, f, to| d.transpose_ops(t, f, to, 1));
+                    v.apply_region_op("transpose +1", |d, t, f, to, ch| {
+                        d.transpose_ops(t, f, to, 1, ch)
+                    });
                     cx.notify();
                 },
             ))
@@ -1110,12 +1114,12 @@ impl Render for EditorView {
                 cx,
                 |v, e: &ClickEvent, cx| {
                     if e.modifiers().shift {
-                        v.apply_region_op("vel ×0.8", |d, t, f, to| {
-                            d.scale_velocity_ops(t, f, to, 0.8)
+                        v.apply_region_op("vel ×0.8", |d, t, f, to, ch| {
+                            d.scale_velocity_ops(t, f, to, 0.8, ch)
                         });
                     } else {
-                        v.apply_region_op("vel ×1.25", |d, t, f, to| {
-                            d.scale_velocity_ops(t, f, to, 1.25)
+                        v.apply_region_op("vel ×1.25", |d, t, f, to, ch| {
+                            d.scale_velocity_ops(t, f, to, 1.25, ch)
                         });
                     }
                     cx.notify();
@@ -3500,8 +3504,8 @@ impl Render for EditorView {
                                 |v, _e, cx| {
                                     let g = v.quantize_grid();
                                     let st = v.q_str;
-                                    v.apply_region_op("quantize", move |d, t, f, to| {
-                                        d.quantize_ops(t, f, to, g, st)
+                                    v.apply_region_op("quantize", move |d, t, f, to, ch| {
+                                        d.quantize_ops(t, f, to, g, st, ch)
                                     });
                                     cx.notify();
                                 },
@@ -3519,8 +3523,8 @@ impl Render for EditorView {
                             .enumerate()
                             .map(|(i, (label, st))| {
                                 Self::mi_leaf(("oct", i), label, "", None, cx, move |v, _e, _cx| {
-                                    v.apply_region_op("octave", move |d, t, f, to| {
-                                        d.transpose_ops(t, f, to, st)
+                                    v.apply_region_op("octave", move |d, t, f, to, ch| {
+                                        d.transpose_ops(t, f, to, st, ch)
                                     });
                                 })
                             })
@@ -3706,7 +3710,7 @@ impl Render for EditorView {
                             .enumerate()
                             .map(|(i, (label, ticks))| {
                                 Self::mi_leaf(("len", i), label, "", None, cx, move |v, _e, _cx| {
-                                    v.apply_region_op("set length", move |d, t, f, to| {
+                                    v.apply_region_op("set length", move |d, t, f, to, _ch| {
                                         d.set_length_ops(t, f, to, ticks)
                                     });
                                 })
@@ -3727,7 +3731,7 @@ impl Render for EditorView {
                             .enumerate()
                             .map(|(i, (label, gap))| {
                                 Self::mi_leaf(("leg", i), label, "", None, cx, move |v, _e, _cx| {
-                                    v.apply_region_op("legato", move |d, t, f, to| {
+                                    v.apply_region_op("legato", move |d, t, f, to, _ch| {
                                         d.legato_ops(t, f, to, gap)
                                     });
                                 })
@@ -3748,7 +3752,7 @@ impl Render for EditorView {
                             .enumerate()
                             .map(|(i, (label, amount))| {
                                 Self::mi_leaf(("swg", i), label, "", None, cx, move |v, _e, _cx| {
-                                    v.apply_region_op("swing", move |d, t, f, to| {
+                                    v.apply_region_op("swing", move |d, t, f, to, _ch| {
                                         d.swing_ops(t, f, to, grid, amount)
                                     });
                                 })
@@ -3772,9 +3776,12 @@ impl Render for EditorView {
                                     None,
                                     cx,
                                     move |v, _e, _cx| {
-                                        v.apply_region_op("set velocity", move |d, t, f, to| {
-                                            d.set_velocity_ops(t, f, to, vel)
-                                        });
+                                        v.apply_region_op(
+                                            "set velocity",
+                                            move |d, t, f, to, _ch| {
+                                                d.set_velocity_ops(t, f, to, vel)
+                                            },
+                                        );
                                     },
                                 )
                             })
@@ -3801,7 +3808,7 @@ impl Render for EditorView {
                                     move |v, _e, _cx| {
                                         v.apply_region_op(
                                             "set release velocity",
-                                            move |d, t, f, to| {
+                                            move |d, t, f, to, _ch| {
                                                 d.set_release_velocity_ops(t, f, to, vel)
                                             },
                                         );
@@ -3814,56 +3821,64 @@ impl Render for EditorView {
                     // whole-track scope (#131). Selection-scoped commands
                     // no-op without a selection; these never need one.
                     Sub::AllTrack => {
-                        type TrackOp =
-                            Box<dyn Fn(&mut Document, usize, u64, u64) -> Vec<Op> + Send>;
+                        type TrackOp = Box<
+                            dyn Fn(&mut Document, usize, u64, u64, Option<u8>) -> Vec<Op> + Send,
+                        >;
                         let g = self.snap_ticks().max(self.td().min_grid_ticks() as i64) as u64;
                         let ppq = self.ppq() as i64;
                         let items: Vec<(String, TrackOp)> = vec![
                             (
                                 format!("Quantize 100% ({})", t("edit.snap")),
-                                Box::new(move |d, tr, f, to| d.quantize_ops(tr, f, to, g, 100)),
+                                Box::new(move |d, tr, f, to, ch| {
+                                    d.quantize_ops(tr, f, to, g, 100, ch)
+                                }),
                             ),
                             (
                                 t("edit.transpose_up").to_string(),
-                                Box::new(|d, tr, f, to| d.transpose_ops(tr, f, to, 1)),
+                                Box::new(|d, tr, f, to, ch| d.transpose_ops(tr, f, to, 1, ch)),
                             ),
                             (
                                 t("edit.transpose_dn").to_string(),
-                                Box::new(|d, tr, f, to| d.transpose_ops(tr, f, to, -1)),
+                                Box::new(|d, tr, f, to, ch| d.transpose_ops(tr, f, to, -1, ch)),
                             ),
                             (
                                 t("edit.oct_up").to_string(),
-                                Box::new(|d, tr, f, to| d.transpose_ops(tr, f, to, 12)),
+                                Box::new(|d, tr, f, to, ch| d.transpose_ops(tr, f, to, 12, ch)),
                             ),
                             (
                                 t("edit.oct_dn").to_string(),
-                                Box::new(|d, tr, f, to| d.transpose_ops(tr, f, to, -12)),
+                                Box::new(|d, tr, f, to, ch| d.transpose_ops(tr, f, to, -12, ch)),
                             ),
                             (
                                 t("edit.vel_up").to_string(),
-                                Box::new(|d, tr, f, to| d.scale_velocity_ops(tr, f, to, 1.25)),
+                                Box::new(|d, tr, f, to, ch| {
+                                    d.scale_velocity_ops(tr, f, to, 1.25, ch)
+                                }),
                             ),
                             (
                                 t("edit.vel_dn").to_string(),
-                                Box::new(|d, tr, f, to| d.scale_velocity_ops(tr, f, to, 0.8)),
+                                Box::new(|d, tr, f, to, ch| {
+                                    d.scale_velocity_ops(tr, f, to, 0.8, ch)
+                                }),
                             ),
                             (
                                 t("edit.humanize").to_string(),
-                                Box::new(move |d, tr, f, to| {
+                                Box::new(move |d, tr, f, to, ch| {
+                                    let _ = ch;
                                     d.humanize_ops(tr, f, to, ppq / 32, 5, d.revision())
                                 }),
                             ),
                             (
                                 format!("{}: touch (0 gap)", t("edit.legato")),
-                                Box::new(|d, tr, f, to| d.legato_ops(tr, f, to, 0)),
+                                Box::new(|d, tr, f, to, _ch| d.legato_ops(tr, f, to, 0)),
                             ),
                             (
                                 t("edit.fix_overlaps").to_string(),
-                                Box::new(|d, tr, f, to| d.fix_overlaps_ops(tr, f, to)),
+                                Box::new(|d, tr, f, to, _ch| d.fix_overlaps_ops(tr, f, to)),
                             ),
                             (
                                 t("edit.join").to_string(),
-                                Box::new(|d, tr, f, to| d.join_ops(tr, f, to)),
+                                Box::new(|d, tr, f, to, _ch| d.join_ops(tr, f, to)),
                             ),
                         ];
                         items
@@ -3877,7 +3892,9 @@ impl Render for EditorView {
                                     None,
                                     cx,
                                     move |v, _e, _cx| {
-                                        v.apply_track_op(&label, |d, tr, f, to| op(d, tr, f, to));
+                                        v.apply_track_op(&label, |d, tr, f, to, ch| {
+                                            op(d, tr, f, to, ch)
+                                        });
                                     },
                                 )
                             })

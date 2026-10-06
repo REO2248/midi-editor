@@ -35,11 +35,124 @@ impl Document {
             .saturating_add(1)
     }
 
+    /// Transmission priority for same-tick events — setup before trigger:
+    /// meta/SysEx, bank select, program change, controllers, note-off
+    /// before note-on, then pitch bend and pressures (#194). This feeds
+    /// `merge_insert_ops` only: serialization stays in stored (tick, seq)
+    /// order, so an untouched file keeps its byte-exact round trip — the
+    /// priority becomes the *stored* order of newly inserted events.
+    pub fn event_priority(kind: &EventKind) -> u8 {
+        match kind {
+            EventKind::Meta { .. } => 0,
+            EventKind::SysEx(_) | EventKind::Escape(_) => 1,
+            EventKind::Channel { status, data, .. } => match status & 0xF0 {
+                // bank select before everything channel-voice
+                0xB0 if data[0] == 0 || data[0] == 32 => 2,
+                0xC0 => 3,
+                0xB0 => 4,
+                // a release must precede the note-ons it terminates at the
+                // same tick, or contiguous notes re-trigger and mute
+                0x80 => 5,
+                0x90 if data[1] == 0 => 5,
+                0x90 => 6,
+                0xE0 => 7,
+                _ => 8,
+            },
+        }
+    }
+
+    /// Merge new events into `track` at one `tick` in canonical same-tick
+    /// order (#194): existing events keep their relative order, each new
+    /// event lands after the existing events of ≤ priority and before the
+    /// first strictly-higher one. The touched same-tick events (existing
+    /// and new) are renumbered densely, which the serializer and playback
+    /// reproduce verbatim. Emits `UpdateEvent` renumbering ops for the
+    /// shifted existing events plus one `InsertEvents` for the batch —
+    /// undo restores the exact original seqs through the before-images.
+    /// `batch` event ids are kept; their `seq` inputs are ignored.
+    pub fn merge_insert_ops(&mut self, track: usize, tick: u64, batch: Vec<Event>) -> Vec<Op> {
+        if batch.is_empty() {
+            return vec![];
+        }
+        let Some(t) = self.tracks.get(track) else {
+            // unknown track: the InsertEvents op fails in apply with a
+            // readable error — pass the batch through untouched
+            return vec![Op::InsertEvents {
+                track,
+                events: batch,
+            }];
+        };
+        // existing same-tick events, stored (tick, seq) order
+        let existing: Vec<(usize, Event)> = t
+            .events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.tick == tick)
+            .map(|(i, e)| (i, e.clone()))
+            .collect();
+        // the batch joins in canonical order: priority first, then the
+        // caller's order for ties (stable sort)
+        let mut batch = batch;
+        batch.sort_by_key(|e| Self::event_priority(&e.kind));
+        let mut merged: Vec<Option<Event>> = Vec::with_capacity(existing.len() + batch.len());
+        let mut batch_iter = batch.into_iter().peekable();
+        for (_, e) in &existing {
+            let pri = Self::event_priority(&e.kind);
+            while let Some(b) = batch_iter.peek() {
+                if Self::event_priority(&b.kind) < pri {
+                    merged.push(Some(batch_iter.next().unwrap()));
+                } else {
+                    break;
+                }
+            }
+            merged.push(None); // placeholder for the existing event
+        }
+        for b in batch_iter {
+            merged.push(Some(b));
+        }
+        // renumber densely; collect renumbering + insert ops
+        let mut ops = Vec::new();
+        let mut inserted: Vec<Event> = Vec::new();
+        let mut existing_iter = existing.iter();
+        for (slot, m) in merged.into_iter().enumerate() {
+            let seq = slot as u32;
+            match m {
+                None => {
+                    let (vec_i, e) = existing_iter.next().unwrap();
+                    if e.seq != seq {
+                        let mut after = e.clone();
+                        after.seq = seq;
+                        ops.push(Op::UpdateEvent {
+                            pos: *vec_i,
+                            track,
+                            before: e.clone(),
+                            after,
+                        });
+                    }
+                }
+                Some(mut b) => {
+                    b.seq = seq;
+                    inserted.push(b);
+                }
+            }
+        }
+        if !inserted.is_empty() {
+            ops.push(Op::InsertEvents {
+                track,
+                events: inserted,
+            });
+        }
+        ops
+    }
+
     /// Quantize note starts inside [from,to) to `grid` ticks, with grid
     /// lines laid from each bar's downbeat per the document's meter map
     /// (so meter changes and pickup bars keep their own boundaries).
     /// `strength` 0..=100 interpolates between the original and the grid point;
     /// the note's duration is preserved (on+off shift together).
+    /// `channel` (None = all) scopes the op inside a track — the only way
+    /// to target one part of a Format 0 file where every channel shares
+    /// track 0 (#195).
     pub fn quantize_ops(
         &mut self,
         track: usize,
@@ -47,6 +160,7 @@ impl Document {
         to: u64,
         grid: u64,
         strength: u32,
+        channel: Option<u8>,
     ) -> Vec<Op> {
         // i128 intermediates: u64-range ticks and grids never overflow
         let grid = grid.max(1) as i128;
@@ -56,11 +170,12 @@ impl Document {
         // pickup bar shifts the bar lines off the global grid
         let mm = self.meter_map_for(track);
         let mut ops = Vec::new();
-        for n in self
-            .notes()
-            .into_iter()
-            .filter(|n| n.track == track && n.start_tick >= from && n.start_tick < to)
-        {
+        for n in self.notes().into_iter().filter(|n| {
+            n.track == track
+                && n.start_tick >= from
+                && n.start_tick < to
+                && channel.is_none_or(|c| n.channel == c)
+        }) {
             let start = n.start_tick as i128;
             let bar = mm.bar_start_tick(n.start_tick) as i128;
             let snapped = bar + (((start - bar) + grid / 2) / grid) * grid;
@@ -89,13 +204,22 @@ impl Document {
 
     /// Transpose all notes starting inside [from,to) by `semitones`
     /// (clamped to 0..=127; notes that would leave the range are skipped).
-    pub fn transpose_ops(&mut self, track: usize, from: u64, to: u64, semitones: i32) -> Vec<Op> {
+    /// `channel` (None = all) scopes the op inside a track (#195).
+    pub fn transpose_ops(
+        &mut self,
+        track: usize,
+        from: u64,
+        to: u64,
+        semitones: i32,
+        channel: Option<u8>,
+    ) -> Vec<Op> {
         let mut ops = Vec::new();
-        for n in self
-            .notes()
-            .into_iter()
-            .filter(|n| n.track == track && n.start_tick >= from && n.start_tick < to)
-        {
+        for n in self.notes().into_iter().filter(|n| {
+            n.track == track
+                && n.start_tick >= from
+                && n.start_tick < to
+                && channel.is_none_or(|c| n.channel == c)
+        }) {
             let Some(new_key) = (n.key as i32 + semitones)
                 .try_into()
                 .ok()
@@ -123,13 +247,22 @@ impl Document {
     }
 
     /// Multiply noteOn velocities inside [from,to) by `factor` (clamped 1..127).
-    pub fn scale_velocity_ops(&mut self, track: usize, from: u64, to: u64, factor: f64) -> Vec<Op> {
+    /// `channel` (None = all) scopes the op inside a track (#195).
+    pub fn scale_velocity_ops(
+        &mut self,
+        track: usize,
+        from: u64,
+        to: u64,
+        factor: f64,
+        channel: Option<u8>,
+    ) -> Vec<Op> {
         let mut ops = Vec::new();
-        for n in self
-            .notes()
-            .into_iter()
-            .filter(|n| n.track == track && n.start_tick >= from && n.start_tick < to)
-        {
+        for n in self.notes().into_iter().filter(|n| {
+            n.track == track
+                && n.start_tick >= from
+                && n.start_tick < to
+                && channel.is_none_or(|c| n.channel == c)
+        }) {
             let nv = ((n.vel as f64 * factor).round() as i64).clamp(1, 127) as u8;
             if nv == n.vel {
                 continue;
@@ -640,31 +773,39 @@ impl Document {
         bank_msb: Option<u8>,
         bank_lsb: Option<u8>,
     ) -> Vec<Op> {
-        let mut seq = self.next_seq(track, tick);
-        let mut mk = |kind: EventKind| Event {
-            id: self.alloc_event_id(),
-            tick,
-            seq: {
-                let s = seq;
-                seq = seq.saturating_add(1);
-                s
-            },
-            raw_body: None,
-            kind,
-        };
         let mut events = Vec::new();
         if let Some(m) = bank_msb {
-            events.push(mk(Self::chan_event(0xB0, channel, 0, m)));
+            events.push(Event {
+                id: self.alloc_event_id(),
+                tick,
+                seq: 0,
+                raw_body: None,
+                kind: Self::chan_event(0xB0, channel, 0, m),
+            });
         }
         if let Some(l) = bank_lsb {
-            events.push(mk(Self::chan_event(0xB0, channel, 32, l)));
+            events.push(Event {
+                id: self.alloc_event_id(),
+                tick,
+                seq: 0,
+                raw_body: None,
+                kind: Self::chan_event(0xB0, channel, 32, l),
+            });
         }
-        events.push(mk(EventKind::Channel {
-            status: 0xC0 | (channel & 0x0F),
-            data: [program & 0x7F, 0],
-            len: 1,
-        }));
-        vec![Op::InsertEvents { track, events }]
+        events.push(Event {
+            id: self.alloc_event_id(),
+            tick,
+            seq: 0,
+            raw_body: None,
+            kind: EventKind::Channel {
+                status: 0xC0 | (channel & 0x0F),
+                data: [program & 0x7F, 0],
+                len: 1,
+            },
+        });
+        // bank + program must transmit before any note-on already sitting
+        // at this tick, or the patch change lands one note late (#194)
+        self.merge_insert_ops(track, tick, events)
     }
 
     /// Insert (or replace at same tick) one CC point.
@@ -676,17 +817,19 @@ impl Document {
         cc: u8,
         value: u8,
     ) -> Vec<Op> {
-        let seq = self.next_seq(track, tick);
-        vec![Op::InsertEvents {
+        let kind = Self::chan_event(0xB0, channel, cc & 0x7F, value & 0x7F);
+        let id = self.alloc_event_id();
+        self.merge_insert_ops(
             track,
-            events: vec![Event {
-                id: self.alloc_event_id(),
+            tick,
+            vec![Event {
+                id,
                 tick,
-                seq,
+                seq: 0,
                 raw_body: None,
-                kind: Self::chan_event(0xB0, channel, cc & 0x7F, value & 0x7F),
+                kind,
             }],
-        }]
+        )
     }
 
     /// Pitch bend point (0..16383, center 8192).
@@ -698,17 +841,18 @@ impl Document {
         value: u16,
     ) -> Vec<Op> {
         let v = value.min(16383);
-        let seq = self.next_seq(track, tick);
-        vec![Op::InsertEvents {
+        let id = self.alloc_event_id();
+        self.merge_insert_ops(
             track,
-            events: vec![Event {
-                id: self.alloc_event_id(),
+            tick,
+            vec![Event {
+                id,
                 tick,
-                seq,
+                seq: 0,
                 raw_body: None,
                 kind: Self::chan_event(0xE0, channel, (v & 0x7F) as u8, (v >> 7) as u8),
             }],
-        }]
+        )
     }
 
     /// Channel pressure (aftertouch, 0xD0) point — single data byte, 0..127.
@@ -719,13 +863,14 @@ impl Document {
         channel: u8,
         value: u8,
     ) -> Vec<Op> {
-        let seq = self.next_seq(track, tick);
-        vec![Op::InsertEvents {
+        let id = self.alloc_event_id();
+        self.merge_insert_ops(
             track,
-            events: vec![Event {
-                id: self.alloc_event_id(),
+            tick,
+            vec![Event {
+                id,
                 tick,
-                seq,
+                seq: 0,
                 raw_body: None,
                 kind: EventKind::Channel {
                     status: 0xD0 | (channel & 0x0F),
@@ -733,7 +878,7 @@ impl Document {
                     len: 1,
                 },
             }],
-        }]
+        )
     }
 
     /// Polyphonic key pressure (0xA0) point — key + value, both 0..127.
@@ -745,13 +890,14 @@ impl Document {
         key: u8,
         value: u8,
     ) -> Vec<Op> {
-        let seq = self.next_seq(track, tick);
-        vec![Op::InsertEvents {
+        let id = self.alloc_event_id();
+        self.merge_insert_ops(
             track,
-            events: vec![Event {
-                id: self.alloc_event_id(),
+            tick,
+            vec![Event {
+                id,
                 tick,
-                seq,
+                seq: 0,
                 raw_body: None,
                 kind: EventKind::Channel {
                     status: 0xA0 | (channel & 0x0F),
@@ -759,7 +905,7 @@ impl Document {
                     len: 2,
                 },
             }],
-        }]
+        )
     }
 
     /// Remove arbitrary events by id (lane deletes, event-list deletes,
@@ -1103,9 +1249,24 @@ impl Document {
         None
     }
 
+    /// Format-1 files keep tempo and meter on the conductor track — a
+    /// tempo or time signature sitting on a music track is ignored by most
+    /// players (#196). Track arguments are anchored, not validated: the
+    /// ops land on track 0 instead of erroring (or silently landing where
+    /// nothing reads them). Format 0 is single-track and format 2 tracks
+    /// own their tempo, so both pass through.
+    fn conductor_track(&self, track: usize) -> usize {
+        if self.format == 1 {
+            0
+        } else {
+            track
+        }
+    }
+
     /// Set/replace the tempo at `tick` on `track` (the conductor is
     /// track 0 for format 0/1; a format-2 sequence owns its own tempo).
     pub fn set_tempo_ops(&mut self, track: usize, tick: u64, bpm: f64) -> Vec<Op> {
+        let track = self.conductor_track(track);
         let mpq = (60_000_000.0 / bpm.max(1.0))
             .round()
             .clamp(1.0, 0xFF_FFFF as f64) as u32;
@@ -1166,16 +1327,18 @@ impl Document {
                 },
             });
         }
-        ops.push(Op::InsertEvents {
+        let id = self.alloc_event_id();
+        ops.extend(self.merge_insert_ops(
             track,
-            events: vec![Event {
-                id: self.alloc_event_id(),
+            tick,
+            vec![Event {
+                id,
                 tick,
-                seq: self.next_seq(track, tick),
+                seq: 0,
                 raw_body: None,
                 kind,
             }],
-        });
+        ));
         ops
     }
 
@@ -1185,6 +1348,7 @@ impl Document {
     /// `cc`/`bb` bytes; a brand-new signature gets the conventional
     /// quarter-note click (36 clocks in compound meter) and 8 32nds.
     pub fn set_time_sig_ops(&mut self, track: usize, tick: u64, num: u8, den: u8) -> Vec<Op> {
+        let track = self.conductor_track(track);
         let dd = (den.max(1) as f64).log2().round() as u8;
         let (cc, bb) = match self
             .tracks
@@ -1211,6 +1375,46 @@ impl Document {
         self.set_time_sig_full_ops(track, tick, num, den, cc, bb)
     }
 
+    /// Insert one note as a NoteOn/NoteOff pair with canonical same-tick
+    /// placement (#194): the release lands before any note-on already
+    /// sitting at its tick (contiguous notes must not re-trigger and mute
+    /// each other), the attack after existing setup events (bank/program).
+    /// Returns the ops plus the new NoteOn's id (for selection).
+    pub fn insert_note_pair_ops(
+        &mut self,
+        track: usize,
+        on_tick: u64,
+        on_kind: EventKind,
+        off_tick: u64,
+        off_kind: EventKind,
+    ) -> (Vec<Op>, EventId) {
+        let off_id = self.alloc_event_id();
+        let on_id = self.alloc_event_id();
+        let mut ops = self.merge_insert_ops(
+            track,
+            off_tick,
+            vec![Event {
+                id: off_id,
+                tick: off_tick,
+                seq: 0,
+                raw_body: None,
+                kind: off_kind,
+            }],
+        );
+        ops.extend(self.merge_insert_ops(
+            track,
+            on_tick,
+            vec![Event {
+                id: on_id,
+                tick: on_tick,
+                seq: 0,
+                raw_body: None,
+                kind: on_kind,
+            }],
+        ));
+        (ops, on_id)
+    }
+
     /// Set/replace a time signature with the complete `nn dd cc bb`
     /// payload — every byte the caller wants stored is written verbatim.
     pub fn set_time_sig_full_ops(
@@ -1222,6 +1426,7 @@ impl Document {
         cc: u8,
         bb: u8,
     ) -> Vec<Op> {
+        let track = self.conductor_track(track);
         let dd = (den.max(1) as f64).log2().round() as u8;
         let data = Bytes::copy_from_slice(&[num, dd, cc, bb]);
         if let Some(e) = self
@@ -1647,16 +1852,18 @@ impl Document {
                 after,
             }];
         }
-        vec![Op::InsertEvents {
+        let id = self.alloc_event_id();
+        self.merge_insert_ops(
             track,
-            events: vec![Event {
-                id: self.alloc_event_id(),
+            tick,
+            vec![Event {
+                id,
                 tick,
-                seq: self.next_seq(track, tick),
+                seq: 0,
                 raw_body: None,
                 kind: EventKind::Meta { meta_type, data },
             }],
-        }]
+        )
     }
 
     /// Delete a single meta event by id — exact removal of one row, nothing

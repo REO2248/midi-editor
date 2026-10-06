@@ -109,13 +109,34 @@ impl EditorView {
                     Some(selected),
                     cx,
                     move |v, _e, _cx| {
+                        // routing changes are undoable session edits (#204)
                         let mut sh = crate::lock_shared(&v.shared);
                         match kind {
                             DestPick::Track => {
+                                let before = sh.track_dest.get(&v.sel_track).copied();
                                 sh.track_dest.insert(v.sel_track, i);
+                                sh.apply_session(mcp_server::SessionOp::SetTrackDest {
+                                    track: v.sel_track,
+                                    before,
+                                    after: i,
+                                });
                             }
-                            DestPick::Default => sh.default_dest = i,
-                            DestPick::Metronome => sh.met_dest = Some(i),
+                            DestPick::Default => {
+                                let before = sh.default_dest;
+                                sh.default_dest = i;
+                                sh.apply_session(mcp_server::SessionOp::SetDefaultDest {
+                                    before,
+                                    after: i,
+                                });
+                            }
+                            DestPick::Metronome => {
+                                let before = sh.met_dest;
+                                sh.met_dest = Some(i);
+                                sh.apply_session(mcp_server::SessionOp::SetMetDest {
+                                    before,
+                                    after: Some(i),
+                                });
+                            }
                         }
                         drop(sh);
                         v.audition_off();
@@ -224,10 +245,30 @@ impl EditorView {
                         let mut sh = crate::lock_shared(&v.shared);
                         match kind {
                             DestPick::Track => {
+                                let before = sh.track_dest.get(&v.sel_track).copied();
                                 sh.track_dest.insert(v.sel_track, i);
+                                sh.apply_session(mcp_server::SessionOp::SetTrackDest {
+                                    track: v.sel_track,
+                                    before,
+                                    after: i,
+                                });
                             }
-                            DestPick::Default => sh.default_dest = i,
-                            DestPick::Metronome => sh.met_dest = Some(i),
+                            DestPick::Default => {
+                                let before = sh.default_dest;
+                                sh.default_dest = i;
+                                sh.apply_session(mcp_server::SessionOp::SetDefaultDest {
+                                    before,
+                                    after: i,
+                                });
+                            }
+                            DestPick::Metronome => {
+                                let before = sh.met_dest;
+                                sh.met_dest = Some(i);
+                                sh.apply_session(mcp_server::SessionOp::SetMetDest {
+                                    before,
+                                    after: Some(i),
+                                });
+                            }
                         }
                         drop(sh);
                         v.audition_off();

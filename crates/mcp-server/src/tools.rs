@@ -450,6 +450,11 @@ fn build_ops(doc: &mut Document, ops: &[serde_json::Value]) -> Result<Vec<Op>, P
     }
 
     let mut out = Vec::new();
+    // a patch's ops are all built against the pre-patch state, so only the
+    // FIRST insert per (track, tick) may use the state-reading canonical
+    // placement (#194) — later ones at the same spot fall back to the
+    // legacy high-seq append, which still sorts after everything merged
+    let mut merged_once: std::collections::HashSet<(usize, u64)> = Default::default();
     for op in ops {
         let kind = op.get("op").and_then(|v| v.as_str()).unwrap_or("");
         match kind {
@@ -472,35 +477,49 @@ fn build_ops(doc: &mut Document, ops: &[serde_json::Value]) -> Result<Vec<Op>, P
                 // has no byte to carry it in
                 let off_vel = op["off_vel"].as_u64().unwrap_or(0).clamp(0, 127) as u8;
                 let off_via_on = op["off_form"].as_str() == Some("on_vel0") && off_vel == 0;
-                let on_id = doc.alloc_event_id();
-                let off_id = doc.alloc_event_id();
-                out.push(Op::InsertEvents {
-                    track,
-                    events: vec![
-                        Event {
-                            id: on_id,
-                            tick: start,
-                            seq: u32::MAX / 2,
-                            raw_body: None,
-                            kind: EventKind::Channel {
-                                status: 0x90 | ch,
-                                data: [key, vel],
-                                len: 2,
+                let on_kind = EventKind::Channel {
+                    status: 0x90 | ch,
+                    data: [key, vel],
+                    len: 2,
+                };
+                let off_kind = EventKind::Channel {
+                    status: (if off_via_on { 0x90 } else { 0x80 }) | ch,
+                    data: [key, off_vel],
+                    len: 2,
+                };
+                let off_tick = start.saturating_add(dur);
+                let fresh_on = merged_once.insert((track, start));
+                let fresh_off = merged_once.insert((track, off_tick));
+                if !fresh_on && !fresh_off {
+                    // canonical same-tick placement (#194): the release
+                    // precedes note-ons at its tick, the attack follows
+                    // existing setup
+                    let (pair_ops, _) =
+                        doc.insert_note_pair_ops(track, start, on_kind, off_tick, off_kind);
+                    out.extend(pair_ops);
+                } else {
+                    let on_id = doc.alloc_event_id();
+                    let off_id = doc.alloc_event_id();
+                    out.push(Op::InsertEvents {
+                        track,
+                        events: vec![
+                            Event {
+                                id: on_id,
+                                tick: start,
+                                seq: u32::MAX / 2,
+                                raw_body: None,
+                                kind: on_kind,
                             },
-                        },
-                        Event {
-                            id: off_id,
-                            tick: start.saturating_add(dur),
-                            seq: u32::MAX / 2,
-                            raw_body: None,
-                            kind: EventKind::Channel {
-                                status: (if off_via_on { 0x90 } else { 0x80 }) | ch,
-                                data: [key, off_vel],
-                                len: 2,
+                            Event {
+                                id: off_id,
+                                tick: off_tick,
+                                seq: u32::MAX / 2,
+                                raw_body: None,
+                                kind: off_kind,
                             },
-                        },
-                    ],
-                });
+                        ],
+                    });
+                }
             }
             "insert_events" => {
                 let track = track_arg(doc, op)?;
@@ -972,27 +991,32 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         },
         edit_spec(
             "quantize",
-            "Snap note onsets to a grid (duration preserved). Args: track? (all when omitted), from?, to?, grid? (ticks, default ppq/4 metrical / one frame SMPTE), strength? (0-100, default 100). Optional base_revision.",
+            "Snap note onsets to a grid (duration preserved). Args: track? (all when omitted), from?, to?, grid? (ticks, default ppq/4 metrical / one frame SMPTE), strength? (0-100, default 100), channel? (1-16, scope inside a track — Format 0 files). Optional base_revision.",
             object_schema(serde_json::json!({
                 "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
                 "grid": {"type": "integer"}, "strength": {"type": "integer"},
+                "channel": {"type": "integer", "description": "1-16: only notes on this channel; default all"},
                 "base_revision": {"type": "integer"},
             })),
         ),
         edit_spec(
             "transpose",
-            "Shift note pitch. Args: track?, from?, to?, semitones (+/-). Notes leaving 0..127 are skipped. Optional base_revision.",
+            "Shift note pitch. Args: track?, from?, to?, semitones (+/-), channel? (1-16, scope inside a track — Format 0 files). Notes leaving 0..127 are skipped. Optional base_revision.",
             object_schema(serde_json::json!({
                 "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
-                "semitones": {"type": "integer"}, "base_revision": {"type": "integer"},
+                "semitones": {"type": "integer"},
+                "channel": {"type": "integer", "description": "1-16: only notes on this channel; default all"},
+                "base_revision": {"type": "integer"},
             })),
         ),
         edit_spec(
             "scale_velocity",
-            "Multiply note velocities. Args: track?, from?, to?, factor (e.g. 1.2 = +20%). Optional base_revision.",
+            "Multiply note velocities. Args: track?, from?, to?, factor (e.g. 1.2 = +20%), channel? (1-16, scope inside a track — Format 0 files). Optional base_revision.",
             object_schema(serde_json::json!({
                 "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
-                "factor": {"type": "number"}, "base_revision": {"type": "integer"},
+                "factor": {"type": "number"},
+                "channel": {"type": "integer", "description": "1-16: only notes on this channel; default all"},
+                "base_revision": {"type": "integer"},
             })),
         ),
         edit_spec(
@@ -1176,9 +1200,10 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ),
         edit_spec(
             "delete_range",
-            "Delete channel events in [from,to) (notes delete whole). Args: track, from, to. Optional base_revision.",
+            "Delete channel events in [from,to) (notes delete whole). Args: track, from, to, channel? (1-16, scope inside a track — Format 0 files). Optional base_revision.",
             object_schema(serde_json::json!({
                 "track": {"type": "integer"}, "from": {"type": "integer"}, "to": {"type": "integer"},
+                "channel": {"type": "integer", "description": "1-16: only this channel's events; default all"},
                 "base_revision": {"type": "integer"},
             })),
         ),
@@ -1253,8 +1278,17 @@ pub fn tool_specs() -> Vec<ToolSpec> {
     .into_iter()
     .map(|mut t| {
         // v3: optional `enc` write-encoding parameter (file-hint default,
-        // #176) — additive, so only the two affected tools bump
-        if matches!(t.name, "set_track_name" | "add_track") {
+        // #176) and optional `channel` scope on region ops (#195) —
+        // additive, so only the affected tools bump
+        if matches!(
+            t.name,
+            "set_track_name"
+                | "add_track"
+                | "quantize"
+                | "transpose"
+                | "scale_velocity"
+                | "delete_range"
+        ) {
             t.version = 3;
         }
         t
@@ -1541,26 +1575,31 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
             let base = sh.doc.revision();
             // summarize the tx about to be reverted before it pops off the stack
             let pending_ops = sh.undo.peek_done().map(|t| t.ops.clone());
-            let res = {
-                let Shared { doc, undo, .. } = &mut *sh;
-                undo.undo(doc)
-            };
-            match res {
-                Some(l) => {
-                    let rev = sh.doc.revision();
-                    let summary = change_summary(&pending_ops.unwrap_or_default());
-                    sh.record_history(TxRecord {
-                        base,
-                        revision: rev,
-                        label: l.clone(),
-                        origin: TxOrigin::Mcp,
-                        kind: TxKind::Undo,
-                        summary: summary.clone(),
-                    });
-                    sh.gui_notify.fetch_add(1, Ordering::Relaxed);
-                    ok_json(serde_json::json!({
-                        "undone": l, "revision": rev, "summary": change_summary_json(&summary),
-                    }))
+            // unified undo (#204): may revert a document transaction or a
+            // session change (GUI routing/mute/solo), whichever is newest
+            match sh.undo_any() {
+                Some((session, l)) => {
+                    if session {
+                        sh.gui_notify.fetch_add(1, Ordering::Relaxed);
+                        ok_json(serde_json::json!({
+                            "undone": l, "kind": "session", "revision": sh.doc.revision(),
+                        }))
+                    } else {
+                        let rev = sh.doc.revision();
+                        let summary = change_summary(&pending_ops.unwrap_or_default());
+                        sh.record_history(TxRecord {
+                            base,
+                            revision: rev,
+                            label: l.clone(),
+                            origin: TxOrigin::Mcp,
+                            kind: TxKind::Undo,
+                            summary: summary.clone(),
+                        });
+                        sh.gui_notify.fetch_add(1, Ordering::Relaxed);
+                        ok_json(serde_json::json!({
+                            "undone": l, "revision": rev, "summary": change_summary_json(&summary),
+                        }))
+                    }
                 }
                 None => err_json("nothing to undo"),
             }
@@ -1573,26 +1612,29 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
             }
             let base = sh.doc.revision();
             let pending_ops = sh.undo.peek_undone().map(|t| t.ops.clone());
-            let res = {
-                let Shared { doc, undo, .. } = &mut *sh;
-                undo.redo(doc)
-            };
-            match res {
-                Some(l) => {
-                    let rev = sh.doc.revision();
-                    let summary = change_summary(&pending_ops.unwrap_or_default());
-                    sh.record_history(TxRecord {
-                        base,
-                        revision: rev,
-                        label: l.clone(),
-                        origin: TxOrigin::Mcp,
-                        kind: TxKind::Redo,
-                        summary: summary.clone(),
-                    });
-                    sh.gui_notify.fetch_add(1, Ordering::Relaxed);
-                    ok_json(serde_json::json!({
-                        "redone": l, "revision": rev, "summary": change_summary_json(&summary),
-                    }))
+            match sh.redo_any() {
+                Some((session, l)) => {
+                    if session {
+                        sh.gui_notify.fetch_add(1, Ordering::Relaxed);
+                        ok_json(serde_json::json!({
+                            "redone": l, "kind": "session", "revision": sh.doc.revision(),
+                        }))
+                    } else {
+                        let rev = sh.doc.revision();
+                        let summary = change_summary(&pending_ops.unwrap_or_default());
+                        sh.record_history(TxRecord {
+                            base,
+                            revision: rev,
+                            label: l.clone(),
+                            origin: TxOrigin::Mcp,
+                            kind: TxKind::Redo,
+                            summary: summary.clone(),
+                        });
+                        sh.gui_notify.fetch_add(1, Ordering::Relaxed);
+                        ok_json(serde_json::json!({
+                            "redone": l, "revision": rev, "summary": change_summary_json(&summary),
+                        }))
+                    }
                 }
                 None => err_json("nothing to redo"),
             }
@@ -1994,13 +2036,19 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
                 .as_u64()
                 .unwrap_or_else(|| sh.view().time_display().min_grid_ticks());
             let strength = args["strength"].as_u64().unwrap_or(100) as u32;
+            // optional channel scope — the only way to target one part of
+            // a Format 0 file without splitting it (#195)
+            let channel = args["channel"].as_u64().map(|c| (c.clamp(1, 16) - 1) as u8);
             let tracks = match sel_tracks(&sh, args) {
                 Ok(t) => t,
                 Err(r) => return r,
             };
             let mut ops = Vec::new();
             for t in tracks {
-                ops.extend(sh.view_mut().quantize_ops(t, from, to, grid, strength));
+                ops.extend(
+                    sh.view_mut()
+                        .quantize_ops(t, from, to, grid, strength, channel),
+                );
             }
             apply_ops(&mut sh, "quantize", ops)
         }
@@ -2010,13 +2058,14 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
             }
             let (from, to) = region(args);
             let st = args["semitones"].as_i64().unwrap_or(0) as i32;
+            let channel = args["channel"].as_u64().map(|c| (c.clamp(1, 16) - 1) as u8);
             let tracks = match sel_tracks(&sh, args) {
                 Ok(t) => t,
                 Err(r) => return r,
             };
             let mut ops = Vec::new();
             for t in tracks {
-                ops.extend(sh.view_mut().transpose_ops(t, from, to, st));
+                ops.extend(sh.view_mut().transpose_ops(t, from, to, st, channel));
             }
             apply_ops(&mut sh, "transpose", ops)
         }
@@ -2026,13 +2075,14 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
             }
             let (from, to) = region(args);
             let f = args["factor"].as_f64().unwrap_or(1.0);
+            let channel = args["channel"].as_u64().map(|c| (c.clamp(1, 16) - 1) as u8);
             let tracks = match sel_tracks(&sh, args) {
                 Ok(t) => t,
                 Err(r) => return r,
             };
             let mut ops = Vec::new();
             for t in tracks {
-                ops.extend(sh.view_mut().scale_velocity_ops(t, from, to, f));
+                ops.extend(sh.view_mut().scale_velocity_ops(t, from, to, f, channel));
             }
             apply_ops(&mut sh, "scale velocity", ops)
         }
@@ -2528,7 +2578,20 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
                 Err(r) => return r,
             };
             let (from, to) = region(args);
-            let ops = sh.view_mut().delete_range_ops(track, from, to);
+            // optional channel scope (#195): one channel's events only —
+            // notes still delete whole (their off rides along)
+            let ops = match args["channel"].as_u64() {
+                Some(c) => {
+                    let nib = (c.clamp(1, 16) - 1) as u8;
+                    sh.view_mut().delete_range_channel_ops(
+                        track,
+                        from,
+                        to,
+                        &std::collections::BTreeSet::from([nib]),
+                    )
+                }
+                None => sh.view_mut().delete_range_ops(track, from, to),
+            };
             apply_ops(&mut sh, "delete range", ops)
         }
         "duplicate_range" => {

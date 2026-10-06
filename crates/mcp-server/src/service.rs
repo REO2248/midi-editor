@@ -187,6 +187,11 @@ pub fn swap_document(shared: &SharedDoc, doc: Document, path: Option<PathBuf>) {
     sh.doc = doc;
     sh.undo = UndoStack::new(512);
     sh.undo.mark_saved();
+    // the session undo log belongs to the outgoing document too (#204)
+    sh.session_undo.clear();
+    sh.session_redo.clear();
+    sh.action_log.clear();
+    sh.redo_log.clear();
     sh.path = path;
     sh.saved_revision = sh.doc.revision();
     sh.generation += 1;

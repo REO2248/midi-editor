@@ -52,7 +52,7 @@ fn apply(d: &mut Document, ops: Vec<Op>) -> Transaction {
 fn quantize_moves_on_and_off_together() {
     // note 490..970 → grid 480: start snaps to 480, off to 960 (shift -10/-10)
     let mut d = doc(vec![vec![chan(490, 0x90, 60, 100), chan(970, 0x80, 60, 0)]]);
-    let ops = d.quantize_ops(0, 0, u64::MAX, 480, 100);
+    let ops = d.quantize_ops(0, 0, u64::MAX, 480, 100, None);
     apply(&mut d, ops);
     let n = &notes_on(&d, 0)[0];
     assert_eq!((n.start_tick, n.end_tick), (480, Some(960)));
@@ -61,7 +61,7 @@ fn quantize_moves_on_and_off_together() {
 #[test]
 fn quantize_strength_50_lands_halfway() {
     let mut d = doc(vec![vec![chan(540, 0x90, 60, 100)]]);
-    let ops = d.quantize_ops(0, 0, u64::MAX, 480, 50);
+    let ops = d.quantize_ops(0, 0, u64::MAX, 480, 50, None);
     apply(&mut d, ops);
     assert_eq!(notes_on(&d, 0)[0].start_tick, 510);
 }
@@ -72,7 +72,7 @@ fn quantize_range_limited() {
         chan(490, 0x90, 60, 100),
         chan(2000, 0x90, 64, 100),
     ]]);
-    let ops = d.quantize_ops(0, 0, 1000, 480, 100);
+    let ops = d.quantize_ops(0, 0, 1000, 480, 100, None);
     apply(&mut d, ops);
     let notes = notes_on(&d, 0);
     assert_eq!(notes[0].start_tick, 480);
@@ -94,7 +94,7 @@ fn transpose_skips_out_of_range_and_meta() {
         chan(100, 0x90, 60, 100),
         chan(200, 0x90, 127, 100),
     ]]);
-    let ops = d.transpose_ops(0, 0, u64::MAX, 5);
+    let ops = d.transpose_ops(0, 0, u64::MAX, 5, None);
     let tx = apply(&mut d, ops);
     let notes = notes_on(&d, 0);
     assert_eq!(notes.iter().find(|n| n.vel == 100).unwrap().key, 65);
@@ -115,10 +115,10 @@ fn transpose_skips_out_of_range_and_meta() {
 #[test]
 fn scale_velocity_clamps() {
     let mut d = doc(vec![vec![chan(0, 0x90, 60, 100), chan(100, 0x90, 62, 10)]]);
-    let __ops = d.scale_velocity_ops(0, 0, u64::MAX, 2.0);
+    let __ops = d.scale_velocity_ops(0, 0, u64::MAX, 2.0, None);
     apply(&mut d, __ops);
     assert_eq!(notes_on(&d, 0)[0].vel, 127, "100*2 clamps to 127");
-    let __ops = d.scale_velocity_ops(0, 0, u64::MAX, 0.01);
+    let __ops = d.scale_velocity_ops(0, 0, u64::MAX, 0.01, None);
     apply(&mut d, __ops);
     assert!(
         notes_on(&d, 0).iter().all(|n| n.vel >= 1),
@@ -176,7 +176,7 @@ fn release_velocity_survives_structural_edits() {
     // transpose rewrites the pitch byte on BOTH ends; set_length moves the
     // off's tick — the release byte rides along untouched
     let mut d = doc(vec![vec![chan(0, 0x90, 60, 100), chan(500, 0x80, 60, 42)]]);
-    let __ops = d.transpose_ops(0, 0, u64::MAX, 5);
+    let __ops = d.transpose_ops(0, 0, u64::MAX, 5, None);
     apply(&mut d, __ops);
     let __ops = d.set_length_ops(0, 0, u64::MAX, 960);
     apply(&mut d, __ops);
@@ -778,7 +778,7 @@ fn kind_edits_survive_save_reload() {
     let mut d = parsed_doc();
     assert!(d.tracks[1].events.iter().all(|e| e.raw_body.is_some()));
 
-    let ops = d.transpose_ops(1, 0, u64::MAX, 12);
+    let ops = d.transpose_ops(1, 0, u64::MAX, 12, None);
     apply(&mut d, ops);
     let ops = d.set_velocity_ops(1, 0, u64::MAX, 33);
     apply(&mut d, ops);
@@ -1132,7 +1132,7 @@ fn format2_edits_stay_inside_their_sequence() {
         vec![tempo(0, 500_000), chan(490, 0x90, 60, 100)],
         vec![tempo(0, 250_000), chan(490, 0x90, 64, 100)],
     ]);
-    let ops = d.quantize_ops(1, 0, u64::MAX, 480, 100);
+    let ops = d.quantize_ops(1, 0, u64::MAX, 480, 100, None);
     apply(&mut d, ops);
     assert_eq!(d.tracks[0].events[1].tick, 490, "sequence A untouched");
     assert_eq!(d.tracks[1].events[1].tick, 480);
@@ -1643,7 +1643,7 @@ fn quantize_snaps_to_bar_anchored_grid_across_meter_changes() {
         chan(2450, 0x90, 64, 100),
         chan(2650, 0x80, 64, 0),
     ]]);
-    let ops = d.quantize_ops(0, 0, u64::MAX, 960, 100);
+    let ops = d.quantize_ops(0, 0, u64::MAX, 960, 100, None);
     apply(&mut d, ops);
     let ns = notes_on(&d, 0);
     let at = |key: u8| ns.iter().find(|n| n.key == key).unwrap().start_tick;
@@ -1665,7 +1665,7 @@ fn quantize_honors_pickup_bar_alignment() {
         chan(1490, 0x90, 60, 100),
         chan(1690, 0x80, 60, 0),
     ]]);
-    let ops = d.quantize_ops(0, 0, u64::MAX, 960, 100);
+    let ops = d.quantize_ops(0, 0, u64::MAX, 960, 100, None);
     apply(&mut d, ops);
     assert_eq!(notes_on(&d, 0)[0].start_tick, 1440);
 }
@@ -1848,4 +1848,147 @@ fn insert_noteoff_after_equal_key_noteon() {
     ));
     let n = &notes_on(&d, 0)[0];
     assert_eq!(n.end_tick, Some(480));
+}
+
+#[test]
+fn program_change_transmits_before_note_on_at_same_tick() {
+    // #194: a patch change inserted at a tick that already carries a note
+    // must serialize (and play) BEFORE the note-on
+    let mut d = doc(vec![vec![chan(0, 0x90, 60, 100)]]);
+    let ops = d.set_program_ops(0, 0, 0, 40, Some(0), Some(0));
+    apply(&mut d, ops);
+    let events = &d.tracks[0].events;
+    let pos = |mt: u8| {
+        events
+            .iter()
+            .position(
+                |e| matches!(e.kind, EventKind::Channel { status, .. } if status & 0xF0 == mt),
+            )
+            .unwrap()
+    };
+    // bank MSB (CC0) < bank LSB (CC32) < program change < note-on
+    let (cc0, cc32, pc, on) = (pos(0xB0), pos(0xB0) + 1, pos(0xC0), pos(0x90));
+    assert!(cc0 < cc32 && cc32 < pc && pc < on, "setup before trigger");
+    // and the stored seqs reflect that order for the serializer
+    let seq = |i: usize| events[i].seq;
+    assert!(seq(cc0) < seq(pc) && seq(pc) < seq(on));
+}
+
+#[test]
+fn note_off_lands_before_note_on_at_shared_tick() {
+    // #194: two contiguous notes — the second note's release sits at the
+    // first note's release tick region; an off inserted at a tick that
+    // already has an on must transmit first
+    let mut d = doc(vec![vec![chan(480, 0x90, 64, 100)]]); // existing on @480
+    let (ops, on_id) = d.insert_note_pair_ops(
+        0,
+        0,
+        EventKind::Channel {
+            status: 0x90,
+            data: [60, 100],
+            len: 2,
+        },
+        480,
+        EventKind::Channel {
+            status: 0x80,
+            data: [60, 0],
+            len: 2,
+        },
+    );
+    apply(&mut d, ops);
+    let ev = &d.tracks[0].events;
+    let off_pos = ev
+        .iter()
+        .position(|e| {
+            e.id != on_id
+                && matches!(e.kind, EventKind::Channel { status, .. } if status & 0xF0 == 0x80)
+        })
+        .unwrap();
+    let on_existing_pos = ev
+        .iter()
+        .position(|e| matches!(e.kind, EventKind::Channel { status, .. } if status & 0xF0 == 0x90 && e.tick == 480))
+        .unwrap();
+    assert!(
+        ev[off_pos].seq < ev[on_existing_pos].seq,
+        "release must sort before the note-on it terminates"
+    );
+}
+
+#[test]
+fn merge_insert_undo_restores_original_seqs() {
+    let mut d = doc(vec![vec![chan(0, 0x90, 60, 100)]]);
+    let before: Vec<u32> = d.tracks[0].events.iter().map(|e| e.seq).collect();
+    let ops = d.set_cc_ops(0, 0, 0, 7, 100);
+    let tx = apply(&mut d, ops);
+    assert!(d.tracks[0].events[0].seq != before[0] || d.tracks[0].events.len() > 1);
+    d.revert(&tx);
+    let after: Vec<u32> = d.tracks[0].events.iter().map(|e| e.seq).collect();
+    assert_eq!(before, after, "undo must restore the exact original seqs");
+}
+
+#[test]
+fn untouched_tick_keeps_its_seq_order() {
+    // the merge only renumbers the tick it inserts into — neighbouring
+    // ticks stay byte-identical
+    let mut d = doc(vec![vec![chan(0, 0x90, 60, 100), chan(480, 0x90, 64, 100)]]);
+    let seqs_before: Vec<u32> = d.tracks[0].events.iter().map(|e| e.seq).collect();
+    let ops = d.set_cc_ops(0, 0, 0, 7, 100);
+    apply(&mut d, ops);
+    let tick480: Vec<u32> = d.tracks[0].events[1..]
+        .iter()
+        .filter(|e| e.tick == 480)
+        .map(|e| e.seq)
+        .collect();
+    assert_eq!(seqs_before[1], tick480[0], "tick 480 untouched");
+}
+
+#[test]
+fn format1_anchors_tempo_and_timesig_to_conductor() {
+    // #196: tempo/time signature on a music track is ignored by most
+    // players — the builders must anchor to track 0 for format-1 files
+    let mut d = doc(vec![
+        vec![meta(0, 0x2F, vec![])],
+        vec![chan(0, 0x90, 60, 100)],
+    ]);
+    d.format = 1;
+    let ops = d.set_tempo_ops(1, 960, 120.0);
+    apply(&mut d, ops);
+    let ops = d.set_time_sig_ops(1, 1920, 3, 4);
+    apply(&mut d, ops);
+    assert!(
+        d.tracks[1].events.iter().all(|e| !matches!(
+            e.kind,
+            EventKind::Meta {
+                meta_type: 0x51 | 0x58,
+                ..
+            }
+        )),
+        "music track carries no tempo/meter"
+    );
+    assert!(d.tracks[0].events.iter().any(|e| matches!(
+        e.kind,
+        EventKind::Meta {
+            meta_type: 0x51,
+            ..
+        }
+    )));
+    assert!(d.tracks[0].events.iter().any(|e| matches!(
+        e.kind,
+        EventKind::Meta {
+            meta_type: 0x58,
+            ..
+        }
+    )));
+    // diagnose flags pre-existing violations on both kinds
+    let mut dirty = doc(vec![
+        vec![meta(0, 0x2F, vec![])],
+        vec![
+            meta(240, 0x51, vec![0x07, 0xA1, 0x20]),
+            meta(240, 0x58, vec![0x03, 0x02, 0x18, 0x08]),
+        ],
+    ]);
+    dirty.format = 1;
+    let codes: Vec<&str> = dirty.diagnose().iter().map(|x| x.code).collect();
+    assert!(codes.contains(&"tempo-outside-conductor"));
+    assert!(codes.contains(&"time-sig-outside-conductor"));
 }
