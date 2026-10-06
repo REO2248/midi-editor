@@ -795,6 +795,14 @@ pub trait EventSink: Send {
     fn send_at(&mut self, bytes: &[u8], rem_us: u64);
     /// All-notes-off / reset — called on stop and at end of timeline.
     fn panic(&mut self);
+    /// Best-effort output level for metering (#203): linear peak in sample
+    /// space, 1.0 = 0 dBFS. The default is "no reading" — sinks that cannot
+    /// measure without risking a real-time stall (ports) or have no output
+    /// keep it. A `0.0` return may also mean "locked, try next poll", not
+    /// just silence, so pollers drive their own ballistics.
+    fn level(&self) -> f32 {
+        0.0
+    }
     /// Release sounding notes without the full reset: All Notes Off on every
     /// channel, leaving controller state and release tails intact. Called at
     /// loop boundaries, where chased state follows immediately.

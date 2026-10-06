@@ -1022,6 +1022,27 @@ impl midi_io::EventSink for PluginSink {
             }
         }
     }
+    fn level(&self) -> f32 {
+        // #203 metering: the plugin's per-block output peak (linear, 1.0 =
+        // 0 dBFS). try_lock guest (#190): the audio callback owns this mutex
+        // for the duration of each block, so a contended poll reports 0.0
+        // ("no reading this frame") instead of stalling the UI thread — the
+        // poller's decay covers the gap. `get_output_levels` itself only
+        // takes the small level mutex inside `Plugin`.
+        let Some(plugin) = self.plugin.as_ref() else {
+            return 0.0;
+        };
+        let p = match plugin.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return 0.0,
+        };
+        p.get_output_levels()
+            .channels
+            .iter()
+            .map(|c| c.peak)
+            .fold(0.0, f32::max)
+    }
 }
 
 /// Decode raw SMF channel-message bytes into a `vst3_host::MidiEvent`.
