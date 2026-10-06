@@ -1992,3 +1992,43 @@ fn format1_anchors_tempo_and_timesig_to_conductor() {
     assert!(codes.contains(&"tempo-outside-conductor"));
     assert!(codes.contains(&"time-sig-outside-conductor"));
 }
+
+#[test]
+fn duplicate_track_clones_events_and_channel() {
+    // #202: Duplicate Track — events clone with fresh ids, the channel
+    // prefix and name ride along, and the copy lands right after the source
+    let mut d = doc(vec![
+        vec![chan(0, 0x90, 60, 100), meta(0, 0x03, b"Bass".to_vec())],
+        vec![],
+    ]);
+    // out_channel is derived from the FF 20 prefix meta, never stored
+    let ff20 = document::Event {
+        id: d.alloc_event_id(),
+        tick: 0,
+        seq: 0,
+        raw_body: None,
+        kind: EventKind::Meta {
+            meta_type: 0x20,
+            data: bytes::Bytes::from(vec![2u8]),
+        },
+    };
+    d.tracks[0].events.push(ff20);
+    let src_ids: Vec<EventId> = d.tracks[0].events.iter().map(|e| e.id).collect();
+    let ops = d.duplicate_track_ops(0);
+    apply(&mut d, ops);
+    assert_eq!(d.tracks.len(), 3);
+    let copy = &d.tracks[1];
+    // 2 cloned events + the FF 20 prefix + the structural EOT the copy
+    // gains on first edit
+    assert_eq!(copy.events.len(), 4);
+    assert_eq!(copy.out_channel, 2, "channel prefix cloned");
+    let cloned: Vec<EventId> = copy.events.iter().map(|e| e.id).collect();
+    assert!(
+        cloned.iter().all(|id| !src_ids.contains(id)),
+        "clone gets fresh ids — undo of one track never touches the other"
+    );
+    // name meta bytes survive
+    assert!(copy.events.iter().any(
+        |e| matches!(e.kind, EventKind::Meta { meta_type: 0x03, ref data } if data.as_ref() == b"Bass")
+    ));
+}

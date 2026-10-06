@@ -88,15 +88,48 @@ pub(crate) fn used_keys(notes: &[Note], drum: bool, sel_track: usize) -> Vec<u8>
     }
 }
 
-/// Pitch-class membership of a diatonic scale (major or natural minor).
-pub(crate) fn scale_pcs_of(root: u8, minor: bool) -> [bool; 12] {
-    const MAJ: [u8; 7] = [0, 2, 4, 5, 7, 9, 11];
-    const MIN: [u8; 7] = [0, 2, 3, 5, 7, 8, 10];
+/// Scale palette (#219): i18n name key + semitone intervals from the root.
+/// The first two entries keep the historical major/minor behavior; the
+/// `scale_minor` bool stored in older sidecars maps onto kinds 0/1.
+pub(crate) const SCALES: &[(&str, &[u8])] = &[
+    ("scale.major", &[0, 2, 4, 5, 7, 9, 11]),
+    ("scale.natural_minor", &[0, 2, 3, 5, 7, 8, 10]),
+    ("scale.harmonic_minor", &[0, 2, 3, 5, 7, 8, 11]),
+    ("scale.melodic_minor", &[0, 2, 3, 5, 7, 9, 11]),
+    ("scale.dorian", &[0, 2, 3, 5, 7, 9, 10]),
+    ("scale.phrygian", &[0, 1, 3, 5, 7, 8, 10]),
+    ("scale.lydian", &[0, 2, 4, 6, 7, 9, 11]),
+    ("scale.mixolydian", &[0, 2, 4, 5, 7, 9, 10]),
+    ("scale.locrian", &[0, 1, 3, 5, 6, 8, 10]),
+    ("scale.major_pentatonic", &[0, 2, 4, 7, 9]),
+    ("scale.minor_pentatonic", &[0, 3, 5, 7, 10]),
+    ("scale.blues", &[0, 3, 5, 6, 7, 10]),
+    ("scale.whole_tone", &[0, 2, 4, 6, 8, 10]),
+    ("scale.diminished", &[0, 2, 3, 5, 6, 8, 9, 11]),
+];
+
+/// Pitch-class membership of scale `kind` (index into `SCALES`) rooted at
+/// `root` (#219).
+pub(crate) fn scale_pcs_of(root: u8, kind: usize) -> [bool; 12] {
+    let intervals = SCALES
+        .get(kind)
+        .map(|(_, iv)| *iv)
+        .unwrap_or(&[0, 2, 4, 5, 7, 9, 11]);
     let mut out = [false; 12];
-    for &iv in if minor { &MIN } else { &MAJ } {
+    for &iv in intervals {
         out[((root + iv) % 12) as usize] = true;
     }
     out
+}
+
+/// Row map for Scale Fold (#219): every octave of in-scale keys, highest
+/// first — drawing is restricted to the visible rows, so every note drawn
+/// in this view is strictly in-key.
+pub(crate) fn scale_keys(pcs: [bool; 12]) -> Vec<u8> {
+    (0u8..128)
+        .rev()
+        .filter(|k| pcs[(*k % 12) as usize])
+        .collect()
 }
 
 /// Tonic pitch class of a 0x59 key signature: sf counts fifths from C
@@ -555,6 +588,29 @@ impl EditorView {
     pub(crate) fn set_scale(&mut self, sel: i8, minor: bool, cx: &mut Context<Self>) {
         self.scale_sel = sel;
         self.scale_minor = minor;
+        self.scale_kind = if minor { 1 } else { 0 };
+        self.refresh_derived();
+        self.persist();
+        cx.notify();
+    }
+
+    /// Pick a scale kind from the palette (#219), keeping the current root.
+    pub(crate) fn set_scale_kind(&mut self, kind: usize, cx: &mut Context<Self>) {
+        self.scale_kind = kind.min(SCALES.len() - 1) as u8;
+        self.scale_minor = self.scale_kind == 1;
+        if self.scale_sel < 0 {
+            // selecting a kind while Off/Auto is active lands on a usable
+            // C-rooted scale rather than doing nothing
+            self.scale_sel = 0;
+        }
+        self.refresh_derived();
+        self.persist();
+        cx.notify();
+    }
+
+    /// Toggle Scale Fold (#219).
+    pub(crate) fn set_scale_fold(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.scale_fold = on;
         self.refresh_derived();
         self.persist();
         cx.notify();
@@ -1215,6 +1271,9 @@ impl EditorView {
                         DragMode::Resize => {
                             d.dtick = tick - d.orig_end.unwrap_or(d.orig_start) as i64;
                         }
+                        DragMode::ResizeStart => {
+                            d.dtick = tick - d.orig_start as i64;
+                        }
                         DragMode::Marquee => {
                             if self.tool == Tool::Draw && key != d.b_key {
                                 strike = Some((
@@ -1318,20 +1377,51 @@ impl EditorView {
 
     /// Note whose right edge is within ~6px of `pos` — a resize target.
     pub(crate) fn edge_at(&self, pos: Point<Pixels>) -> Option<Note> {
+        self.edge_grab_at(pos).map(|(n, _)| n)
+    }
+
+    /// Edge hit-test with side (#180): `true` = the note's START (left)
+    /// edge, `false` = its END (right) edge. The nearest matching edge
+    /// wins so short notes still grab predictably.
+    pub(crate) fn edge_grab_at(&self, pos: Point<Pixels>) -> Option<(Note, bool)> {
         let (tick, key) = self.hit(pos);
         let seq = self.is_seq();
-        self.notes
+        let mut best: Option<(Note, bool, f32)> = None;
+        for n in self
+            .notes
             .iter()
             .rev()
             .filter(|n| !seq || n.track == self.sel_track)
-            .find(|n| {
-                n.key as i32 == key
-                    && n.end_tick.is_some()
-                    && tick >= n.start_tick as i64
-                    && ((n.end_tick.unwrap() as i64) - tick) as f32 * self.zoom <= 6.0
-                    && ((n.end_tick.unwrap() as i64) - tick) as f32 * self.zoom >= -2.0
-            })
-            .cloned()
+        {
+            if n.key as i32 != key || n.end_tick.is_none() {
+                continue;
+            }
+            let st = n.start_tick as i64;
+            let en = n.end_tick.unwrap() as i64;
+            let d_end = (en - tick) as f32 * self.zoom;
+            let d_start = (tick - st) as f32 * self.zoom;
+            let end_hit = (-2.0..=6.0).contains(&d_end);
+            let start_hit = (-2.0..=6.0).contains(&d_start);
+            if !end_hit && !start_hit {
+                continue;
+            }
+            let (side, dist) = match (end_hit, start_hit) {
+                (true, true) => {
+                    if d_end.abs() <= d_start.abs() {
+                        (false, d_end.abs())
+                    } else {
+                        (true, d_start.abs())
+                    }
+                }
+                (true, false) => (false, d_end.abs()),
+                (false, true) => (true, d_start.abs()),
+                _ => continue,
+            };
+            if best.as_ref().is_none_or(|(_, _, bd)| dist < *bd) {
+                best = Some((n.clone(), side, dist));
+            }
+        }
+        best.map(|(n, side, _)| (n, side))
     }
 
     /// Channel the selected track's previews route through — the track's

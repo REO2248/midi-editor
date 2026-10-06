@@ -220,6 +220,10 @@ pub(crate) struct Prefs {
     pub(crate) drum: Option<bool>,
     pub(crate) scale: Option<i8>,
     pub(crate) scale_minor: Option<bool>,
+    #[serde(default)]
+    pub(crate) scale_kind: Option<u8>,
+    #[serde(default)]
+    pub(crate) scale_fold: Option<bool>,
     /// None in old sidecars = keep the default (page)
     pub(crate) follow: Option<String>,
     /// per-track insert/edit channel (editor state; `FF 20` prefix is the
@@ -260,6 +264,8 @@ impl Default for Prefs {
             drum: None,
             scale: None,
             scale_minor: None,
+            scale_kind: None,
+            scale_fold: None,
             follow: None,
             poly_key: None,
             lanes: None,
@@ -528,6 +534,12 @@ impl EditorView {
         if let Some(m) = p.scale_minor {
             self.scale_minor = m;
         }
+        if let Some(k) = p.scale_kind {
+            self.scale_kind = (k as usize).min(SCALES.len() - 1) as u8;
+        }
+        if let Some(f) = p.scale_fold {
+            self.scale_fold = f;
+        }
         self.follow = match p.follow.as_deref() {
             Some("off") => Follow::Off,
             Some("smooth") => Follow::Smooth,
@@ -625,6 +637,8 @@ impl EditorView {
             drum: Some(self.drum),
             scale: Some(self.scale_sel),
             scale_minor: Some(self.scale_minor),
+            scale_kind: Some(self.scale_kind),
+            scale_fold: Some(self.scale_fold),
             enc: self.enc_override.map(|e| {
                 match e {
                     smf_core::TextEncoding::Utf8 => "utf8",

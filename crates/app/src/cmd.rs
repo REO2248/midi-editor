@@ -463,6 +463,16 @@ pub static COMMANDS: &[Command] = &[
         let on = !v.fold;
         v.set_fold(on, cx);
     }),
+    cmd!(
+        "view.scale_fold",
+        "view.scale_fold",
+        &[],
+        None,
+        |v, _w, cx| {
+            let on = !v.scale_fold;
+            v.set_scale_fold(on, cx);
+        }
+    ),
     cmd!("view.drum", "view.drum", &[], None, |v, _w, cx| {
         let on = !v.drum;
         v.set_drum(on, cx);
@@ -587,6 +597,59 @@ pub static COMMANDS: &[Command] = &[
     // track
     cmd!("track.rename", "track.rename", &[], None, |v, w, cx| v
         .focus_rename(w, cx)),
+    cmd!("track.add", "track.add", &["ctrl+t"], None, |v, _w, cx| {
+        // append at the end — no sidecar track maps need shifting
+        let (ops, new_index) = {
+            let mut sh = crate::lock_shared(&v.shared);
+            let index = sh.doc.tracks.len();
+            (sh.doc.add_track_ops(None, None), index)
+        };
+        if !ops.is_empty() {
+            v.apply_tx("add track", ops);
+            v.sel_track = new_index;
+        }
+        cx.notify();
+    }),
+    cmd!(
+        "track.duplicate",
+        "track.duplicate",
+        &["ctrl+shift+d"],
+        None,
+        |v, _w, cx| {
+            // clone events + channel prefix + routing right after the source
+            let ops = {
+                let mut sh = crate::lock_shared(&v.shared);
+                sh.doc.duplicate_track_ops(v.sel_track)
+            };
+            if !ops.is_empty() {
+                let (src, dst) = (v.sel_track, v.sel_track + 1);
+                v.shift_track_maps_for_insert(src);
+                v.apply_tx("duplicate track", ops);
+                // the copy inherits the source's routing and mix state
+                {
+                    let mut sh = crate::lock_shared(&v.shared);
+                    if let Some(d) = sh.track_dest.get(&src).copied() {
+                        sh.track_dest.insert(dst, d);
+                    }
+                    if sh.muted.contains(&src) {
+                        sh.muted.insert(dst);
+                    }
+                    if sh.soloed.contains(&src) {
+                        sh.soloed.insert(dst);
+                    }
+                }
+                v.sel_track = dst;
+            }
+            cx.notify();
+        }
+    ),
+    cmd!(
+        "track.delete",
+        "track.delete",
+        &["ctrl+backspace"],
+        None,
+        |v, w, cx| { v.prompt_delete_track(w, cx) }
+    ),
     cmd!("track.mute", "track.mute", &[], None, |v, _w, _cx| {
         let t = v.sel_track;
         {

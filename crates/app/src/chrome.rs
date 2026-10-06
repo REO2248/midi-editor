@@ -352,31 +352,38 @@ impl EditorView {
                             // on every frame stuttered large projects
                             // (#189)
                             let first = lane_notes.partition_point(|n| (n.start_tick as i64) < t0);
-                            for n in &lane_notes[first..] {
-                                if n.start_tick > t1 as u64 {
-                                    break;
-                                }
-                                if n.track != lane_sel_track {
-                                    continue;
-                                }
-                                let x = bounds.origin.x + px(n.start_tick as f32 * zoom - scroll_x);
-                                let mut vel = n.vel as f32 / 127.0;
-                                if let Some((DragMode::Velocity, d_on, dkey)) = drag_v {
-                                    if d_on == n.on_id {
-                                        vel = (dkey as f32 / 127.0).clamp(0.0, 1.0);
+                            // two passes (#181): selected stalks paint last so
+                            // chord mates sharing one x cannot hide them
+                            let visible: Vec<&document::Note> = lane_notes[first..]
+                                .iter()
+                                .filter(|n| n.start_tick <= t1 as u64 && n.track == lane_sel_track)
+                                .collect();
+                            for selected in [false, true] {
+                                for n in &visible {
+                                    let is_sel = lane_selection.contains(&n.on_id);
+                                    if is_sel != selected {
+                                        continue;
                                     }
+                                    let x =
+                                        bounds.origin.x + px(n.start_tick as f32 * zoom - scroll_x);
+                                    let mut vel = n.vel as f32 / 127.0;
+                                    if let Some((DragMode::Velocity, d_on, dkey)) = drag_v {
+                                        if d_on == n.on_id {
+                                            vel = (dkey as f32 / 127.0).clamp(0.0, 1.0);
+                                        }
+                                    }
+                                    let bh = px((h - 6.0) * vel);
+                                    let y = bounds.origin.y + px(h) - bh - px(3.0);
+                                    let c = if is_sel {
+                                        theme::current().sel
+                                    } else {
+                                        th.track_colors[n.track % th.track_colors.len()]
+                                    };
+                                    window.paint_quad(fill(
+                                        Bounds::new(point(x, y), size(px(2.0), bh)),
+                                        rgb(c),
+                                    ));
                                 }
-                                let bh = px((h - 6.0) * vel);
-                                let y = bounds.origin.y + px(h) - bh - px(3.0);
-                                let c = if lane_selection.contains(&n.on_id) {
-                                    theme::current().sel
-                                } else {
-                                    th.track_colors[n.track % th.track_colors.len()]
-                                };
-                                window.paint_quad(fill(
-                                    Bounds::new(point(x, y), size(px(2.0), bh)),
-                                    rgb(c),
-                                ));
                             }
                         }
                         _ => {
@@ -744,7 +751,12 @@ impl EditorView {
                                 .min_by(|a, b| bar_dx(a).abs().total_cmp(&bar_dx(b).abs()))
                                 .filter(|n| bar_dx(n).abs() <= 6.0)
                             {
-                                this.selection = BTreeSet::from([n.on_id]);
+                                // clicking a stalk of an already-selected note
+                                // keeps the multi-selection so one drag adjusts
+                                // every selected velocity together (#181)
+                                if !(this.selection.len() > 1 && this.selection.contains(&n.on_id)) {
+                                    this.selection = BTreeSet::from([n.on_id]);
+                                }
                                 this.sel_events.clear();
                                 this.drag = Some(Drag {
                                     mode: DragMode::Velocity,

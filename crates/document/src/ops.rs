@@ -1731,6 +1731,39 @@ impl Document {
         ops
     }
 
+    /// Clone track `index` — all events (fresh ids), channel prefix and
+    /// name — into a new track inserted right after it. Format 0 converts
+    /// to Format 1 explicitly, like `add_track_ops`.
+    pub fn duplicate_track_ops(&mut self, index: usize) -> Vec<Op> {
+        let Some(mut events) = self.tracks.get(index).map(|t| t.events.clone()) else {
+            return vec![];
+        };
+        for e in &mut events {
+            e.id = self.alloc_event_id();
+        }
+        let (name, out_port, out_channel) = self
+            .tracks
+            .get(index)
+            .map(|t| (t.name.clone(), t.out_port, t.out_channel))
+            .unwrap_or((None, 0, 0));
+        let mut ops = vec![Op::InsertTrack {
+            index: index + 1,
+            track: Track {
+                name,
+                out_port,
+                out_channel,
+                events,
+            },
+        }];
+        if self.format == 0 && !self.tracks.is_empty() {
+            ops.push(Op::SetFormat {
+                before: 0,
+                after: 1,
+            });
+        }
+        ops
+    }
+
     /// Remove track `index` entirely (undo restores it wholesale).
     /// The last track cannot be removed — a document keeps at least one.
     pub fn remove_track_ops(&mut self, index: usize) -> Vec<Op> {

@@ -447,6 +447,9 @@ impl Render for EditorView {
                             DragMode::Resize if d_on == n.on_id => {
                                 en = (en + dtick).max(st + 1);
                             }
+                            DragMode::ResizeStart if d_on == n.on_id => {
+                                st = (st + dtick).max(0).min(en - 1);
+                            }
                             _ => {}
                         }
                     }
@@ -2338,7 +2341,7 @@ impl Render for EditorView {
                                     cx.notify();
                                     return;
                                 }
-                                if let Some(n) = this.edge_at(ev.position) {
+                                if let Some((n, grab_start)) = this.edge_grab_at(ev.position) {
                                     this.sel_track = n.track;
                                     this.audition_strike(
                                         n.track,
@@ -2348,7 +2351,11 @@ impl Render for EditorView {
                                         n.start_tick,
                                     );
                                     this.drag = Some(Drag {
-                                        mode: DragMode::Resize,
+                                        mode: if grab_start {
+                                            DragMode::ResizeStart
+                                        } else {
+                                            DragMode::Resize
+                                        },
                                         on_id: n.on_id,
                                         off_id: n.off_id,
                                         track: n.track,
@@ -2728,6 +2735,7 @@ impl Render for EditorView {
                     Self::msep(),
                     Self::mi_sub("v.rowh", t("view.row_height"), Sub::RowH, cx),
                     self.mi_cmd("view.fold", Some(self.fold), cx),
+                    self.mi_cmd("view.scale_fold", Some(self.scale_fold), cx),
                     self.mi_cmd("view.drum", Some(self.drum), cx),
                     Self::mi_sub("v.scale", t("view.scale"), Sub::Scale, cx),
                     Self::msep(),
@@ -2736,6 +2744,10 @@ impl Render for EditorView {
                 ],
                 TopMenu::Track => {
                     let mut items = vec![
+                        self.mi_cmd("track.add", None, cx),
+                        self.mi_cmd("track.duplicate", None, cx),
+                        self.mi_cmd("track.delete", None, cx),
+                        Self::msep(),
                         self.mi_cmd("track.rename", None, cx),
                         Self::msep(),
                         self.mi_cmd("track.mute", Some(muted_set.contains(&self.sel_track)), cx),
@@ -3412,19 +3424,20 @@ impl Render for EditorView {
                                 |v, _e, cx| v.set_scale(-2, false, cx),
                             ),
                             Self::msep(),
-                            Self::mi_leaf(
-                                "scale.minor",
-                                t("view.scale_minor"),
-                                "",
-                                Some(self.scale_minor),
-                                cx,
-                                |v, _e, cx| {
-                                    let sel = if v.scale_sel >= 0 { v.scale_sel } else { 0 };
-                                    v.set_scale(sel, !v.scale_minor, cx);
-                                },
-                            ),
                             Self::msep(),
                         ];
+                        // scale palette (#219): kinds first, then roots
+                        for (kind, (name_key, _)) in crate::nav::SCALES.iter().enumerate() {
+                            rows.push(Self::mi_leaf(
+                                ("scale.kind", kind),
+                                t(name_key),
+                                "",
+                                Some(self.scale_kind == kind as u8),
+                                cx,
+                                move |v, _e, cx| v.set_scale_kind(kind, cx),
+                            ));
+                        }
+                        rows.push(Self::msep());
                         for (i, name) in PC_NAMES.iter().enumerate() {
                             rows.push(Self::mi_leaf(
                                 ("scale.root", i),
