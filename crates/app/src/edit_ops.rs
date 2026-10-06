@@ -2044,6 +2044,74 @@ impl EditorView {
         cx.notify();
     }
 
+    /// #181: Alt+wheel over a note nudges its velocity — the whole
+    /// multi-selection when the hovered note is selected, otherwise just
+    /// the hovered note. One notch = ±2 (wheel up = louder), clamped
+    /// 1..127, committed as one undoable transaction. Returns false when
+    /// there is no note under the cursor so the wheel can scroll normally.
+    pub(crate) fn alt_wheel_velocity(
+        &mut self,
+        cursor: Point<Pixels>,
+        dy: Pixels,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.roll_bounds.get().contains(&cursor) {
+            return false;
+        }
+        let Some(hover) = self.note_at(cursor) else {
+            return false;
+        };
+        let dv: i32 = if dy > Pixels::ZERO {
+            2
+        } else if dy < Pixels::ZERO {
+            -2
+        } else {
+            return false;
+        };
+        // a hovered note inside a multi-selection moves the whole selection,
+        // each note clamped independently (same policy as the velocity drag)
+        let multi = self.selection.len() > 1 && self.selection.contains(&hover.on_id);
+        let mut ops = Vec::new();
+        {
+            let sh = lock_shared(&self.shared);
+            for n in self.notes.iter().filter(|n| {
+                if multi {
+                    self.selection.contains(&n.on_id)
+                } else {
+                    n.on_id == hover.on_id
+                }
+            }) {
+                let nv = (n.vel as i32 + dv).clamp(1, 127) as u8;
+                if nv == n.vel {
+                    continue;
+                }
+                let Some(track) = sh.doc.tracks.get(n.track) else {
+                    continue;
+                };
+                for e in track.events.iter() {
+                    if e.id != n.on_id {
+                        continue;
+                    }
+                    let mut after = e.clone();
+                    if let EventKind::Channel { data, .. } = &mut after.kind {
+                        data[1] = nv;
+                    }
+                    ops.push(Op::UpdateEvent {
+                        pos: usize::MAX,
+                        track: n.track,
+                        before: e.clone(),
+                        after,
+                    });
+                }
+            }
+        }
+        if !ops.is_empty() {
+            self.apply_tx("set velocity", ops);
+        }
+        cx.notify();
+        true
+    }
+
     pub(crate) fn commit_drag(&mut self, cx: &mut Context<Self>) {
         // every release ends any sounding preview (draw scrub, pitch drag,
         // key strip) — the worker's own deadline is the backstop

@@ -1628,7 +1628,7 @@ impl EditorView {
         // the plugin-unavailable golden wants
         let (plugin_req, _req_rx) = std::sync::mpsc::channel::<output::PluginReq>();
         let (_evt_tx, plugin_evt) = std::sync::mpsc::channel::<output::PluginEvent>();
-        Self::build(
+        let mut v = Self::build(
             sh,
             "test document".into(),
             &None,
@@ -1647,7 +1647,15 @@ impl EditorView {
             meta_input,
             window,
             cx,
-        )
+        );
+        // `build` enumerates live audio devices for the output panel — a
+        // machine-dependent count that changes the panel's height and
+        // with it every golden that renders the panel. Pin a fixture
+        // list, and push the hot-plug re-enumeration (3s) past any
+        // test's lifetime so the geometry stays deterministic.
+        v.audio_devices = vec!["Test Audio Out".to_string()];
+        v.audio_devices_at = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        v
     }
 
     pub(crate) fn doc<R>(&self, f: impl FnOnce(&Document) -> R) -> R {

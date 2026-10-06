@@ -1872,6 +1872,9 @@ impl Render for EditorView {
                         this.zoom = (this.zoom * (1.0 - d.y.to_f64() as f32 * 0.002))
                             .clamp(ZOOM_MIN, ZOOM_MAX);
                         this.scroll_x = (anchor_tick * this.zoom - off).max(0.0);
+                    } else if ev.modifiers.alt && this.alt_wheel_velocity(ev.position, d.y, cx) {
+                        // Alt+wheel over a note nudged its velocity (#181);
+                        // the gesture is consumed instead of scrolling
                     } else {
                         this.scroll_x = (this.scroll_x + d.x.to_f64() as f32).max(0.0);
                         this.scroll_y = (this.scroll_y + d.y.to_f64() as f32).max(0.0);

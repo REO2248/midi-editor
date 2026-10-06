@@ -703,6 +703,169 @@ fn note_drag_moves_note(cx: &mut TestAppContext) {
     .unwrap();
 }
 
+// --- core edit workflows -----------------------------------------------------
+
+/// Select a note, Delete removes its on/off pair, and one undo restores it
+/// with the same event identity.
+#[gpui_kit::test]
+fn delete_selected_note_then_undo_restores(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, fixture_doc());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        let on_id = view.update(cx, |v, _| {
+            v.sel_track = 1;
+            let on_id = v
+                .notes
+                .iter()
+                .find(|n| n.track == 1)
+                .expect("fixture track-1 note")
+                .on_id;
+            v.selection.insert(on_id);
+            on_id
+        });
+        w.press("delete", cx);
+        view.update(cx, |v, cx| {
+            assert!(
+                !v.notes.iter().any(|n| n.on_id == on_id),
+                "Delete did not remove the selected note"
+            );
+            v.undo(cx);
+            assert!(
+                v.notes.iter().any(|n| n.on_id == on_id),
+                "undo did not restore the deleted note"
+            );
+        });
+    })
+    .unwrap();
+}
+
+/// Opening a menu and dismissing it with Escape closes the popup without
+/// wiping the note selection underneath.
+#[gpui_kit::test]
+fn menu_escape_keeps_note_selection(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, fixture_doc());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        view.update(cx, |v, _| v.sel_track = 1);
+        w.press("ctrl-a", cx);
+        let selected = view.read(cx).selection.len();
+        assert!(selected > 0, "Ctrl+A selected nothing on track 1");
+        w.click("menu.file", cx);
+        assert!(w.try_find("file.new").is_some(), "File menu did not open");
+        w.press("escape", cx);
+        assert!(
+            w.try_find("menu-popup").is_none(),
+            "Escape did not close the menu"
+        );
+        assert_eq!(
+            view.read(cx).selection.len(),
+            selected,
+            "the menu cycle wiped the note selection"
+        );
+    })
+    .unwrap();
+}
+
+/// track.add (Ctrl+T) appends a track at the end and selects it; one undo
+/// removes it again.
+#[gpui_kit::test]
+fn track_add_appends_and_undo_removes(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, fixture_doc());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        let before = view.read(cx).doc(|d| d.tracks.len());
+        w.press("ctrl-t", cx);
+        view.update(cx, |v, cx| {
+            assert_eq!(
+                v.doc(|d| d.tracks.len()),
+                before + 1,
+                "track.add did not append a track"
+            );
+            assert_eq!(v.sel_track, before, "the appended track was not selected");
+            v.undo(cx);
+            assert_eq!(
+                v.doc(|d| d.tracks.len()),
+                before,
+                "undo did not remove the added track"
+            );
+        });
+    })
+    .unwrap();
+}
+
+/// #181 — Alt+wheel velocity: wheel-up nudges the hovered note louder
+/// (clamped at 127), wheel-down quieter, and with the hovered note inside
+/// a multi-selection every selected note moves by the same delta,
+/// clamped independently, in one undoable transaction. The scroll helper
+/// can't attach modifiers (see `wheel_scrolls_vertically`), so this
+/// drives `alt_wheel_velocity` with the hovered note's on-screen center.
+#[gpui_kit::test]
+fn alt_wheel_velocity_edits_hovered_and_selection(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, fixture_doc());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        view.update(cx, |v, cx| {
+            v.sel_track = 1;
+            let n0 = v
+                .notes
+                .iter()
+                .find(|n| n.track == 1)
+                .expect("fixture track-1 note")
+                .clone();
+            let pos = {
+                let b = v.roll_bounds.get();
+                point(
+                    b.origin.x + px(n0.start_tick as f32 * v.zoom - v.scroll_x + 8.),
+                    b.origin.y + px((127. - n0.key as f32) * NOTE_H - v.scroll_y + 6.5),
+                )
+            };
+            let vel_of = |v: &EditorView, id: document::EventId| {
+                v.notes
+                    .iter()
+                    .find(|n| n.on_id == id)
+                    .expect("note survived the nudge")
+                    .vel
+            };
+
+            // wheel up = louder, wheel down = quieter
+            assert!(v.alt_wheel_velocity(pos, px(20.), cx));
+            assert_eq!(vel_of(v, n0.on_id), n0.vel + 2);
+            assert!(v.alt_wheel_velocity(pos, px(-20.), cx));
+            assert_eq!(vel_of(v, n0.on_id), n0.vel);
+            // clamped at 127 — repeated wheel-ups never wrap
+            for _ in 0..40 {
+                v.alt_wheel_velocity(pos, px(20.), cx);
+            }
+            assert_eq!(vel_of(v, n0.on_id), 127);
+
+            // hovered note inside a multi-selection carries the others along
+            let second = v
+                .notes
+                .iter()
+                .find(|n| n.track == 1 && n.on_id != n0.on_id)
+                .expect("second fixture track-1 note")
+                .clone();
+            v.selection.insert(n0.on_id);
+            v.selection.insert(second.on_id);
+            assert!(v.alt_wheel_velocity(pos, px(20.), cx));
+            assert_eq!(
+                vel_of(v, n0.on_id),
+                127,
+                "clamped note stays put while the selection moves"
+            );
+            assert_eq!(vel_of(v, second.on_id), second.vel + 2);
+            // one transaction — a single undo reverts the whole nudge
+            v.undo(cx);
+            assert_eq!(vel_of(v, second.on_id), second.vel);
+        });
+    })
+    .unwrap();
+}
+
 // --- #133: playhead-aware tempo / signature controls ------------------------
 
 /// Tempo bump at the playhead writes a tempo event at the playhead tick and
