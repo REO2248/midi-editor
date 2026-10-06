@@ -459,6 +459,44 @@ pub static COMMANDS: &[Command] = &[
         v.persist();
     }),
     cmd!("view.hc", "view.hc", &[], None, |v, _w, cx| v.toggle_hc(cx)),
+    // panel-switch shortcuts (#183): keyboard-only users can reach every
+    // major pane without the mouse
+    cmd!(
+        "nav.focus_tracks",
+        "nav.focus_tracks",
+        &["ctrl+1"],
+        None,
+        |v, w, cx| {
+            w.focus(&v.tracks_fh, cx);
+        }
+    ),
+    cmd!(
+        "nav.focus_roll",
+        "nav.focus_roll",
+        &["ctrl+2"],
+        None,
+        |v, w, cx| {
+            w.focus(&v.roll_fh, cx);
+        }
+    ),
+    cmd!(
+        "nav.focus_lane",
+        "nav.focus_lane",
+        &["ctrl+3"],
+        None,
+        |v, w, cx| {
+            w.focus(&v.lane_fh, cx);
+        }
+    ),
+    cmd!(
+        "nav.focus_events",
+        "nav.focus_events",
+        &["ctrl+4"],
+        None,
+        |v, w, cx| {
+            w.focus(&v.events_fh, cx);
+        }
+    ),
     cmd!("view.fold", "view.fold", &[], None, |v, _w, cx| {
         let on = !v.fold;
         v.set_fold(on, cx);
