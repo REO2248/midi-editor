@@ -299,6 +299,13 @@ impl EditorView {
             self.audio_retry.insert(d, std::time::Instant::now());
             self.status = tf("audio.device_lost", &[("e", err.as_str())]).into();
             self.ensure_plugin(d, true);
+            // a running pass still holds the dead sink — flag the live
+            // routing dirty so the pass relinks onto the recovered slot
+            // below instead of playing into a closed stream until a manual
+            // Stop/Play cycle (#191)
+            if self.playback.is_some() {
+                self.live_route_dirty = true;
+            }
             changed = true;
         }
         if self.play_pending {
