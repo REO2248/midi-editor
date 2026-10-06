@@ -703,6 +703,99 @@ fn note_drag_moves_note(cx: &mut TestAppContext) {
     .unwrap();
 }
 
+// --- core edit workflows -----------------------------------------------------
+
+/// Select a note, Delete removes its on/off pair, and one undo restores it
+/// with the same event identity.
+#[gpui_kit::test]
+fn delete_selected_note_then_undo_restores(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, fixture_doc());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        let on_id = view.update(cx, |v, _| {
+            v.sel_track = 1;
+            let on_id = v
+                .notes
+                .iter()
+                .find(|n| n.track == 1)
+                .expect("fixture track-1 note")
+                .on_id;
+            v.selection.insert(on_id);
+            on_id
+        });
+        w.press("delete", cx);
+        view.update(cx, |v, cx| {
+            assert!(
+                !v.notes.iter().any(|n| n.on_id == on_id),
+                "Delete did not remove the selected note"
+            );
+            v.undo(cx);
+            assert!(
+                v.notes.iter().any(|n| n.on_id == on_id),
+                "undo did not restore the deleted note"
+            );
+        });
+    })
+    .unwrap();
+}
+
+/// Opening a menu and dismissing it with Escape closes the popup without
+/// wiping the note selection underneath.
+#[gpui_kit::test]
+fn menu_escape_keeps_note_selection(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, fixture_doc());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        view.update(cx, |v, _| v.sel_track = 1);
+        w.press("ctrl-a", cx);
+        let selected = view.read(cx).selection.len();
+        assert!(selected > 0, "Ctrl+A selected nothing on track 1");
+        w.click("menu.file", cx);
+        assert!(w.try_find("file.new").is_some(), "File menu did not open");
+        w.press("escape", cx);
+        assert!(
+            w.try_find("menu-popup").is_none(),
+            "Escape did not close the menu"
+        );
+        assert_eq!(
+            view.read(cx).selection.len(),
+            selected,
+            "the menu cycle wiped the note selection"
+        );
+    })
+    .unwrap();
+}
+
+/// track.add (Ctrl+T) appends a track at the end and selects it; one undo
+/// removes it again.
+#[gpui_kit::test]
+fn track_add_appends_and_undo_removes(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, fixture_doc());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        let before = view.read(cx).doc(|d| d.tracks.len());
+        w.press("ctrl-t", cx);
+        view.update(cx, |v, cx| {
+            assert_eq!(
+                v.doc(|d| d.tracks.len()),
+                before + 1,
+                "track.add did not append a track"
+            );
+            assert_eq!(v.sel_track, before, "the appended track was not selected");
+            v.undo(cx);
+            assert_eq!(
+                v.doc(|d| d.tracks.len()),
+                before,
+                "undo did not remove the added track"
+            );
+        });
+    })
+    .unwrap();
+}
+
 // --- #133: playhead-aware tempo / signature controls ------------------------
 
 /// Tempo bump at the playhead writes a tempo event at the playhead tick and
