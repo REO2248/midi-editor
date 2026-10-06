@@ -632,7 +632,9 @@ fn region_op_requires_selection(cx: &mut TestAppContext) {
         view.update(cx, |v, _| {
             let rev0 = crate::lock_shared(&v.shared).doc.revision();
             v.selection.clear();
-            v.apply_region_op("transpose", |d, t, f, to| d.transpose_ops(t, f, to, 1));
+            v.apply_region_op("transpose", |d, t, f, to, ch| {
+                d.transpose_ops(t, f, to, 1, ch)
+            });
             assert_eq!(
                 crate::lock_shared(&v.shared).doc.revision(),
                 rev0,
@@ -647,12 +649,16 @@ fn region_op_requires_selection(cx: &mut TestAppContext) {
                 .expect("fixture track-1 note")
                 .on_id;
             v.selection.insert(on_id);
-            v.apply_region_op("transpose", |d, t, f, to| d.transpose_ops(t, f, to, 1));
+            v.apply_region_op("transpose", |d, t, f, to, ch| {
+                d.transpose_ops(t, f, to, 1, ch)
+            });
             let rev1 = crate::lock_shared(&v.shared).doc.revision();
             assert!(rev1 > rev0, "selected-note transpose did nothing");
             // explicit whole-track path works regardless of selection
             v.selection.clear();
-            v.apply_track_op("transpose", |d, t, f, to| d.transpose_ops(t, f, to, -1));
+            v.apply_track_op("transpose", |d, t, f, to, ch| {
+                d.transpose_ops(t, f, to, -1, ch)
+            });
             assert!(
                 crate::lock_shared(&v.shared).doc.revision() > rev1,
                 "whole-track op did nothing"

@@ -356,6 +356,27 @@ impl Document {
                         detail: "tempo change outside track 0 is ignored by many players".into(),
                     });
                 }
+                // same for meter (#196) — diagnose() previously only
+                // flagged tempo, so time signatures on music tracks
+                // slipped through unnoticed
+                if self.format == 1
+                    && ti != 0
+                    && matches!(
+                        e.kind,
+                        EventKind::Meta {
+                            meta_type: 0x58,
+                            ..
+                        }
+                    )
+                {
+                    out.push(Diagnostic {
+                        code: "time-sig-outside-conductor",
+                        track: ti,
+                        tick: e.tick,
+                        event: Some(e.id),
+                        detail: "time signature outside track 0 is ignored by many players".into(),
+                    });
+                }
             }
             if !eot && !t.events.is_empty() {
                 out.push(Diagnostic {
@@ -488,8 +509,8 @@ impl Document {
                         }
                     }
                 }
-                "tempo-outside-conductor" => {
-                    // move the tempo event into track 0 (same tick)
+                "tempo-outside-conductor" | "time-sig-outside-conductor" => {
+                    // move the tempo/meter event into track 0 (same tick)
                     if let Some(id) = d.event {
                         if let Some((ti, ei)) = self.by_id.get(&id).copied() {
                             let e = self.tracks[ti].events[ei].clone();

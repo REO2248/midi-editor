@@ -354,7 +354,9 @@ pub static COMMANDS: &[Command] = &[
         &[],
         None,
         |v, _w, _cx| {
-            v.apply_region_op("transpose +1", |d, t, f, to| d.transpose_ops(t, f, to, 1));
+            v.apply_region_op("transpose +1", |d, t, f, to, ch| {
+                d.transpose_ops(t, f, to, 1, ch)
+            });
         }
     ),
     cmd!(
@@ -363,22 +365,24 @@ pub static COMMANDS: &[Command] = &[
         &[],
         None,
         |v, _w, _cx| {
-            v.apply_region_op("transpose -1", |d, t, f, to| d.transpose_ops(t, f, to, -1));
+            v.apply_region_op("transpose -1", |d, t, f, to, ch| {
+                d.transpose_ops(t, f, to, -1, ch)
+            });
         }
     ),
     cmd!("edit.humanize", "edit.humanize", &[], None, |v, _w, _cx| {
-        v.apply_region_op("humanize", |d, t, f, to| {
+        v.apply_region_op("humanize", |d, t, f, to, _ch| {
             d.humanize_ops(t, f, to, 12, 8, d.revision())
         });
     }),
     cmd!("edit.legato", "edit.legato", &[], None, |v, _w, _cx| {
-        v.apply_region_op("legato", |d, t, f, to| d.legato_ops(t, f, to, 0));
+        v.apply_region_op("legato", |d, t, f, to, _ch| d.legato_ops(t, f, to, 0));
     }),
     cmd!("edit.split", "edit.split", &[], None, |v, _w, cx| {
         v.split_at_playhead(cx);
     }),
     cmd!("edit.join", "edit.join", &[], None, |v, _w, _cx| {
-        v.apply_region_op("join", |d, t, f, to| d.join_ops(t, f, to));
+        v.apply_region_op("join", |d, t, f, to, _ch| d.join_ops(t, f, to));
     }),
     cmd!(
         "edit.fix_overlaps",
@@ -386,17 +390,19 @@ pub static COMMANDS: &[Command] = &[
         &[],
         None,
         |v, _w, _cx| {
-            v.apply_region_op("fix overlaps", |d, t, f, to| d.fix_overlaps_ops(t, f, to));
+            v.apply_region_op("fix overlaps", |d, t, f, to, _ch| {
+                d.fix_overlaps_ops(t, f, to)
+            });
         }
     ),
     cmd!("edit.vel_up", "edit.vel_up", &[], None, |v, _w, _cx| {
-        v.apply_region_op("vel ×1.25", |d, t, f, to| {
-            d.scale_velocity_ops(t, f, to, 1.25)
+        v.apply_region_op("vel ×1.25", |d, t, f, to, ch| {
+            d.scale_velocity_ops(t, f, to, 1.25, ch)
         });
     }),
     cmd!("edit.vel_dn", "edit.vel_dn", &[], None, |v, _w, _cx| {
-        v.apply_region_op("vel ×0.8", |d, t, f, to| {
-            d.scale_velocity_ops(t, f, to, 0.8)
+        v.apply_region_op("vel ×0.8", |d, t, f, to, ch| {
+            d.scale_velocity_ops(t, f, to, 0.8, ch)
         });
     }),
     // nudge (grid step / 1 tick / semitone / octave)
@@ -585,9 +591,16 @@ pub static COMMANDS: &[Command] = &[
         let t = v.sel_track;
         {
             let mut sh = crate::lock_shared(&v.shared);
+            let before = sh.muted.contains(&t);
             if !sh.muted.remove(&t) {
                 sh.muted.insert(t);
             }
+            // mute/solo are undoable session edits (#204)
+            sh.apply_session(mcp_server::SessionOp::SetMute {
+                track: t,
+                before,
+                after: !before,
+            });
         }
         v.persist();
         // live mix control: the running pass updates in place (#140)
@@ -597,9 +610,15 @@ pub static COMMANDS: &[Command] = &[
         let t = v.sel_track;
         {
             let mut sh = crate::lock_shared(&v.shared);
+            let before = sh.soloed.contains(&t);
             if !sh.soloed.remove(&t) {
                 sh.soloed.insert(t);
             }
+            sh.apply_session(mcp_server::SessionOp::SetSolo {
+                track: t,
+                before,
+                after: !before,
+            });
         }
         v.persist();
         v.refresh_live_schedule();

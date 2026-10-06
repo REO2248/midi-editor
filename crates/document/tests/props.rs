@@ -256,19 +256,19 @@ pub fn build_ops(doc: &mut Document, spec: &OpSpec) -> Vec<Op> {
             to,
             grid,
             strength,
-        } => doc.quantize_ops(track % n, from, to, grid, strength),
+        } => doc.quantize_ops(track % n, from, to, grid, strength, None),
         OpSpec::Transpose {
             track,
             from,
             to,
             semitones,
-        } => doc.transpose_ops(track % n, from, to, semitones),
+        } => doc.transpose_ops(track % n, from, to, semitones, None),
         OpSpec::ScaleVelocity {
             track,
             from,
             to,
             factor,
-        } => doc.scale_velocity_ops(track % n, from, to, factor),
+        } => doc.scale_velocity_ops(track % n, from, to, factor, None),
         OpSpec::Humanize {
             track,
             from,
@@ -869,7 +869,7 @@ fn transforms_respect_range_boundaries() {
 
     // quantize [0,960) grid=240 @100%: only the 60→0 note moves (2 events);
     // 480 is on-grid (delta 0 → skipped), 960/1440 are out of range.
-    let ops = doc.quantize_ops(0, 0, 960, 240, 100);
+    let ops = doc.quantize_ops(0, 0, 960, 240, 100, None);
     assert_eq!(ops.len(), 2, "quantize must move exactly the off-grid note");
     for op in &ops {
         let Op::UpdateEvent { before, after, .. } = op else {
@@ -881,7 +881,7 @@ fn transforms_respect_range_boundaries() {
 
     // transpose [480,1440) +12: notes at 480/960 move, the 1440/60/127-key
     // notes don't. 2 notes × (on+off) = 4 ops.
-    let ops = doc.transpose_ops(0, 480, 1440, 12);
+    let ops = doc.transpose_ops(0, 480, 1440, 12, None);
     assert_eq!(
         ops.len(),
         4,
@@ -902,7 +902,7 @@ fn transforms_respect_range_boundaries() {
 
     // scale_velocity [480,1440) ×2: the three in-range on-events (incl. the
     // key-127 note — velocity scaling has no key limit) = 3 ops.
-    let ops = doc.scale_velocity_ops(0, 480, 1440, 2.0);
+    let ops = doc.scale_velocity_ops(0, 480, 1440, 2.0, None);
     assert_eq!(ops.len(), 3, "scale_velocity edits noteOn events only");
     for op in &ops {
         let Op::UpdateEvent { before, after, .. } = op else {

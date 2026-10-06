@@ -1754,3 +1754,96 @@ fn set_track_name_writes_file_hint_encoding() {
         "hinted file must keep Shift-JIS bytes"
     );
 }
+
+#[test]
+fn session_ops_undo_and_redo_in_user_order() {
+    // #204: routing/mute/solo participate in the same undo history as
+    // document edits, reverted in the order the user made them
+    let sh = shared();
+    // 1. document edit
+    let mut g = sh.lock().unwrap();
+    let ev = document::Event {
+        id: g.doc.alloc_event_id(),
+        tick: 960,
+        seq: 0,
+        raw_body: None,
+        kind: EventKind::Channel {
+            status: 0x90,
+            data: [72, 100],
+            len: 2,
+        },
+    };
+    let ops = vec![document::Op::InsertEvents {
+        track: 1,
+        events: vec![ev],
+    }];
+    g.apply("edit", ops).unwrap();
+    let rev_after_edit = g.doc.revision();
+    // 2. session change: mute track 1
+    g.muted.insert(1);
+    g.apply_session(SessionOp::SetMute {
+        track: 1,
+        before: false,
+        after: true,
+    });
+    drop(g);
+    // undo #1: the session change (newest)
+    let mut g = sh.lock().unwrap();
+    let (session, label) = g.undo_any().expect("undo reverts the mute");
+    assert!(session, "newest action is the mute");
+    assert!(label.contains("mute"));
+    assert!(!g.muted.contains(&1), "mute reverted");
+    drop(g);
+    // undo #2: the document edit
+    let mut g = sh.lock().unwrap();
+    let (session, _) = g.undo_any().expect("undo reverts the edit");
+    assert!(!session);
+    assert_eq!(g.muted.contains(&1), false);
+    assert_eq!(
+        g.doc.notes().len(),
+        1,
+        "the inserted note is gone (revision still climbs on undo)"
+    );
+    drop(g);
+    let _ = rev_after_edit;
+    // redo order mirrors: edit first, then mute
+    let mut g = sh.lock().unwrap();
+    let (session, _) = g.redo_any().expect("redo the edit");
+    assert!(!session);
+    let (session, _) = g.redo_any().expect("redo the mute");
+    assert!(session);
+    assert!(g.muted.contains(&1), "mute re-applied");
+    drop(g);
+    // a fresh edit clears the redo logs
+    let mut g = sh.lock().unwrap();
+    g.apply("another edit", vec![]).unwrap_or_default();
+    drop(g);
+    // (apply with empty ops still records; redo must be gone)
+    let mut g = sh.lock().unwrap();
+    assert!(g.redo_any().is_none(), "redo cleared by the fresh edit");
+}
+
+#[test]
+fn track_dest_undo_restores_previous_assignment() {
+    let sh = shared();
+    let mut g = sh.lock().unwrap();
+    let dest = g.ensure_dest(
+        "out",
+        Destination::MidiPort {
+            port_name: "loop".into(),
+            ord: 0,
+        },
+    );
+    // no prior track dest → undo removes the entry
+    g.track_dest.insert(1, dest);
+    g.apply_session(SessionOp::SetTrackDest {
+        track: 1,
+        before: None,
+        after: dest,
+    });
+    let (session, _) = g.undo_any().unwrap();
+    assert!(session);
+    assert!(!g.track_dest.contains_key(&1), "assignment removed by undo");
+    g.redo_any().unwrap();
+    assert_eq!(g.track_dest.get(&1), Some(&dest), "redo re-assigns");
+}

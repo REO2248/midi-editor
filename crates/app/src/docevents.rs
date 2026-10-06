@@ -499,14 +499,19 @@ impl EditorView {
     pub(crate) fn undo(&mut self, cx: &mut Context<Self>) {
         let arc = self.shared.clone();
         let mut sh = lock_shared(&arc);
-        if let Some(l) = {
-            let Shared { doc, undo, .. } = &mut *sh;
-            undo.undo(doc)
-        } {
-            self.status = tf("status.undo", &[("label", &l)]).into();
+        // unified undo (#204): document transactions and session changes
+        // (routing/mute/solo) revert in the order the user made them
+        if let Some((session, label)) = sh.undo_any() {
+            self.status = tf("status.undo", &[("label", &label)]).into();
             self.selection.clear();
-            self.refresh_derived_sh(&mut sh);
-            drop(sh);
+            if session {
+                // a sidecar change: rewrite it and refresh the live mix
+                drop(sh);
+                self.persist();
+            } else {
+                self.refresh_derived_sh(&mut sh);
+                drop(sh);
+            }
             // undo reaches the running pass too (#141)
             self.refresh_live_schedule();
             cx.notify();
@@ -516,14 +521,16 @@ impl EditorView {
     pub(crate) fn redo(&mut self, cx: &mut Context<Self>) {
         let arc = self.shared.clone();
         let mut sh = lock_shared(&arc);
-        if let Some(l) = {
-            let Shared { doc, undo, .. } = &mut *sh;
-            undo.redo(doc)
-        } {
-            self.status = tf("status.redo", &[("label", &l)]).into();
+        if let Some((session, label)) = sh.redo_any() {
+            self.status = tf("status.redo", &[("label", &label)]).into();
             self.selection.clear();
-            self.refresh_derived_sh(&mut sh);
-            drop(sh);
+            if session {
+                drop(sh);
+                self.persist();
+            } else {
+                self.refresh_derived_sh(&mut sh);
+                drop(sh);
+            }
             self.refresh_live_schedule();
             cx.notify();
         }

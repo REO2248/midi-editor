@@ -414,7 +414,7 @@ fn all_cases() -> Vec<CaseResult> {
     {
         let mut d = parse_doc(&notes_fixture(100_000));
         out.push(timed("quantize_ops_100k", 3, || {
-            d.quantize_ops(1, 0, u64::MAX, 120, 50).len() as u64
+            d.quantize_ops(1, 0, u64::MAX, 120, 50, None).len() as u64
         }));
         let ops = d.delete_range_ops(1, 0, 480 * 4);
         let mut tx = Transaction {

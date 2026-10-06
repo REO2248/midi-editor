@@ -492,7 +492,7 @@ impl EditorView {
                 self.status = t("status.no_take").into();
                 return;
             }
-            sh.doc.quantize_ops(track, from, to, grid, 100)
+            sh.doc.quantize_ops(track, from, to, grid, 100, None)
         };
         if ops.is_empty() {
             self.status = t("status.no_take").into();

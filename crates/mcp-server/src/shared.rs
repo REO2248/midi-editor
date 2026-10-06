@@ -70,6 +70,14 @@ pub struct Shared {
     /// last agent-originated committed transaction — the GUI watches this to
     /// show "MCP: name" in the status bar
     pub last_mcp_tx: Option<TxRecord>,
+    /// session-level undo stack (routing / mute / solo sidecar changes)
+    pub(crate) session_undo: Vec<SessionOp>,
+    pub(crate) session_redo: Vec<SessionOp>,
+    /// unified undo ordering: the kind of every user-visible change, most
+    /// recent last. Entries beyond the document stack's cap pop as no-ops
+    /// (undo stops) — never as wrong state.
+    pub(crate) action_log: std::collections::VecDeque<ActKind>,
+    pub(crate) redo_log: std::collections::VecDeque<ActKind>,
     /// file-write scope for `save` — stamped by the transport entry point;
     /// defaults to the stricter HTTP policy
     pub fs_scope: FsScope,
@@ -171,6 +179,122 @@ pub struct TxRecord {
 /// reads never grow past this.
 pub const TX_HISTORY_CAP: usize = 64;
 
+/// A session-level (sidecar) change that participates in undo — track
+/// output destinations and mute/solo. These never touch SMF bytes (they
+/// live in the `.editor.json` sidecar), but an accidental reassignment
+/// must still be Ctrl+Z-able, so they join the unified undo log with
+/// explicit before/after values (#204).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionOp {
+    SetTrackDest {
+        track: usize,
+        before: Option<usize>,
+        after: usize,
+    },
+    SetDefaultDest {
+        before: usize,
+        after: usize,
+    },
+    SetMetDest {
+        before: Option<usize>,
+        after: Option<usize>,
+    },
+    SetMute {
+        track: usize,
+        before: bool,
+        after: bool,
+    },
+    SetSolo {
+        track: usize,
+        before: bool,
+        after: bool,
+    },
+}
+
+impl SessionOp {
+    fn label(&self) -> String {
+        match self {
+            SessionOp::SetTrackDest { track, .. } => format!("track {track} output"),
+            SessionOp::SetDefaultDest { .. } => "default output".into(),
+            SessionOp::SetMetDest { .. } => "metronome output".into(),
+            SessionOp::SetMute { track, .. } => format!("track {track} mute"),
+            SessionOp::SetSolo { track, .. } => format!("track {track} solo"),
+        }
+    }
+
+    /// Re-state the `before` value (undo).
+    fn revert(&self, sh: &mut Shared) {
+        match self {
+            SessionOp::SetTrackDest { track, before, .. } => match before {
+                Some(i) => {
+                    sh.track_dest.insert(*track, *i);
+                }
+                None => {
+                    sh.track_dest.remove(track);
+                }
+            },
+            SessionOp::SetDefaultDest { before, .. } => sh.default_dest = *before,
+            SessionOp::SetMetDest { before, .. } => sh.met_dest = *before,
+            SessionOp::SetMute { track, before, .. } => {
+                if *before {
+                    sh.muted.insert(*track);
+                } else {
+                    sh.muted.remove(track);
+                }
+            }
+            SessionOp::SetSolo { track, before, .. } => {
+                if *before {
+                    sh.soloed.insert(*track);
+                } else {
+                    sh.soloed.remove(track);
+                }
+            }
+        }
+    }
+
+    /// Re-state the `after` value (redo).
+    fn apply(&self, sh: &mut Shared) {
+        match self {
+            SessionOp::SetTrackDest { track, after, .. } => {
+                sh.track_dest.insert(*track, *after);
+            }
+            SessionOp::SetDefaultDest { after, .. } => sh.default_dest = *after,
+            SessionOp::SetMetDest { after, .. } => sh.met_dest = *after,
+            SessionOp::SetMute { track, after, .. } => {
+                if *after {
+                    sh.muted.insert(*track);
+                } else {
+                    sh.muted.remove(track);
+                }
+            }
+            SessionOp::SetSolo { track, after, .. } => {
+                if *after {
+                    sh.soloed.insert(*track);
+                } else {
+                    sh.soloed.remove(track);
+                }
+            }
+        }
+    }
+}
+
+/// Which kind of user-visible change sits at a position of the unified
+/// undo ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActKind {
+    /// a document transaction (SMF-level, on the undo stack)
+    Doc,
+    /// a session-level sidecar change (routing / mute / solo)
+    Session,
+}
+
+/// Bounded unified action log — document edits and session changes
+/// interleave here in the order the user made them, so undo/redo can
+/// always pick the right stack to pop.
+const ACTION_LOG_CAP: usize = 1024;
+/// Session-undo depth cap — matches the document undo stack's spirit.
+const SESSION_UNDO_CAP: usize = 512;
+
 pub type SharedDoc = Arc<Mutex<Shared>>;
 
 impl Shared {
@@ -206,11 +330,109 @@ impl Shared {
             batch: None,
             history: std::collections::VecDeque::new(),
             last_mcp_tx: None,
+            session_undo: Vec::new(),
+            session_redo: Vec::new(),
+            action_log: std::collections::VecDeque::new(),
+            redo_log: std::collections::VecDeque::new(),
             fs_scope: FsScope::Http,
         };
         // a fresh document starts clean at its stack's empty shape (#177)
         s.undo.mark_saved();
         s
+    }
+
+    /// Record a session-level change (routing / mute / solo) as undoable.
+    /// The caller has already mutated the shared state; the op carries the
+    /// before/after values for exact undo/redo (#204).
+    pub fn apply_session(&mut self, op: SessionOp) {
+        self.session_undo.push(op);
+        if self.session_undo.len() > SESSION_UNDO_CAP {
+            self.session_undo.remove(0);
+        }
+        self.session_redo.clear();
+        self.redo_log.clear();
+        self.push_action(ActKind::Session);
+        self.gui_notify.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn push_action(&mut self, k: ActKind) {
+        if self.action_log.len() == ACTION_LOG_CAP {
+            self.action_log.pop_front();
+        }
+        self.action_log.push_back(k);
+    }
+
+    /// Undo one user-visible change — a document transaction or a session
+    /// (routing/mute/solo) change, whichever the user made last (#204).
+    /// Returns (session?, label); `session` callers must persist the
+    /// sidecar and refresh the live schedule instead of derived views.
+    pub fn undo_any(&mut self) -> Option<(bool, String)> {
+        match self.action_log.pop_back()? {
+            ActKind::Session => {
+                let op = self.session_undo.pop()?;
+                self.session_redo.push(op.clone());
+                self.redo_log.push_back(ActKind::Session);
+                let label = op.label();
+                op.revert(self);
+                self.gui_notify.fetch_add(1, Ordering::Relaxed);
+                Some((true, label))
+            }
+            ActKind::Doc => {
+                if self.undo.peek_done().is_none() {
+                    // log outlived the (capped) stack — undo stops
+                    self.action_log.push_back(ActKind::Doc);
+                    return None;
+                }
+                let res = {
+                    let Shared { doc, undo, .. } = self;
+                    undo.undo(doc)
+                };
+                match res {
+                    Some(l) => {
+                        self.redo_log.push_back(ActKind::Doc);
+                        Some((false, l))
+                    }
+                    None => {
+                        self.action_log.push_back(ActKind::Doc);
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    /// Redo one user-visible change — the mirror of `undo_any` (#204).
+    pub fn redo_any(&mut self) -> Option<(bool, String)> {
+        match self.redo_log.pop_back()? {
+            ActKind::Session => {
+                let op = self.session_redo.pop()?;
+                self.session_undo.push(op.clone());
+                if self.session_undo.len() > SESSION_UNDO_CAP {
+                    self.session_undo.remove(0);
+                }
+                self.action_log.push_back(ActKind::Session);
+                let label = op.label();
+                op.apply(self);
+                self.gui_notify.fetch_add(1, Ordering::Relaxed);
+                Some((true, label))
+            }
+            ActKind::Doc => {
+                let res = {
+                    let Shared { doc, undo, .. } = self;
+                    undo.redo(doc)
+                };
+                match res {
+                    Some(l) => {
+                        self.action_log.push_back(ActKind::Doc);
+                        Some((false, l))
+                    }
+                    None => {
+                        self.redo_log.push_back(ActKind::Doc);
+                        None
+                    }
+                }
+            }
+        }
     }
 
     /// Save-prompt dirty state (#177). A verified save records the undo
@@ -287,6 +509,10 @@ impl Shared {
             kind: TxKind::Commit,
             summary,
         });
+        // a fresh edit is the newest action and clears redo on both stacks
+        self.push_action(ActKind::Doc);
+        self.session_redo.clear();
+        self.redo_log.clear();
         self.gui_notify.fetch_add(1, Ordering::Relaxed);
         Ok(rev)
     }

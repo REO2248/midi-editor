@@ -1058,11 +1058,14 @@ impl EditorView {
     /// scoped commands never silently retarget the whole track (#131); the
     /// explicit whole-track path is `apply_track_op`.
     /// The same generators power the MCP tools, so GUI and AI edits
-    /// share semantics and undo.
+    /// share semantics and undo. On a Format 0 file with several channels
+    /// sharing track 0 the transform is scoped to the track's active edit
+    /// channel — transposing "the melody" must not scramble the drum kit
+    /// on channel 10 (#195).
     pub(crate) fn apply_region_op(
         &mut self,
         label: &str,
-        f: impl Fn(&mut Document, usize, u64, u64) -> Vec<Op>,
+        f: impl Fn(&mut Document, usize, u64, u64, Option<u8>) -> Vec<Op>,
     ) {
         if self.selection.is_empty() {
             self.status = t("status.nosel").into();
@@ -1080,9 +1083,24 @@ impl EditorView {
         let (tracks, from, to) = (tracks.into_iter().collect::<Vec<_>>(), lo, hi + 1);
         let ops = {
             let mut sh = lock_shared(&self.shared);
-            tracks
+            let fmt0_multichan = sh.doc.format == 0 && sh.doc.channels_used().len() > 1;
+            // resolve each selected track's channel scope first — the
+            // immutable doc read must end before the generators borrow it
+            let scoped: Vec<(usize, Option<u8>)> = tracks
                 .into_iter()
-                .flat_map(|t| f(&mut sh.doc, t, from, to))
+                .map(|t| {
+                    let ch = if fmt0_multichan {
+                        let prefix = sh.doc.tracks.get(t).map(|tr| tr.out_channel).unwrap_or(0);
+                        Some(self.edit_channel_of(t, prefix))
+                    } else {
+                        None
+                    };
+                    (t, ch)
+                })
+                .collect();
+            scoped
+                .into_iter()
+                .flat_map(|(t, ch)| f(&mut sh.doc, t, from, to, ch))
                 .collect::<Vec<_>>()
         };
         if ops.is_empty() {
@@ -1096,14 +1114,31 @@ impl EditorView {
     /// Explicit whole-track transform — the "Apply to Entire Track" menu.
     /// Equivalent to Select-All-then-transform, but names its scope so a
     /// user who means "the whole track" doesn't have to select anything.
+    /// Whole-track transform — the Track menu path. On a Format 0 file
+    /// with several channels sharing track 0 the op is scoped to the
+    /// track's active edit channel: transposing a whole track must not
+    /// scramble every other part living on the same track (#195).
+    /// Format 1+ files keep whole-track semantics (`channel: None`).
     pub(crate) fn apply_track_op(
         &mut self,
         label: &str,
-        f: impl Fn(&mut Document, usize, u64, u64) -> Vec<Op>,
+        f: impl Fn(&mut Document, usize, u64, u64, Option<u8>) -> Vec<Op>,
     ) {
         let ops = {
             let mut sh = lock_shared(&self.shared);
-            f(&mut sh.doc, self.sel_track, 0, u64::MAX)
+            let fmt0_multichan = sh.doc.format == 0 && sh.doc.channels_used().len() > 1;
+            let ch = if fmt0_multichan {
+                let prefix = sh
+                    .doc
+                    .tracks
+                    .get(self.sel_track)
+                    .map(|t| t.out_channel)
+                    .unwrap_or(0);
+                Some(self.edit_channel_of(self.sel_track, prefix))
+            } else {
+                None
+            };
+            f(&mut sh.doc, self.sel_track, 0, u64::MAX, ch)
         };
         if ops.is_empty() {
             self.status = format!("{label}: nothing to change").into();
@@ -1231,50 +1266,34 @@ impl EditorView {
     }
 
     pub(crate) fn insert_note_len(&mut self, tick: u64, key: u8, len: u64, cx: &mut Context<Self>) {
-        let (on_id, off_id, track, ch) = {
+        let tick = self.snap_down(tick as i64).max(0) as u64;
+        let on_vel = self.vel_src.resolve(self.last_vel);
+        self.last_note_len = len.max(1);
+        self.last_vel = on_vel;
+        let (ops, on_id, track) = {
             let mut sh = lock_shared(&self.shared);
             let track = self.sel_track.min(sh.doc.tracks.len().saturating_sub(1));
             let prefix = sh.doc.tracks.get(track).map(|t| t.out_channel).unwrap_or(0);
-            (
-                sh.doc.alloc_event_id(),
-                sh.doc.alloc_event_id(),
-                track,
-                self.edit_channel_of(track, prefix),
-            )
-        };
-        let tick = self.snap_down(tick as i64).max(0) as u64;
-        let on_vel = self.vel_src.resolve(self.last_vel);
-        let on = DocEvent {
-            id: on_id,
-            tick,
-            seq: u32::MAX / 2,
-            raw_body: None,
-            kind: EventKind::Channel {
+            let ch = self.edit_channel_of(track, prefix);
+            let on_kind = EventKind::Channel {
                 status: 0x90 | ch,
                 data: [key, on_vel],
                 len: 2,
-            },
-        };
-        let off = DocEvent {
-            id: off_id,
-            tick: tick + len,
-            seq: u32::MAX / 2,
-            raw_body: None,
-            kind: EventKind::Channel {
+            };
+            let off_kind = EventKind::Channel {
                 status: 0x80 | ch,
                 data: [key, 0],
                 len: 2,
-            },
+            };
+            // canonical same-tick placement: the release precedes any
+            // note-on at its tick, the attack follows existing setup (#194)
+            let (ops, on_id) =
+                sh.doc
+                    .insert_note_pair_ops(track, tick, on_kind, tick + len, off_kind);
+            (ops, on_id, track)
         };
-        self.last_note_len = len.max(1);
-        self.last_vel = on_vel;
-        self.apply_tx(
-            "insert note",
-            vec![Op::InsertEvents {
-                track,
-                events: vec![on, off],
-            }],
-        );
+        let _ = track;
+        self.apply_tx("insert note", ops);
         self.selection = BTreeSet::from([on_id]);
         self.sel_events.clear();
         cx.notify();
@@ -1860,7 +1879,19 @@ impl EditorView {
                 });
             }
             for (track, events) in per_track {
-                ops.push(Op::InsertEvents { track, events });
+                // merge each destination tick in canonical same-tick order
+                // (#194): pasted releases precede note-ons already at that
+                // tick, pasted setup precedes everything of its kind; the
+                // clip's own relative order survives within each priority
+                let mut by_tick: BTreeMap<u64, Vec<DocEvent>> = BTreeMap::new();
+                for e in events {
+                    by_tick.entry(e.tick).or_default().push(e);
+                }
+                for (tick, mut evs) in by_tick {
+                    // clip order within one tick = captured (seq) order
+                    evs.sort_by_key(|e| (document::Document::event_priority(&e.kind), e.seq));
+                    ops.extend(sh.doc.merge_insert_ops(track, tick, evs));
+                }
             }
         }
         self.apply_tx(label, ops);
