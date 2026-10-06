@@ -68,7 +68,10 @@ static EN: &[(&str, &str)] = &[
     ("plugin.gui_open_failed", "plugin GUI: {e}"),
     ("doc.untitled", "untitled"),
     ("import.fmt0_title", "Format 0 multichannel file"),
-    ("import.fmt0_detail", "This file keeps all MIDI channels in a single track."),
+    (
+        "import.fmt0_detail",
+        "Keep: all channels stay in one track, sharing a single output destination. Split: one track per channel, so each channel can get its own VST3 or MIDI-port output.",
+    ),
     ("import.fmt0_keep", "Keep One Track"),
     ("import.fmt0_split", "Split by Channel"),
     ("events.header", "Events"),
@@ -610,7 +613,10 @@ static JA: &[(&str, &str)] = &[
     ("plugin.gui_open_failed", "プラグインGUI: {e}"),
     ("doc.untitled", "無題"),
     ("import.fmt0_title", "フォーマット0のマルチチャンネルファイル"),
-    ("import.fmt0_detail", "このファイルは全MIDIチャンネルを1トラックに保持しています。"),
+    (
+        "import.fmt0_detail",
+        "このまま:全チャンネルが1トラックにまとまり、出力先は1つだけです。分割:チャンネルごとにトラックを作り、VST3やMIDIポートの出力先を個別に割り当てられます。",
+    ),
     ("import.fmt0_keep", "1トラックのまま開く"),
     ("import.fmt0_split", "チャンネル別に分割"),
     ("events.header", "イベント"),
