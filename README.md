@@ -66,7 +66,9 @@ hint. When the event list header shows `[fix]`, clicking it normalizes
 imported-file issues (dangling note-ons, missing EOT, tempo outside the
 conductor track) as a single undoable transaction. `met` adds a GM woodblock
 click on every beat (accented downbeats) routed to a MIDI destination. Mouse
-wheel scrolls, Ctrl+wheel zooms.
+wheel scrolls, Ctrl+wheel zooms, and Alt+wheel over a note nudges its
+velocity (the whole selection moves with it when the hovered note is
+part of a multi-selection).
 
 Destinations, mute/solo, metronome/loop state, zoom/scroll, selected track and
 encoding persist per-file in `<song>.mid.editor.json` next to the .mid — the

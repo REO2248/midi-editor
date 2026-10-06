@@ -796,6 +796,76 @@ fn track_add_appends_and_undo_removes(cx: &mut TestAppContext) {
     .unwrap();
 }
 
+/// #181 — Alt+wheel velocity: wheel-up nudges the hovered note louder
+/// (clamped at 127), wheel-down quieter, and with the hovered note inside
+/// a multi-selection every selected note moves by the same delta,
+/// clamped independently, in one undoable transaction. The scroll helper
+/// can't attach modifiers (see `wheel_scrolls_vertically`), so this
+/// drives `alt_wheel_velocity` with the hovered note's on-screen center.
+#[gpui_kit::test]
+fn alt_wheel_velocity_edits_hovered_and_selection(cx: &mut TestAppContext) {
+    init(cx, "en");
+    let (view, window) = open_editor(cx, fixture_doc());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        view.update(cx, |v, cx| {
+            v.sel_track = 1;
+            let n0 = v
+                .notes
+                .iter()
+                .find(|n| n.track == 1)
+                .expect("fixture track-1 note")
+                .clone();
+            let pos = {
+                let b = v.roll_bounds.get();
+                point(
+                    b.origin.x + px(n0.start_tick as f32 * v.zoom - v.scroll_x + 8.),
+                    b.origin.y + px((127. - n0.key as f32) * NOTE_H - v.scroll_y + 6.5),
+                )
+            };
+            let vel_of = |v: &EditorView, id: document::EventId| {
+                v.notes
+                    .iter()
+                    .find(|n| n.on_id == id)
+                    .expect("note survived the nudge")
+                    .vel
+            };
+
+            // wheel up = louder, wheel down = quieter
+            assert!(v.alt_wheel_velocity(pos, px(20.), cx));
+            assert_eq!(vel_of(v, n0.on_id), n0.vel + 2);
+            assert!(v.alt_wheel_velocity(pos, px(-20.), cx));
+            assert_eq!(vel_of(v, n0.on_id), n0.vel);
+            // clamped at 127 — repeated wheel-ups never wrap
+            for _ in 0..40 {
+                v.alt_wheel_velocity(pos, px(20.), cx);
+            }
+            assert_eq!(vel_of(v, n0.on_id), 127);
+
+            // hovered note inside a multi-selection carries the others along
+            let second = v
+                .notes
+                .iter()
+                .find(|n| n.track == 1 && n.on_id != n0.on_id)
+                .expect("second fixture track-1 note")
+                .clone();
+            v.selection.insert(n0.on_id);
+            v.selection.insert(second.on_id);
+            assert!(v.alt_wheel_velocity(pos, px(20.), cx));
+            assert_eq!(
+                vel_of(v, n0.on_id),
+                127,
+                "clamped note stays put while the selection moves"
+            );
+            assert_eq!(vel_of(v, second.on_id), second.vel + 2);
+            // one transaction — a single undo reverts the whole nudge
+            v.undo(cx);
+            assert_eq!(vel_of(v, second.on_id), second.vel);
+        });
+    })
+    .unwrap();
+}
+
 // --- #133: playhead-aware tempo / signature controls ------------------------
 
 /// Tempo bump at the playhead writes a tempo event at the playhead tick and
