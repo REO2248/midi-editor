@@ -102,7 +102,9 @@ impl EditorView {
             return;
         };
         // index now points at a different bundle — retire the old instance,
-        // capturing its state first so a re-point doesn't lose the patch
+        // capturing its state first so a re-point doesn't lose the patch.
+        // #190: blocking capture is deliberate (once-only retire of a slot
+        // dropped right after — a skip here would lose the patch, #175)
         if retire && self.plugin_slots.contains_key(&d) {
             self.capture_plugin_state(d);
             self.state_restored.remove(&d);
@@ -533,7 +535,9 @@ impl EditorView {
         match output::load_for_gui(&path) {
             Ok(a) => {
                 // adopt the live state of the playing instance so the editor
-                // shows what's actually being heard
+                // shows what's actually being heard. #190: blocking lock is
+                // fine here — a once-per-open user gesture, and skipping
+                // would show the editor a stale patch.
                 if let Some(slot) = self.plugin_slots.get(&d).filter(|s| s.path == path) {
                     let state = slot.plugin.lock().ok().and_then(|p| p.save_state().ok());
                     if let Some(data) = state {
@@ -559,6 +563,11 @@ impl EditorView {
 
     /// Copy the in-process editor's full state into the playing instance —
     /// covers program/bank changes parameter-edit draining can't see.
+    ///
+    /// #190: blocking lock is deliberate — this whole-state transfer runs
+    /// once per editor close / preset change (a user gesture, not a tick),
+    /// and skipping it would silently drop those program/bank changes from
+    /// the playing instance (patch loss, #175).
     pub(crate) fn push_editor_state(
         &mut self,
         d: usize,
@@ -578,20 +587,68 @@ impl EditorView {
         }
     }
 
+    /// Locking discipline for the shared plugin mutex (#190): the audio
+    /// callback owns `slot.plugin` for the duration of every audio block;
+    /// the GUI is a try-lock guest on anything that runs periodically
+    /// (state drains, restart servicing) and skips a tick under contention.
+    /// Blocking locks are reserved for once-only points — teardown
+    /// (doc swap / new file / rescan retire, where `stop_playback` has
+    /// already closed the pass and panic'd the sinks, so the wait is at
+    /// most one audio block) and data-transfer moments (restore on load,
+    /// editor open/close, destination re-point) where skipping could lose
+    /// a user's patch. State loss is worse than a stalled frame (#175).
+    ///
     /// Capture one warm slot's component+controller state into the per-song
     /// store. The blob is keyed by the loaded plugin's own class uid so the
     /// record follows the component when the bundle path moves; while a uid
     /// is unknown the bundle path is the key. No-op without a readable slot.
+    ///
+    /// Blocking (teardown semantics): the slot is about to be retired or the
+    /// document is going away — wait for the plugin mutex so the patch
+    /// cannot be lost (#175). See `capture_plugin_state_try` for the
+    /// contention-safe periodic variant.
     pub(crate) fn capture_plugin_state(&mut self, d: usize) {
+        self.capture_plugin_state_impl(d, true);
+    }
+
+    /// Contention-safe capture (#190): takes the plugin mutex only when the
+    /// audio callback isn't holding it (a block boundary in progress). On
+    /// contention returns `false` WITHOUT capturing — the caller must keep
+    /// the destination queued so a later tick retries. A skip never loses
+    /// state because nothing was drained; it merely defers it.
+    pub(crate) fn capture_plugin_state_try(&mut self, d: usize) -> bool {
+        self.capture_plugin_state_impl(d, false)
+    }
+
+    /// Shared capture body. `blocking` = teardown semantics (wait for the
+    /// mutex — runs at most once, so a bounded stall is the right trade);
+    /// `false` = periodic drain (skip when contended, retry next tick).
+    /// Returns `true` when the record is safely in the store (or there was
+    /// nothing to capture), `false` only for a contended non-blocking call.
+    fn capture_plugin_state_impl(&mut self, d: usize, blocking: bool) -> bool {
         let Some(slot) = self.plugin_slots.get(&d) else {
-            return;
+            return true;
         };
-        let (uid, blob) = match slot.plugin.lock() {
-            Ok(p) => match p.save_state() {
-                Ok(b) => (p.info().uid.clone(), b),
-                Err(_) => return,
-            },
-            Err(_) => return,
+        // #190 locking discipline (audio = owner, GUI = try-lock guest):
+        // see the note at the top of this capture/restore section
+        let p = if blocking {
+            slot.plugin
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        } else {
+            match slot.plugin.try_lock() {
+                Ok(guard) => guard,
+                // a poisoned mutex is recoverable (the audio thread panicked
+                // earlier) — capture anyway; only a live block is skipped
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return false,
+            }
+        };
+        let (uid, blob) = match p.save_state() {
+            Ok(b) => (p.info().uid.clone(), b),
+            // save_state failed — record nothing, matching the old
+            // behavior (an immediate retry would not succeed either)
+            Err(_) => return true,
         };
         let key = slot.path.to_string_lossy().into_owned();
         let meta = self.plugin_meta.get(&key);
@@ -610,10 +667,14 @@ impl EditorView {
             state: blob,
         });
         self.state_file_dirty |= changed;
+        true
     }
 
     /// Snapshot every warm slot — used at doc swaps and catalog rebuilds,
     /// where the instances the state belongs to are about to be retired.
+    /// #190: blocking captures — these slots die right after, so a skipped
+    /// capture could never be retried (patch loss); on the doc-swap path
+    /// `stop_playback` has already closed the pass first.
     pub(crate) fn capture_all_plugin_states(&mut self) {
         let ds: Vec<usize> = self.plugin_slots.keys().copied().collect();
         for d in ds {
@@ -622,14 +683,31 @@ impl EditorView {
     }
 
     /// Drain pending captures into the store and write the companion file
-    /// when records changed. `force` bypasses the ~1 s write throttle used
-    /// by the periodic tick — teardown points (persist, doc swap, rescan,
-    /// editor close) always force so a quick exit can't strand state.
+    /// when records changed. `force` does double duty (#190): it bypasses
+    /// the ~1 s write throttle used by the periodic tick AND selects
+    /// blocking captures — teardown points (persist, doc swap, rescan,
+    /// editor close) always force so a quick exit can't strand state, and
+    /// on those paths playback has already been stopped first (see
+    /// `open`/`new_file`), so the wait is bounded and safe. The periodic
+    /// (`force = false`) tick captures with `try_lock` instead: a
+    /// destination whose audio callback holds the mutex stays queued in
+    /// `pending_state_capture` and retries next tick — a skip defers, it
+    /// never drops.
     pub(crate) fn flush_plugin_states(&mut self, force: bool) {
         let pending = std::mem::take(&mut self.pending_state_capture);
+        let mut skipped = Vec::new();
         for d in pending {
-            self.capture_plugin_state(d);
+            let captured = if force {
+                self.capture_plugin_state(d);
+                true
+            } else {
+                self.capture_plugin_state_try(d)
+            };
+            if !captured {
+                skipped.push(d);
+            }
         }
+        self.pending_state_capture.extend(skipped);
         let doc_path = lock_shared(&self.shared).path.clone();
         let Some(doc_path) = doc_path else {
             // untitled document: keep records in memory until Save As gives
@@ -663,6 +741,10 @@ impl EditorView {
     /// disagrees with the loaded plugin's real uid is rejected as
     /// incompatible; any failure is a status line note, never fatal — the
     /// plugin still loads and plays with its defaults.
+    ///
+    /// #190: the plugin locks below block, deliberately — this is a
+    /// once-per-load transfer of the user's saved patch, so skipping on
+    /// contention would lose it; the wait is bounded by one audio block.
     pub(crate) fn restore_plugin_state(&mut self, d: usize) {
         if self.state_restored.contains(&d) {
             return;

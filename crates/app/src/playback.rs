@@ -13,6 +13,30 @@ pub(crate) fn track_audible(tr: usize, muted: &HashSet<usize>, soloed: &HashSet<
     }
 }
 
+/// Clip threshold (#203): linear peaks above this have left sample space
+/// (1.0 = 0 dBFS); the extra hair guards against float noise at the rail.
+pub(crate) const CLIP_LEVEL: f32 = 0.99;
+/// Meter display floor in dB below full scale (#203). Peaks below it (and
+/// zero) map to an empty bar — the meter element is only drawn when the
+/// fraction is non-zero or the clip LED is latched, so golden screenshots
+/// (rendered without playback) never show it.
+const METER_FLOOR_DB: f32 = 48.0;
+/// Headroom above 0 dBFS the bar's top edge stands for, so a clip stays
+/// drawable instead of pegging at 100%.
+const METER_HEADROOM_DB: f32 = 6.0;
+
+/// Linear peak → 0..1 bar fraction on the meter's dB scale (#203):
+/// -48 dBFS at the left edge, +6 dBFS at the right, so the 0 dBFS point
+/// sits ~89% out and a clipped peak still grows the red segment. Silence
+/// maps to 0.
+pub(crate) fn meter_frac(peak: f32) -> f32 {
+    if peak <= 0.0 {
+        return 0.0;
+    }
+    let db = 20.0 * peak.log10();
+    ((db + METER_FLOOR_DB) / (METER_FLOOR_DB + METER_HEADROOM_DB)).clamp(0.0, 1.0)
+}
+
 /// Filter a per-track timeline to audible tracks and remap each event's
 /// track onto its sink index; events whose destination has no open sink
 /// (failed port, unavailable plugin) are dropped. Tracks with an explicit
@@ -492,6 +516,11 @@ impl EditorView {
                         sinks.push(Box::new(slot.sink.clone()));
                         transport_of.insert(d, sinks.len());
                         sinks.push(Box::new(output::TransportSink::new(slot.plugin.clone())));
+                        // #190: blocking lock is deliberate — this runs once
+                        // per play start / route refresh and skipping it
+                        // would leave the instance not processing for the
+                        // whole pass (a silent destination, not a retried
+                        // op); the wait is bounded by one audio block.
                         if let Ok(mut p) = slot.plugin.lock() {
                             let _ = p.set_playing(true);
                         }
@@ -917,6 +946,10 @@ impl EditorView {
         self.live_transport.clear();
         self.live_dest_of.clear();
         self.live_route_dirty = false;
+        // the pass is over — its signal is gone; the clip latch stays until
+        // the user clears it (#203)
+        self.master_peak = 0.0;
+        self.master_peak_at = std::time::Instant::now();
         if let Some(mut p) = self.playback.take() {
             self.play_us = self.live_pos_us(&p);
             p.stop();
@@ -986,6 +1019,32 @@ impl EditorView {
     /// Current playhead position in ticks — where a punch bound lands.
     pub(crate) fn playhead_tick(&self) -> u64 {
         self.doc(|d| d.tempo_map.us_to_tick(self.play_us))
+    }
+
+    /// Per-frame master output level poll (#203): max peak across every warm
+    /// plugin slot — the running pass's sinks are clones of these, so the
+    /// slots read the same live instances (port sinks report nothing). A
+    /// contended `try_lock` reads 0, so the held value decays instead of
+    /// snapping down; a fresh peak jumps straight up (instant attack).
+    /// Also latches the clip LED while any reading leaves sample space.
+    pub(crate) fn poll_master_peak(&mut self) {
+        let now = std::time::Instant::now();
+        let dt = now.duration_since(self.master_peak_at).as_secs_f32();
+        self.master_peak_at = now;
+        let raw = self
+            .plugin_slots
+            .values()
+            .map(|s| s.sink.level())
+            .fold(0.0f32, f32::max);
+        if raw >= self.master_peak {
+            self.master_peak = raw;
+        } else {
+            // ~-20 dB/s release toward 0 (amplitude × 0.1 per second)
+            self.master_peak = (self.master_peak * 0.1f32.powf(dt)).max(raw);
+        }
+        if raw > CLIP_LEVEL {
+            self.clip_latched = true;
+        }
     }
 
     /// Center the timeline view on the minimap position under window-x
@@ -1215,5 +1274,40 @@ mod metronome_tests {
     fn zero_end_is_single_click() {
         let mm = mm_of(&[(0, 4, 4)], 480);
         assert_eq!(metronome_clicks(&mm, 0), vec![0]);
+    }
+}
+
+#[cfg(test)]
+mod meter_tests {
+    use super::{meter_frac, CLIP_LEVEL};
+
+    /// #203 — the dB scale anchors: silence is empty, -6 dBFS lands at the
+    /// green/amber boundary, 0 dBFS near (but not at) the top, and a clipped
+    /// peak still grows the bar instead of pegging at 100%.
+    #[test]
+    fn meter_scale_anchors() {
+        assert_eq!(meter_frac(0.0), 0.0);
+        assert_eq!(meter_frac(-1.0), 0.0);
+        // -6 dBFS = 0.5 linear → ≈42 dB of the 54 dB span (log10(0.5) is
+        // -6.02 dB, not exactly -6, so allow a hair of tolerance)
+        let minus6 = meter_frac(0.5);
+        assert!((minus6 - 42.0 / 54.0).abs() < 1e-2, "{minus6}");
+        // 0 dBFS = 1.0 linear → 48 of 54 dB — headroom remains above
+        let zero = meter_frac(1.0);
+        assert!((zero - 48.0 / 54.0).abs() < 1e-4, "{zero}");
+        // clipped: past 0 dBFS but still inside the bar
+        let clip = meter_frac(CLIP_LEVEL * 1.5);
+        assert!(clip > zero && clip <= 1.0, "{clip} vs {zero}");
+        assert_eq!(meter_frac(100.0), 1.0);
+    }
+
+    /// The draw gate is "fraction non-zero": peaks below the -48 dB floor
+    /// map to an empty bar, so the meter hides in golden screenshots
+    /// (rendered without playback, peak 0.0) and at true silence.
+    #[test]
+    fn floor_hides_silence() {
+        assert_eq!(meter_frac(0.001), 0.0); // -60 dBFS, under the floor
+        assert!(meter_frac(0.1) > 0.0); // -20 dBFS, drawn
+        assert!(meter_frac(0.004) > 0.0); // ≈ -48 dBFS, just over it
     }
 }

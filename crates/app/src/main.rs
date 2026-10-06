@@ -919,6 +919,15 @@ struct EditorView {
     /// runs this far ahead of the document while the song is parked —
     /// subtracted from worker positions so `play_us` stays document-true
     live_countin_us: u64,
+    /// master output peak across warm plugin sinks (linear, 1.0 = 0 dBFS),
+    /// polled each animation frame while a pass runs (#203). Decays ~20 dB/s
+    /// so a contended or silent poll glides down instead of snapping to zero.
+    master_peak: f32,
+    /// when `master_peak` was last polled — integrates the release slope
+    master_peak_at: std::time::Instant,
+    /// latching clip indicator (#203): lit once any polled peak leaves
+    /// sample space (> 0.99), cleared by clicking the meter
+    clip_latched: bool,
     /// playhead follow mode during playback (per-song pref)
     follow: Follow,
     /// manual scroll pauses follow until this instant
@@ -1436,6 +1445,9 @@ impl EditorView {
             live_dest_of: HashMap::new(),
             live_route_dirty: false,
             live_countin_us: 0,
+            master_peak: 0.0,
+            master_peak_at: std::time::Instant::now(),
+            clip_latched: false,
             follow: Follow::Page,
             follow_hold: None,
             lanes: vec![LaneCfg::default()],

@@ -146,6 +146,12 @@ impl Render for EditorView {
         // playback thread; reaching this branch means playback ended)
         if let Some(p) = &self.playback {
             self.play_us = self.live_pos_us(p);
+        }
+        // master peak poll rides the same per-frame path (#203)
+        if self.playback.is_some() {
+            self.poll_master_peak();
+        }
+        if let Some(p) = &self.playback {
             if !p.is_running() {
                 self.playback = None;
                 // natural end follows the same stop policy as a manual
@@ -153,6 +159,9 @@ impl Render for EditorView {
                 if self.return_to_start_on_stop {
                     self.play_us = self.play_start_us;
                 }
+                // signal ended with the pass; the clip latch stays
+                self.master_peak = 0.0;
+                self.master_peak_at = std::time::Instant::now();
             }
         }
         let (
@@ -851,6 +860,89 @@ impl Render for EditorView {
                     v.persist();
                 },
             ))
+            // master peak meter (#203): exists only while there is signal
+            // (or a latched clip LED), so golden screenshots — rendered
+            // without playback, peak 0.0 — never show it (nor its leading
+            // separator, which lives inside the container so hidden means
+            // zero footprint). Bar scale is -48..+6 dBFS (see `meter_frac`);
+            // segments split at -6 dBFS (green|amber) and 0 dBFS
+            // (amber|red). Clicking the meter clears the clip latch.
+            .children({
+                let clip = self.clip_latched;
+                let frac = meter_frac(self.master_peak);
+                (frac > 0.0 || clip).then(|| {
+                    const METER_W: f32 = 60.0;
+                    const METER_H: f32 = 12.0;
+                    // segment boundaries on the same scale as the fill
+                    let (g_end, a_end) = (meter_frac(0.5), meter_frac(1.0));
+                    let inner = METER_W - 2.0; // inside the 1px border
+                    let seg = |a: f32, b: f32| (frac.min(b) - a).max(0.0) * inner;
+                    div()
+                        .id("master-meter")
+                        .test_support()
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .gap(px(2.0))
+                        .mr_1()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|v, _e, _w, cx| {
+                                v.clip_latched = false;
+                                cx.notify();
+                            }),
+                        )
+                        .child(Self::vsep())
+                        .child(
+                            div()
+                                .w(px(METER_W))
+                                .h(px(METER_H))
+                                .relative()
+                                .overflow_hidden()
+                                .bg(rgb(th.bg_input))
+                                .border_1()
+                                .border_color(rgb(th.border))
+                                .rounded_sm()
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .top(px(0.0))
+                                        .left(px(0.0))
+                                        .h(px(METER_H - 2.0))
+                                        .w(px(seg(0.0, g_end)))
+                                        .bg(rgb(th.ok)),
+                                )
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .top(px(0.0))
+                                        .left(px(g_end * inner))
+                                        .h(px(METER_H - 2.0))
+                                        .w(px(seg(g_end, a_end)))
+                                        .bg(rgb(th.warn)),
+                                )
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .top(px(0.0))
+                                        .left(px(a_end * inner))
+                                        .h(px(METER_H - 2.0))
+                                        .w(px(seg(a_end, 1.0)))
+                                        .bg(rgb(th.danger)),
+                                ),
+                        )
+                        .child(
+                            // clip LED — red once latched, dark otherwise
+                            div()
+                                .w(px(7.0))
+                                .h(px(7.0))
+                                .rounded_full()
+                                .border_1()
+                                .border_color(rgb(th.border))
+                                .bg(rgb(if clip { th.danger } else { th.bg_off })),
+                        )
+                })
+            })
             .child(Self::vsep())
             // position + tempo + meter readouts (LCD style)
             .child(
