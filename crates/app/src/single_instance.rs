@@ -15,7 +15,8 @@
 //!    so a crashed primary cannot wedge the next launch);
 //! 2. a secondary opens the same mutex, sees `ERROR_ALREADY_EXISTS`, writes
 //!    one UTF-8 JSON line `{"paths": [...]}` to the byte-mode named pipe
-//!    `\\.\pipe\midi-editor-instance`, and exits 0;
+//!    `\\.\pipe\midi-editor-instance` (duplex: the primary answers with a
+//!    one-byte ack once the paths are queued), and exits 0;
 //! 3. the primary's listener thread (only alive while the mutex is held)
 //!    accepts connections, decodes the line, and parks the paths in
 //!    `pending_opens`; the doc-watch tick drains them through the same
@@ -24,9 +25,11 @@
 //!
 //! Failure handling: the OS cannot leave a stale mutex, but the pipe server
 //! may not be up yet while the primary is still starting, so the secondary
-//! waits a bounded time for the pipe; if forwarding fails the user's file
-//! argument must never be lost — the process falls back to launching as a
-//! normal (unguarded) instance and opens the file locally.
+//! waits a bounded time for the pipe; forwarding reports success only after
+//! the primary acknowledges the hand-off (one byte written once the paths
+//! are queued). If forwarding fails the user's file argument must never be
+//! lost — the process falls back to launching as a normal (unguarded)
+//! instance and opens the file locally.
 //!
 //! Everything Windows-specific is inside `imp`; the pure parts (argument
 //! classification, message encode/decode) compile on every platform so
@@ -197,13 +200,12 @@ mod imp {
     use windows::core::{HRESULT, HSTRING};
     use windows::Win32::Foundation::{
         CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND,
-        ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
-        WIN32_ERROR,
+        ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE,
+        INVALID_HANDLE_VALUE, WIN32_ERROR,
     };
     use windows::Win32::Storage::FileSystem::{
-        CreateFileW, FlushFileBuffers, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES,
-        FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-        PIPE_ACCESS_INBOUND,
+        CreateFileW, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_FIRST_PIPE_INSTANCE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
     };
     use windows::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, WaitNamedPipeW,
@@ -267,16 +269,19 @@ mod imp {
         e.code() == HRESULT::from_win32(code.0)
     }
 
-    /// One pipe instance in byte mode, inbound only (the client just writes
-    /// its hand-off line). `FILE_FLAG_FIRST_PIPE_INSTANCE` asserts nobody
-    /// else created the pipe — redundant with the mutex, but it turns a
-    /// future bug into a loud error instead of silent misdelivery.
+    /// One pipe instance in byte mode, duplex (the client writes its
+    /// hand-off line and waits for a one-byte ack). `PIPE_ACCESS_DUPLEX`
+    /// lets the server acknowledge after the paths are queued, so a
+    /// secondary only reports success when delivery actually happened.
+    /// `FILE_FLAG_FIRST_PIPE_INSTANCE` asserts nobody else created the
+    /// pipe — redundant with the mutex, but it turns a future bug into a
+    /// loud error instead of silent misdelivery.
     fn create_pipe_instance(name: &str) -> Result<HANDLE, String> {
         let wide = HSTRING::from(name);
         let h = unsafe {
             CreateNamedPipeW(
                 &wide,
-                PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                 PIPE_UNLIMITED_INSTANCES,
                 4096,
@@ -318,10 +323,18 @@ mod imp {
         if let Some(line) = read_line(pipe) {
             match decode_message(&line) {
                 Some(paths) if !paths.is_empty() => {
-                    let mut q = pending.lock().unwrap_or_else(|e| e.into_inner());
-                    q.extend(paths);
+                    {
+                        let mut q = pending.lock().unwrap_or_else(|e| e.into_inner());
+                        q.extend(paths);
+                    }
+                    ack(pipe);
                 }
-                Some(_) => {}
+                // empty list: nothing to queue, but the message was
+                // understood — ack so the secondary can exit cleanly
+                Some(_) => ack(pipe),
+                // malformed: no ack. The client sees a broken pipe, reports
+                // failure, and falls back to opening the files locally —
+                // its file arguments are never silently lost.
                 None => tracing::warn!("discarded a malformed single-instance hand-off message"),
             }
         }
@@ -330,6 +343,14 @@ mod imp {
             let _ = CloseHandle(pipe);
         }
         Ok(())
+    }
+
+    /// Tell the client its message is queued. A failed write cannot be
+    /// helped from here — the client's ack read fails and it falls back to
+    /// a local launch.
+    fn ack(pipe: HANDLE) {
+        let mut written = 0u32;
+        let _ = unsafe { WriteFile(pipe, Some(b"1".as_slice()), Some(&mut written), None) };
     }
 
     /// Read up to one newline-terminated line (or until the client closes
@@ -395,12 +416,20 @@ mod imp {
 
     /// Secondary side: connect to the primary's pipe within `timeout`
     /// (the primary may still be starting up), write one JSON line, and
-    /// flush before closing so the message is delivered.
+    /// wait for the primary's one-byte ack — success means the paths are
+    /// actually queued in the running instance, not merely written into a
+    /// pipe whose reader may have vanished.
     pub(super) fn forward_files(
         pipe_name: &str,
         files: &[PathBuf],
         timeout: Duration,
     ) -> Result<(), String> {
+        let fail = |pipe: HANDLE, msg: String| -> String {
+            unsafe {
+                let _ = CloseHandle(pipe);
+            }
+            msg
+        };
         let pipe = connect_client(pipe_name, timeout)?;
         let message = encode_message(files);
         let bytes = message.as_bytes();
@@ -410,28 +439,27 @@ mod imp {
             if let Err(e) =
                 unsafe { WriteFile(pipe, Some(&bytes[off..]), Some(&mut written), None) }
             {
-                unsafe {
-                    let _ = CloseHandle(pipe);
-                }
-                return Err(format!("WriteFile failed: {e}"));
+                return Err(fail(pipe, format!("WriteFile failed: {e}")));
             }
             if written == 0 {
-                unsafe {
-                    let _ = CloseHandle(pipe);
-                }
-                return Err("WriteFile made no progress".into());
+                return Err(fail(pipe, "WriteFile made no progress".into()));
             }
             off += written as usize;
         }
-        let flush_ok = unsafe { FlushFileBuffers(pipe) }.is_ok();
+        // the ack is the delivery receipt: the primary queued the paths.
+        // Anything else (broken pipe, EOF, wrong byte) means the hand-off
+        // did not land — the caller falls back to a local launch.
+        let mut ack = [0u8; 1];
+        let mut n = 0u32;
+        match unsafe { ReadFile(pipe, Some(&mut ack), Some(&mut n), None) } {
+            Ok(()) if n == 1 && ack[0] == b'1' => {}
+            Ok(_) => return Err(fail(pipe, "unexpected hand-off ack".into())),
+            Err(e) => return Err(fail(pipe, format!("hand-off ack failed: {e}"))),
+        }
         unsafe {
             let _ = CloseHandle(pipe);
         }
-        if flush_ok {
-            Ok(())
-        } else {
-            Err("FlushFileBuffers failed".into())
-        }
+        Ok(())
     }
 
     /// CreateFileW loop with a bounded wait: `ERROR_FILE_NOT_FOUND` means
@@ -445,7 +473,7 @@ mod imp {
             match unsafe {
                 CreateFileW(
                     &wide,
-                    GENERIC_WRITE.0,
+                    GENERIC_READ.0 | GENERIC_WRITE.0,
                     FILE_SHARE_READ | FILE_SHARE_WRITE,
                     None,
                     OPEN_EXISTING,
@@ -557,6 +585,50 @@ mod imp {
             let r = forward_files(&name, &[PathBuf::from("x.mid")], Duration::from_millis(150));
             assert!(r.is_err());
             assert!(t0.elapsed() < Duration::from_secs(5));
+        }
+
+        /// A message the primary cannot parse gets no ack: the client sees
+        /// a failed/broken read, `forward_files` reports failure, and the
+        /// fallback opens the files locally instead of losing them.
+        #[test]
+        fn malformed_handoff_gets_no_ack_and_fails_forwarding() {
+            let name = test_pipe_name("garbage");
+            let pending: PendingOpens = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (done_tx, done_rx) = mpsc::channel();
+            let p = pending.clone();
+            let n = name.clone();
+            std::thread::spawn(move || {
+                let r = serve_once(&n, &p);
+                let _ = done_tx.send(r);
+            });
+            let pipe = connect_client(&name, Duration::from_secs(5)).expect("connect");
+            let mut written = 0u32;
+            unsafe {
+                WriteFile(
+                    pipe,
+                    Some("not json\n".as_bytes()),
+                    Some(&mut written),
+                    None,
+                )
+            }
+            .expect("write");
+            let mut ack = [0u8; 1];
+            let mut nread = 0u32;
+            let r = unsafe { ReadFile(pipe, Some(&mut ack), Some(&mut nread), None) };
+            // broken pipe or EOF — anything a client treats as failure
+            assert!(
+                r.is_err() || nread == 0,
+                "malformed message must not be acked"
+            );
+            assert!(pending.lock().unwrap().is_empty());
+            // release our end (the server has already disconnected)
+            unsafe {
+                let _ = CloseHandle(pipe);
+            }
+            done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("server served the connection")
+                .expect("server had no errors");
         }
     }
 }
