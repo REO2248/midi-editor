@@ -415,6 +415,7 @@ fn golden_plugin_unavailable(cx: &mut TestAppContext) {
                 1,
                 PluginState::Failed {
                     path: "C:/Fixtures/TestSynth.vst3".into(),
+                    instance: 1,
                     phase: "load",
                     msg: "the VST3 bundle was removed".into(),
                 },

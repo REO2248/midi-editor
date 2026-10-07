@@ -57,7 +57,7 @@ pub(crate) const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// response field) don't require a bump — but the checked-in schema
 /// snapshot test still fails on every surface diff, so even additive
 /// changes are deliberate.
-pub const MCP_SURFACE_VERSION: u32 = 2;
+pub const MCP_SURFACE_VERSION: u32 = 3;
 
 /// One tool's contract metadata as advertised by `editor_info` and covered
 /// by the schema snapshot test. `version` starts at 1 and is bumped when
@@ -350,6 +350,10 @@ fn editor_info_json(sh: &Shared) -> serde_json::Value {
                 "text_encodings": ["auto", "utf-8", "shift-jis", "latin-1"],
             },
             "destinations": ["midi_port", "vst3"],
+            // #222: (bundle, instance) pairs are distinct destinations —
+            // dest JSON carries `instance` (1 = base), set_track_destination
+            // accepts an `instance` arg, the catalog dedups per instance
+            "vst3_instances": true,
             "editing": {
                 "undo": true,
                 "redo": true,
@@ -963,19 +967,27 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             "Enumerate real MIDI outputs/inputs on this machine (WinMM): [{index, name}]. Use names in set_track_destination.",
             object_schema(serde_json::json!({})),
         ),
-        spec(
-            "list_destinations",
-            "Output routing: catalog [{index, label, kind, port_name|plugin_path}], default_dest, per-track overrides, mute/solo.",
-            object_schema(serde_json::json!({})),
-        ),
-        spec(
-            "set_track_destination",
-            "Route a track to an output. Args: track, destination: {\"midi_port\":\"<name>\"} | {\"vst3\":\"<bundle path>\"} | \"default\" (inherit). Unknown destinations are remembered and fail at play time.",
+        ToolSpec {
+            // v2 (#222): dest entries carry `instance` — several entries may
+            // share one bundle path as independent plugin instances
+            version: 2,
+            ..spec(
+                "list_destinations",
+                "Output routing: catalog [{index, label, kind, port_name|plugin_path, instance}], default_dest, per-track overrides, mute/solo. VST3 `instance` distinguishes independent instances of one bundle (1 = base).",
+            object_schema(serde_json::json!({})),)
+        },
+        ToolSpec {
+            // v2 (#222): {"vst3": path, "instance": n} assigns/creates an
+            // additional instance of the bundle as a separate destination
+            version: 2,
+            ..spec(
+                "set_track_destination",
+                "Route a track to an output. Args: track, destination: {\"midi_port\":\"<name>\"} | {\"vst3\":\"<bundle path>\", \"instance\"?: n≥2} | \"default\" (inherit). Unknown destinations are remembered and fail at play time.",
             object_schema(serde_json::json!({
                 "track": {"type": "integer"},
                 "destination": {},
-            })),
-        ),
+            })),)
+        },
         ToolSpec {
             // v2: added the `set_loop` action + start/end args (#130)
             version: 2,
@@ -1979,11 +1991,15 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
                         ord: d["ord"].as_u64().unwrap_or(0) as usize,
                     }
                 } else if let Some(p) = d["vst3"].as_str() {
+                    // #222: `instance` selects a numbered instance of the
+                    // bundle — 1/absent is the base instance
+                    let inst = d["instance"].as_u64().filter(|n| *n >= 2);
                     Destination::Plugin {
                         plugin_path: p.to_string(),
                         component_id: None,
                         vendor: None,
                         plugin_name: None,
+                        instance: inst,
                     }
                 } else {
                     return err_json(
@@ -2874,8 +2890,16 @@ fn dest_label(d: &Destination) -> String {
                 format!("{port_name} #{}", ord + 1)
             }
         }
-        Destination::Plugin { plugin_path, .. } => {
-            format!("{} [VST3]", plugin_path)
+        Destination::Plugin {
+            plugin_path,
+            instance,
+            ..
+        } => {
+            // additional instances of one bundle are distinguishable (#222)
+            match midi_io::instance_num(*instance) {
+                n if n >= 2 => format!("{plugin_path} #{n} [VST3]"),
+                _ => format!("{plugin_path} [VST3]"),
+            }
         }
     }
 }
@@ -2885,8 +2909,14 @@ fn dest_json(d: &Destination) -> serde_json::Value {
         Destination::MidiPort { port_name, ord } => {
             serde_json::json!({"kind": "midi_port", "port_name": port_name, "ord": ord})
         }
-        Destination::Plugin { plugin_path, .. } => {
-            serde_json::json!({"kind": "vst3", "plugin_path": plugin_path})
+        Destination::Plugin {
+            plugin_path,
+            instance,
+            ..
+        } => {
+            // `instance` is additive (#222): 1 = the base instance, ≥2 an
+            // additional independent instance of the same bundle
+            serde_json::json!({"kind": "vst3", "plugin_path": plugin_path, "instance": midi_io::instance_num(*instance)})
         }
     }
 }

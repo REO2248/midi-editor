@@ -18,13 +18,19 @@ fn needs_state_write(dirty: bool, written_for: Option<&Path>, target: &Path) -> 
 pub(crate) enum PluginState {
     Loading {
         path: PathBuf,
+        /// 1-based instance number of the bundle being loaded (#222)
+        instance: u64,
         since: std::time::Instant,
     },
     Ready {
         path: PathBuf,
+        /// 1-based instance number of the resident plugin (#222)
+        instance: u64,
     },
     Failed {
         path: PathBuf,
+        /// 1-based instance number whose load failed (#222)
+        instance: u64,
         phase: &'static str,
         msg: String,
     },
@@ -53,28 +59,38 @@ pub(crate) enum PluginPlan {
     Open { retire: bool },
 }
 
-/// `state` is the tracked lifecycle state for the index, `warm` the bundle
-/// currently resident in its slot (if any), `target` the bundle the
-/// destination now points at. Order of checks matters: a Ready+resident
-/// match short-circuits before the wait guards, and any other mismatch
-/// reloads — retiring the stale slot first so the host never holds two
-/// instances for one index.
+/// `state` is the tracked lifecycle state for the index, `warm` the
+/// (bundle, 1-based instance) pair currently resident in its slot (if
+/// any), `target`/`target_instance` what the destination now points at.
+/// Order of checks matters: a Ready+resident match short-circuits before
+/// the wait guards, and any other mismatch reloads — retiring the stale
+/// slot first so the host never holds two instances for one index.
+///
+/// The instance is part of every comparison (#222): a warm slot or
+/// in-flight load for instance 1 never satisfies instance 2 — it opens a
+/// second, independent instance.
 pub(crate) fn plugin_plan(
     state: Option<&PluginState>,
-    warm: Option<&Path>,
+    warm: Option<(&Path, u64)>,
     target: &Path,
+    target_instance: u64,
     force: bool,
 ) -> PluginPlan {
-    if let Some(PluginState::Ready { path }) = state {
-        if path == target && warm == Some(target) {
+    let same = |path: &PathBuf, instance: u64| path == target && instance == target_instance;
+    if let Some(PluginState::Ready { path, instance }) = state {
+        if same(path, *instance) && warm == Some((target, target_instance)) {
             return PluginPlan::Satisfied;
         }
-    } else if warm == Some(target) {
+    } else if warm == Some((target, target_instance)) {
         return PluginPlan::Satisfied;
     }
     match state {
-        Some(PluginState::Loading { path, .. }) if path == target => PluginPlan::Wait,
-        Some(PluginState::Failed { path, .. }) if path == target && !force => PluginPlan::Wait,
+        Some(PluginState::Loading { path, instance, .. }) if same(path, *instance) => {
+            PluginPlan::Wait
+        }
+        Some(PluginState::Failed { path, instance, .. }) if same(path, *instance) && !force => {
+            PluginPlan::Wait
+        }
         _ => PluginPlan::Open {
             retire: warm.is_some(),
         },
@@ -86,17 +102,24 @@ impl EditorView {
     /// thread to warm it. Called when a destination is assigned and from
     /// `refresh_plugins` — Play then never pays the load stall.
     pub(crate) fn ensure_plugin(&mut self, d: usize, force: bool) {
-        let path = {
+        let (path, inst) = {
             let sh = lock_shared(&self.shared);
             match sh.dests.get(d).map(|(_, dest)| dest) {
-                Some(output::Destination::Plugin { plugin_path, .. }) => PathBuf::from(plugin_path),
+                Some(output::Destination::Plugin {
+                    plugin_path,
+                    instance,
+                    ..
+                }) => (PathBuf::from(plugin_path), midi_io::instance_num(*instance)),
                 _ => return,
             }
         };
         let PluginPlan::Open { retire } = plugin_plan(
             self.plugin_state.get(&d),
-            self.plugin_slots.get(&d).map(|s| s.path.as_path()),
+            self.plugin_slots
+                .get(&d)
+                .map(|s| (s.path.as_path(), s.instance)),
             &path,
+            inst,
             force,
         ) else {
             return;
@@ -120,6 +143,7 @@ impl EditorView {
             d,
             PluginState::Loading {
                 path: path.clone(),
+                instance: inst,
                 since: std::time::Instant::now(),
             },
         );
@@ -128,9 +152,12 @@ impl EditorView {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
         self.status = tf("plugin.loading", &[("name", name.as_str())]).into();
-        let _ = self
-            .plugin_req
-            .send(output::PluginReq::Open(d, path, self.audio_sel.clone()));
+        let _ = self.plugin_req.send(output::PluginReq::Open(
+            d,
+            path,
+            self.audio_sel.clone(),
+            inst,
+        ));
     }
 
     /// Warm instances for every VST3 destination a track or the default
@@ -172,12 +199,14 @@ impl EditorView {
             matches!(s, PluginState::Loading { since, .. } if now.duration_since(*since) >= std::time::Duration::from_secs(20)).then_some(d)
         }).collect();
         for d in timed_out {
-            if let Some(PluginState::Loading { path, .. }) = self.plugin_state.remove(&d) {
+            if let Some(PluginState::Loading { path, instance, .. }) = self.plugin_state.remove(&d)
+            {
                 tracing::warn!(dest = d, path = %path.display(), "plugin load timed out");
                 self.plugin_state.insert(
                     d,
                     PluginState::Failed {
                         path,
+                        instance,
                         phase: "load",
                         msg: t("plugin.timeout").to_string(),
                     },
@@ -190,10 +219,15 @@ impl EditorView {
             }
         }
         while let Ok(event) = self.plugin_evt.try_recv() {
-            let Some(PluginState::Loading { path, .. }) = self.plugin_state.get(&event.dest) else {
+            // a stale event (a different bundle or instance has since been
+            // queued for this index) is discarded — the slot it describes
+            // was already superseded
+            let Some(PluginState::Loading { path, instance, .. }) =
+                self.plugin_state.get(&event.dest)
+            else {
                 continue;
             };
-            if path != &event.path {
+            if path != &event.path || *instance != event.instance {
                 continue;
             }
             match event.result {
@@ -211,8 +245,13 @@ impl EditorView {
                     // saved sidecar state goes in before Ready — playback may
                     // start as soon as this slot reports ready
                     self.restore_plugin_state(event.dest);
-                    self.plugin_state
-                        .insert(event.dest, PluginState::Ready { path: event.path });
+                    self.plugin_state.insert(
+                        event.dest,
+                        PluginState::Ready {
+                            path: event.path,
+                            instance: event.instance,
+                        },
+                    );
                     self.status = tf("plugin.ready", &[("name", name.as_str())]).into();
                 }
                 Err(e) => {
@@ -238,6 +277,7 @@ impl EditorView {
                         event.dest,
                         PluginState::Failed {
                             path: event.path,
+                            instance: event.instance,
                             phase,
                             msg: e.to_string(),
                         },
@@ -453,7 +493,17 @@ impl EditorView {
             "destination catalog applied"
         );
         let mut sh = lock_shared(&self.shared);
-        if fresh == sh.dests {
+        // user-created extra instances (#222) are not scan results — carry
+        // them over so a rescan doesn't drop a track's second instance
+        let mut merged = fresh;
+        for (label, d) in &sh.dests {
+            if matches!(d, output::Destination::Plugin { instance: Some(n), .. } if *n >= 2)
+                && !merged.iter().any(|(_, dd)| dd.same_identity(d))
+            {
+                merged.push((label.clone(), d.clone()));
+            }
+        }
+        if merged == sh.dests {
             let ns = sh.dests.len().to_string();
             drop(sh);
             self.status = tf("status.rescan", &[("n", ns.as_str())]).into();
@@ -465,7 +515,7 @@ impl EditorView {
             .iter()
             .filter_map(|(t, i)| sh.dests.get(*i).map(|(_, d)| (*t, d.clone())))
             .collect();
-        sh.dests = fresh;
+        sh.dests = merged;
         sh.default_dest = old_default
             .map(|d| {
                 // identity-aware lookup (path or component id), then re-add
@@ -522,23 +572,33 @@ impl EditorView {
             self.editor_plugin = None;
             return;
         }
-        let (d, path) = {
+        let (d, pi) = {
             let sh = lock_shared(&self.shared);
             let d = sh.dest_of(self.sel_track);
             let p = sh.dests.get(d).and_then(|(_, dd)| match dd {
-                output::Destination::Plugin { plugin_path, .. } => Some(PathBuf::from(plugin_path)),
+                output::Destination::Plugin {
+                    plugin_path,
+                    instance,
+                    ..
+                } => Some((PathBuf::from(plugin_path), midi_io::instance_num(*instance))),
                 _ => None,
             });
             (d, p)
         };
-        let Some(path) = path else { return };
+        let Some((path, inst)) = pi else { return };
         match output::load_for_gui(&path) {
             Ok(a) => {
                 // adopt the live state of the playing instance so the editor
                 // shows what's actually being heard. #190: blocking lock is
                 // fine here — a once-per-open user gesture, and skipping
-                // would show the editor a stale patch.
-                if let Some(slot) = self.plugin_slots.get(&d).filter(|s| s.path == path) {
+                // would show the editor a stale patch. Path AND instance
+                // must match — a stale slot of another instance of the same
+                // bundle is not this destination's state (#222).
+                if let Some(slot) = self
+                    .plugin_slots
+                    .get(&d)
+                    .filter(|s| s.path == path && s.instance == inst)
+                {
                     let state = slot.plugin.lock().ok().and_then(|p| p.save_state().ok());
                     if let Some(data) = state {
                         if let Ok(mut e) = a.lock() {
@@ -654,6 +714,9 @@ impl EditorView {
         let meta = self.plugin_meta.get(&key);
         let changed = self.plugin_states.insert(plugin_state::PluginStateRecord {
             uid,
+            // state belongs to this instance of the bundle — two instances
+            // of one synth keep independent patches (#222)
+            instance: (slot.instance >= 2).then_some(slot.instance),
             path: key.clone(),
             vendor: meta.map(|m| m.vendor.clone()).unwrap_or_default(),
             name: meta.map(|m| m.name.clone()).unwrap_or_else(|| {
@@ -754,12 +817,13 @@ impl EditorView {
         };
         let plugin = slot.plugin.clone();
         let path = slot.path.clone();
+        let inst = slot.instance;
         let uid = plugin
             .lock()
             .map(|p| p.info().uid.clone())
             .unwrap_or_default();
         let err = {
-            let Some(rec) = self.plugin_states.lookup(&uid, &path) else {
+            let Some(rec) = self.plugin_states.lookup(&uid, &path, inst) else {
                 return;
             };
             if !rec.uid.is_empty() && !uid.is_empty() && rec.uid != uid {

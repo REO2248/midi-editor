@@ -1,5 +1,5 @@
 {
-  "mcp_surface_version": 2,
+  "mcp_surface_version": 3,
   "tools": [
     {
       "deprecated": null,
@@ -450,13 +450,13 @@
     },
     {
       "deprecated": null,
-      "description": "Output routing: catalog [{index, label, kind, port_name|plugin_path}], default_dest, per-track overrides, mute/solo.",
+      "description": "Output routing: catalog [{index, label, kind, port_name|plugin_path, instance}], default_dest, per-track overrides, mute/solo. VST3 `instance` distinguishes independent instances of one bundle (1 = base).",
       "input_schema": {
         "properties": {},
         "type": "object"
       },
       "name": "list_destinations",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,
@@ -1193,7 +1193,7 @@
     },
     {
       "deprecated": null,
-      "description": "Route a track to an output. Args: track, destination: {\"midi_port\":\"<name>\"} | {\"vst3\":\"<bundle path>\"} | \"default\" (inherit). Unknown destinations are remembered and fail at play time.",
+      "description": "Route a track to an output. Args: track, destination: {\"midi_port\":\"<name>\"} | {\"vst3\":\"<bundle path>\", \"instance\"?: n≥2} | \"default\" (inherit). Unknown destinations are remembered and fail at play time.",
       "input_schema": {
         "properties": {
           "destination": {},
@@ -1204,7 +1204,7 @@
         "type": "object"
       },
       "name": "set_track_destination",
-      "version": 1
+      "version": 2
     },
     {
       "deprecated": null,

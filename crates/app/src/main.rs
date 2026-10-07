@@ -1137,6 +1137,9 @@ pub(crate) fn build_dest_catalog(
                 component_id: p.uid.clone(),
                 vendor: (!p.vendor.is_empty()).then(|| p.vendor.clone()),
                 plugin_name: Some(p.name.clone()),
+                // scans produce the base instance; extra instances are
+                // user-created catalog entries, not scan results (#222)
+                instance: None,
             },
         ));
     }
@@ -1656,6 +1659,7 @@ impl EditorView {
                     component_id: None,
                     vendor: None,
                     plugin_name: None,
+                    instance: None,
                 },
             ),
         ];
@@ -2599,23 +2603,38 @@ mod tests {
     }
 
     pub(crate) fn loading(path: &Path) -> PluginState {
+        loading_inst(path, 1)
+    }
+
+    pub(crate) fn loading_inst(path: &Path, instance: u64) -> PluginState {
         PluginState::Loading {
             path: path.to_path_buf(),
+            instance,
             since: Instant::now(),
         }
     }
 
     pub(crate) fn failed(path: &Path) -> PluginState {
+        failed_inst(path, 1)
+    }
+
+    pub(crate) fn failed_inst(path: &Path, instance: u64) -> PluginState {
         PluginState::Failed {
             path: path.to_path_buf(),
+            instance,
             phase: "load",
             msg: String::new(),
         }
     }
 
     pub(crate) fn ready(path: &Path) -> PluginState {
+        ready_inst(path, 1)
+    }
+
+    pub(crate) fn ready_inst(path: &Path, instance: u64) -> PluginState {
         PluginState::Ready {
             path: path.to_path_buf(),
+            instance,
         }
     }
 
@@ -2630,53 +2649,93 @@ mod tests {
 
         // fresh index, nothing resident → load
         assert_eq!(
-            plugin_plan(None, None, &a, false),
+            plugin_plan(None, None, &a, 1, false),
             PluginPlan::Open { retire: false }
         );
 
         // already loaded + resident → untouched
         assert_eq!(
-            plugin_plan(Some(&ready(&a)), Some(&a), &a, false),
+            plugin_plan(Some(&ready(&a)), Some((&a as &Path, 1)), &a, 1, false),
             PluginPlan::Satisfied
         );
 
         // state says Ready but the slot is empty (lost instance) → reload
         assert_eq!(
-            plugin_plan(Some(&ready(&a)), None, &a, false),
+            plugin_plan(Some(&ready(&a)), None, &a, 1, false),
             PluginPlan::Open { retire: false }
         );
 
         // resident but state lost its Ready marker → leave alone
         assert_eq!(
-            plugin_plan(Some(&failed(&a)), Some(&a), &a, false),
+            plugin_plan(Some(&failed(&a)), Some((&a as &Path, 1)), &a, 1, false),
             PluginPlan::Satisfied
         );
 
         // same bundle already loading → don't double-load
         assert_eq!(
-            plugin_plan(Some(&loading(&a)), None, &a, false),
+            plugin_plan(Some(&loading(&a)), None, &a, 1, false),
             PluginPlan::Wait
         );
 
         // failed load of the same bundle is sticky until a forced retry
         assert_eq!(
-            plugin_plan(Some(&failed(&a)), None, &a, false),
+            plugin_plan(Some(&failed(&a)), None, &a, 1, false),
             PluginPlan::Wait
         );
         assert_eq!(
-            plugin_plan(Some(&failed(&a)), None, &a, true),
+            plugin_plan(Some(&failed(&a)), None, &a, 1, true),
             PluginPlan::Open { retire: false }
         );
 
         // destination re-pointed while something else is resident → the old
         // instance is retired before the new one opens
         assert_eq!(
-            plugin_plan(Some(&ready(&b)), Some(&b), &a, false),
+            plugin_plan(Some(&ready(&b)), Some((&b as &Path, 1)), &a, 1, false),
             PluginPlan::Open { retire: true }
         );
         assert_eq!(
-            plugin_plan(Some(&loading(&b)), Some(&b), &a, false),
+            plugin_plan(Some(&loading(&b)), Some((&b as &Path, 1)), &a, 1, false),
             PluginPlan::Open { retire: true }
+        );
+    }
+
+    /// #222: a warm slot or in-flight/failed load only matches its own
+    /// instance — instance 1's resident slot never satisfies a load for
+    /// instance 2 (and vice versa), so both open as independent plugins.
+    #[test]
+    pub(crate) fn plugin_plan_matches_instance() {
+        let a = PathBuf::from(r"C:\VST3\A.vst3");
+        let a1 = &a as &Path;
+
+        // instance 1 resident — instance 2 still opens a fresh load
+        assert_eq!(
+            plugin_plan(Some(&ready_inst(&a, 1)), Some((a1, 1)), &a, 2, false),
+            PluginPlan::Open { retire: true }
+        );
+        // and vice versa: instance 2 resident — instance 1 is its own load
+        assert_eq!(
+            plugin_plan(Some(&ready_inst(&a, 2)), Some((a1, 2)), &a, 1, false),
+            PluginPlan::Open { retire: true }
+        );
+        // same-instance Ready + resident → satisfied
+        assert_eq!(
+            plugin_plan(Some(&ready_inst(&a, 2)), Some((a1, 2)), &a, 2, false),
+            PluginPlan::Satisfied
+        );
+        // Loading for instance 2 does not suppress instance 1's load
+        assert_eq!(
+            plugin_plan(Some(&loading_inst(&a, 2)), None, &a, 1, false),
+            PluginPlan::Open { retire: false }
+        );
+        // but it does suppress a duplicate load of instance 2
+        assert_eq!(
+            plugin_plan(Some(&loading_inst(&a, 2)), None, &a, 2, false),
+            PluginPlan::Wait
+        );
+        // Failed for instance 2 stays scoped: instance 1 still opens
+        assert_eq!(
+            plugin_plan(Some(&failed_inst(&a, 2)), None, &a, 1, false),
+            PluginPlan::Open { retire: false }
         );
     }
 

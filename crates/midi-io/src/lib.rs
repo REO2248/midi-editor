@@ -35,14 +35,31 @@ pub enum Destination {
         /// human name, for display + disambiguation
         #[serde(default)]
         plugin_name: Option<String>,
+        /// instance discriminator — `None` is the base (first) instance,
+        /// `Some(n)` with n ≥ 2 an additional independent instance of the
+        /// same bundle (#222). Absent in sidecars written before
+        /// multi-instance support and never written for the base instance.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance: Option<u64>,
     },
+}
+
+/// `Option<u64>` instance discriminator → 1-based instance number: `None`
+/// (legacy entries) and `Some(0)`/`Some(1)` all mean the base instance.
+/// Comparison code always normalizes through this, so a sidecar claiming
+/// `instance: 1` can never fork the catalog away from `None`.
+pub fn instance_num(instance: Option<u64>) -> u64 {
+    instance.unwrap_or(1).max(1)
 }
 
 impl Destination {
     /// Same endpoint for routing purposes — not byte equality. Ports match
     /// by name. Plugins match when the path agrees (covers in-place bundle
     /// upgrades that may change the reported class id) OR when both sides
-    /// carry a component ID and those agree (covers the bundle moving).
+    /// carry a component ID and those agree (covers the bundle moving) —
+    /// but only within the same instance: `instance` is part of the
+    /// identity, so two instances of one bundle never collapse into a
+    /// single destination (#222).
     pub fn same_identity(&self, other: &Destination) -> bool {
         match (self, other) {
             (
@@ -59,14 +76,19 @@ impl Destination {
                 Destination::Plugin {
                     plugin_path: pa,
                     component_id: ca,
+                    instance: ia,
                     ..
                 },
                 Destination::Plugin {
                     plugin_path: pb,
                     component_id: cb,
+                    instance: ib,
                     ..
                 },
-            ) => pa == pb || matches!((ca, cb), (Some(a), Some(b)) if a == b),
+            ) => {
+                instance_num(*ia) == instance_num(*ib)
+                    && (pa == pb || matches!((ca, cb), (Some(a), Some(b)) if a == b))
+            }
             _ => false,
         }
     }
@@ -90,7 +112,13 @@ pub enum Resolved {
 
 /// Match a stored plugin destination against the scanned catalog, preferring
 /// the recorded path and falling back to the class/component ID when the
-/// bundle moved. Non-plugin destinations pass through unchanged.
+/// bundle moved. Non-plugin destinations pass through unchanged. The
+/// instance discriminator is part of the match: an instance-numbered stored
+/// destination only resolves against catalog entries of the same instance,
+/// and a no-match keeps the stored instance instead of collapsing onto the
+/// base entry (#222). Its durable metadata (component id / vendor / name /
+/// current path) is then adopted from the same bundle's catalog entry, so
+/// the instance stays a first-class destination.
 pub fn resolve_plugin_dest(
     stored: &Destination,
     catalog: &[Destination],
@@ -98,22 +126,29 @@ pub fn resolve_plugin_dest(
     let Destination::Plugin {
         plugin_path,
         component_id,
+        instance,
         ..
     } = stored
     else {
         return (stored.clone(), Resolved::SamePath);
     };
+    let inst = instance_num(*instance);
     fn path_of(d: &Destination) -> &str {
         match d {
             Destination::Plugin { plugin_path, .. } => plugin_path,
             _ => "",
         }
     }
+    fn inst_of(d: &Destination) -> u64 {
+        match d {
+            Destination::Plugin { instance, .. } => instance_num(*instance),
+            _ => 0,
+        }
+    }
     // 1. preferred hint: exact path match — adopt the catalog's fresh metadata
-    if let Some(exact) = catalog
-        .iter()
-        .find(|d| matches!(d, Destination::Plugin { plugin_path: p, .. } if p == plugin_path))
-    {
+    if let Some(exact) = catalog.iter().find(
+        |d| matches!(d, Destination::Plugin { plugin_path: p, .. } if p == plugin_path && inst_of(d) == inst),
+    ) {
         return (exact.clone(), Resolved::SamePath);
     }
     // 2. component-ID match: the bundle moved or was reinstalled
@@ -121,7 +156,8 @@ pub fn resolve_plugin_dest(
         let mut matches: Vec<&Destination> = catalog
             .iter()
             .filter(|d| {
-                matches!(d, Destination::Plugin { component_id: c, .. } if c.as_deref() == Some(cid.as_str()))
+                matches!(d, Destination::Plugin { component_id: c, instance: i, .. }
+                    if c.as_deref() == Some(cid.as_str()) && instance_num(*i) == inst)
             })
             .collect();
         match matches.len() {
@@ -156,7 +192,46 @@ pub fn resolve_plugin_dest(
             }
         }
     }
-    (stored.clone(), Resolved::Missing)
+    // no same-instance entry — keep the stored identity (the instance must
+    // not fold into the base instance), but adopt the live bundle's durable
+    // metadata from a same-bundle entry under another instance so the new
+    // destination is still named and survives a later move
+    let mut stored = stored.clone();
+    let twin = catalog
+        .iter()
+        .find(|d| matches!(d, Destination::Plugin { plugin_path: p, .. } if p == plugin_path))
+        .or_else(|| {
+            component_id.as_ref().and_then(|cid| {
+                catalog.iter().find(|d| {
+                    matches!(d, Destination::Plugin { component_id: c, .. } if c.as_deref() == Some(cid.as_str()))
+                })
+            })
+        });
+    if let Some(twin) = twin {
+        if let (
+            Destination::Plugin {
+                plugin_path: sp,
+                component_id: sc,
+                vendor: sv,
+                plugin_name: sn,
+                ..
+            },
+            Destination::Plugin {
+                plugin_path: tp,
+                component_id: tc,
+                vendor: tv,
+                plugin_name: tn,
+                ..
+            },
+        ) = (&mut stored, twin)
+        {
+            sp.clone_from(tp);
+            sc.clone_from(tc);
+            sv.clone_from(tv);
+            sn.clone_from(tn);
+        }
+    }
+    (stored, Resolved::Missing)
 }
 
 #[derive(Debug, Error)]
@@ -1507,6 +1582,17 @@ mod tests {
             component_id: cid.map(str::to_string),
             vendor: None,
             plugin_name: None,
+            instance: None,
+        }
+    }
+
+    fn plugin_inst(path: &str, cid: Option<&str>, instance: u64) -> Destination {
+        Destination::Plugin {
+            plugin_path: path.into(),
+            component_id: cid.map(str::to_string),
+            vendor: None,
+            plugin_name: None,
+            instance: (instance >= 2).then_some(instance),
         }
     }
 
@@ -1527,6 +1613,66 @@ mod tests {
         assert!(!a_old.same_identity(&b));
         assert!(!a_moved.same_identity(&b));
         assert!(!a_moved.same_identity(&a_path_only)); // no shared key
+    }
+
+    /// The instance discriminator is part of routing identity (#222): two
+    /// instances of the same bundle never collapse, but the same instance
+    /// still matches across moves/metadata churn — and `None`/`Some(1)` are
+    /// the same base instance.
+    #[test]
+    fn destination_identity_includes_instance() {
+        let base = plugin(r"C:\VST3\A.vst3", Some("UID_A"));
+        let i2 = plugin_inst(r"C:\VST3\A.vst3", Some("UID_A"), 2);
+        let i2_moved = plugin_inst(r"D:\Moved\A.vst3", Some("UID_A"), 2);
+        let i3 = plugin_inst(r"C:\VST3\A.vst3", Some("UID_A"), 3);
+
+        assert!(!base.same_identity(&i2));
+        assert!(!i2.same_identity(&i3));
+        assert!(i2.same_identity(&i2_moved)); // instance follows the move
+                                              // None and an explicit instance 1 are the same base instance
+        let mut explicit_one = plugin(r"C:\VST3\A.vst3", Some("UID_A"));
+        if let Destination::Plugin { instance, .. } = &mut explicit_one {
+            *instance = Some(1);
+        }
+        assert!(base.same_identity(&explicit_one));
+    }
+
+    /// Resolution keeps the stored instance (#222): a missing instance
+    /// entry does not collapse onto the base catalog entry, but adopts its
+    /// durable bundle metadata.
+    #[test]
+    fn resolve_preserves_instance() {
+        let catalog = vec![plugin(r"C:\VST3\Surge.vst3", Some("UID_SURGE"))];
+
+        // instance 2 of a cataloged bundle: identity kept, metadata adopted
+        let stored = plugin_inst(r"C:\VST3\Surge.vst3", None, 2);
+        let (got, outcome) = resolve_plugin_dest(&stored, &catalog);
+        assert!(matches!(outcome, Resolved::Missing));
+        assert!(
+            matches!(&got, Destination::Plugin { instance: Some(2), component_id: Some(c), .. } if c == "UID_SURGE")
+        );
+
+        // once the catalog has an instance-2 entry, exact resolution works
+        let catalog = vec![
+            plugin(r"C:\VST3\Surge.vst3", Some("UID_SURGE")),
+            plugin_inst(r"C:\VST3\Surge.vst3", Some("UID_SURGE"), 2),
+        ];
+        let stored = Destination::Plugin {
+            plugin_path: r"C:\VST3\Surge.vst3".into(),
+            component_id: None,
+            vendor: None,
+            plugin_name: None,
+            instance: Some(2),
+        };
+        let (got, outcome) = resolve_plugin_dest(&stored, &catalog);
+        assert!(matches!(outcome, Resolved::SamePath));
+        assert!(matches!(
+            &got,
+            Destination::Plugin {
+                instance: Some(2),
+                ..
+            }
+        ));
     }
 
     /// Resolution order: exact path first (preferred hint), then a single
@@ -1593,7 +1739,8 @@ mod tests {
                 plugin_path: _,
                 component_id: None,
                 vendor: None,
-                plugin_name: None
+                plugin_name: None,
+                instance: None
             }
         ));
     }
