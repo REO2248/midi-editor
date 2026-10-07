@@ -143,6 +143,7 @@ fn run(
         start_us,
         loop_from_us,
         None, // no explicit right locator — these tests use wrap-at-end
+        None, // no MIDI clock
         &stop,
         &pos,
         &watch,
@@ -489,6 +490,7 @@ fn playback_start_sends_and_stops() {
         0,
         None,
         None,
+        None, // no MIDI clock
         true, // this sink marks exit via panic()
     );
     // wait for the send — stop() landing before the thread's first pass
@@ -557,6 +559,7 @@ fn hardware_wake_jitter() {
         0,
         None,
         None,
+        None, // no MIDI clock
         false,
     );
     pb.stop();

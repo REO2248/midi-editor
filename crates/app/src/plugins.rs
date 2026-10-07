@@ -465,6 +465,11 @@ impl EditorView {
             .iter()
             .filter_map(|(t, i)| sh.dests.get(*i).map(|(_, d)| (*t, d.clone())))
             .collect();
+        let old_clocks: Vec<midi_io::Destination> = self
+            .clock_dests
+            .iter()
+            .filter_map(|i| sh.dests.get(*i).map(|(_, d)| d.clone()))
+            .collect();
         sh.dests = fresh;
         sh.default_dest = old_default
             .map(|d| {
@@ -486,6 +491,17 @@ impl EditorView {
                 };
                 (t, i)
             })
+            .collect();
+        // clock toggles are dest-indexed too — remap by identity or the
+        // set would silently retarget/drop ports on every rebuild (#213)
+        self.clock_dests = old_clocks
+            .into_iter()
+            .map(
+                |d| match sh.dests.iter().position(|(_, dd)| dd.same_identity(&d)) {
+                    Some(i) => i,
+                    None => sh.ensure_dest(&dest_label(&d), d),
+                },
+            )
             .collect();
         let n = sh.dests.len();
         drop(sh);

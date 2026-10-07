@@ -913,6 +913,10 @@ struct EditorView {
     live_sink_of: HashMap<usize, usize>,
     live_transport: Vec<usize>,
     live_dest_of: HashMap<usize, usize>,
+    /// per-file MIDI clock toggles (#213): destination indices that send
+    /// the transport — Start/SPP/Continue/Clock/Stop — during playback.
+    /// Persisted in the sidecar as serialized destination identities.
+    clock_dests: HashSet<usize>,
     /// a routing refresh was deferred because a newly-assigned plugin is
     /// still loading — retried when its slot reports Ready
     live_route_dirty: bool,
@@ -1444,6 +1448,7 @@ impl EditorView {
             live_sink_of: HashMap::new(),
             live_transport: Vec::new(),
             live_dest_of: HashMap::new(),
+            clock_dests: HashSet::new(),
             live_route_dirty: false,
             live_countin_us: 0,
             master_peak: 0.0,

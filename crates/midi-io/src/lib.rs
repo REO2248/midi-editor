@@ -1086,6 +1086,36 @@ pub struct SchedulePatch {
     /// schedule's last event (the old unbounded behavior)
     pub loop_end_us: Option<u64>,
     pub sinks: Option<Vec<Box<dyn EventSink>>>,
+    /// MIDI clock transport config — the full desired state each patch:
+    /// `None` stops clocking (sinks losing it get a Stop first).
+    pub clock: Option<MidiClock>,
+}
+
+/// MIDI clock transport for the scheduling loop. The Clock / Start / Stop /
+/// Song Position Pointer / Continue wire bytes ride the schedule like any
+/// other event; this carries what the loop must synthesize itself because
+/// it lives outside the timeline: the repositioning sequence at a loop
+/// wrap (an unbounded wrap has no scheduled µs of its own) and Stop at
+/// pass end. Producers pre-encode positions, so the loop stays in the µs
+/// domain and never needs the document's tick grid.
+#[derive(Debug, Clone)]
+pub struct MidiClock {
+    /// Sink indices receiving transport messages — the same sinks the
+    /// schedule's 0xF8 tick events are routed to.
+    pub sinks: Vec<usize>,
+    /// Song Position Pointer value for `loop_from_us` — 16th-note units,
+    /// 14-bit, already clamped by the producer.
+    pub wrap_spp: u16,
+}
+
+/// Emit one realtime transport byte to each clock sink, skipping indices
+/// outside the sink array (a patch can shrink it mid-pass).
+fn clock_emit(sinks: &mut [Box<dyn EventSink>], mc: &MidiClock, bytes: &[u8]) {
+    for &si in &mc.sinks {
+        if let Some(s) = sinks.get_mut(si) {
+            s.send_at(bytes, 0);
+        }
+    }
 }
 
 /// Control-plane message for a running schedule.
@@ -1126,6 +1156,7 @@ fn note_sent(
 /// `from_us` is the timeline point playback resumes from — a sounding note
 /// survives only if the new schedule still delivers its note-off at or after
 /// that point; otherwise the channel gets CC123 and the entry drops.
+#[allow(clippy::too_many_arguments)]
 fn drain_updates(
     updates: &std::sync::mpsc::Receiver<SchedMsg>,
     events: &mut Vec<(u64, usize, Vec<u8>)>,
@@ -1134,6 +1165,7 @@ fn drain_updates(
     sinks: &mut Vec<Box<dyn EventSink>>,
     sounding: &mut std::collections::BTreeMap<(usize, u8), u32>,
     from_us: u64,
+    midi_clock: &mut Option<MidiClock>,
 ) -> bool {
     let mut applied = false;
     while let Ok(msg) = updates.try_recv() {
@@ -1148,6 +1180,29 @@ fn drain_updates(
             continue;
         };
         applied = true;
+        // clock transport leaving a sink gets a Stop first — a toggle-off
+        // or sink-array swap must not leave the receiver clocking (#213)
+        if let Some(mc) = midi_clock.take() {
+            let dropping: Vec<usize> = match &p.sinks {
+                // a wholesale swap retires every old connection
+                Some(_) => mc.sinks.clone(),
+                None => {
+                    let keep: &[usize] =
+                        p.clock.as_ref().map(|c| c.sinks.as_slice()).unwrap_or(&[]);
+                    mc.sinks
+                        .iter()
+                        .copied()
+                        .filter(|si| !keep.contains(si))
+                        .collect()
+                }
+            };
+            for &si in &dropping {
+                if let Some(s) = sinks.get_mut(si) {
+                    s.send_at(&[0xFC], 0);
+                }
+            }
+        }
+        *midi_clock = p.clock;
         *events = p.events;
         *loop_from_us = p.loop_from_us;
         *loop_end_us = p.loop_end_us;
@@ -1225,6 +1280,7 @@ pub fn run_schedule(
     start_us: u64,
     mut loop_from_us: Option<u64>,
     mut loop_end_us: Option<u64>,
+    mut midi_clock: Option<MidiClock>,
     stop: &std::sync::atomic::AtomicBool,
     pos: &std::sync::atomic::AtomicU64,
     watch: &std::sync::atomic::AtomicBool,
@@ -1267,6 +1323,7 @@ pub fn run_schedule(
                     sinks,
                     &mut sounding,
                     base_us,
+                    &mut midi_clock,
                 ) {
                     i = events.partition_point(|(us, _, _)| *us < base_us);
                     order = wake_order(&events, sinks, i);
@@ -1319,6 +1376,7 @@ pub fn run_schedule(
                 sinks,
                 &mut sounding,
                 base_us,
+                &mut midi_clock,
             ) {
                 i = events.partition_point(|(us, _, _)| *us < base_us);
                 order = wake_order(&events, sinks, i);
@@ -1363,6 +1421,16 @@ pub fn run_schedule(
                 order = wake_order(&events, sinks, i);
                 j = 0;
                 pos.store(ls, Relaxed);
+                // #213: a wrap is a transport reposition — receivers need
+                // SPP + Continue before the next clock tick
+                if let Some(mc) = &midi_clock {
+                    clock_emit(
+                        sinks,
+                        mc,
+                        &[0xF2, (mc.wrap_spp & 0x7F) as u8, (mc.wrap_spp >> 7) as u8],
+                    );
+                    clock_emit(sinks, mc, &[0xFB]);
+                }
             }
             None => break,
         }
@@ -1378,6 +1446,10 @@ pub fn run_schedule(
         for s in sinks.iter_mut() {
             s.notes_off();
         }
+    }
+    // #213: the pass ended — receivers stop clocking
+    if let Some(mc) = &midi_clock {
+        clock_emit(sinks, mc, &[0xFC]);
     }
 }
 
@@ -1412,6 +1484,7 @@ impl Playback {
         start_us: u64,
         loop_from_us: Option<u64>,
         loop_end_us: Option<u64>,
+        midi_clock: Option<MidiClock>,
         panic_on_stop: bool,
     ) -> Self {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1429,6 +1502,7 @@ impl Playback {
                 start_us,
                 loop_from_us,
                 loop_end_us,
+                midi_clock,
                 &stop2,
                 &pos2,
                 &watch2,
@@ -1713,6 +1787,7 @@ mod tests {
             0,
             None,
             None,
+            None, // no MIDI clock
             false,
         );
         let snap = wait_for(&log, 2);
@@ -1745,6 +1820,7 @@ mod tests {
             0,
             None,
             None,
+            None, // no MIDI clock
             false,
         );
         let snap = wait_for(&log, 2);
@@ -1774,6 +1850,7 @@ mod tests {
             900_000, // 100 ms before the second event
             None,
             None,
+            None, // no MIDI clock
             false,
         );
         let snap = wait_for(&log, 1);
@@ -1860,6 +1937,7 @@ mod tests {
             0,
             Some(0),
             None,
+            None, // no MIDI clock
             &stop,
             &pos,
             &watch,
@@ -1947,6 +2025,7 @@ mod tests {
             start,
             None,
             None,
+            None, // no MIDI clock
             &stop,
             pos.as_ref(),
             &watch,
@@ -2058,6 +2137,7 @@ mod tests {
             loop_from_us: None,
             loop_end_us: None,
             sinks: None,
+            clock: None,
         };
         let mut sinks: Vec<Box<dyn EventSink>> = vec![Box::new(PatchSink {
             log: log.clone(),
@@ -2077,7 +2157,7 @@ mod tests {
         ];
         let mut clock = FakeClock { now: 0 };
         run_schedule(
-            &mut clock, &mut sinks, events, 0, None, None, &stop, &pos, &watch, &rx, false,
+            &mut clock, &mut sinks, events, 0, None, None, None, &stop, &pos, &watch, &rx, false,
         );
         let snap = log.lock().unwrap().clone();
         // orphaned ch0: CC123 lands before the surviving ch1 note-off
@@ -2112,6 +2192,7 @@ mod tests {
             events: vec![(5_000u64, 0usize, vec![0x80, 60, 0])],
             loop_from_us: None,
             loop_end_us: None,
+            clock: None,
             sinks: Some(vec![Box::new(RecordingSink::recording(log_b.clone()))]),
         };
         let mut sinks: Vec<Box<dyn EventSink>> = vec![Box::new(PatchSink {
@@ -2130,7 +2211,7 @@ mod tests {
         ];
         let mut clock = FakeClock { now: 0 };
         run_schedule(
-            &mut clock, &mut sinks, events, 0, None, None, &stop, &pos, &watch, &rx, false,
+            &mut clock, &mut sinks, events, 0, None, None, None, &stop, &pos, &watch, &rx, false,
         );
         let a = log_a.lock().unwrap().clone();
         let b = log_b.lock().unwrap().clone();
@@ -2161,6 +2242,7 @@ mod tests {
             loop_from_us: Some(0),
             loop_end_us: None,
             sinks: None,
+            clock: None,
         };
         let mut sinks: Vec<Box<dyn EventSink>> = vec![Box::new(PatchSink {
             log: log.clone(),
@@ -2180,7 +2262,7 @@ mod tests {
         ];
         let mut clock = FakeClock { now: 0 };
         run_schedule(
-            &mut clock, &mut sinks, events, 0, None, None, &stop, &pos, &watch, &rx, false,
+            &mut clock, &mut sinks, events, 0, None, None, None, &stop, &pos, &watch, &rx, false,
         );
         let snap = log.lock().unwrap().clone();
         // rebase replay + the installed loop's wrap replay = 3 note-ons
@@ -2255,6 +2337,7 @@ mod tests {
             0,
             Some(0),
             Some(20_000),
+            None, // no MIDI clock
             &stop,
             &pos,
             &watch,
@@ -2308,6 +2391,7 @@ mod tests {
             0,
             Some(0),
             Some(10_000),
+            None, // no MIDI clock
             &stop,
             &pos,
             &watch,
@@ -2515,7 +2599,7 @@ mod tests {
             (0u64, 0usize, dump),
             (50_000u64, 0usize, vec![0x90, 60, 100]),
         ];
-        let mut pb = Playback::start(vec![Box::new(sink)], events, 0, None, None, false);
+        let mut pb = Playback::start(vec![Box::new(sink)], events, 0, None, None, None, false);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while log.lock().unwrap().is_empty() {
             assert!(std::time::Instant::now() < deadline, "note never arrived");
@@ -2636,6 +2720,7 @@ mod tests {
             5_000,
             None,
             None,
+            None, // no MIDI clock
             false,
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -2668,6 +2753,7 @@ mod tests {
             0,
             None,
             None,
+            None, // no MIDI clock
             false,
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -2709,6 +2795,7 @@ mod tests {
             0,
             None,
             None,
+            None, // no MIDI clock
             true, // reset-on-stop preference enabled
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -2738,6 +2825,7 @@ mod tests {
             0,
             None,
             None,
+            None, // no MIDI clock
             false,
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -2783,7 +2871,7 @@ mod tests {
         ];
         let mut clock = FakeClock { now: 0 };
         run_schedule(
-            &mut clock, &mut sinks, events, 0, None, None, &stop, &pos, &watch, &rx, false,
+            &mut clock, &mut sinks, events, 0, None, None, None, &stop, &pos, &watch, &rx, false,
         );
         let sent = log.lock().unwrap().clone();
         for ctl in [123u8, 121, 120] {
@@ -2797,6 +2885,184 @@ mod tests {
         let on62 = sent.iter().position(|b| *b == vec![0x90, 62, 100]).unwrap();
         let panic_at = sent.iter().position(|b| *b == vec![0xB0, 121, 0]).unwrap();
         assert!(on60 < panic_at && panic_at < on62);
+    }
+
+    // --- MIDI clock transport (#213) -------------------------------------
+
+    /// The loop emits the transport bytes that live outside the timeline:
+    /// SPP + Continue at a loop wrap, Stop at pass end. Clock ticks
+    /// themselves are ordinary scheduled events and need no machinery.
+    #[test]
+    fn clock_wrap_emits_spp_continue_and_stop() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let pos = AtomicU64::new(0);
+        let events = vec![
+            (0u64, 0usize, vec![0x90, 60, 100]),
+            (5_000u64, 0usize, vec![0x80, 60, 0]),
+        ];
+        let mut sinks: Vec<Box<dyn EventSink>> = vec![Box::new(RecordingSink {
+            log: log.clone(),
+            stop: stop.clone(),
+            // on, off, wrap SPP, wrap Continue, pass-2 on → stop mid-cycle
+            stop_after: 5,
+            sends: 0,
+        })];
+        let mut clock = FakeClock { now: 0 };
+        let watch = AtomicBool::new(false);
+        let (_tx, rx) = std::sync::mpsc::channel();
+        run_schedule(
+            &mut clock,
+            &mut sinks,
+            events,
+            0,
+            Some(0),
+            None,
+            Some(MidiClock {
+                sinks: vec![0],
+                wrap_spp: 42,
+            }),
+            &stop,
+            &pos,
+            &watch,
+            &rx,
+            false,
+        );
+        let snap = log.lock().unwrap().clone();
+        // the wrap emitted SPP (14-bit, LSB first) then Continue, after
+        // the notes-off sweep and before the replayed note-on
+        let spp = snap.iter().position(|b| b[0] == 0xF2).expect("wrap SPP");
+        assert_eq!(snap[spp], vec![0xF2, 42, 0]);
+        assert_eq!(snap[spp + 1], vec![0xFB]);
+        assert!(is_cc123_on(&snap[spp - 1], 15), "notes_off runs at wrap");
+        assert!(
+            snap[spp + 2][0] & 0xF0 == 0x90,
+            "Continue precedes the next pass's first note"
+        );
+        // stopping mid-second-cycle → Stop is the last byte the wire sees
+        assert_eq!(snap.last().unwrap(), &vec![0xFC]);
+    }
+
+    /// A patch that drops clock transport sends Stop to the sinks it left,
+    /// so a mid-pass toggle-off doesn't leave a receiver clocking.
+    #[test]
+    fn patch_dropping_clock_sends_stop() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let pos = AtomicU64::new(0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let watch = Arc::new(AtomicBool::new(false));
+        // content-only patch carrying no clock config → clock ends here
+        let patch = SchedulePatch {
+            events: vec![(5_000u64, 0usize, vec![0x80, 60, 0])],
+            loop_from_us: None,
+            loop_end_us: None,
+            sinks: None,
+            clock: None,
+        };
+        let mut sinks: Vec<Box<dyn EventSink>> = vec![Box::new(PatchSink {
+            log: log.clone(),
+            tx,
+            watch: watch.clone(),
+            patch: Mutex::new(Some(patch)),
+            panic: false,
+            fire_after: 1,
+            sends: 0,
+            stop_after: None,
+        })];
+        let events = vec![
+            (0u64, 0usize, vec![0x90, 60, 100]),
+            (5_000u64, 0usize, vec![0x80, 60, 0]),
+            (6_000u64, 0usize, vec![0x90, 62, 100]),
+        ];
+        let mut clock = FakeClock { now: 0 };
+        run_schedule(
+            &mut clock,
+            &mut sinks,
+            events,
+            0,
+            None,
+            None,
+            Some(MidiClock {
+                sinks: vec![0],
+                wrap_spp: 0,
+            }),
+            &stop,
+            &pos,
+            &watch,
+            &rx,
+            false,
+        );
+        let snap = log.lock().unwrap().clone();
+        // the patch dropped the clock → a Stop reached the sink at patch
+        // time, before the patched schedule's note-off played
+        let fc = snap.iter().position(|b| *b == vec![0xFC]).expect("stop");
+        let off = snap.iter().position(|b| *b == vec![0x80, 60, 0]).unwrap();
+        assert!(fc < off, "dropped clock should stop before the patch plays");
+        // and that early Stop is the only one — clock already off, so the
+        // pass end emits nothing
+        assert_eq!(snap.iter().filter(|b| *b == &vec![0xFC]).count(), 1);
+    }
+
+    /// A patch that keeps clock transport on the same sink sends no Stop —
+    /// only sinks losing the clock are told.
+    #[test]
+    fn patch_keeping_clock_sends_no_stop() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let pos = AtomicU64::new(0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let watch = Arc::new(AtomicBool::new(false));
+        let patch = SchedulePatch {
+            events: vec![(5_000u64, 0usize, vec![0x80, 60, 0])],
+            loop_from_us: None,
+            loop_end_us: None,
+            sinks: None,
+            clock: Some(MidiClock {
+                sinks: vec![0],
+                wrap_spp: 0,
+            }),
+        };
+        let mut sinks: Vec<Box<dyn EventSink>> = vec![Box::new(PatchSink {
+            log: log.clone(),
+            tx,
+            watch: watch.clone(),
+            patch: Mutex::new(Some(patch)),
+            panic: false,
+            fire_after: 1,
+            sends: 0,
+            stop_after: None,
+        })];
+        let events = vec![
+            (0u64, 0usize, vec![0x90, 60, 100]),
+            (5_000u64, 0usize, vec![0x80, 60, 0]),
+        ];
+        let mut clock = FakeClock { now: 0 };
+        run_schedule(
+            &mut clock,
+            &mut sinks,
+            events,
+            0,
+            None,
+            None,
+            Some(MidiClock {
+                sinks: vec![0],
+                wrap_spp: 0,
+            }),
+            &stop,
+            &pos,
+            &watch,
+            &rx,
+            false,
+        );
+        let snap = log.lock().unwrap().clone();
+        // exactly one Stop — the pass-end one, not a mid-run toggle blip
+        assert_eq!(
+            snap.iter().filter(|b| *b == &vec![0xFC]).count(),
+            1,
+            "clock continuity must not emit Stop"
+        );
+        assert_eq!(snap.last().unwrap(), &vec![0xFC]);
     }
 }
 
