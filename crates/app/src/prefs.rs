@@ -230,6 +230,11 @@ pub(crate) struct Prefs {
     /// fallback when a track has no entry). New in v2 sidecars.
     #[serde(default)]
     pub(crate) edit_ch: HashMap<usize, u8>,
+    /// destinations toggled to send the MIDI clock transport (#213) —
+    /// serialized `Destination` JSON per entry, like `track_dest`'s keys;
+    /// absent in old sidecars = no clock output
+    #[serde(default)]
+    pub(crate) clock_dests: Option<Vec<String>>,
 }
 
 impl Default for Prefs {
@@ -270,6 +275,7 @@ impl Default for Prefs {
             poly_key: None,
             lanes: None,
             edit_ch: HashMap::new(),
+            clock_dests: None,
         }
     }
 }
@@ -430,6 +436,18 @@ impl EditorView {
                 sh.sysex_policy = sp;
             }
         }
+        // MIDI-clock toggles resolve like track_dest — a defunct or
+        // renamed port keeps its identity until the hardware returns;
+        // anything not a MIDI port (or an unparseable entry) is dropped
+        // (#213)
+        self.clock_dests = p
+            .clock_dests
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|s| serde_json::from_str::<output::Destination>(s).ok())
+            .filter(|d| matches!(d, output::Destination::MidiPort { .. }))
+            .map(|d| self.resolve_dest(&d))
+            .collect();
         if let Some(m) = p.rec_mode.as_deref().and_then(RecMode::from_label) {
             self.rec_mode = m;
         }
@@ -622,6 +640,13 @@ impl EditorView {
             loop_enabled: sh.loop_enabled,
             loop_start: sh.loop_start,
             loop_end: sh.loop_end,
+            clock_dests: Some(
+                self.clock_dests
+                    .iter()
+                    .filter_map(|d| sh.dests.get(*d))
+                    .filter_map(|(_, dest)| serde_json::to_string(dest).ok())
+                    .collect(),
+            ),
             chase_sysex: Some(sh.chase_sysex),
             sysex_policy: Some(sh.sysex_policy.label().to_string()),
             rec_mode: Some(self.rec_mode.label().to_string()),

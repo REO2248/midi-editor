@@ -146,6 +146,27 @@ impl EditorView {
                         v.refresh_live_schedule();
                     },
                 ));
+                // #213: per-port clock transport toggle — a checked leaf
+                // nested under its port. Output ▸ Default Destination is
+                // the one destination menu carrying it; the set lives on
+                // the view and persists via the per-file sidecar.
+                if kind == DestPick::Default {
+                    let on = self.clock_dests.contains(&i);
+                    rows.push(Self::mi_leaf(
+                        ("clock", i),
+                        format!("  {}", t("output.clock_send")),
+                        "",
+                        Some(on),
+                        cx,
+                        move |v, _e, _cx| {
+                            if !v.clock_dests.remove(&i) {
+                                v.clock_dests.insert(i);
+                            }
+                            v.persist();
+                            v.refresh_live_schedule();
+                        },
+                    ));
+                }
             }
         }
         rows.push(Self::msep());

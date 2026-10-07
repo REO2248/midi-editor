@@ -164,6 +164,53 @@ pub(crate) fn countin_clicks_of(
     out
 }
 
+// --- MIDI clock transport (#213) -------------------------------------------
+
+/// Song Position Pointer value for a song tick: 16th-note units, 14-bit,
+/// clamped at the wire maximum.
+fn spp_of(start_tick: u64, quarter: u64) -> u16 {
+    (start_tick / (quarter / 4).max(1)).min(0x3FFF) as u16
+}
+
+/// SPP wire bytes — 14-bit value, LSB first.
+fn spp_bytes(spp: u16) -> Vec<u8> {
+    vec![0xF2, (spp & 0x7F) as u8, (spp >> 7) as u8]
+}
+
+/// Transport messages opening a pass: Start from tick 0, else SPP +
+/// Continue from mid-song. Loop-wrap repositioning and the end-of-pass
+/// Stop are emitted by midi-io's scheduling loop (`MidiClock`), not here.
+fn clock_start_msgs(start_tick: u64, quarter: u64) -> Vec<Vec<u8>> {
+    if start_tick == 0 {
+        vec![vec![0xFA]]
+    } else {
+        vec![spp_bytes(spp_of(start_tick, quarter)), vec![0xFB]]
+    }
+}
+
+/// Clock tick events on the constant 24-PPQ tick grid. Mapping each tick
+/// through the tempo map retimes the stream across tempo regions without
+/// any special handling; SMPTE documents carry no quarter-note grid and
+/// get no clock ticks.
+fn clock_events(
+    tm: &document::TempoMap,
+    start_tick: u64,
+    end_tick: u64,
+    sink: usize,
+) -> Vec<(u64, usize, Vec<u8>)> {
+    let Some(ppq) = tm.ppq().filter(|p| *p > 0) else {
+        return Vec::new();
+    };
+    let grid = (ppq / 24).max(1);
+    let mut out = Vec::new();
+    let mut t = start_tick.div_ceil(grid) * grid;
+    while t < end_tick {
+        out.push((tm.tick_to_us(t), sink, vec![0xF8]));
+        t = t.saturating_add(grid);
+    }
+    out
+}
+
 /// `EditorView::transport_points` on a bare `Document` — free so tests can
 /// drive it without a view. Tempo map + every `0x58` meter meta as `(µs,
 /// TransportCmd)`, sorted by µs.
@@ -251,6 +298,9 @@ pub(crate) struct LiveCtx {
     /// explicit loop locators in ticks (#130) — both  = unset
     loop_start: Option<u64>,
     loop_end: Option<u64>,
+    /// destinations carrying the MIDI clock transport this pass (#213) —
+    /// indices into `dests`, filtered to MidiPort where it matters
+    clock_dests: HashSet<usize>,
     chase_sysex: bool,
     sequential: bool,
     sxp: midi_io::SysexPolicy,
@@ -424,6 +474,7 @@ impl EditorView {
             loop_enabled: sh.loop_enabled,
             loop_start: sh.loop_start,
             loop_end: sh.loop_end,
+            clock_dests: self.clock_dests.clone(),
             chase_sysex: sh.chase_sysex,
             sequential: sh.doc.is_sequential(),
             sxp: sh.sysex_policy,
@@ -458,6 +509,9 @@ impl EditorView {
         if ctx.metronome || ctx.countin_us > 0 {
             needed.insert(ctx.met_dest.unwrap_or(ctx.default_dest));
         }
+        // a clock-toggled port opens for the transport even when no track
+        // routes to it — the ticks themselves are its only traffic (#213)
+        needed.extend(ctx.clock_dests.iter().copied());
         needed
     }
 
@@ -546,6 +600,7 @@ impl EditorView {
         ctx: &LiveCtx,
         start_us: u64,
         loop_ls_us: Option<u64>,
+        loop_re_us: Option<u64>,
         sink_of: &HashMap<usize, usize>,
         transport_lanes: &[usize],
     ) -> Vec<(u64, usize, Vec<u8>)> {
@@ -613,6 +668,40 @@ impl EditorView {
                     events.push((us, s, vec![0x99, note, 110]));
                     events.push((us + 20_000, s, vec![0x99, note, 0]));
                 }
+            }
+        }
+        // #213: MIDI clock transport on toggled port destinations. The
+        // start sequence (Start, or SPP + Continue from mid-song) lands at
+        // the boundary ahead of the first tick — same µs, earlier sort
+        // index; the 24-PPQ grid stays constant in ticks so tempo regions
+        // retime it themselves. The wrap's SPP + Continue and the
+        // end-of-pass Stop are synthesized by the scheduling loop from
+        // `MidiClock`, not listed here. When the pass starts inside the
+        // loop range the grid still covers [loop_from, end): ticks before
+        // the start are skipped this pass and replayed on every wrap.
+        let quarter = self.doc(|d| d.meter_map_for(self.sel_track).quarter_ticks());
+        let clock_sinks: Vec<usize> = ctx
+            .clock_dests
+            .iter()
+            .filter(|d| {
+                matches!(
+                    ctx.dests.get(**d).map(|(_, dd)| dd),
+                    Some(output::Destination::MidiPort { .. })
+                )
+            })
+            .filter_map(|d| sink_of.get(d).copied())
+            .collect();
+        if !clock_sinks.is_empty() {
+            let tm = self.doc(|d| d.tempo_map_for(self.sel_track));
+            let start_tick = tm.us_to_tick(start_us);
+            let sched_end_us = events.iter().map(|e| e.0).max().unwrap_or(0);
+            let end_tick = tm.us_to_tick(loop_re_us.unwrap_or(sched_end_us));
+            let grid_start = tm.us_to_tick(loop_ls_us.map_or(start_us, |ls| ls.min(start_us)));
+            for s in clock_sinks {
+                for b in clock_start_msgs(start_tick, quarter) {
+                    events.push((start_us, s, b));
+                }
+                events.extend(clock_events(&tm, grid_start, end_tick, s));
             }
         }
         // transport map -> scheduled updates on each plugin's transport
@@ -745,7 +834,15 @@ impl EditorView {
             return;
         }
         let ctx = self.live_ctx();
-        if ctx.dest_of_track != self.live_dest_of {
+        // a clock toggled on for an unrouted port needs the heavier path —
+        // its sink only exists after open_sinks (#213)
+        let clock_unsunk = ctx.clock_dests.iter().any(|d| {
+            matches!(
+                ctx.dests.get(*d).map(|(_, dd)| dd),
+                Some(output::Destination::MidiPort { .. })
+            ) && !self.live_sink_of.contains_key(d)
+        });
+        if ctx.dest_of_track != self.live_dest_of || clock_unsunk {
             self.refresh_live_routing();
             return;
         }
@@ -755,10 +852,12 @@ impl EditorView {
             &ctx,
             pos,
             loop_from,
+            loop_end,
             &self.live_sink_of,
             &self.live_transport,
         );
-        self.send_live_patch(events, loop_from, loop_end, None);
+        let clock = self.clock_cfg(&ctx, &self.live_sink_of, loop_from);
+        self.send_live_patch(events, loop_from, loop_end, None, clock);
     }
 
     /// Heavier live update for destination/routing changes: rebuild the
@@ -790,10 +889,12 @@ impl EditorView {
             &ctx,
             pos,
             loop_from,
+            loop_end,
             &self.live_sink_of,
             &self.live_transport,
         );
-        self.send_live_patch(events, loop_from, loop_end, Some(sinks));
+        let clock = self.clock_cfg(&ctx, &self.live_sink_of, loop_from);
+        self.send_live_patch(events, loop_from, loop_end, Some(sinks), clock);
     }
 
     /// Explicit loop locators → µs bounds for the schedule (#130). Ticks
@@ -821,12 +922,47 @@ impl EditorView {
         }
     }
 
+    /// midi-io transport config for the clock-enabled port sinks (#213):
+    /// the tick grid and the start sequence already ride the event
+    /// schedule; the worker synthesizes the wrap reposition (SPP +
+    /// Continue at `loop_from`'s tick) and the end-of-pass Stop itself.
+    fn clock_cfg(
+        &self,
+        ctx: &LiveCtx,
+        sink_of: &HashMap<usize, usize>,
+        loop_from: Option<u64>,
+    ) -> Option<midi_io::MidiClock> {
+        let sinks: Vec<usize> = ctx
+            .clock_dests
+            .iter()
+            .filter(|d| {
+                matches!(
+                    ctx.dests.get(**d).map(|(_, dd)| dd),
+                    Some(output::Destination::MidiPort { .. })
+                )
+            })
+            .filter_map(|d| sink_of.get(d).copied())
+            .collect();
+        if sinks.is_empty() {
+            return None;
+        }
+        let wrap_spp = self.doc(|d| {
+            spp_of(
+                d.tempo_map_for(self.sel_track)
+                    .us_to_tick(loop_from.unwrap_or(0)),
+                d.meter_map_for(self.sel_track).quarter_ticks(),
+            )
+        });
+        Some(midi_io::MidiClock { sinks, wrap_spp })
+    }
+
     fn send_live_patch(
         &self,
         events: Vec<(u64, usize, Vec<u8>)>,
         loop_from_us: Option<u64>,
         loop_end_us: Option<u64>,
         sinks: Option<Vec<Box<dyn EventSink>>>,
+        clock: Option<midi_io::MidiClock>,
     ) {
         if let Some(pb) = &self.playback {
             // locator bounds are doc µs — translate into the running
@@ -845,6 +981,7 @@ impl EditorView {
                 }),
                 loop_end_us: loop_end_us.map(|v| v + cin),
                 sinks,
+                clock,
             });
         }
     }
@@ -883,8 +1020,17 @@ impl EditorView {
         }
         let transport_lanes: Vec<usize> = transport_of.values().copied().collect();
         let (loop_from, loop_end) = self.loop_range_us(&ctx);
-        let events =
-            self.build_live_events(&ctx, self.play_us, loop_from, &sink_of, &transport_lanes);
+        let events = self.build_live_events(
+            &ctx,
+            self.play_us,
+            loop_from,
+            loop_end,
+            &sink_of,
+            &transport_lanes,
+        );
+        // clock config reads the doc-domain locator — the parked-domain
+        // shift happens inside start()'s own args below (#213)
+        let clock = self.clock_cfg(&ctx, &sink_of, loop_from);
         self.loop_start_us = self.play_us;
         self.live_sink_of = sink_of;
         self.live_transport = transport_lanes;
@@ -899,6 +1045,7 @@ impl EditorView {
             self.play_us,
             loop_from.map(|v| (if cin > 0 { v.max(self.play_us) } else { v }) + cin),
             loop_end.map(|v| v + cin),
+            clock,
             self.reset_on_stop,
         ));
         // Auto monitoring silences the echo while the transport runs
@@ -1309,5 +1456,134 @@ mod meter_tests {
         assert_eq!(meter_frac(0.001), 0.0); // -60 dBFS, under the floor
         assert!(meter_frac(0.1) > 0.0); // -20 dBFS, drawn
         assert!(meter_frac(0.004) > 0.0); // ≈ -48 dBFS, just over it
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::{clock_events, clock_start_msgs, spp_bytes, spp_of};
+    use document::TempoMap;
+
+    /// doc with FF51 tempo events (µs per quarter) at the given ticks
+    fn tm_of(tempos: &[(u64, u32)], ppq: u16) -> TempoMap {
+        let mut events: Vec<document::Event> = tempos
+            .iter()
+            .enumerate()
+            .map(|(i, &(tick, mpq))| document::Event {
+                id: i as document::EventId,
+                tick,
+                seq: 0,
+                raw_body: None,
+                kind: smf_core::EventKind::Meta {
+                    meta_type: 0x51,
+                    data: bytes::Bytes::from(mpq.to_be_bytes()[1..].to_vec()),
+                },
+            })
+            .collect();
+        events.sort_by_key(|e| e.tick);
+        TempoMap::build(
+            &[document::Track {
+                events,
+                name: None,
+                out_port: 0,
+                out_channel: 0,
+            }],
+            smf_core::Division::Metrical(ppq),
+        )
+    }
+
+    /// SPP counts 16th notes (ppq/4 ticks each), 14-bit, LSB first —
+    /// with the mandated clamp at 0x3FFF (#213).
+    #[test]
+    fn spp_encodes_sixteenths_and_clamps() {
+        let quarter = 480u64;
+        assert_eq!(spp_of(0, quarter), 0);
+        assert_eq!(spp_of(119, quarter), 0); // under one 16th
+        assert_eq!(spp_of(120, quarter), 1); // one 16th
+        assert_eq!(spp_of(1920, quarter), 16); // one 4/4 bar
+                                               // max representable: 16383 * 120 ticks; anything past clamps
+        assert_eq!(spp_of(16383 * 120, quarter), 16383);
+        assert_eq!(spp_of(16384 * 120, quarter), 16383);
+        assert_eq!(spp_of(u64::MAX, quarter), 16383);
+        // wire format LSB first
+        assert_eq!(spp_bytes(0x0000), vec![0xF2, 0x00, 0x00]);
+        assert_eq!(spp_bytes(0x1234), vec![0xF2, 0x34, 0x24]);
+        assert_eq!(spp_bytes(0x3FFF), vec![0xF2, 0x7F, 0x7F]);
+        // data bytes never set bit 7 — SPP is not a realtime byte
+        let b = spp_bytes(0x3FFF);
+        assert!(b[1] <= 0x7F && b[2] <= 0x7F);
+    }
+
+    /// Message selection on start: tick 0 issues Start alone; any
+    /// non-zero start sends SPP(position) then Continue — never Start.
+    #[test]
+    fn start_selection_start_vs_spp_continue() {
+        assert_eq!(clock_start_msgs(0, 480), vec![vec![0xFA]]);
+        // non-zero → F2 pair + FB, position from spp_of
+        assert_eq!(
+            clock_start_msgs(1920, 480),
+            vec![vec![0xF2, 0x10, 0x00], vec![0xFB]]
+        );
+        // clamped position still emits Continue (16383 16ths @120 ticks)
+        let far = clock_start_msgs(2_000_000, 480);
+        assert_eq!(far[1], vec![0xFB]);
+        assert_eq!(far[0], spp_bytes(16383));
+    }
+
+    /// Clock ticks ride the schedule as ordinary events on a constant
+    /// 24-PPQ grid; the tempo map retimes them into µs, so a tempo
+    /// change halves the spacing while the tick stride stays fixed.
+    #[test]
+    fn grid_is_constant_in_ticks_across_tempo_regions() {
+        // 120 BPM until tick 960, then 60 BPM (a 2× slowdown mid-pass)
+        let tm = tm_of(&[(0, 500_000), (960, 1_000_000)], 480);
+        let ev = clock_events(&tm, 0, 1920, 0);
+        // ticks 0,20,40,…,1900 → 96 clocks
+        assert_eq!(ev.len(), 96);
+        assert!(ev.iter().all(|(_, sink, b)| *sink == 0 && b == &[0xF8]));
+        // µs spacing: 20 ticks at 500 µs/beat-quarter… (500_000 µs per
+        // quarter → 20/480 quarter → ≈20_833 µs), then double after 960
+        let fast = ev[1].0 - ev[0].0;
+        let slow = ev[49].0 - ev[48].0; // tick 980 - tick 960 region
+        assert_eq!(fast, 20 * 500_000 / 480);
+        assert_eq!(slow, 20 * 1_000_000 / 480);
+        assert_eq!(slow, 2 * fast);
+        // boundary lands exactly on the 960-tick grid point (index 48)
+        assert_eq!(ev[48].0, tm.tick_to_us(960));
+    }
+
+    /// A mid-grid start still emits ticks on the document grid —
+    /// the first clock after the play position, never the position itself.
+    #[test]
+    fn grid_snaps_to_the_next_clock_tick() {
+        let tm = tm_of(&[(0, 500_000)], 480);
+        let ev = clock_events(&tm, 10, 100, 0);
+        assert_eq!(ev.len(), 4); // ticks 20/40/60/80
+        assert_eq!(ev[0].0, tm.tick_to_us(20));
+        assert_eq!(ev.last().unwrap().0, tm.tick_to_us(80));
+    }
+
+    /// Count-in decks park the song at 0 while the schedule runs ahead —
+    /// clocks still start on the document grid at the parked tick, not
+    /// the shifted µs region.
+    #[test]
+    fn count_in_still_clocks_from_grid_zero() {
+        let tm = tm_of(&[(0, 500_000)], 480);
+        let ev = clock_events(&tm, 0, 48, 0);
+        assert_eq!(ev.len(), 3); // 0, 20, 40
+    }
+
+    /// SMPTE division has no tick→beat mapping — no clocks (#213:
+    /// grid is defined in ticks, so the whole feature is tick-domain).
+    #[test]
+    fn smpte_files_emit_no_clock() {
+        let tm = TempoMap::build(
+            &[],
+            smf_core::Division::Smpte {
+                fps: 25,
+                ticks_per_frame: 40,
+            },
+        );
+        assert!(clock_events(&tm, 0, 1000, 0).is_empty());
     }
 }
