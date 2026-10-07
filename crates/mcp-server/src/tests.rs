@@ -68,6 +68,7 @@ fn ensure_dest_dedups_by_routing_identity() {
         component_id: Some("UID".into()),
         vendor: Some("V".into()),
         plugin_name: Some("Surge".into()),
+        instance: None,
     };
     let i = sh.ensure_dest("Surge", catalog_dest);
     // MCP-style: same bundle, no metadata at all → same slot
@@ -78,6 +79,7 @@ fn ensure_dest_dedups_by_routing_identity() {
             component_id: None,
             vendor: None,
             plugin_name: None,
+            instance: None,
         },
     );
     assert_eq!(i, j);
@@ -89,6 +91,7 @@ fn ensure_dest_dedups_by_routing_identity() {
             component_id: Some("UID".into()),
             vendor: None,
             plugin_name: None,
+            instance: None,
         },
     );
     assert_eq!(i, k);
@@ -101,9 +104,114 @@ fn ensure_dest_dedups_by_routing_identity() {
             component_id: Some("UID2".into()),
             vendor: None,
             plugin_name: None,
+            instance: None,
         },
     );
     assert_eq!(l, 1);
+}
+
+/// #222: the instance discriminator is part of routing identity — same
+/// bundle + same instance dedups; same bundle + different instance forks a
+/// new catalog slot; an explicit instance 1 is the base (None).
+#[test]
+fn ensure_dest_forks_per_instance() {
+    let mut sh = Shared::new(Document::from_file(smf_core::File {
+        format: 1,
+        division: smf_core::Division::Metrical(480),
+        tracks: vec![],
+        warnings: vec![],
+    }));
+    let surge = |instance: Option<u64>| Destination::Plugin {
+        plugin_path: r"C:\VST3\Surge.vst3".into(),
+        component_id: Some("UID".into()),
+        vendor: None,
+        plugin_name: None,
+        instance,
+    };
+    let base = sh.ensure_dest("Surge", surge(None));
+    // instance 2 is a distinct destination…
+    let i2 = sh.ensure_dest("Surge #2", surge(Some(2)));
+    assert_ne!(base, i2);
+    assert_eq!(sh.dests.len(), 2);
+    // …that dedups within itself, even via a component-id-only match
+    let i2_again = sh.ensure_dest("Surge #2", surge(Some(2)));
+    assert_eq!(i2, i2_again);
+    let i2_moved = sh.ensure_dest(
+        "Surge #2",
+        Destination::Plugin {
+            plugin_path: r"D:\Elsewhere\Surge.vst3".into(),
+            component_id: Some("UID".into()),
+            vendor: None,
+            plugin_name: None,
+            instance: Some(2),
+        },
+    );
+    assert_eq!(
+        i2, i2_moved,
+        "same instance still matches on a moved bundle"
+    );
+    // instance 3 forks again; explicit instance 1 lands on the base slot
+    let i3 = sh.ensure_dest("Surge #3", surge(Some(3)));
+    assert_ne!(i2, i3);
+    assert_eq!(sh.dests.len(), 3);
+    let base_again = sh.ensure_dest("Surge", surge(Some(1)));
+    assert_eq!(base, base_again);
+    assert_eq!(sh.plugin_instance_span(r"C:\VST3\Surge.vst3"), 3);
+    assert_eq!(sh.dests.len(), 3);
+}
+
+/// #222: `list_destinations` exposes both instances of one bundle with
+/// their instance number, and `set_track_destination` can assign a
+/// numbered instance directly.
+#[test]
+fn list_destinations_shows_instances() {
+    let sh = shared();
+    // catalog: the base VST3 entry plus a user-created instance 2
+    {
+        let mut g = sh.lock().unwrap();
+        let surge = |instance: Option<u64>| Destination::Plugin {
+            plugin_path: r"C:\VST3\Surge.vst3".into(),
+            component_id: Some("UID".into()),
+            vendor: None,
+            plugin_name: Some("Surge".into()),
+            instance,
+        };
+        g.ensure_dest("Surge [VST3]", surge(None));
+        g.ensure_dest("Surge #2 [VST3]", surge(Some(2)));
+    }
+    let (err, v) = call(&sh, "list_destinations", json!({}));
+    assert!(!err);
+    let dests = v["destinations"].as_array().unwrap();
+    let surges: Vec<&serde_json::Value> = dests
+        .iter()
+        .filter(|d| d["plugin_path"] == r"C:\VST3\Surge.vst3")
+        .collect();
+    assert_eq!(surges.len(), 2, "both instances must be listed");
+    let mut insts: Vec<u64> = surges
+        .iter()
+        .map(|d| d["instance"].as_u64().unwrap())
+        .collect();
+    insts.sort_unstable();
+    assert_eq!(insts, vec![1, 2]);
+
+    // MCP assignment of instance 3: creates + routes in one call
+    let (err, v) = call(
+        &sh,
+        "set_track_destination",
+        json!({"track": 1, "destination": {"vst3": r"C:\VST3\Surge.vst3", "instance": 3}}),
+    );
+    assert!(!err);
+    let dests = v["destinations"].as_array().unwrap();
+    let i3 = dests
+        .iter()
+        .find(|d| d["plugin_path"] == r"C:\VST3\Surge.vst3" && d["instance"] == 3)
+        .expect("instance 3 must appear in the catalog");
+    let i3_idx = i3["index"].as_u64().unwrap();
+    assert_eq!(v["track_dest"]["1"], i3_idx);
+    // and instance 2 remains its own destination
+    assert!(dests
+        .iter()
+        .any(|d| d["plugin_path"] == r"C:\VST3\Surge.vst3" && d["instance"] == 2));
 }
 
 #[test]

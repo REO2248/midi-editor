@@ -15,13 +15,26 @@
 //! keyed by path is promoted to its uid key on the next capture once the uid
 //! is known; lookup tries uid first and falls back to the path key so older
 //! records still resolve.
+//!
+//! Format v2 (#222): a record captured from an additional plugin *instance*
+//! is keyed by `inst:{n}:{uid-or-path}` so two instances of one bundle keep
+//! independent patches. Files without instance records are still written as
+//! v1 (byte-identical to the old format); v1 readers reject v2 files via the
+//! version check rather than silently misapplying an instance's state to
+//! the base plugin. A fresh instance with no record of its own inherits the
+//! base record as its starting patch.
 
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 8] = b"MEDPLGST";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION_V1: u32 = 1;
+/// v2 adds `inst:{n}:`-prefixed identity keys for extra plugin instances
+/// (#222). The record layout is unchanged; the version bump exists so a
+/// v1 reader discards the file instead of treating an instance's record
+/// as an opaque extra entry it could misapply.
+const FORMAT_VERSION: u32 = 2;
 /// Sanity cap on one record's metadata header (bytes of UTF-8 JSON) — the
 /// fields it carries are small; a larger header means the file isn't ours.
 const MAX_META_LEN: usize = 1 << 16;
@@ -45,6 +58,33 @@ pub fn identity_key(uid: &str, path: &Path) -> String {
     }
 }
 
+/// Storage key for a plugin *instance* (#222): the plain `identity_key` for
+/// the base instance (v1-compatible), `inst:{n}:{identity}` for instance
+/// `n ≥ 2`. The `inst:` namespace is disjoint — uids are hex, path keys
+/// start `path:`.
+fn store_key(uid: &str, path: &Path, instance: Option<u64>) -> String {
+    let base = identity_key(uid, path);
+    match instance.unwrap_or(1).max(1) {
+        n if n >= 2 => format!("inst:{n}:{base}"),
+        _ => base,
+    }
+}
+
+/// Reverse of `store_key`'s prefixing: `(instance, identity)` for a stored
+/// key — `None` for the base instance.
+fn split_store_key(key: &str) -> (Option<u64>, &str) {
+    if let Some(rest) = key.strip_prefix("inst:") {
+        if let Some((n, id)) = rest.split_once(':') {
+            if let Ok(n) = n.parse::<u64>() {
+                if n >= 2 {
+                    return (Some(n), id);
+                }
+            }
+        }
+    }
+    (None, key)
+}
+
 /// One plugin's saved state plus the identity needed to decide later whether
 /// a loaded instance should receive it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +98,9 @@ pub struct PluginStateRecord {
     pub vendor: String,
     pub name: String,
     pub version: String,
+    /// Which instance of the bundle this state belongs to — `None` is the
+    /// base instance, `Some(n ≥ 2)` an additional one (#222).
+    pub instance: Option<u64>,
     /// Unix epoch milliseconds when the blob was captured.
     pub saved_unix_ms: u64,
     /// Opaque component+controller blob from `Plugin::save_state`.
@@ -119,12 +162,35 @@ impl PluginStateStore {
         Ok(true)
     }
 
-    /// Find the record for a plugin: by class uid first, then by bundle path
-    /// (covers records captured before the uid was known), then a last-resort
-    /// scan for a uid-keyed record whose stored path matches — the same bundle
-    /// at the same location is the same plugin even when the uid differs or
-    /// wasn't reported this time around.
-    pub fn lookup(&self, uid: &str, path: &Path) -> Option<&PluginStateRecord> {
+    /// Find the record for a plugin instance (`instance` is 1-based): by
+    /// class uid first, then by bundle path (covers records captured before
+    /// the uid was known), then a last-resort scan for a uid-keyed record
+    /// whose stored path matches — the same bundle at the same location is
+    /// the same plugin even when the uid differs or wasn't reported this
+    /// time around. For `instance ≥ 2` the instance-keyed entries are tried
+    /// before falling back to the base record, so a fresh instance inherits
+    /// the base patch as its starting point (#222).
+    pub fn lookup(&self, uid: &str, path: &Path, instance: u64) -> Option<&PluginStateRecord> {
+        if instance >= 2 {
+            let inst = Some(instance);
+            if !uid.is_empty() {
+                if let Some(rec) = self.records.get(&store_key(uid, path, inst)) {
+                    return Some(rec);
+                }
+            }
+            if let Some(rec) = self.records.get(&store_key("", path, inst)) {
+                return Some(rec);
+            }
+            let path_str = path.to_string_lossy();
+            if let Some(rec) = self
+                .records
+                .values()
+                .find(|r| r.instance == inst && r.path == path_str.as_ref())
+            {
+                return Some(rec);
+            }
+            // no instance record yet — the base patch is the starting point
+        }
         if !uid.is_empty() {
             if let Some(rec) = self.records.get(uid) {
                 return Some(rec);
@@ -134,16 +200,19 @@ impl PluginStateStore {
             return Some(rec);
         }
         let path = path.to_string_lossy();
-        self.records.values().find(|r| r.path == path.as_ref())
+        self.records
+            .values()
+            .find(|r| r.instance.is_none() && r.path == path.as_ref())
     }
 
-    /// Store a captured blob. Replaces the record under the same identity and
-    /// removes a stale path-keyed twin when the uid is now known. Returns true
-    /// when the stored bytes actually changed (cheap "needs write" signal).
+    /// Store a captured blob. Replaces the record under the same (instance,
+    /// identity) key and removes a stale path-keyed twin when the uid is now
+    /// known. Returns true when the stored bytes actually changed (cheap
+    /// "needs write" signal).
     pub fn insert(&mut self, record: PluginStateRecord) -> bool {
-        let key = identity_key(&record.uid, Path::new(&record.path));
+        let key = store_key(&record.uid, Path::new(&record.path), record.instance);
         if !record.uid.is_empty() {
-            let path_key = identity_key("", Path::new(&record.path));
+            let path_key = store_key("", Path::new(&record.path), record.instance);
             if path_key != key {
                 self.records.remove(&path_key);
             }
@@ -181,9 +250,16 @@ pub fn now_unix_ms() -> u64 {
 }
 
 fn encode(records: &BTreeMap<String, PluginStateRecord>) -> Vec<u8> {
+    // v1 bytes when no instance-scoped record exists — the common single-
+    // instance song stays byte-identical with the old format (#222)
+    let version = if records.keys().any(|k| split_store_key(k).0.is_some()) {
+        FORMAT_VERSION
+    } else {
+        FORMAT_VERSION_V1
+    };
     let mut out = Vec::with_capacity(64 + records.len() * 256);
     out.extend_from_slice(MAGIC);
-    out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
     out.extend_from_slice(&(records.len() as u32).to_le_bytes());
     for (key, rec) in records {
         let meta = serde_json::json!({
@@ -245,7 +321,7 @@ fn decode(bytes: &[u8]) -> Result<BTreeMap<String, PluginStateRecord>, String> {
         return Err("bad magic".into());
     }
     let version = cur.u32()?;
-    if version != FORMAT_VERSION {
+    if !(FORMAT_VERSION_V1..=FORMAT_VERSION).contains(&version) {
         return Err(format!("unsupported version {version}"));
     }
     let count = cur.u32()? as usize;
@@ -267,6 +343,9 @@ fn decode(bytes: &[u8]) -> Result<BTreeMap<String, PluginStateRecord>, String> {
             return Err("state blob length out of range".into());
         }
         let state = cur.take(blob_len as usize)?.to_vec();
+        // the instance dimension rides inside the key (`inst:{n}:` prefix);
+        // v1 files never carry it, so their records decode as base (#222)
+        let (instance, _) = split_store_key(&key);
         records.insert(
             key,
             PluginStateRecord {
@@ -275,6 +354,7 @@ fn decode(bytes: &[u8]) -> Result<BTreeMap<String, PluginStateRecord>, String> {
                 vendor: meta.vendor,
                 name: meta.name,
                 version: meta.version,
+                instance,
                 saved_unix_ms: meta.saved_unix_ms,
                 state,
             },
@@ -297,9 +377,29 @@ mod tests {
             vendor: "Vendor".into(),
             name: "Plugin".into(),
             version: "1.0".into(),
+            instance: None,
             saved_unix_ms: 123,
             state: blob.to_vec(),
         }
+    }
+
+    fn rec_inst(uid: &str, path: &str, instance: u64, blob: &[u8]) -> PluginStateRecord {
+        PluginStateRecord {
+            instance: (instance >= 2).then_some(instance),
+            ..rec(uid, path, blob)
+        }
+    }
+
+    /// Raw byte view of a store write (encode is private — same output via
+    /// save, without the fs dance).
+    fn bytes_of(store: &PluginStateStore) -> Vec<u8> {
+        encode(&store.records)
+    }
+
+    /// Header (magic + version) of an encoded store.
+    fn version_of(bytes: &[u8]) -> u32 {
+        assert_eq!(&bytes[..8], MAGIC);
+        u32::from_le_bytes(bytes[8..12].try_into().unwrap())
     }
 
     fn write(store: &PluginStateStore, path: &Path) {
@@ -319,20 +419,96 @@ mod tests {
         assert_eq!(loaded.records.len(), 2);
         assert_eq!(
             loaded
-                .lookup("AABBCCDD", Path::new("ignored"))
+                .lookup("AABBCCDD", Path::new("ignored"), 1)
                 .unwrap()
                 .state,
             vec![1, 2, 3]
         );
         assert_eq!(
             loaded
-                .lookup("", Path::new("C:/VST3/b.vst3"))
+                .lookup("", Path::new("C:/VST3/b.vst3"), 1)
                 .unwrap()
                 .state
                 .len(),
             1000
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v2 round-trip: base + instance records of the same bundle keep
+    /// independent state, encode as version 2, and decode back (#222).
+    #[test]
+    fn v2_roundtrip_keeps_instances_independent() {
+        let dir = std::env::temp_dir().join(format!("med-ps-i-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("song.mid.editor.state");
+        let mut store = PluginStateStore::default();
+        store.insert(rec("UIDSYNTH", "C:/VST3/synth.vst3", &[1, 1]));
+        store.insert(rec_inst("UIDSYNTH", "C:/VST3/synth.vst3", 2, &[2, 2]));
+        store.insert(rec_inst("UIDSYNTH", "C:/VST3/synth.vst3", 3, &[3, 3, 3]));
+        let bytes = bytes_of(&store);
+        assert_eq!(version_of(&bytes), FORMAT_VERSION, "instance records => v2");
+        write(&store, &file);
+        let loaded = PluginStateStore::load(&file);
+        assert_eq!(loaded.records.len(), 3);
+        let p = Path::new("C:/VST3/synth.vst3");
+        assert_eq!(loaded.lookup("UIDSYNTH", p, 1).unwrap().state, vec![1, 1]);
+        assert_eq!(loaded.lookup("UIDSYNTH", p, 2).unwrap().state, vec![2, 2]);
+        assert_eq!(
+            loaded.lookup("UIDSYNTH", p, 3).unwrap().state,
+            vec![3, 3, 3]
+        );
+        assert_eq!(loaded.lookup("UIDSYNTH", p, 2).unwrap().instance, Some(2));
+        // a fourth instance has no record yet — inherits the base patch
+        assert_eq!(loaded.lookup("UIDSYNTH", p, 4).unwrap().state, vec![1, 1]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v1 read compat: a file written without instance records is version 1
+    /// and its records decode with `instance: None` (#222).
+    #[test]
+    fn v1_file_reads_as_base_instance() {
+        let mut store = PluginStateStore::default();
+        store.insert(rec("AABB", "C:/VST3/a.vst3", &[7]));
+        store.insert(rec("", "C:/VST3/b.vst3", &[8]));
+        let bytes = bytes_of(&store);
+        assert_eq!(
+            version_of(&bytes),
+            FORMAT_VERSION_V1,
+            "no instance records => v1 bytes"
+        );
+        let decoded = decode(&bytes).unwrap();
+        assert!(decoded.values().all(|r| r.instance.is_none()));
+    }
+
+    /// A hand-built v1 blob (old-build output) still loads: magic + version
+    /// 1 + one uid record, laid out by hand so the test doesn't lean on the
+    /// current encoder (#222).
+    #[test]
+    fn v1_blob_written_by_old_build_still_reads() {
+        let meta = serde_json::json!({
+            "uid": "AABB",
+            "path": "C:/VST3/a.vst3",
+            "vendor": "Vendor",
+            "name": "Plugin",
+            "version": "1.0",
+            "saved_unix_ms": 123u64,
+        })
+        .to_string();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&FORMAT_VERSION_V1.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&("AABB".len() as u32).to_le_bytes());
+        bytes.extend_from_slice(b"AABB");
+        bytes.extend_from_slice(&(meta.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(meta.as_bytes());
+        bytes.extend_from_slice(&3u64.to_le_bytes());
+        bytes.extend_from_slice(&[9, 9, 9]);
+        let decoded = decode(&bytes).unwrap();
+        let rec = decoded.values().next().unwrap();
+        assert!(rec.instance.is_none());
+        assert_eq!(rec.state, vec![9, 9, 9]);
     }
 
     #[test]
@@ -355,6 +531,8 @@ mod tests {
                 "truncated",
                 b"MEDPLGST\x01\x00\x00\x00\x05\x00\x00\x00".to_vec(),
             ),
+            // version from the future
+            ("v3", b"MEDPLGST\x03\x00\x00\x00\x00\x00\x00\x00".to_vec()),
         ] {
             let file = dir.join(name);
             std::fs::write(&file, bytes).unwrap();
@@ -374,15 +552,31 @@ mod tests {
         assert!(store.insert(rec("", "C:/VST3/x.vst3", &[7])));
         // same plugin, now with its class uid: lookup by uid misses, path hits
         assert_eq!(
-            store.lookup("AABB", path).unwrap().state,
+            store.lookup("AABB", path, 1).unwrap().state,
             vec![7],
             "uid-miss must fall back to the path key"
         );
         // capture with the known uid promotes the record off the path key
         assert!(store.insert(rec("AABB", "C:/VST3/x.vst3", &[8])));
         assert_eq!(store.records.len(), 1, "stale path key must be removed");
-        assert_eq!(store.lookup("AABB", path).unwrap().state, vec![8]);
-        assert_eq!(store.lookup("", path).unwrap().state, vec![8]);
+        assert_eq!(store.lookup("AABB", path, 1).unwrap().state, vec![8]);
+        assert_eq!(store.lookup("", path, 1).unwrap().state, vec![8]);
+    }
+
+    /// Instance-scoped promotion: a path-keyed record for instance 2 is
+    /// promoted to its uid key within instance 2 only — base records and
+    /// other instances are untouched (#222).
+    #[test]
+    fn instance_path_record_promotes_within_its_scope() {
+        let mut store = PluginStateStore::default();
+        let path = Path::new("C:/VST3/x.vst3");
+        assert!(store.insert(rec("AABB", "C:/VST3/x.vst3", &[1])));
+        assert!(store.insert(rec_inst("", "C:/VST3/x.vst3", 2, &[2])));
+        // instance 2's uid now known — promotes inside the inst:2 namespace
+        assert!(store.insert(rec_inst("AABB", "C:/VST3/x.vst3", 2, &[3])));
+        assert_eq!(store.records.len(), 2, "base record must be untouched");
+        assert_eq!(store.lookup("AABB", path, 2).unwrap().state, vec![3]);
+        assert_eq!(store.lookup("AABB", path, 1).unwrap().state, vec![1]);
     }
 
     #[test]
@@ -394,7 +588,10 @@ mod tests {
         assert!(!store.insert(rec("U1", "C:/VST3/a.vst3", &[1])));
         // different blob for a different plugin -> U2 record untouched
         assert!(store.insert(rec("U1", "C:/VST3/a.vst3", &[3])));
-        assert_eq!(store.lookup("U2", Path::new("x")).unwrap().state, vec![2]);
+        assert_eq!(
+            store.lookup("U2", Path::new("x"), 1).unwrap().state,
+            vec![2]
+        );
     }
 
     #[test]

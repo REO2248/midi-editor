@@ -839,6 +839,9 @@ pub struct PluginSlot {
     /// the .vst3 bundle this instance was loaded from (guards against stale
     /// slots after a destination re-point or rescan)
     pub path: std::path::PathBuf,
+    /// which instance of the bundle this slot hosts — 1 for the base
+    /// instance; lets a warm slot satisfy only its own destination (#222)
+    pub instance: u64,
     /// live latency tracker shared with `sink` — the compensation math reads
     /// it per event, so `refresh_latency` retimes playback in place
     pub latency: LatencyComp,
@@ -886,7 +889,10 @@ pub enum PluginReq {
     /// configuration; result arrives on the event channel. A same-dest
     /// reopen preserves plugin state — it is a reconfigure (device/rate/
     /// buffer change) or a device-loss recovery, not a plugin swap.
-    Open(usize, std::path::PathBuf, AudioSelection),
+    /// The trailing `u64` is the 1-based instance number (#222) — a
+    /// dest index hosts at most one instance, so this mainly decorates
+    /// the slot/event for warm-slot matching on the app side.
+    Open(usize, std::path::PathBuf, AudioSelection, u64),
     /// unload the instance for a dest index (dest re-pointed/rescan)
     Drop(usize),
     /// drop every instance (rescan rebuilt the catalog)
@@ -898,6 +904,8 @@ pub enum PluginReq {
 pub struct PluginEvent {
     pub dest: usize,
     pub path: std::path::PathBuf,
+    /// 1-based instance number of the opened plugin (#222)
+    pub instance: u64,
     pub result: Result<PluginSlot, PluginError>,
 }
 
@@ -919,7 +927,7 @@ pub fn spawn_plugin_host() -> (
             std::collections::HashMap::new();
         while let Ok(req) = req_rx.recv() {
             match req {
-                PluginReq::Open(d, path, sel) => {
+                PluginReq::Open(d, path, sel, inst) => {
                     // reopening a live destination keeps the plugin's state
                     // (program, params) — the new instance continues where
                     // the old stream left off
@@ -938,6 +946,7 @@ pub fn spawn_plugin_host() -> (
                                 sink: p.event_sink(),
                                 plugin: p.plugin_handle(),
                                 path,
+                                instance: inst,
                                 latency: p.latency(),
                                 audio: p.audio_config(),
                                 stream: p.stream_state(),
@@ -946,6 +955,7 @@ pub fn spawn_plugin_host() -> (
                             let _ = evt_tx.send(PluginEvent {
                                 dest: d,
                                 path: slot.path.clone(),
+                                instance: inst,
                                 result: Ok(slot),
                             });
                         }
@@ -953,6 +963,7 @@ pub fn spawn_plugin_host() -> (
                             let _ = evt_tx.send(PluginEvent {
                                 dest: d,
                                 path,
+                                instance: inst,
                                 result: Err(e),
                             });
                         }
@@ -1821,11 +1832,21 @@ mod tests {
     fn host_worker_request_ordering_and_exit() {
         let (tx, rx, _worker) = spawn_plugin_host();
         let bogus = std::path::PathBuf::from(r"C:\no\such\bundle.vst3");
-        tx.send(PluginReq::Open(7, bogus.clone(), AudioSelection::default()))
-            .unwrap();
+        tx.send(PluginReq::Open(
+            7,
+            bogus.clone(),
+            AudioSelection::default(),
+            1,
+        ))
+        .unwrap();
         tx.send(PluginReq::Drop(3)).unwrap();
-        tx.send(PluginReq::Open(2, bogus.clone(), AudioSelection::default()))
-            .unwrap();
+        tx.send(PluginReq::Open(
+            2,
+            bogus.clone(),
+            AudioSelection::default(),
+            2,
+        ))
+        .unwrap();
         tx.send(PluginReq::Clear).unwrap();
         tx.send(PluginReq::Shutdown).unwrap();
 
@@ -1834,11 +1855,13 @@ mod tests {
             .expect("first reply");
         assert_eq!(first.dest, 7);
         assert_eq!(first.path, bogus);
+        assert_eq!(first.instance, 1);
         assert!(first.result.is_err(), "bogus bundle must fail to open");
         let second = rx
             .recv_timeout(std::time::Duration::from_secs(60))
             .expect("second reply");
         assert_eq!(second.dest, 2);
+        assert_eq!(second.instance, 2, "events carry the request's instance");
         assert!(second.result.is_err());
         // after Shutdown the worker exits and the event channel closes
         assert!(rx.recv_timeout(std::time::Duration::from_secs(30)).is_err());

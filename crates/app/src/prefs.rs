@@ -351,12 +351,21 @@ pub(crate) fn dest_label(d: &output::Destination) -> String {
                 format!("{port_name} #{}", ord + 1)
             }
         }
-        output::Destination::Plugin { plugin_path, .. } => {
+        output::Destination::Plugin {
+            plugin_path,
+            instance,
+            ..
+        } => {
             let stem = PathBuf::from(plugin_path)
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "plugin".into());
-            format!("{stem} [VST3]")
+            // additional instances of one bundle are distinguished in the
+            // label — the base instance keeps the legacy name (#222)
+            match midi_io::instance_num(*instance) {
+                n if n >= 2 => format!("{stem} #{n} [VST3]"),
+                _ => format!("{stem} [VST3]"),
+            }
         }
     }
 }

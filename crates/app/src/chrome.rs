@@ -242,39 +242,40 @@ impl EditorView {
                     detail,
                     cx,
                     move |v, _e, _cx| {
-                        let mut sh = crate::lock_shared(&v.shared);
-                        match kind {
-                            DestPick::Track => {
-                                let before = sh.track_dest.get(&v.sel_track).copied();
-                                sh.track_dest.insert(v.sel_track, i);
-                                sh.apply_session(mcp_server::SessionOp::SetTrackDest {
-                                    track: v.sel_track,
-                                    before,
-                                    after: i,
-                                });
-                            }
-                            DestPick::Default => {
-                                let before = sh.default_dest;
-                                sh.default_dest = i;
-                                sh.apply_session(mcp_server::SessionOp::SetDefaultDest {
-                                    before,
-                                    after: i,
-                                });
-                            }
-                            DestPick::Metronome => {
-                                let before = sh.met_dest;
-                                sh.met_dest = Some(i);
-                                sh.apply_session(mcp_server::SessionOp::SetMetDest {
-                                    before,
-                                    after: Some(i),
-                                });
-                            }
-                        }
-                        drop(sh);
-                        v.audition_off();
-                        v.persist();
-                        v.ensure_plugin(i, true);
+                        pick_dest(v, kind, i);
                         let _ = path2;
+                    },
+                ));
+                // "New instance" (#222): spawn the next instance id for this
+                // bundle and assign it like a normal pick — it lands in the
+                // catalog as an independent destination (same undo path).
+                let path3 = path.clone();
+                rows.push(Self::mi_leaf(
+                    ("plugin-inst", i),
+                    format!("   + {}", t("output.new_instance")),
+                    "",
+                    None,
+                    cx,
+                    move |v, _e, _cx| {
+                        let j = {
+                            let mut sh = crate::lock_shared(&v.shared);
+                            let Some(mut inst_dest) = sh
+                                .dests
+                                .iter()
+                                .find(|(_, d)| {
+                                    matches!(d, output::Destination::Plugin { plugin_path: p, .. } if p == &path3)
+                                })
+                                .map(|(_, d)| d.clone())
+                            else {
+                                return;
+                            };
+                            if let output::Destination::Plugin { instance, .. } = &mut inst_dest
+                            {
+                                *instance = Some(sh.plugin_instance_span(&path3) + 1);
+                            }
+                            sh.ensure_dest(&dest_label(&inst_dest), inst_dest)
+                        };
+                        pick_dest(v, kind, j);
                     },
                 ));
             }
@@ -1477,4 +1478,40 @@ impl EditorView {
                 cx.notify();
             }))
     }
+}
+
+/// Assign catalog destination `i` to the picker target (`kind`) — the shared
+/// tail of every plugin destination pick: session-op undo recording,
+/// audition off, persist, and the VST3 warm-up. #222's "New instance" rows
+/// reuse it for the destination they just cataloged.
+fn pick_dest(v: &mut EditorView, kind: DestPick, i: usize) {
+    let mut sh = crate::lock_shared(&v.shared);
+    match kind {
+        DestPick::Track => {
+            let before = sh.track_dest.get(&v.sel_track).copied();
+            sh.track_dest.insert(v.sel_track, i);
+            sh.apply_session(mcp_server::SessionOp::SetTrackDest {
+                track: v.sel_track,
+                before,
+                after: i,
+            });
+        }
+        DestPick::Default => {
+            let before = sh.default_dest;
+            sh.default_dest = i;
+            sh.apply_session(mcp_server::SessionOp::SetDefaultDest { before, after: i });
+        }
+        DestPick::Metronome => {
+            let before = sh.met_dest;
+            sh.met_dest = Some(i);
+            sh.apply_session(mcp_server::SessionOp::SetMetDest {
+                before,
+                after: Some(i),
+            });
+        }
+    }
+    drop(sh);
+    v.audition_off();
+    v.persist();
+    v.ensure_plugin(i, true);
 }

@@ -457,13 +457,33 @@ impl Shared {
     /// time, which surfaces a readable error instead of a wrong port. Dedup
     /// is by routing identity (`same_identity`), not struct equality, so a
     /// plugin arriving with different metadata (moved path, fresh vendor
-    /// string) doesn't fork the catalog into duplicate entries.
+    /// string) doesn't fork the catalog into duplicate entries. Plugin
+    /// identity includes the instance discriminator (#222): two instances
+    /// of one bundle are two independent destinations.
     pub fn ensure_dest(&mut self, label: &str, dest: Destination) -> usize {
         if let Some(i) = self.dests.iter().position(|(_, d)| d.same_identity(&dest)) {
             return i;
         }
         self.dests.push((label.to_string(), dest));
         self.dests.len() - 1
+    }
+
+    /// Highest cataloged instance number for a plugin bundle path — 0 when
+    /// the bundle isn't in the catalog. "New instance" entries are numbered
+    /// `span + 1`, so instances of one bundle stay dense 1..=n (#222).
+    pub fn plugin_instance_span(&self, plugin_path: &str) -> u64 {
+        self.dests
+            .iter()
+            .filter_map(|(_, d)| match d {
+                Destination::Plugin {
+                    plugin_path: p,
+                    instance,
+                    ..
+                } if p == plugin_path => Some(midi_io::instance_num(*instance)),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     /// The destination index a track resolves to (per-track override else default).
