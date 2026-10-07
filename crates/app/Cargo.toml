@@ -32,7 +32,10 @@ raw-window-handle = "0.6"
 # API exposes no type filter list, so Open/Save-As call COM directly to
 # offer "MIDI files" + "All files" like a real Windows document app.
 # Threading/Pipes/IO/Storage/Security back the single-instance guard
-# (#197): the named mutex and the hand-off named pipe.
+# (#197): the named mutex and the hand-off named pipe. System::Shutdown
+# carries the shutdown-block reason and WindowsAndMessaging the
+# WM_*ENDSESSION messages for the session-end subclass (#198); Shell
+# already supplies comctl32's SetWindowSubclass/DefSubclassProc.
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Globalization",
@@ -45,6 +48,8 @@ windows = { version = "0.62", features = [
     "Win32_System_Threading",
     "Win32_System_Pipes",
     "Win32_System_IO",
+    "Win32_System_Shutdown",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [dev-dependencies]
