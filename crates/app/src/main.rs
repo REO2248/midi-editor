@@ -25,6 +25,7 @@ mod recording;
 mod recovery;
 mod render;
 mod shutdown;
+mod single_instance;
 mod theme;
 #[cfg(test)]
 mod ui_tests;
@@ -2141,19 +2142,6 @@ impl Drop for EditorView {
     }
 }
 
-/// First non-flag argument = the file to open. `args_os` (not `args`) because
-/// a shell-open verb can deliver non-UTF-8 paths on Windows and `args()`
-/// panics on them; Explorer always quotes "%1", but flags like `--foo` must
-/// never be mistaken for a filename.
-fn file_arg() -> Option<PathBuf> {
-    file_arg_from(std::env::args_os().skip(1))
-}
-
-fn file_arg_from(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<PathBuf> {
-    args.find(|a| !a.to_string_lossy().starts_with('-'))
-        .map(PathBuf::from)
-}
-
 fn main() {
     // exact build identity for bug reports — same string as Help>About and
     // MCP serverInfo: "<semver>+<commit>[.dirty]"
@@ -2182,12 +2170,26 @@ fn main() {
     diagnostics::install_panic_hook();
     diagnostics::log_boot();
     tracing::info!(log_dir = %log_dir.display(), "logging initialized");
-    let path = file_arg();
+    // CLI classification (first non-flag argument = the file to open).
+    // `args_os` (not `args`) because a shell-open verb can deliver non-UTF-8
+    // paths on Windows and `args()` panics on them; Explorer always quotes
+    // "%1", but flags like `--foo` must never be mistaken for a filename.
+    let cli = single_instance::classify_args(std::env::args_os().skip(1));
+    let path = cli.files.first().cloned();
+    // #197 — single-instance guard. On Windows the primary claims
+    // `Local\midi-editor-single-instance` for the process lifetime (this
+    // binding must stay alive until main returns) and serves the hand-off
+    // pipe; a secondary forwards its file arguments to the primary and
+    // exits before any window (or MCP server) exists. `--new-instance`
+    // skips the guard entirely. Other platforms: a no-op, today's behavior.
+    let instance = single_instance::startup(&cli);
+    let pending_opens = instance.pending_opens;
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
         // the component theme (text inputs etc.) is applied in
         // EditorView::apply_theme once prefs resolve the effective palette
         let path = path.clone();
+        let pending_opens = pending_opens.clone();
         cx.spawn(async move |cx| {
             cx.open_window(WindowOptions::default(), move |window, cx| {
                 let input =
@@ -2221,7 +2223,9 @@ fn main() {
                     v.window_handle = Some(window.window_handle());
                     let (mcp_stop, mcp_thread) = spawn_mcp(v.shared.clone());
                     v.shutdown.track_mcp(mcp_stop, mcp_thread);
-                    spawn_doc_watch(cx, v.shared.clone());
+                    // the hand-off queue is only ever `Some` in the Windows
+                    // primary; elsewhere the tick drains an empty option
+                    spawn_doc_watch(cx, v.shared.clone(), pending_opens.clone());
                     window.focus(&v.focus.clone(), cx);
                     v
                 });
@@ -2355,9 +2359,9 @@ fn spawn_mcp(
 #[cfg(test)]
 mod tests {
     use crate::{
-        assemble_events, clip_from_item, clip_to_item, countin_clicks_of, empty_doc, file_arg_from,
-        is_midi_path, park_schedule, plugin_plan, route_events, track_audible, Clip, ClipEvent,
-        GlobalPrefs, PluginPlan, PluginState, Prefs,
+        assemble_events, clip_from_item, clip_to_item, countin_clicks_of, empty_doc, is_midi_path,
+        park_schedule, plugin_plan, route_events, track_audible, Clip, ClipEvent, GlobalPrefs,
+        PluginPlan, PluginState, Prefs,
     };
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
@@ -3478,24 +3482,5 @@ mod tests {
         assert_eq!(ch, Some(5));
         assert!(wire_to_kind(&[0xC5]).is_none());
         assert!(wire_to_kind(&[]).is_none());
-    }
-
-    #[test]
-    pub(crate) fn file_arg_skips_flags_and_picks_first_path() {
-        use std::ffi::OsString;
-        let args = vec![
-            OsString::from("--fullscreen"),
-            OsString::from(r"C:\Music\my song.mid"),
-            OsString::from("extra.mid"),
-        ];
-        assert_eq!(
-            file_arg_from(args.into_iter()),
-            Some(PathBuf::from(r"C:\Music\my song.mid"))
-        );
-        assert_eq!(file_arg_from(Vec::new().into_iter()), None);
-        assert_eq!(
-            file_arg_from(vec![OsString::from("--only-flags")].into_iter()),
-            None
-        );
     }
 }
