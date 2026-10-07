@@ -131,8 +131,15 @@ pub(crate) fn fmt_rel_time(unix_ts: u64) -> String {
 }
 
 /// Poll the shared doc's notify counter so MCP-driven edits repaint the UI
-/// even while the user is idle.
-pub(crate) fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
+/// even while the user is idle. `pending_opens` (Windows primary only)
+/// carries file paths handed over by secondary instances (#197); each tick
+/// drains them through the same discard-guarded open drag/drop uses and
+/// brings the window to the foreground.
+pub(crate) fn spawn_doc_watch(
+    cx: &mut Context<EditorView>,
+    shared: SharedDoc,
+    pending_opens: Option<crate::single_instance::PendingOpens>,
+) {
     cx.spawn(async move |this, cx| {
         let mut last = 0u64;
         let mut last_tx = 0u64;
@@ -185,8 +192,8 @@ pub(crate) fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
                     last_tx = r.revision;
                     r.label.clone()
                 });
-            if let Some(this) = this.upgrade() {
-                this.update(cx, |v, cx| {
+            if let Some(view) = this.upgrade() {
+                view.update(cx, |v, cx| {
                     // hotplug reconcile ~every 2 s: fresh endpoints join the
                     // catalog, vanished ones stay visible but marked offline,
                     // and an armed recording's input reconnects on return
@@ -383,6 +390,30 @@ pub(crate) fn spawn_doc_watch(cx: &mut Context<EditorView>, shared: SharedDoc) {
                         cx.notify();
                     }
                 });
+                // #197: file paths a secondary instance forwarded. Outside
+                // the update above so `update_in` can borrow the window:
+                // each path goes through the same guarded open drag/drop
+                // uses (the discard prompt applies), then the window is
+                // foregrounded. An empty queue costs nothing.
+                let forwarded = match &pending_opens {
+                    Some(q) => {
+                        let mut q = q.lock().unwrap_or_else(|e| e.into_inner());
+                        std::mem::take(&mut *q)
+                    }
+                    None => Vec::new(),
+                };
+                if !forwarded.is_empty() {
+                    let opened = this.update_in(cx, |v, w, cx| {
+                        for p in forwarded {
+                            v.confirm_discard_or_save(PendingAction::OpenPath(p), w, cx);
+                        }
+                        // best-effort foreground; activate cannot fail
+                        w.activate_window();
+                    });
+                    if opened.is_err() {
+                        tracing::warn!("single-instance hand-off arrived after the window closed");
+                    }
+                }
             } else {
                 break;
             }

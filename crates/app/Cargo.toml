@@ -30,7 +30,9 @@ raw-window-handle = "0.6"
 [target.'cfg(windows)'.dependencies]
 # common-item dialogs (IFileOpenDialog/IFileSaveDialog) — gpui's prompt
 # API exposes no type filter list, so Open/Save-As call COM directly to
-# offer "MIDI files" + "All files" like a real Windows document app
+# offer "MIDI files" + "All files" like a real Windows document app.
+# Threading/Pipes/IO/Storage/Security back the single-instance guard
+# (#197): the named mutex and the hand-off named pipe.
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Globalization",
@@ -38,6 +40,11 @@ windows = { version = "0.62", features = [
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
     "Win32_System_LibraryLoader",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+    "Win32_System_Pipes",
+    "Win32_System_IO",
 ] }
 
 [dev-dependencies]
