@@ -10,6 +10,8 @@ mod cmd;
 mod diagnostics;
 mod docevents;
 mod edit_ops;
+#[cfg(windows)]
+mod end_session;
 mod filedlg;
 mod geometry;
 mod guard;
@@ -2233,6 +2235,21 @@ fn main() {
                 // close) runs the same discard guard as New/Open; once the
                 // guard passes, the teardown coordinator runs once
                 // (idempotent with the on_app_quit hook)
+                #[cfg(windows)]
+                {
+                    // #198 — with the main HWND known, subclass the window so
+                    // an OS logoff/reboot snapshots a dirty document instead
+                    // of losing it; the hook only adds protection, every
+                    // message still reaches gpui's own handling
+                    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                    let hwnd = match window.window_handle().map(|h| h.as_raw()) {
+                        Ok(RawWindowHandle::Win32(h)) => h.hwnd.get() as usize,
+                        _ => 0,
+                    };
+                    if hwnd != 0 {
+                        view.update(cx, |v, _| end_session::install(hwnd, v));
+                    }
+                }
                 let weak = view.downgrade();
                 window.on_window_should_close(cx, move |window, cx| {
                     let Some(view) = weak.upgrade() else {

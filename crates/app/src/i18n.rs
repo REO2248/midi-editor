@@ -433,6 +433,10 @@ static EN: &[(&str, &str)] = &[
     ("recovery.restored", "Recovered unsaved work"),
     ("recovery.failed", "Recovery failed: {e}"),
     ("recovery.untitled", "(untitled)"),
+    (
+        "shutdown.block_reason",
+        "Saving an emergency snapshot of unsaved MIDI edits…",
+    ),
     ("time.sec_ago", "{n} s ago"),
     ("time.min_ago", "{n} min ago"),
     ("time.hr_ago", "{n} h ago"),
@@ -965,6 +969,10 @@ static JA: &[(&str, &str)] = &[
     ("recovery.restored", "未保存の作業を復元しました"),
     ("recovery.failed", "復元に失敗: {e}"),
     ("recovery.untitled", "（無題）"),
+    (
+        "shutdown.block_reason",
+        "未保存のMIDI編集の緊急スナップショットを保存中…",
+    ),
     ("time.sec_ago", "{n} 秒前"),
     ("time.min_ago", "{n} 分前"),
     ("time.hr_ago", "{n} 時間前"),
