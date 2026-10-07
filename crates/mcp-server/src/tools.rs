@@ -1981,6 +1981,7 @@ pub fn dispatch(name: &str, args: &serde_json::Value, shared: SharedDoc) -> Call
                 } else if let Some(p) = d["vst3"].as_str() {
                     Destination::Plugin {
                         plugin_path: p.to_string(),
+                        instance: None,
                         component_id: None,
                         vendor: None,
                         plugin_name: None,

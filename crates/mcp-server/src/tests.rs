@@ -65,6 +65,7 @@ fn ensure_dest_dedups_by_routing_identity() {
     }));
     let catalog_dest = Destination::Plugin {
         plugin_path: r"C:\VST3\Surge.vst3".into(),
+        instance: None,
         component_id: Some("UID".into()),
         vendor: Some("V".into()),
         plugin_name: Some("Surge".into()),
@@ -75,6 +76,7 @@ fn ensure_dest_dedups_by_routing_identity() {
         "Surge",
         Destination::Plugin {
             plugin_path: r"C:\VST3\Surge.vst3".into(),
+            instance: None,
             component_id: None,
             vendor: None,
             plugin_name: None,
@@ -86,6 +88,7 @@ fn ensure_dest_dedups_by_routing_identity() {
         "Surge",
         Destination::Plugin {
             plugin_path: r"D:\Moved\Surge.vst3".into(),
+            instance: None,
             component_id: Some("UID".into()),
             vendor: None,
             plugin_name: None,
@@ -98,12 +101,33 @@ fn ensure_dest_dedups_by_routing_identity() {
         "Dexed",
         Destination::Plugin {
             plugin_path: r"C:\VST3\Dexed.vst3".into(),
+            instance: None,
             component_id: Some("UID2".into()),
             vendor: None,
             plugin_name: None,
         },
     );
     assert_eq!(l, 1);
+}
+
+#[test]
+fn ensure_dest_distinguishes_plugin_instances() {
+    let shared = shared();
+    let mut sh = shared.lock().unwrap();
+    let plugin = |instance| Destination::Plugin {
+        plugin_path: "Synth.vst3".into(),
+        instance,
+        component_id: Some("UID".into()),
+        vendor: None,
+        plugin_name: None,
+    };
+    let legacy = sh.ensure_dest("Synth", plugin(None));
+    let first = sh.ensure_dest("Synth", plugin(Some(1)));
+    let second = sh.ensure_dest("Synth #2", plugin(Some(2)));
+    assert_eq!(first, sh.ensure_dest("renamed", plugin(Some(1))));
+    assert_eq!(second, sh.ensure_dest("renamed", plugin(Some(2))));
+    assert_ne!(first, second);
+    assert_ne!(legacy, first);
 }
 
 #[test]

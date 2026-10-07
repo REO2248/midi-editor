@@ -26,6 +26,9 @@ pub enum Destination {
     /// persistence — serde defaults migrate them on read.
     Plugin {
         plugin_path: String,
+        /// Explicit hosted instance; absent in legacy single-instance sidecars.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance: Option<u64>,
         /// VST3 class/component ID (TUID hex string) when a probe saw it
         #[serde(default)]
         component_id: Option<String>,
@@ -59,14 +62,16 @@ impl Destination {
                 Destination::Plugin {
                     plugin_path: pa,
                     component_id: ca,
+                    instance: ia,
                     ..
                 },
                 Destination::Plugin {
                     plugin_path: pb,
                     component_id: cb,
+                    instance: ib,
                     ..
                 },
-            ) => pa == pb || matches!((ca, cb), (Some(a), Some(b)) if a == b),
+            ) => ia == ib && (pa == pb || matches!((ca, cb), (Some(a), Some(b)) if a == b)),
             _ => false,
         }
     }
@@ -98,6 +103,7 @@ pub fn resolve_plugin_dest(
     let Destination::Plugin {
         plugin_path,
         component_id,
+        instance,
         ..
     } = stored
     else {
@@ -109,12 +115,19 @@ pub fn resolve_plugin_dest(
             _ => "",
         }
     }
+    let adopt = |d: &Destination| {
+        let mut d = d.clone();
+        if let Destination::Plugin { instance: i, .. } = &mut d {
+            *i = *instance;
+        }
+        d
+    };
     // 1. preferred hint: exact path match — adopt the catalog's fresh metadata
     if let Some(exact) = catalog
         .iter()
         .find(|d| matches!(d, Destination::Plugin { plugin_path: p, .. } if p == plugin_path))
     {
-        return (exact.clone(), Resolved::SamePath);
+        return (adopt(exact), Resolved::SamePath);
     }
     // 2. component-ID match: the bundle moved or was reinstalled
     if let Some(cid) = component_id {
@@ -129,7 +142,7 @@ pub fn resolve_plugin_dest(
             1 => {
                 let found = matches.pop().expect("one match");
                 return (
-                    found.clone(),
+                    adopt(found),
                     Resolved::Moved(std::path::PathBuf::from(path_of(found))),
                 );
             }
@@ -150,7 +163,7 @@ pub fn resolve_plugin_dest(
                 });
                 let found = matches[0];
                 return (
-                    found.clone(),
+                    adopt(found),
                     Resolved::Ambiguous(std::path::PathBuf::from(path_of(found))),
                 );
             }
@@ -1504,6 +1517,7 @@ mod tests {
     fn plugin(path: &str, cid: Option<&str>) -> Destination {
         Destination::Plugin {
             plugin_path: path.into(),
+            instance: None,
             component_id: cid.map(str::to_string),
             vendor: None,
             plugin_name: None,
@@ -1591,6 +1605,7 @@ mod tests {
             d,
             Destination::Plugin {
                 plugin_path: _,
+                instance: None,
                 component_id: None,
                 vendor: None,
                 plugin_name: None

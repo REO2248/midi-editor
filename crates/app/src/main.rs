@@ -1134,6 +1134,7 @@ pub(crate) fn build_dest_catalog(
             p.name.clone(),
             midi_io::Destination::Plugin {
                 plugin_path: p.path.to_string_lossy().into_owned(),
+                instance: None,
                 component_id: p.uid.clone(),
                 vendor: (!p.vendor.is_empty()).then(|| p.vendor.clone()),
                 plugin_name: Some(p.name.clone()),
@@ -1653,6 +1654,7 @@ impl EditorView {
                 "Test Synth".into(),
                 midi_io::Destination::Plugin {
                     plugin_path: "C:/Fixtures/TestSynth.vst3".into(),
+                    instance: None,
                     component_id: None,
                     vendor: None,
                     plugin_name: None,
